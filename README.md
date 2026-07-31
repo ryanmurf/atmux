@@ -13,7 +13,7 @@
 │                           │ │                                       │
 │                           │ │ ❯                                     │
 └───────────────────────────┘ └───────────────────────────────────────┘
- enter switch   n new   / filter   x kill   ? help   q quit
+ e quick edit   enter switch   n new   / filter   x kill   ? help   q quit
 ```
 
 ## What it does
@@ -21,6 +21,7 @@
 - Shows all tmux sessions in a persistent left rail.
 - Marks detected Codex and Claude agents as `● working` or `◆ waiting`.
 - Shows a live preview of the selected session's active pane.
+- Opens a selected session for a quick edit in a popup without leaving the control plane.
 - Switches the current tmux client instantly, or attaches when run outside tmux.
 - Launches an agent through a folder → harness → profile → session-name wizard.
 - Finds projects beneath configured roots, Codex layered profiles, and local `claude-*` wrapper profiles.
@@ -59,7 +60,8 @@ Then reload tmux and press your prefix followed by `A`.
 | Key | Action |
 | --- | --- |
 | `j` / `k`, arrows | Select a session |
-| `Enter` / `s` | Switch or attach |
+| `e` | Quick edit in a popup; press your tmux prefix then `d` to return |
+| `Enter` / `s` | Switch or attach; press your tmux prefix then `L` to return |
 | `n` | Launch a new agent |
 | `/` | Filter sessions |
 | `Page Up` / `Page Down` | Scroll pane preview |
@@ -69,6 +71,10 @@ Then reload tmux and press your prefix followed by `A`.
 | `q` | Quit |
 
 The launch wizard accepts text to filter project folders. `Enter` advances and `Esc` goes back.
+
+Quick edit creates a temporary nested tmux client inside the popup. Detaching closes only that
+client and reveals atmux again; it does not detach your outer terminal. A full switch uses tmux's
+standard last-session shortcut to return.
 
 ## Configuration
 
@@ -86,6 +92,7 @@ project_roots = ["~/IdeaProjects", "~/work"]
 favorite_dirs = ["~/Documents/notes"]
 refresh_ms = 750
 preview_lines = 160
+sidebar_width = 32
 switch_on_launch = true
 
 [[profiles]]

@@ -16,6 +16,7 @@ project_roots = ["~/IdeaProjects", "~/work"]
 favorite_dirs = []
 refresh_ms = 750
 preview_lines = 160
+sidebar_width = 32
 switch_on_launch = true
 
 # Profiles are grouped by harness in the launcher. Add as many as you like.
@@ -70,6 +71,7 @@ pub struct GeneralConfig {
     pub favorite_dirs: Vec<PathBuf>,
     pub refresh_ms: u64,
     pub preview_lines: usize,
+    pub sidebar_width: u16,
     pub switch_on_launch: bool,
 }
 
@@ -80,6 +82,7 @@ impl Default for GeneralConfig {
             favorite_dirs: Vec::new(),
             refresh_ms: 750,
             preview_lines: 160,
+            sidebar_width: 32,
             switch_on_launch: true,
         }
     }
@@ -153,6 +156,7 @@ impl Config {
     fn normalize(&mut self) {
         self.general.refresh_ms = self.general.refresh_ms.clamp(100, 10_000);
         self.general.preview_lines = self.general.preview_lines.clamp(20, 2_000);
+        self.general.sidebar_width = self.general.sidebar_width.clamp(20, 60);
         for path in &mut self.general.project_roots {
             *path = expand_tilde(path);
         }
@@ -309,6 +313,7 @@ mod tests {
         let config: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
         assert_eq!(config.profiles.len(), 2);
         assert_eq!(config.general.refresh_ms, 750);
+        assert_eq!(config.general.sidebar_width, 32);
     }
 
     #[test]
@@ -322,6 +327,7 @@ mod tests {
     fn partial_config_uses_field_defaults_without_recursing() {
         let config: Config = toml::from_str("profiles = []").unwrap();
         assert_eq!(config.general.refresh_ms, 750);
+        assert_eq!(config.general.sidebar_width, 32);
         assert!(config.status.working_markers.is_empty());
     }
 }

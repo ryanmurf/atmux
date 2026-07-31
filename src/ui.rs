@@ -27,8 +27,10 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     .areas(area);
 
     render_header(frame, app, header);
+    let max_sidebar = body.width.saturating_sub(24).max(1);
+    let sidebar_width = app.config.general.sidebar_width.min(max_sidebar);
     let [sessions, detail] =
-        Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)])
+        Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(24)])
             .spacing(1)
             .areas(body);
     app.session_area = sessions;
@@ -193,6 +195,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ])
     } else {
         shortcuts(&[
+            ("e", "quick edit"),
             ("enter", "switch"),
             ("n", "new"),
             ("/", "filter"),
@@ -212,7 +215,8 @@ fn render_help(frame: &mut Frame<'_>, app: &App) {
         Line::styled("Keyboard", Style::default().fg(CYAN).bold()),
         Line::from(""),
         help_line("j / k, arrows", "move through sessions"),
-        help_line("enter / s", "switch to the selected session"),
+        help_line("e", "quick edit in a popup; prefix + d returns"),
+        help_line("enter / s", "full switch; prefix + L returns to atmux"),
         help_line("n", "launch an agent"),
         help_line("/", "filter sessions"),
         help_line("r", "refresh now"),

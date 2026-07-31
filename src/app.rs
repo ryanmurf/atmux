@@ -319,6 +319,7 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => self.select_edge(false),
             KeyCode::Char('G') | KeyCode::End => self.select_edge(true),
             KeyCode::Enter | KeyCode::Char('s') => self.activate_selected()?,
+            KeyCode::Char('e') => self.quick_edit_selected()?,
             KeyCode::Char('n') => {
                 self.launcher = Some(Launcher::new(&self.config));
                 self.mode = Mode::Launch;
@@ -566,6 +567,19 @@ impl App {
         if let Some(name) = self.selected_session().map(|session| session.name.clone()) {
             self.activate_named(name)?;
         }
+        Ok(())
+    }
+
+    fn quick_edit_selected(&mut self) -> Result<()> {
+        let name = self
+            .selected_session()
+            .map(|session| session.name.clone())
+            .context("no tmux session selected")?;
+        if self.current_session.as_deref() == Some(&name) {
+            bail!("atmux is already running in this session");
+        }
+        self.tmux.popup(&name)?;
+        self.refresh()?;
         Ok(())
     }
 

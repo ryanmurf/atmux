@@ -223,6 +223,29 @@ impl Tmux {
         Self::output(["switch-client", "-t", name]).map(|_| ())
     }
 
+    /// Opens an interactive attachment to a session in a tmux popup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error outside tmux, for a malformed tmux environment, or when the popup fails.
+    pub fn popup(&self, name: &str) -> Result<()> {
+        let tmux_environment = env::var("TMUX").context("quick edit requires atmux inside tmux")?;
+        let command = popup_attach_command(name, &tmux_environment)?;
+        let title = format!(" atmux · {name} ");
+        Self::output([
+            "display-popup",
+            "-E",
+            "-w",
+            "94%",
+            "-h",
+            "92%",
+            "-T",
+            &title,
+            &command,
+        ])
+        .map(|_| ())
+    }
+
     /// Attaches the process terminal to a tmux session until it detaches.
     ///
     /// # Errors
@@ -323,6 +346,27 @@ fn command_available(command: &str) -> bool {
     })
 }
 
+fn popup_attach_command(name: &str, tmux_environment: &str) -> Result<String> {
+    let socket = tmux_environment
+        .split(',')
+        .next()
+        .filter(|value| !value.is_empty())
+        .context("TMUX does not contain a server socket")?;
+    Ok(shell_words::join([
+        "env",
+        "-u",
+        "TMUX",
+        "-u",
+        "TMUX_PANE",
+        "tmux",
+        "-S",
+        socket,
+        "attach-session",
+        "-t",
+        name,
+    ]))
+}
+
 #[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -417,5 +461,26 @@ mod tests {
         assert!(command_available("sh"));
         assert!(command_available("/bin/sh"));
         assert!(!command_available("/definitely/missing/atmux-agent"));
+    }
+
+    #[test]
+    fn popup_command_reuses_the_current_tmux_socket() {
+        let command = popup_attach_command("review one", "/tmp/tmux-1000/custom,42,0").unwrap();
+        assert_eq!(
+            shell_words::split(&command).unwrap(),
+            [
+                "env",
+                "-u",
+                "TMUX",
+                "-u",
+                "TMUX_PANE",
+                "tmux",
+                "-S",
+                "/tmp/tmux-1000/custom",
+                "attach-session",
+                "-t",
+                "review one",
+            ]
+        );
     }
 }
