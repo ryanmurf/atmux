@@ -30,7 +30,15 @@
 
 ## Install
 
-You need Rust 1.88+ and tmux.
+atmux supports Linux and macOS and tests both in CI. You need Rust 1.88+ and tmux.
+
+On macOS, install tmux first if needed:
+
+```bash
+brew install tmux
+```
+
+Then install atmux on either platform:
 
 ```bash
 cargo install --git https://github.com/ryanmurf/atmux

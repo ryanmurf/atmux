@@ -280,7 +280,7 @@ fn check_output(output: &Output, summary: &str) -> Result<String> {
         bail!("{summary}: {stderr}");
     }
     Ok(String::from_utf8_lossy(&output.stdout)
-        .trim_end()
+        .trim_end_matches(['\r', '\n'])
         .to_owned())
 }
 
@@ -402,6 +402,14 @@ mod tests {
         assert_eq!(pane.pane_id, "%7");
         assert_eq!(pane.status_override, "waiting");
         assert_eq!(pane.score(), 3);
+    }
+
+    #[test]
+    fn parses_pane_with_empty_status_override() {
+        let line = "solo\t0\t1\t123\t0\t1\t0\t1\t42\tbash\t/tmp\tsolo\t%0\t";
+        let pane = parse_pane(line).unwrap();
+        assert_eq!(pane.name, "solo");
+        assert!(pane.status_override.is_empty());
     }
 
     #[test]
