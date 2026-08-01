@@ -18,7 +18,7 @@
 
 ## What it does
 
-- Shows all tmux sessions in a persistent left rail.
+- Shows all tmux sessions in a compact left rail that grows to fit, stops at 25%, and ellipsizes long names.
 - Marks detected Codex and Claude agents as `● working` or `◆ waiting`.
 - Shows a live preview of the selected session's active pane.
 - Opens a selected session for a quick edit in a popup without leaving the control plane.
@@ -92,7 +92,6 @@ project_roots = ["~/IdeaProjects", "~/work"]
 favorite_dirs = ["~/Documents/notes"]
 refresh_ms = 750
 preview_lines = 160
-sidebar_width = 32
 switch_on_launch = true
 
 [[profiles]]

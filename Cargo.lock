@@ -85,6 +85,7 @@ dependencies = [
  "serde",
  "shell-words",
  "toml",
+ "unicode-width",
 ]
 
 [[package]]

@@ -5,10 +5,12 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{App, LaunchStage, Launcher, Mode},
     status::AgentStatus,
+    tmux::Session,
 };
 
 const CYAN: Color = Color::Rgb(72, 202, 228);
@@ -27,8 +29,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     .areas(area);
 
     render_header(frame, app, header);
-    let max_sidebar = body.width.saturating_sub(24).max(1);
-    let sidebar_width = app.config.general.sidebar_width.min(max_sidebar);
+    let sidebar_width = sidebar_width(app, body.width);
     let [sessions, detail] =
         Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(24)])
             .spacing(1)
@@ -73,10 +74,13 @@ fn render_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .map(|&index| {
             let session = &app.sessions[index];
             let color = status_color(session.status);
+            let suffix = session_suffix(app, session);
+            let name_width = usize::from(area.width).saturating_sub(6 + suffix.width());
+            let name = ellipsize(&session.name, name_width);
             let mut spans = vec![
                 Span::styled(session.status.icon(), Style::default().fg(color).bold()),
                 Span::raw(" "),
-                Span::styled(session.name.clone(), Style::default().fg(Color::White)),
+                Span::styled(name, Style::default().fg(Color::White)),
             ];
             if session.attached {
                 spans.push(Span::styled("  attached", Style::default().fg(MUTED)));
@@ -531,4 +535,81 @@ fn title_case(value: &str) -> String {
     characters.next().map_or_else(String::new, |first| {
         first.to_uppercase().chain(characters).collect()
     })
+}
+
+fn sidebar_width(app: &App, body_width: u16) -> u16 {
+    let visible = app.filtered_indices();
+    let title = if app.filter.is_empty() {
+        format!(" Sessions ({}) ", visible.len())
+    } else {
+        format!(" Sessions · /{} ({}) ", app.filter, visible.len())
+    };
+    let title_width = title.width() + 2;
+    let row_width = visible
+        .iter()
+        .map(|&index| {
+            let session = &app.sessions[index];
+            6 + session.name.width() + session_suffix(app, session).width()
+        })
+        .max()
+        .unwrap_or_default();
+    cap_sidebar_width(title_width.max(row_width), body_width)
+}
+
+fn cap_sidebar_width(desired: usize, body_width: u16) -> u16 {
+    let quarter = usize::from(body_width / 4).max(1);
+    u16::try_from(desired.min(quarter).max(1)).unwrap_or(u16::MAX)
+}
+
+fn session_suffix(app: &App, session: &Session) -> String {
+    let mut suffix = String::new();
+    if session.attached {
+        suffix.push_str("  attached");
+    }
+    if app.current_session.as_deref() == Some(&session.name) {
+        suffix.push_str("  atmux");
+    }
+    suffix
+}
+
+fn ellipsize(value: &str, max_width: usize) -> String {
+    if value.width() <= max_width {
+        return value.to_owned();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let target = max_width - 3;
+    let mut width = 0;
+    let mut output = String::new();
+    for character in value.chars() {
+        let character_width = character.width().unwrap_or_default();
+        if width + character_width > target {
+            break;
+        }
+        output.push(character);
+        width += character_width;
+    }
+    output.push_str("...");
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidebar_collapses_but_never_exceeds_one_quarter() {
+        assert_eq!(cap_sidebar_width(18, 120), 18);
+        assert_eq!(cap_sidebar_width(80, 120), 30);
+    }
+
+    #[test]
+    fn long_names_are_ellipsized_to_the_exact_width() {
+        assert_eq!(ellipsize("short", 10), "short");
+        assert_eq!(ellipsize("a-very-long-session", 10), "a-very-...");
+        assert_eq!(ellipsize("session", 3), "...");
+        assert_eq!(ellipsize("session", 0), "");
+    }
 }
