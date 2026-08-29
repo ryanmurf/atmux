@@ -101,6 +101,20 @@ jobs:
       - name: Install tmux on macOS
         if: runner.os == 'macOS'
         run: brew install tmux
+      # macOS exposes its default /var/folders temp root through the /var ->
+      # /private/var symlink. Pulse deliberately rejects symlinked ancestry for
+      # credential, transcript, and SQLite paths, so keep test fixtures under
+      # the runner-owned workspace temp tree instead of weakening production
+      # path validation.
+      - name: Prepare secure macOS test temp root
+        if: runner.os == 'macOS'
+        run: |
+          secure_tmp="$RUNNER_TEMP/atmux-secure-tmp"
+          mkdir -p "$secure_tmp"
+          chmod 700 "$secure_tmp"
+          secure_tmp_physical="$(cd "$secure_tmp" && pwd -P)"
+          test "$secure_tmp" = "$secure_tmp_physical"
+          echo "TMPDIR=$secure_tmp_physical" >> "$GITHUB_ENV"
       - name: Report tmux version
         run: tmux -V
       - name: Test transactional Quick Resume helper

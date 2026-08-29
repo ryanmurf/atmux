@@ -32,6 +32,13 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(180);
 const PROCESS_GROUP_GRACE: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const PROCESS_GROUP_GRACE: Duration = Duration::from_millis(100);
+// Keep the interpreter absolute and platform-pinned: the recovery child runs
+// with an empty environment, so PATH lookup is intentionally unavailable.
+// Linux (including Tron) installs bash in /usr/bin, while macOS ships it in
+// /bin. This also keeps recovery fixtures representative on both CI hosts.
+#[cfg(target_os = "macos")]
+const BASH_COMMAND: &str = "/bin/bash";
+#[cfg(not(target_os = "macos"))]
 const BASH_COMMAND: &str = "/usr/bin/bash";
 const RECOVERY_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:/home/ryan/.asdf/shims:/home/ryan/.local/bin";
 const TRON_HOME: &str = "/home/ryan";
@@ -637,8 +644,13 @@ mod tests {
     }
 
     #[test]
-    fn sanitized_path_covers_every_preflighted_roster_command() {
+    fn pinned_bash_is_absolute_and_executable_on_this_platform() {
+        assert!(Path::new(BASH_COMMAND).is_absolute());
         assert!(required_commands_available(&[BASH_COMMAND]));
+    }
+
+    #[test]
+    fn sanitized_path_covers_every_preflighted_roster_command() {
         assert!(!required_commands_available(&[
             "/definitely/missing/atmux-recovery-command"
         ]));

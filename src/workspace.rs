@@ -1869,7 +1869,6 @@ fn language_hint(path: &Path) -> Option<&'static str> {
 mod tests {
     use super::*;
     use std::{
-        fs::OpenOptions,
         os::unix::fs::symlink,
         process::Command as StdCommand,
         time::{SystemTime, UNIX_EPOCH},
@@ -2547,14 +2546,15 @@ mod tests {
     fn regular_file_identity_check_detects_replacement() {
         let root = fixture("identity");
         let path = root.join("file.txt");
+        let replacement = root.join("replacement.txt");
         fs::write(&path, "first").unwrap();
         let before = fs::symlink_metadata(&path).unwrap();
-        fs::remove_file(&path).unwrap();
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap();
+        // Create the replacement while the original still exists, so the two
+        // files are guaranteed to have distinct identities. Deleting and then
+        // recreating `path` lets Linux immediately reuse the original inode,
+        // which made this regression nondeterministic on CI.
+        fs::write(&replacement, "second").unwrap();
+        fs::rename(&replacement, &path).unwrap();
         let after = fs::symlink_metadata(&path).unwrap();
         assert!(ensure_same_file(&before, &after).is_err());
         fs::remove_dir_all(root).unwrap();
