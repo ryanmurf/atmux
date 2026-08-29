@@ -10,7 +10,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use ratatui::{layout::Rect, widgets::ListState};
 
 use crate::{
-    config::{AgentProfile, Config},
+    config::{AgentProfile, Config, ProfileMode},
+    project::{self, ProjectPreferences},
     status::AgentStatus,
     tmux::{Session, Tmux},
 };
@@ -30,6 +31,7 @@ pub enum LaunchStage {
     Directory,
     Harness,
     Profile,
+    Mode,
     Name,
 }
 
@@ -40,10 +42,13 @@ pub struct Launcher {
     pub directory_query: String,
     pub directory_selected: usize,
     pub directory: Option<PathBuf>,
+    project_preferences: Option<ProjectPreferences>,
     pub harnesses: Vec<String>,
     pub harness_selected: usize,
     pub profiles: Vec<AgentProfile>,
     pub profile_selected: usize,
+    pub modes: Vec<ProfileMode>,
+    pub mode_selected: usize,
     pub name: String,
     name_pristine: bool,
 }
@@ -62,10 +67,13 @@ impl Launcher {
             directory_query: String::new(),
             directory_selected: 0,
             directory: None,
+            project_preferences: None,
             harnesses: config.harnesses(),
             harness_selected: 0,
             profiles: Vec::new(),
             profile_selected: 0,
+            modes: Vec::new(),
+            mode_selected: 0,
             name: String::new(),
             name_pristine: false,
         }
@@ -101,6 +109,9 @@ impl Launcher {
             LaunchStage::Profile => {
                 self.profile_selected =
                     move_index(self.profile_selected, delta, self.profiles.len());
+            }
+            LaunchStage::Mode => {
+                self.mode_selected = move_index(self.mode_selected, delta, self.modes.len());
             }
             LaunchStage::Name => {}
         }
@@ -171,14 +182,9 @@ impl App {
     /// Returns an error when tmux cannot provide its current session state.
     pub fn refresh(&mut self) -> Result<()> {
         let selected_name = self.selected_session().map(|session| session.name.clone());
-        let sessions = match self
+        let sessions = self
             .tmux
-            .sessions(&self.previous_hashes, &self.config.status)
-        {
-            Ok(sessions) => sessions,
-            Err(error) if error.to_string().contains("no server running") => Vec::new(),
-            Err(error) => return Err(error),
-        };
+            .sessions(&self.previous_hashes, &self.config.status)?;
         self.previous_hashes = sessions
             .iter()
             .map(|session| (session.pane_id.clone(), session.content_hash))
@@ -407,7 +413,10 @@ impl App {
             }
             KeyCode::Char('k')
                 if self.launcher.as_ref().is_some_and(|launcher| {
-                    matches!(launcher.stage, LaunchStage::Harness | LaunchStage::Profile)
+                    matches!(
+                        launcher.stage,
+                        LaunchStage::Harness | LaunchStage::Profile | LaunchStage::Mode
+                    )
                 }) =>
             {
                 if let Some(launcher) = &mut self.launcher {
@@ -416,7 +425,10 @@ impl App {
             }
             KeyCode::Char('j')
                 if self.launcher.as_ref().is_some_and(|launcher| {
-                    matches!(launcher.stage, LaunchStage::Harness | LaunchStage::Profile)
+                    matches!(
+                        launcher.stage,
+                        LaunchStage::Harness | LaunchStage::Profile | LaunchStage::Mode
+                    )
                 }) =>
             {
                 if let Some(launcher) = &mut self.launcher {
@@ -436,7 +448,7 @@ impl App {
                             launcher.name.pop();
                             launcher.name_pristine = false;
                         }
-                        LaunchStage::Harness | LaunchStage::Profile => {}
+                        LaunchStage::Harness | LaunchStage::Profile | LaunchStage::Mode => {}
                     }
                 }
             }
@@ -456,7 +468,7 @@ impl App {
                                 launcher.name.push(character);
                             }
                         }
-                        LaunchStage::Harness | LaunchStage::Profile => {}
+                        LaunchStage::Harness | LaunchStage::Profile | LaunchStage::Mode => {}
                     }
                 }
             }
@@ -474,8 +486,21 @@ impl App {
                     .as_ref()
                     .and_then(Launcher::selected_directory)
                     .context("no project directory matches the filter")?;
+                let preferences = project::load(&directory)?;
                 let launcher = self.launcher.as_mut().expect("launcher exists");
                 launcher.directory = Some(directory);
+                launcher.project_preferences = preferences;
+                if let Some(harness) = launcher
+                    .project_preferences
+                    .as_ref()
+                    .and_then(|preferences| preferences.harness.as_deref())
+                    && let Some(index) = launcher
+                        .harnesses
+                        .iter()
+                        .position(|candidate| candidate.eq_ignore_ascii_case(harness))
+                {
+                    launcher.harness_selected = index;
+                }
                 launcher.stage = LaunchStage::Harness;
             }
             Some(LaunchStage::Harness) => {
@@ -487,29 +512,72 @@ impl App {
                     .context("no harness profiles are configured")?;
                 let profiles = self.config.profiles_for(&harness);
                 let launcher = self.launcher.as_mut().expect("launcher exists");
+                launcher.profile_selected = launcher
+                    .project_preferences
+                    .as_ref()
+                    .filter(|preferences| {
+                        preferences
+                            .harness
+                            .as_deref()
+                            .is_none_or(|saved| saved.eq_ignore_ascii_case(&harness))
+                    })
+                    .and_then(|preferences| preferences.profile.as_deref())
+                    .and_then(|saved| {
+                        profiles
+                            .iter()
+                            .position(|profile| profile.name.eq_ignore_ascii_case(saved))
+                    })
+                    .unwrap_or(0);
                 launcher.profiles = profiles;
-                launcher.profile_selected = 0;
                 launcher.stage = LaunchStage::Profile;
             }
             Some(LaunchStage::Profile) => {
-                let directory = self
+                let modes = self
                     .launcher
                     .as_ref()
-                    .and_then(|launcher| launcher.directory.as_ref())
-                    .context("no project directory selected")?;
-                let proposed = directory
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map_or_else(|| "agent".to_owned(), slugify);
-                let name = self.available_session_name(&proposed);
+                    .and_then(|launcher| launcher.profiles.get(launcher.profile_selected))
+                    .map(|profile| profile.modes.clone())
+                    .context("no agent profile selected")?;
                 let launcher = self.launcher.as_mut().expect("launcher exists");
-                launcher.name = name;
-                launcher.name_pristine = true;
-                launcher.stage = LaunchStage::Name;
+                launcher.modes = modes;
+                launcher.mode_selected = 0;
+                if launcher.modes.len() > 1 {
+                    launcher.stage = LaunchStage::Mode;
+                    return Ok(());
+                }
+                self.open_launch_name()?;
             }
+            Some(LaunchStage::Mode) => self.open_launch_name()?,
             Some(LaunchStage::Name) => self.finish_launch()?,
             None => self.mode = Mode::Normal,
         }
+        Ok(())
+    }
+
+    fn open_launch_name(&mut self) -> Result<()> {
+        let directory = self
+            .launcher
+            .as_ref()
+            .and_then(|launcher| launcher.directory.as_ref())
+            .context("no project directory selected")?;
+        let proposed = self
+            .launcher
+            .as_ref()
+            .and_then(|launcher| launcher.project_preferences.as_ref())
+            .and_then(|preferences| preferences.session_name.as_deref())
+            .map(slugify)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| {
+                directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map_or_else(|| "agent".to_owned(), slugify)
+            });
+        let name = self.available_session_name(&proposed);
+        let launcher = self.launcher.as_mut().expect("launcher exists");
+        launcher.name = name;
+        launcher.name_pristine = true;
+        launcher.stage = LaunchStage::Name;
         Ok(())
     }
 
@@ -526,7 +594,8 @@ impl App {
             }
             LaunchStage::Harness => LaunchStage::Directory,
             LaunchStage::Profile => LaunchStage::Harness,
-            LaunchStage::Name => LaunchStage::Profile,
+            LaunchStage::Name if launcher.modes.len() > 1 => LaunchStage::Mode,
+            LaunchStage::Mode | LaunchStage::Name => LaunchStage::Profile,
         };
     }
 
@@ -542,14 +611,25 @@ impl App {
         let directory = launcher
             .directory
             .as_ref()
-            .context("no project directory selected")?;
+            .context("no project directory selected")?
+            .clone();
         let profile = launcher
             .profiles
             .get(launcher.profile_selected)
-            .context("no agent profile selected")?;
-        self.tmux.launch(&name, directory, profile)?;
+            .context("no agent profile selected")?
+            .clone();
+        let mode = launcher.modes.get(launcher.mode_selected).cloned();
+        project::remember_launch(&directory, &name, &profile)?;
+        self.tmux
+            .launch(&name, &directory, &profile, mode.as_ref())?;
         self.message = Some((
-            format!("launched {} · {} · {}", name, profile.harness, profile.name),
+            format!(
+                "launched {} · {} · {}{}",
+                name,
+                profile.harness,
+                profile.name,
+                mode.map_or_else(String::new, |mode| format!(" · {}", mode.display_label()))
+            ),
             false,
         ));
         self.launcher = None;

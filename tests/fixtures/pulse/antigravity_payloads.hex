@@ -1,0 +1,5 @@
+# Sanitized protobuf fixture derived from Claude Pulse's Apache-2.0 test encoder at 00ef42a.
+# Three payloads: the third duplicates the first. Expected totals are prompt=15528, output=347, thinking=386.
+088afe95d1063a0c10f37818d30448820350d101
+088dfe95d1063a0a1035188a014800508a01
+088afe95d1063a0c10f37818d30448820350d101

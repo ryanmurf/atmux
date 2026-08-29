@@ -1,0 +1,25 @@
+[Unit]
+Description=atmux web dashboard on Max
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=/home/ryan/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/home/ryan/.local/libexec/atmux-wait-max-lan
+ExecStart=/home/ryan/IdeaProjects/atmux/target/release/atmux --config /home/ryan/.config/atmux/config.toml web --bind 0.0.0.0:7345 --allow-remote --allowed-host max:7345 --allowed-host max.local:7345 --allowed-host 192.168.0.124:7345 --allowed-host 192.168.0.46:7345
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=120
+TimeoutStopSec=15
+# The web process can be the process that first invokes `tmux new-session`.
+# A daemonized default tmux server then inherits this service's cgroup even
+# though its sessions have a lifecycle independent from the dashboard.  Stop
+# only the atmux main process so a web deploy/restart cannot terminate that
+# server (and, through its PTYs, every agent pane).
+KillMode=process
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=Resume Max agent sessions once after a machine reboot
+After=atmux-web.service claude-qwen-proxy.service qwen-kernel-prefill-router.service qwen-kernel-decode-halo.service qwen-kernel-prefill-xtx.service
+Wants=atmux-web.service claude-qwen-proxy.service qwen-kernel-prefill-router.service qwen-kernel-decode-halo.service qwen-kernel-prefill-xtx.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/ryan/.local/libexec/resume-max-at-boot
+TimeoutStartSec=780
+RemainAfterExit=yes
+RuntimeDirectory=atmux-max-resume
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+# The recovery process can create the default tmux server. Once daemonized it
+# has an independent lifecycle and must survive a repair-unit restart.
+KillMode=process
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=default.target

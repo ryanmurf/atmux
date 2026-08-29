@@ -1,0 +1,55 @@
+host: atmux.murphytek.com
+
+# atmux continues to run on tron so it can manage the host tmux server. The
+# gateway is deliberately limited to this single private-node endpoint.
+atmux:
+  hostAddress: 192.168.0.109
+  hostPort: 7345
+  # The server certificate on Tron is issued to this DNS name. Nginx connects
+  # by private IP but still validates this exact certificate identity.
+  tlsServerName: tron
+  proxyTokenSecret: atmux-proxy-token
+  # A client certificate plus the private atmux CA. The gateway verifies the
+  # host certificate and presents this identity to the host TLS listener.
+  tlsSecret: atmux-gateway-tls
+
+oauth:
+  image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.3@sha256:10a1165743a192e1940b4708fb9647027185ce11a681a1c5519b442ff7f1f561
+  # Bump this value whenever all browser sessions must be invalidated. Keeping
+  # the version in the cookie name makes rotation explicit and leaves no old
+  # cookie decryptable by accident.
+  sessionVersion: v2
+  resources:
+    requests: {cpu: 25m, memory: 64Mi}
+    limits: {cpu: 500m, memory: 256Mi}
+  secretName: atmux-oauth
+  # Exact Google identities authorized to control the tmux host. For a public
+  # ingress, Helm accepts only the explicitly reviewed addresses encoded in
+  # the chart; never use a broad public domain here.
+  allowedEmails: []
+  issuerUrl: https://herodevs.dev/realms/usage
+  # Google-only login is enforced twice: the dedicated Keycloak browser flow
+  # and OAuth2 Proxy's required identity_provider=google token claim. The OIDC
+  # proxy never treats a mutable kc_idp_hint parameter as an auth boundary.
+  # OAuth2 Proxy talks only to Keycloak's public issuer. Do not broaden this
+  # to all internet egress: Google login itself happens between the browser
+  # and Keycloak.
+  keycloakEgressCidrs:
+    - 66.7.119.163/32
+  # OAuth2 Proxy trusts forwarded headers only from the ingress controller's
+  # pod subnet. Never use 0.0.0.0/0 or ::/0 here.
+  trustedProxyCidrs:
+    - 10.1.112.0/24
+
+gateway:
+  image: nginxinc/nginx-unprivileged:1.31.1-alpine@sha256:cc300bd2e8776708a8c2c8686a74f06eadf221c5ce01e85d0e821955d7a730ab
+  resources:
+    requests: {cpu: 10m, memory: 16Mi}
+    limits: {cpu: 250m, memory: 128Mi}
+
+ingress:
+  # Public routing is a separate, reviewed opt-in. The safe default must never
+  # recreate an Ingress during an unrelated Helm upgrade.
+  enabled: false
+  className: public
+  clusterIssuer: lets-encrypt

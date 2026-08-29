@@ -1,0 +1,307 @@
+{{- $name := "atmux" -}}
+{{- $allowedEmails := .Values.oauth.allowedEmails -}}
+{{- $approvedEmails := list "ryanmurf@gmail.com" "ryanm@herodevs.com" -}}
+{{- $keycloakEgressCidrs := .Values.oauth.keycloakEgressCidrs -}}
+{{- $trustedProxyCidrs := .Values.oauth.trustedProxyCidrs -}}
+{{- $sessionVersion := .Values.oauth.sessionVersion -}}
+{{- if and .Values.ingress.enabled (eq (len $allowedEmails) 0) -}}
+{{- fail "oauth.allowedEmails must contain at least one approved Google identity" -}}
+{{- end -}}
+{{- if gt (len $allowedEmails) (len $approvedEmails) -}}
+{{- fail "oauth.allowedEmails contains more identities than the reviewed public allowlist" -}}
+{{- end -}}
+{{- range $email := $allowedEmails -}}
+{{- if or (eq $email "*") (not (regexMatch "^[^@ ]+@[^@ ]+\\.[^@ ]+$" $email)) -}}
+{{- fail (printf "oauth.allowedEmails contains an invalid or wildcard identity: %q" $email) -}}
+{{- end -}}
+{{- if and $.Values.ingress.enabled (not (has $email $approvedEmails)) -}}
+{{- fail (printf "oauth.allowedEmails contains an unapproved public identity: %q" $email) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq (len $keycloakEgressCidrs) 0 -}}
+{{- fail "oauth.keycloakEgressCidrs must contain the pinned Keycloak ingress address" -}}
+{{- end -}}
+{{- range $cidr := $keycloakEgressCidrs -}}
+{{- if not (regexMatch "^([0-9]{1,3}\\.){3}[0-9]{1,3}/32$" $cidr) -}}
+{{- fail (printf "oauth.keycloakEgressCidrs must contain reviewed IPv4 /32 entries: %q" $cidr) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq (len $trustedProxyCidrs) 0 -}}
+{{- fail "oauth.trustedProxyCidrs must contain the ingress controller pod range" -}}
+{{- end -}}
+{{- range $cidr := $trustedProxyCidrs -}}
+{{- if or (eq $cidr "0.0.0.0/0") (eq $cidr "::/0") (not (regexMatch "^([0-9]{1,3}\\.){3}[0-9]{1,3}/(3[0-2]|[12]?[0-9])$" $cidr)) -}}
+{{- fail (printf "oauth.trustedProxyCidrs contains an invalid or universal address: %q" $cidr) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (regexMatch "^v([2-9]|[1-9][0-9]+)$" $sessionVersion) -}}
+{{- fail "oauth.sessionVersion must be v2 or greater; v1 is permanently revoked" -}}
+{{- end -}}
+{{- if not (regexMatch "^[A-Za-z0-9.-]+$" .Values.atmux.tlsServerName) -}}
+{{- fail "atmux.tlsServerName must be the exact DNS name from the host certificate" -}}
+{{- end -}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-gateway-config
+data:
+  default.conf.template: |
+    server {
+      # The privileged bearer/mTLS bridge is reachable only inside this Pod's
+      # network namespace. oauth2-proxy is the sole network-facing container.
+      listen 127.0.0.1:8080;
+      server_name _;
+      client_max_body_size 18m;
+      location = /healthz {
+        access_log off;
+        return 204;
+      }
+      location / {
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_set_header Host "{{ .Values.host }}";
+        proxy_set_header Authorization "Bearer ${ATMUX_PROXY_TOKEN}";
+        proxy_ssl_server_name on;
+        proxy_ssl_name {{ .Values.atmux.tlsServerName | quote }};
+        proxy_ssl_verify on;
+        proxy_ssl_trusted_certificate /etc/nginx/atmux-tls/ca.crt;
+        proxy_ssl_certificate /etc/nginx/atmux-tls/tls.crt;
+        proxy_ssl_certificate_key /etc/nginx/atmux-tls/tls.key;
+        proxy_ssl_protocols TLSv1.2 TLSv1.3;
+        proxy_pass https://{{ .Values.atmux.hostAddress }}:{{ .Values.atmux.hostPort }};
+      }
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-allowed-emails
+data:
+  authenticated-emails.txt: |
+    {{- range $allowedEmails }}
+    {{ . }}
+    {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ $name }}-web
+  template:
+    metadata:
+      labels:
+        app: {{ $name }}-web
+      annotations:
+        checksum/allowed-emails: {{ join "\n" $allowedEmails | sha256sum | quote }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile: {type: RuntimeDefault}
+        fsGroup: 101
+      containers:
+        - name: gateway
+          image: {{ .Values.gateway.image | quote }}
+          imagePullPolicy: IfNotPresent
+          # A literal newline in the envsubst value creates a folded
+          # Authorization header in nginx and drops subsequent request headers
+          # such as Content-Type. Reject CR/LF and non-token values before
+          # nginx renders its configuration; never silently repair a malformed
+          # credential at this trust boundary.
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              cleaned="$(printf '%s' "$ATMUX_PROXY_TOKEN" | tr -d '\r\n')"
+              test "$cleaned" = "$ATMUX_PROXY_TOKEN" || { echo "invalid ATMUX_PROXY_TOKEN" >&2; exit 1; }
+              case "$cleaned" in
+                ''|*[!A-Za-z0-9._~-]*) echo "invalid ATMUX_PROXY_TOKEN" >&2; exit 1 ;;
+              esac
+              ATMUX_PROXY_TOKEN="$cleaned"
+              export ATMUX_PROXY_TOKEN
+              exec /docker-entrypoint.sh nginx -g 'daemon off;'
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          env:
+            - name: ATMUX_PROXY_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.atmux.proxyTokenSecret }}, key: token}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 101
+            runAsGroup: 101
+          volumeMounts:
+            - {name: templates, mountPath: /etc/nginx/templates, readOnly: true}
+            # nginx's envsubst entrypoint renders the read-only template into
+            # this writable runtime directory while the root filesystem stays
+            # read-only.
+            - {name: conf, mountPath: /etc/nginx/conf.d}
+            - {name: tls, mountPath: /etc/nginx/atmux-tls, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+            - {name: cache, mountPath: /var/cache/nginx}
+            - {name: run, mountPath: /var/run}
+          readinessProbe:
+            exec:
+              command: [wget, -q, -O, /dev/null, http://127.0.0.1:8080/healthz]
+            initialDelaySeconds: 3
+          livenessProbe:
+            exec:
+              command: [wget, -q, -O, /dev/null, http://127.0.0.1:8080/healthz]
+            initialDelaySeconds: 10
+        - name: oauth2-proxy
+          image: {{ .Values.oauth.image | quote }}
+          imagePullPolicy: IfNotPresent
+          resources:
+            {{- toYaml .Values.oauth.resources | nindent 12 }}
+          args:
+            - --provider=oidc
+            - --oidc-issuer-url={{ .Values.oauth.issuerUrl }}
+            - --redirect-url=https://{{ .Values.host }}/oauth2/callback
+            - --upstream=http://127.0.0.1:8080
+            - --http-address=0.0.0.0:4180
+            - --reverse-proxy=true
+            - --scope=openid email profile
+            # Keycloak maps the broker user-session note into this ID-token
+            # claim. Reusing the groups authorization hook makes the current
+            # login provider a server-verified requirement, not a URL hint.
+            - --oidc-groups-claim=identity_provider
+            - --allowed-group=google
+            - --authenticated-emails-file=/etc/oauth2-proxy/authenticated-emails.txt
+            # Never let an existing Keycloak/Google SSO session make a new
+            # atmux login look like an authentication bypass. `login` forces
+            # Keycloak reauthentication and `select_account` makes Google
+            # visibly choose the authorized account.
+            - "--prompt=login select_account"
+            - --cookie-secure=true
+            - --cookie-name=__Host-atmux-{{ $sessionVersion }}
+            - --cookie-httponly=true
+            - --cookie-samesite=lax
+            - --cookie-refresh=1h
+            - --cookie-expire=168h
+            - --cookie-csrf-expire=15m
+            - --skip-provider-button=true
+            - --set-xauthrequest=true
+            - --pass-access-token=false
+            - --whitelist-domain={{ .Values.host }}
+            {{- range $trustedProxyCidrs }}
+            - --trusted-proxy-ip={{ . }}
+            {{- end }}
+          env:
+            - name: OAUTH2_PROXY_CLIENT_ID
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.oauth.secretName }}, key: client-id}
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.oauth.secretName }}, key: client-secret}
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.oauth.secretName }}, key: cookie-secret}
+          ports: [{name: http, containerPort: 4180}]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 2000
+            runAsGroup: 2000
+          volumeMounts:
+            - {name: oauth-tmp, mountPath: /tmp}
+            - {name: allowed-emails, mountPath: /etc/oauth2-proxy, readOnly: true}
+          readinessProbe:
+            httpGet: {path: /ping, port: http}
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet: {path: /ping, port: http}
+            initialDelaySeconds: 10
+      volumes:
+        - name: templates
+          configMap: {name: {{ $name }}-gateway-config}
+        - {name: conf, emptyDir: {}}
+        - name: tls
+          secret:
+            secretName: {{ .Values.atmux.tlsSecret }}
+            defaultMode: 0440
+        - {name: tmp, emptyDir: {}}
+        - {name: cache, emptyDir: {}}
+        - {name: run, emptyDir: {}}
+        - {name: oauth-tmp, emptyDir: {}}
+        - name: allowed-emails
+          configMap: {name: {{ $name }}-allowed-emails}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-oauth2-proxy
+spec:
+  selector: {app: {{ $name }}-web}
+  ports: [{name: http, port: 4180, targetPort: http}]
+---
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $name }}
+  annotations:
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.clusterIssuer | quote }}
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/limit-connections: "10"
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "3"
+    nginx.ingress.kubernetes.io/proxy-body-size: "18m"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  tls:
+    - hosts: [{{ .Values.host | quote }}]
+      secretName: {{ $name }}-tls
+  rules:
+    - host: {{ .Values.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $name }}-oauth2-proxy
+                port: {name: http}
+---
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-web
+spec:
+  podSelector: {matchLabels: {app: {{ $name }}-web}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ingress}
+          podSelector:
+            matchLabels: {name: nginx-ingress-microk8s}
+      ports: [{protocol: TCP, port: 4180}]
+  egress:
+    - to:
+        - ipBlock: {cidr: {{ printf "%s/32" .Values.atmux.hostAddress | quote }} }
+      ports: [{protocol: TCP, port: {{ .Values.atmux.hostPort }}}]
+    {{- range $keycloakEgressCidrs }}
+    - to:
+        - ipBlock: {cidr: {{ . | quote }}}
+      ports: [{protocol: TCP, port: 443}]
+    {{- end }}
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}

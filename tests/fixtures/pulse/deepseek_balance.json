@@ -1,0 +1,18 @@
+{
+  "_provenance": "Sanitized behavioral fixture derived from Claude Pulse at 00ef42a; no provider response or credential bytes retained.",
+  "is_available": true,
+  "balance_infos": [
+    {
+      "currency": "CNY",
+      "total_balance": "0.00",
+      "granted_balance": "0.00",
+      "topped_up_balance": "0.00"
+    },
+    {
+      "currency": "USD",
+      "total_balance": "61.50",
+      "granted_balance": "11.50",
+      "topped_up_balance": "50.00"
+    }
+  ]
+}

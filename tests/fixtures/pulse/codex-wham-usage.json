@@ -1,0 +1,16 @@
+{
+  "email": "removed@example.invalid",
+  "user_id": "removed-user",
+  "account_id": "removed-account",
+  "plan_type": "fixture-plan",
+  "rate_limit": {
+    "allowed": true,
+    "limit_reached": false,
+    "primary_window": {
+      "used_percent": 34.5,
+      "limit_window_seconds": 604800,
+      "reset_at": 1786838400
+    },
+    "secondary_window": null
+  }
+}

@@ -51,7 +51,14 @@ pub fn detect_kind(current_command: &str, process_tree: &str) -> AgentKind {
     let haystack = format!("{current_command} {process_tree}").to_lowercase();
     if haystack.split_whitespace().any(is_codex_token) || haystack.contains("/codex ") {
         AgentKind::Codex
-    } else if haystack.split_whitespace().any(is_claude_token) {
+    } else if haystack.split_whitespace().any(is_claude_token)
+        // Recent Claude Code releases execute a versioned binary such as
+        // `~/.local/share/claude/versions/2.1.232`. Its basename has no
+        // "claude" marker, so use the stable executable path or the
+        // profile-scoping environment variable emitted by atmux launches.
+        || haystack.contains("/.local/share/claude/versions/")
+        || haystack.contains("claude_config_dir=")
+    {
         AgentKind::Claude
     } else {
         AgentKind::Other
@@ -167,6 +174,86 @@ pub fn classify(
     }
 }
 
+/// Proves that an automation may safely submit at the harness's empty,
+/// top-level composer. Generic Waiting fallbacks, overrides, approval prompts,
+/// option pickers, and custom waiting markers are deliberately insufficient.
+#[must_use]
+pub(crate) fn automation_idle(
+    kind: AgentKind,
+    content: &str,
+    title: &str,
+    config: &StatusConfig,
+) -> bool {
+    if !matches!(kind, AgentKind::Claude | AgentKind::Codex) {
+        return false;
+    }
+    let recent = content
+        .lines()
+        .rev()
+        .take(18)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    if [
+        "esc to interrupt",
+        "ctrl+c to interrupt",
+        "working (",
+        "running…",
+        "running...",
+    ]
+    .iter()
+    .any(|marker| recent.contains(marker))
+        || config
+            .working_markers
+            .iter()
+            .any(|marker| recent.contains(&marker.to_lowercase()))
+        || title
+            .chars()
+            .next()
+            .is_some_and(|character| ('\u{2801}'..='\u{28ff}').contains(&character))
+    {
+        return false;
+    }
+    let immediate = content
+        .lines()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    if [
+        "do you want to proceed?",
+        "would you like to proceed?",
+        "waiting for your input",
+        "press enter to continue",
+        "select an option",
+        "yes, allow",
+        "allow this command",
+        "[y/n]",
+        "(y/n)",
+    ]
+    .iter()
+    .any(|marker| immediate.contains(marker))
+    {
+        return false;
+    }
+    let Some(tail) = content.lines().rev().find(|line| !line.trim().is_empty()) else {
+        return false;
+    };
+    let tail = tail.trim();
+    match kind {
+        AgentKind::Claude => tail == "❯",
+        AgentKind::Codex => tail == "›",
+        AgentKind::Other => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +271,20 @@ mod tests {
         );
         assert_eq!(detect_kind("bash", "claude-max"), AgentKind::Claude);
         assert_eq!(detect_kind("bash", "bash"), AgentKind::Other);
+        assert_eq!(
+            detect_kind(
+                "2.1.232",
+                "Claude Code v2.1.232\nSonnet 5 with xhigh effort"
+            ),
+            AgentKind::Claude
+        );
+        assert_eq!(
+            detect_kind(
+                "2.1.232",
+                "env CLAUDE_CONFIG_DIR=/Users/ryan/.claude-hd /Users/ryan/.local/share/claude/versions/2.1.232"
+            ),
+            AgentKind::Claude
+        );
         assert_eq!(
             detect_kind("atmux", "atmux --config /tmp/claude-tmp/config.toml"),
             AgentKind::Other
@@ -251,5 +352,39 @@ mod tests {
             ),
             AgentStatus::Working
         );
+    }
+
+    #[test]
+    fn automation_requires_exact_empty_native_composer() {
+        assert!(!automation_idle(
+            AgentKind::Claude,
+            "quiet but unrecognized work",
+            "",
+            &config()
+        ));
+        assert!(!automation_idle(
+            AgentKind::Claude,
+            "Do you want to proceed?\n❯",
+            "",
+            &config()
+        ));
+        assert!(!automation_idle(
+            AgentKind::Codex,
+            "Select an option\n›",
+            "",
+            &config()
+        ));
+        assert!(automation_idle(
+            AgentKind::Claude,
+            "finished\n\n❯ ",
+            "",
+            &config()
+        ));
+        assert!(automation_idle(
+            AgentKind::Codex,
+            "finished\n\n› ",
+            "",
+            &config()
+        ));
     }
 }

@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="dark">
+  <title>atmux</title>
+  <link rel="icon" type="image/jpeg" href="/atmux-logo.jpg">
+  <link rel="apple-touch-icon" href="/atmux-logo.jpg">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <button id="rail-toggle" class="rail-toggle subtle" type="button" aria-controls="session-rail" aria-expanded="true" title="Collapse agent list" aria-label="Collapse agent list">‹</button>
+    <div class="brand"><img class="brand-logo" src="/atmux-logo.jpg" alt=""><span class="brand-wordmark">atmux</span><small>agent control plane</small></div>
+    <div id="counts" class="counts" aria-label="Agent summary">Connecting…</div>
+    <button id="pulse-open" class="subtle topbar-action" type="button" aria-pressed="false">Usage</button>
+    <button id="recovery-open" class="subtle topbar-action" type="button" hidden>Quick resume</button>
+    <button id="launch-open" class="primary" type="button">New agent</button>
+  </header>
+
+  <div id="health-alert" class="health-alert" role="alert" hidden></div>
+
+  <div class="workspace">
+    <nav id="session-rail" class="rail" aria-label="Agent sessions">
+      <label class="search-label" for="filter">Filter agents</label>
+      <input id="filter" type="search" placeholder="Name, path, harness…" autocomplete="off">
+      <ul id="sessions" class="session-list"></ul>
+      <p id="empty" class="empty" hidden>No matching sessions.</p>
+    </nav>
+
+    <main id="detail" class="detail">
+      <section id="welcome" class="welcome">
+        <h1>Your agents, without the tab hunt.</h1>
+        <p>Select a session to inspect it, send a message, or interrupt its current work.</p>
+      </section>
+
+      <section id="machine-view" class="machine-view" hidden>
+        <div class="agent-head">
+          <button id="machine-mobile-back" class="mobile-only subtle" type="button">← Machines</button>
+          <div>
+            <h1 id="machine-name"></h1>
+            <p id="machine-meta" class="meta"></p>
+          </div>
+        </div>
+        <p id="machine-offline" class="agent-offline" role="status" hidden></p>
+        <div id="machine-metrics" class="metrics-grid" aria-label="Machine resource metrics"></div>
+      </section>
+
+      <section id="pulse-view" class="pulse-view" aria-labelledby="pulse-heading" hidden>
+        <header class="pulse-head">
+          <button id="pulse-mobile-back" class="mobile-only subtle" type="button">← Agents</button>
+          <div class="pulse-title">
+            <h1 id="pulse-heading">Pulse Usage</h1>
+            <p id="pulse-status" class="meta" role="status">Choose an account to load usage.</p>
+          </div>
+          <form id="pulse-account-form" class="pulse-account-form">
+            <label for="pulse-account">Account</label>
+            <select id="pulse-account" aria-label="Pulse account" disabled>
+              <option value="">Discovering…</option>
+            </select>
+          </form>
+          <button id="pulse-refresh" class="subtle" type="button">Refresh</button>
+        </header>
+        <nav class="pulse-tabs" aria-label="Pulse sections">
+          <button class="pulse-tab selected" type="button" data-pulse-tab="dashboard" aria-pressed="true">Dashboard</button>
+          <button class="pulse-tab" type="button" data-pulse-tab="reports" aria-pressed="false">Reports</button>
+          <button class="pulse-tab" type="button" data-pulse-tab="alerts" aria-pressed="false">Alerts</button>
+          <button class="pulse-tab" type="button" data-pulse-tab="settings" aria-pressed="false">Settings</button>
+        </nav>
+        <div id="pulse-notice" class="pulse-notice" role="status" hidden></div>
+        <div id="pulse-content" class="pulse-content" aria-live="polite"></div>
+      </section>
+
+      <section id="agent-view" class="agent-view" hidden>
+        <div class="agent-head">
+          <button id="mobile-back" class="mobile-only subtle" type="button">← Agents</button>
+          <div>
+            <div class="agent-title-row">
+              <h1 id="agent-name"></h1>
+              <span id="agent-branch" class="agent-branch" hidden></span>
+            </div>
+            <p id="agent-meta" class="meta"></p>
+            <p id="agent-launch" class="launch-command" hidden></p>
+            <div id="model-control" class="model-control" hidden>
+              <label for="agent-model">Model</label>
+              <select id="agent-model" aria-describedby="model-status"></select>
+              <span id="model-status" role="status"></span>
+            </div>
+          </div>
+          <button id="quick-actions-open" class="subtle quick-actions-open" type="button" aria-haspopup="dialog" aria-controls="quick-actions-dialog" aria-expanded="false">Actions</button>
+          <div class="actions">
+            <button id="tmux-prefix-twice" class="subtle" type="button" title="Send Ctrl+B twice to this pane">Ctrl+B ×2</button>
+            <button id="interrupt" class="subtle" type="button">Interrupt</button>
+            <button id="kill-open" class="danger" type="button">Kill</button>
+          </div>
+        </div>
+
+        <p id="agent-offline" class="agent-offline" role="status" hidden></p>
+
+        <section class="terminal-shell" aria-labelledby="pane-heading">
+          <div class="terminal-title">
+            <h2 id="pane-heading">Conversation</h2>
+            <div class="view-switch" role="tablist" aria-label="Session display">
+              <button id="conversation-view" class="view-button selected" type="button" role="tab" aria-selected="true" aria-controls="conversation" tabindex="0">Conversation</button>
+              <button id="raw-view" class="view-button" type="button" role="tab" aria-selected="false" aria-controls="pane" tabindex="-1">Raw pane</button>
+              <button id="files-view" class="view-button" type="button" role="tab" aria-selected="false" aria-controls="files-panel" tabindex="-1">Files</button>
+              <button id="git-view" class="view-button" type="button" role="tab" aria-selected="false" aria-controls="git-panel" tabindex="-1">Git</button>
+            </div>
+            <span id="stream-state">Connecting…</span>
+          </div>
+          <div id="conversation" class="conversation" role="tabpanel" aria-live="polite" aria-labelledby="conversation-view" tabindex="0" title="Start typing to message this agent"></div>
+          <pre id="pane" role="tabpanel" aria-live="off" aria-labelledby="raw-view" tabindex="0" title="Start typing to message this agent" hidden></pre>
+          <section id="files-panel" class="project-panel" role="tabpanel" aria-labelledby="files-view" tabindex="0" hidden>
+            <nav id="files-breadcrumbs" class="project-breadcrumbs" aria-label="File path"></nav>
+            <div class="files-workspace">
+              <nav id="files-list" class="files-list" aria-label="Project files"></nav>
+              <section id="file-viewer" class="code-viewer" aria-label="File contents" tabindex="0"></section>
+            </div>
+          </section>
+          <section id="git-panel" class="project-panel git-panel" role="tabpanel" aria-labelledby="git-view" tabindex="0" hidden>
+            <header id="git-summary" class="git-summary"></header>
+            <div class="git-workspace">
+              <nav id="git-changes" class="git-changes" aria-label="Changed files"></nav>
+              <section id="git-diff" class="code-viewer" aria-label="Git diff" tabindex="0"></section>
+            </div>
+          </section>
+        </section>
+
+        <form id="composer" class="composer" aria-label="Send message">
+          <label for="message">Message agent</label>
+          <textarea id="message" rows="3" maxlength="65536" placeholder="What should this agent do next?"></textarea>
+          <section id="attachment-tray" class="attachment-tray" aria-label="Image attachments" hidden>
+            <div class="attachment-head"><span id="attachment-target"></span><button id="attachment-clear" class="attachment-clear" type="button">Clear</button></div>
+            <div id="attachment-list" class="attachment-list"></div>
+          </section>
+          <div class="composer-row">
+            <span>↑/↓ history · Enter to send · Ctrl/⌘ + Enter for newline</span>
+            <div class="composer-actions">
+              <button id="attach" class="subtle" type="button" title="Attach PNG or JPEG images">Image</button>
+              <input id="image-input" class="visually-hidden" type="file" accept="image/png,image/jpeg" multiple>
+              <button id="talk" class="subtle" type="button" title="Hold to dictate, then release to send">Hold to talk</button>
+              <button id="send" class="primary" type="button">Send</button>
+            </div>
+          </div>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="launch-dialog" aria-labelledby="launch-dialog-title">
+    <form id="launch-form" class="dialog-form">
+      <div class="dialog-head"><h2 id="launch-dialog-title">Launch agent</h2><button class="icon-button dialog-cancel" type="button" aria-label="Close">×</button></div>
+      <label id="launch-machine-row">Machine<select id="launch-machine" required></select></label>
+      <label id="launch-harness-row">Agent<select id="launch-harness" required></select></label>
+      <label id="launch-profile-row">Profile<select id="launch-profile" required></select></label>
+      <label id="launch-mode-row">Mode<select id="launch-mode"></select></label>
+      <div class="launch-project-field"><label for="launch-directory">Project</label>
+        <span class="launch-directory-control"><input id="launch-directory" type="search" list="launch-directory-options" placeholder="Filter projects or type an absolute folder" autocomplete="off" required><button id="launch-browse" type="button">Browse</button></span>
+        <datalist id="launch-directory-options"></datalist>
+      </div>
+      <section id="launch-browser" class="launch-browser" aria-label="Project folder browser" hidden>
+        <div class="launch-browser-head"><strong id="launch-browser-path">Project roots</strong><button id="launch-browser-close" class="icon-button" type="button" aria-label="Close folder browser">×</button></div>
+        <div class="launch-browser-actions"><button id="launch-browser-up" class="subtle" type="button">Up</button><button id="launch-browser-use" class="primary" type="button">Use this folder</button></div>
+        <div id="launch-browser-list" class="launch-browser-list" role="list"></div>
+        <p id="launch-browser-note" class="dialog-note" hidden></p>
+      </section>
+      <section id="launch-sessions" class="launch-sessions" aria-label="Saved conversations" hidden>
+        <label for="launch-session">Conversation<select id="launch-session"></select></label>
+        <p id="launch-sessions-note" class="dialog-note" role="status"></p>
+      </section>
+      <label>Session name<input id="launch-name" required maxlength="100" pattern="[A-Za-z0-9_-]+"></label>
+      <p id="launch-note" class="dialog-note" hidden></p>
+      <div class="dialog-actions"><button type="button" class="subtle dialog-cancel">Cancel</button><button class="primary" type="submit">Launch</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="kill-dialog" aria-labelledby="kill-dialog-title">
+    <form class="dialog-form">
+      <h2 id="kill-dialog-title">Kill <span id="kill-name"></span>?</h2>
+      <p>This terminates the tmux session and its running agent.</p>
+      <div class="dialog-actions"><button type="button" class="subtle dialog-cancel">Cancel</button><button id="kill-confirm" class="danger" type="button">Kill session</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="resume-dialog" aria-labelledby="resume-dialog-title">
+    <form class="dialog-form">
+      <h2 id="resume-dialog-title">Relaunch Claude &amp; resume?</h2>
+      <p>atmux will stop this Claude process and resume its saved conversation with the current Claude launcher.</p>
+      <p>Any in-flight work is terminated. Custom launch flags that are not configured in atmux are not preserved.</p>
+      <div class="dialog-actions"><button type="button" class="subtle dialog-cancel">Cancel</button><button id="resume-confirm" class="primary" type="button">Relaunch &amp; resume</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="recovery-dialog" aria-labelledby="recovery-dialog-title">
+    <form class="dialog-form">
+      <h2 id="recovery-dialog-title">Resume Tron sessions?</h2>
+      <p>Restore the saved Tron session roster after a restart. Sessions that already exist are preserved; only missing sessions are launched.</p>
+      <p id="recovery-status" class="dialog-note" role="status"></p>
+      <div class="dialog-actions"><button type="button" class="subtle dialog-cancel">Cancel</button><button id="recovery-confirm" class="primary" type="button">Resume missing sessions</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="quick-actions-dialog" aria-labelledby="quick-actions-title">
+    <form method="dialog" class="dialog-form quick-actions-form">
+      <div class="dialog-head"><h2 id="quick-actions-title">Quick actions</h2><button class="icon-button" type="submit" aria-label="Close">×</button></div>
+      <div id="quick-model-control" class="quick-model-control" hidden>
+        <label for="quick-agent-model">Model &amp; effort</label>
+        <select id="quick-agent-model" aria-describedby="quick-model-status"></select>
+        <p id="quick-model-status" class="dialog-note" role="status"></p>
+      </div>
+      <div class="quick-actions-grid">
+        <button id="quick-duplicate" class="subtle" type="button">Duplicate agent</button>
+        <button id="quick-resume" class="subtle" type="button" hidden>Relaunch &amp; resume</button>
+        <button id="quick-compact" class="subtle" type="button">Compact</button>
+        <button id="quick-tmux-prefix-twice" class="subtle" type="button">Ctrl+B ×2</button>
+        <button id="quick-interrupt" class="subtle" type="button">Interrupt</button>
+        <button id="quick-kill-open" class="danger" type="button">Kill agent</button>
+      </div>
+      <p id="quick-resume-note" class="dialog-note" role="status" hidden></p>
+    </form>
+  </dialog>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

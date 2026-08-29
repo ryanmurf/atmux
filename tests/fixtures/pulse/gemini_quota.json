@@ -1,0 +1,17 @@
+{
+  "_provenance": "Sanitized behavioral fixture derived from Claude Pulse at 00ef42a; synthetic per-model buckets.",
+  "buckets": [
+    {
+      "modelId": "gemini-2.5-pro",
+      "remainingFraction": 0.5,
+      "remainingAmount": "50 requests",
+      "resetTime": "2026-08-09T00:00:00Z"
+    },
+    {
+      "modelId": "gemini-2.5-flash",
+      "remainingFraction": 0.875,
+      "remainingAmount": null,
+      "resetTime": null
+    }
+  ]
+}

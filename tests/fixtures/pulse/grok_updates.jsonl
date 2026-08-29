@@ -1,0 +1,3 @@
+# Sanitized behavioral fixture derived from Claude Pulse at 00ef42a; no transcript text or identifiers retained.
+{"timestamp":1786213800,"params":{"_meta":{"agentTimestampMs":1786213800123},"message":"Synthetic notice: Usage resets over a rolling 24-hour window — tokens (actual/limit): 1500000/2000000"}}
+{"timestamp":1786214000,"params":{"message":"unrelated synthetic update"}}

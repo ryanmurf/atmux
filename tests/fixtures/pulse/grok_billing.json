@@ -1,0 +1,14 @@
+{
+  "_provenance": "Sanitized behavioral fixture derived from Claude Pulse at 00ef42a; synthetic account values only.",
+  "config": {
+    "creditUsagePercent": 42.25,
+    "currentPeriod": {
+      "type": "USAGE_PERIOD_TYPE_WEEKLY",
+      "start": "2026-08-03T00:00:00.999Z",
+      "end": "2026-08-10T00:00:00Z"
+    },
+    "productUsage": [
+      { "product": "synthetic-fixture", "usagePercent": 42.25 }
+    ]
+  }
+}

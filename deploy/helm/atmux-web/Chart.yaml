@@ -1,0 +1,6 @@
+apiVersion: v2
+name: atmux-web
+description: OIDC-protected public gateway for the host-managed atmux daemon
+type: application
+version: 0.3.2
+appVersion: "0.1.0"

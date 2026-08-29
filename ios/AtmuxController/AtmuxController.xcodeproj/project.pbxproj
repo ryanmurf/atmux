@@ -1,0 +1,234 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 60;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		100000000000000000000001 /* AtmuxControllerApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000001 /* AtmuxControllerApp.swift */; };
+		100000000000000000000002 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000002 /* Models.swift */; };
+		100000000000000000000003 /* ConnectionProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000003 /* ConnectionProfile.swift */; };
+		100000000000000000000004 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000004 /* KeychainStore.swift */; };
+		100000000000000000000005 /* ClientIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000005 /* ClientIdentity.swift */; };
+		100000000000000000000006 /* APIEndpoint.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000006 /* APIEndpoint.swift */; };
+		100000000000000000000007 /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000007 /* APIClient.swift */; };
+		100000000000000000000008 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000008 /* AppModel.swift */; };
+		100000000000000000000009 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000009 /* ContentView.swift */; };
+		10000000000000000000000A /* ConnectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20000000000000000000000A /* ConnectionView.swift */; };
+		10000000000000000000000B /* SessionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20000000000000000000000B /* SessionsView.swift */; };
+		10000000000000000000000C /* SessionDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20000000000000000000000C /* SessionDetailView.swift */; };
+		10000000000000000000000D /* PulseView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20000000000000000000000D /* PulseView.swift */; };
+		110000000000000000000001 /* APIEndpointTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 210000000000000000000001 /* APIEndpointTests.swift */; };
+		110000000000000000000002 /* ModelDecodingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 210000000000000000000002 /* ModelDecodingTests.swift */; };
+		110000000000000000000003 /* SecretStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 210000000000000000000003 /* SecretStoreTests.swift */; };
+		110000000000000000000004 /* APIClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 210000000000000000000004 /* APIClientTests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		300000000000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 700000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 600000000000000000000001;
+			remoteInfo = AtmuxController;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		200000000000000000000001 /* AtmuxControllerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AtmuxControllerApp.swift; sourceTree = "<group>"; };
+		200000000000000000000002 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		200000000000000000000003 /* ConnectionProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionProfile.swift; sourceTree = "<group>"; };
+		200000000000000000000004 /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
+		200000000000000000000005 /* ClientIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientIdentity.swift; sourceTree = "<group>"; };
+		200000000000000000000006 /* APIEndpoint.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIEndpoint.swift; sourceTree = "<group>"; };
+		200000000000000000000007 /* APIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClient.swift; sourceTree = "<group>"; };
+		200000000000000000000008 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		200000000000000000000009 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		20000000000000000000000A /* ConnectionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionView.swift; sourceTree = "<group>"; };
+		20000000000000000000000B /* SessionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionsView.swift; sourceTree = "<group>"; };
+		20000000000000000000000C /* SessionDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionDetailView.swift; sourceTree = "<group>"; };
+		20000000000000000000000D /* PulseView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PulseView.swift; sourceTree = "<group>"; };
+		210000000000000000000001 /* APIEndpointTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIEndpointTests.swift; sourceTree = "<group>"; };
+		210000000000000000000002 /* ModelDecodingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelDecodingTests.swift; sourceTree = "<group>"; };
+		210000000000000000000003 /* SecretStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecretStoreTests.swift; sourceTree = "<group>"; };
+		210000000000000000000004 /* APIClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClientTests.swift; sourceTree = "<group>"; };
+		220000000000000000000001 /* AtmuxController.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AtmuxController.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		220000000000000000000002 /* AtmuxControllerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AtmuxControllerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		400000000000000000000001 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		400000000000000000000002 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		500000000000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				500000000000000000000002 /* AtmuxController */,
+				500000000000000000000003 /* AtmuxControllerTests */,
+				500000000000000000000004 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		500000000000000000000002 /* AtmuxController */ = {
+			isa = PBXGroup;
+			children = (
+				200000000000000000000001 /* AtmuxControllerApp.swift */,
+				200000000000000000000002 /* Models.swift */,
+				200000000000000000000003 /* ConnectionProfile.swift */,
+				200000000000000000000004 /* KeychainStore.swift */,
+				200000000000000000000005 /* ClientIdentity.swift */,
+				200000000000000000000006 /* APIEndpoint.swift */,
+				200000000000000000000007 /* APIClient.swift */,
+				200000000000000000000008 /* AppModel.swift */,
+				200000000000000000000009 /* ContentView.swift */,
+				20000000000000000000000A /* ConnectionView.swift */,
+				20000000000000000000000B /* SessionsView.swift */,
+				20000000000000000000000C /* SessionDetailView.swift */,
+				20000000000000000000000D /* PulseView.swift */,
+			);
+			path = AtmuxController;
+			sourceTree = "<group>";
+		};
+		500000000000000000000003 /* AtmuxControllerTests */ = {
+			isa = PBXGroup;
+			children = (
+				210000000000000000000001 /* APIEndpointTests.swift */,
+				210000000000000000000002 /* ModelDecodingTests.swift */,
+				210000000000000000000003 /* SecretStoreTests.swift */,
+				210000000000000000000004 /* APIClientTests.swift */,
+			);
+			path = AtmuxControllerTests;
+			sourceTree = "<group>";
+		};
+		500000000000000000000004 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				220000000000000000000001 /* AtmuxController.app */,
+				220000000000000000000002 /* AtmuxControllerTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		600000000000000000000001 /* AtmuxController */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 800000000000000000000001 /* Build configuration list for PBXNativeTarget "AtmuxController" */;
+			buildPhases = (
+				900000000000000000000001 /* Sources */,
+				400000000000000000000001 /* Frameworks */,
+				900000000000000000000003 /* Resources */,
+			);
+			buildRules = ();
+			dependencies = ();
+			name = AtmuxController;
+			productName = AtmuxController;
+			productReference = 220000000000000000000001 /* AtmuxController.app */;
+			productType = "com.apple.product-type.application";
+		};
+		600000000000000000000002 /* AtmuxControllerTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 800000000000000000000002 /* Build configuration list for PBXNativeTarget "AtmuxControllerTests" */;
+			buildPhases = (
+				900000000000000000000002 /* Sources */,
+				400000000000000000000002 /* Frameworks */,
+				900000000000000000000004 /* Resources */,
+			);
+			buildRules = ();
+			dependencies = (A00000000000000000000001 /* PBXTargetDependency */);
+			name = AtmuxControllerTests;
+			productName = AtmuxControllerTests;
+			productReference = 220000000000000000000002 /* AtmuxControllerTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		700000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					600000000000000000000001 = { CreatedOnToolsVersion = 16.0; };
+					600000000000000000000002 = { CreatedOnToolsVersion = 16.0; TestTargetID = 600000000000000000000001; };
+				};
+			};
+			buildConfigurationList = 800000000000000000000003 /* Build configuration list for PBXProject "AtmuxController" */;
+			compatibilityVersion = "Xcode 15.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (en, Base);
+			mainGroup = 500000000000000000000001;
+			productRefGroup = 500000000000000000000004 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (600000000000000000000001 /* AtmuxController */, 600000000000000000000002 /* AtmuxControllerTests */);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		900000000000000000000003 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		900000000000000000000004 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		900000000000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				100000000000000000000001 /* AtmuxControllerApp.swift in Sources */,
+				100000000000000000000002 /* Models.swift in Sources */,
+				100000000000000000000003 /* ConnectionProfile.swift in Sources */,
+				100000000000000000000004 /* KeychainStore.swift in Sources */,
+				100000000000000000000005 /* ClientIdentity.swift in Sources */,
+				100000000000000000000006 /* APIEndpoint.swift in Sources */,
+				100000000000000000000007 /* APIClient.swift in Sources */,
+				100000000000000000000008 /* AppModel.swift in Sources */,
+				100000000000000000000009 /* ContentView.swift in Sources */,
+				10000000000000000000000A /* ConnectionView.swift in Sources */,
+				10000000000000000000000B /* SessionsView.swift in Sources */,
+				10000000000000000000000C /* SessionDetailView.swift in Sources */,
+				10000000000000000000000D /* PulseView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		900000000000000000000002 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				110000000000000000000001 /* APIEndpointTests.swift in Sources */,
+				110000000000000000000002 /* ModelDecodingTests.swift in Sources */,
+				110000000000000000000003 /* SecretStoreTests.swift in Sources */,
+				110000000000000000000004 /* APIClientTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		A00000000000000000000001 /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = 600000000000000000000001 /* AtmuxController */; targetProxy = 300000000000000000000001 /* PBXContainerItemProxy */; };
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		B00000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_C_LANGUAGE_STANDARD = gnu17; GCC_OPTIMIZATION_LEVEL = 0; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SDKROOT = iphoneos; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
+		B00000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = YES; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; GCC_C_LANGUAGE_STANDARD = gnu17; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SDKROOT = iphoneos; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O"; VALIDATE_PRODUCT = YES; }; name = Release; };
+		B00000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; DEVELOPMENT_ASSET_PATHS = ""; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_CFBundleDisplayName = AtmuxController; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools"; INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Connect to your atmux servers on the local network."; INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES; INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES; INFOPLIST_KEY_UILaunchScreen_Generation = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.murphytek.AtmuxController; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		B00000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_CFBundleDisplayName = AtmuxController; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools"; INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Connect to your atmux servers on the local network."; INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES; INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES; INFOPLIST_KEY_UILaunchScreen_Generation = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.murphytek.AtmuxController; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		B00000000000000000000005 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = com.murphytek.AtmuxControllerTests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/AtmuxController.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/AtmuxController"; }; name = Debug; };
+		B00000000000000000000006 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"; PRODUCT_BUNDLE_IDENTIFIER = com.murphytek.AtmuxControllerTests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/AtmuxController.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/AtmuxController"; }; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		800000000000000000000001 /* Build configuration list for PBXNativeTarget "AtmuxController" */ = {isa = XCConfigurationList; buildConfigurations = (B00000000000000000000003 /* Debug */, B00000000000000000000004 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		800000000000000000000002 /* Build configuration list for PBXNativeTarget "AtmuxControllerTests" */ = {isa = XCConfigurationList; buildConfigurations = (B00000000000000000000005 /* Debug */, B00000000000000000000006 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		800000000000000000000003 /* Build configuration list for PBXProject "AtmuxController" */ = {isa = XCConfigurationList; buildConfigurations = (B00000000000000000000001 /* Debug */, B00000000000000000000002 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+	};
+	rootObject = 700000000000000000000001 /* Project object */;
+}

@@ -18,6 +18,61 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked
 
+  web:
+    name: Dashboard tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - run: node --check web/app.js
+      - run: node --test web/app.test.mjs
+      - run: node --test tests/web_mobile_pulse_browser.mjs
+
+  helm:
+    name: Gateway chart safety
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v4
+      - run: bash deploy/helm/atmux-web/tests/render.sh
+
+  pulse-postgres:
+    name: Pulse PostgreSQL conformance
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: atmux_admin
+          POSTGRES_PASSWORD: atmux_admin_test
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U atmux_admin -d postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ATMUX_PULSE_TEST_POSTGRES_URL: postgresql://atmux_runtime:atmux_runtime_test@127.0.0.1:5432/atmux_pulse_test?sslmode=disable
+      PGPASSWORD: atmux_admin_test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: Create non-bypass Pulse runtime role
+        run: >-
+          psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U atmux_admin -d postgres
+          -c "CREATE ROLE atmux_runtime LOGIN PASSWORD 'atmux_runtime_test'
+          NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS"
+      - name: Create disposable Pulse database
+        run: >-
+          psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U atmux_admin -d postgres
+          -c "CREATE DATABASE atmux_pulse_test OWNER atmux_runtime"
+      - run: cargo test --locked --features pulse-postgres --test pulse_store_conformance
+
   check:
     name: Test (${{ matrix.os }})
     strategy:
@@ -25,15 +80,32 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # The tmux-backed and federation suites skip themselves when tmux is
+    # missing. Requiring it here means a runner without tmux fails the build
+    # instead of quietly shrinking coverage to nothing.
+    env:
+      ATMUX_REQUIRE_TMUX: '1'
+      # Never let tests inspect or mutate a runner account's default tmux
+      # server. Every library/federation command inherits this disposable
+      # socket; dedicated smoke fixtures use still narrower per-test sockets.
+      ATMUX_TMUX_SOCKET_NAME: atmux-ci-${{ github.run_id }}-${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install tmux on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tmux
       - name: Install tmux on macOS
         if: runner.os == 'macOS'
         run: brew install tmux
+      - name: Report tmux version
+        run: tmux -V
+      - name: Test transactional Quick Resume helper
+        if: runner.os == 'Linux'
+        run: bash tests/resume_tron_transactional.sh
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --check
@@ -41,3 +113,6 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
+      - name: Clean disposable tmux server
+        if: always()
+        run: tmux -L "$ATMUX_TMUX_SOCKET_NAME" kill-server || true

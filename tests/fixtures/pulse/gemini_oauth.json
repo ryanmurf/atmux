@@ -1,0 +1,7 @@
+{
+  "_provenance": "Synthetic credential-shape fixture derived from Claude Pulse at 00ef42a; values are deliberately unusable.",
+  "access_token": "not-a-secret-fixture-access-value",
+  "refresh_token": "not-a-secret-fixture-refresh-value",
+  "expiry_date": 1786210000000,
+  "token_uri": "https://oauth2.googleapis.com/token"
+}

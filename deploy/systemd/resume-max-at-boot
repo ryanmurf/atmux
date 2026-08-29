@@ -1,0 +1,430 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly max_resume_runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/atmux-max-resume"
+readonly max_resume_marker="$max_resume_runtime_dir/complete"
+readonly max_resume_boot_id_file="${ATMUX_MAX_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
+readonly max_resume_clay_script=/home/ryan/IdeaProjects/research/math-prize-problems/clay-max.sh
+readonly max_resume_codex_home=/home/ryan/.codex
+declare -a max_resume_created_ids=()
+declare -a max_resume_created_names=()
+declare -a max_resume_created_indices=()
+declare -a max_resume_created_at=()
+
+# Parallel, fixed-order arrays keep recovery deterministic and make rollback
+# order the reverse of creation order. Identity is the native conversation ID,
+# not a display label or a mutable pane PID.
+readonly -a max_resume_names=(
+  clay-p-vs-np-max
+  clay-navier-stokes-max
+  clay-hodge-max
+  clay-bsd-max
+  clay-yang-mills-max
+  riemann-aristotle
+  riemann-fable
+  qwen-cve-59270
+  kernel
+)
+readonly -a max_resume_directories=(
+  /home/ryan/IdeaProjects/research/math-prize-problems/attacks/p-vs-np
+  /home/ryan/IdeaProjects/research/math-prize-problems/attacks/navier-stokes
+  /home/ryan/IdeaProjects/research/math-prize-problems/attacks/hodge-conjecture
+  /home/ryan/IdeaProjects/research/math-prize-problems/attacks/birch-swinnerton-dyer
+  /home/ryan/IdeaProjects/research/math-prize-problems/attacks/yang-mills
+  /home/ryan/IdeaProjects/research/math-prize-problems
+  /home/ryan/IdeaProjects/research/math-prize-problems
+  /home/ryan/IdeaProjects/research/cve-research
+  /home/ryan/IdeaProjects/qwen-kernel
+)
+readonly -a max_resume_harnesses=(codex codex codex codex codex codex claude claude codex)
+readonly -a max_resume_profiles=(Default Default Default Default Default Default max qwen Default)
+readonly -a max_resume_identities=(
+  01a04598-ddc3-7923-aee9-1993d0fbe241
+  01a04598-ddb6-7ae0-880b-3bca0a14ad1e
+  01a04598-ddd3-7943-b109-26a0cad031d5
+  01a04598-dde4-7e90-a839-ff0f4f23e77a
+  01a04598-ddca-7462-b87d-57a99e32e371
+  01a02c06-b75c-7553-8daf-d45ae8e52258
+  6d2436ec-a5aa-4ab7-a4e2-5b8b76bd7d9f
+  265df46d-f95a-4532-9cd5-59f3cabbac76
+  01a03c8d-0826-7561-8a84-c16d95ac7a49
+)
+readonly -a max_resume_models=(
+  gpt-5.6-sol gpt-5.6-sol gpt-5.6-sol gpt-5.6-sol gpt-5.6-sol
+  gpt-5.6-sol fable qwen3.8-27b-mtp gpt-5.6-sol
+)
+readonly -a max_resume_efforts=(max max max max max max '' '' xhigh)
+readonly -a max_resume_modes=(sol-max sol-max sol-max sol-max sol-max sol-max fable '' sol-xhigh)
+readonly -a max_resume_commands=(
+  'exec /home/ryan/IdeaProjects/research/math-prize-problems/clay-max.sh __run p-vs-np'
+  'exec /home/ryan/IdeaProjects/research/math-prize-problems/clay-max.sh __run navier-stokes'
+  'exec /home/ryan/IdeaProjects/research/math-prize-problems/clay-max.sh __run hodge-conjecture'
+  'exec /home/ryan/IdeaProjects/research/math-prize-problems/clay-max.sh __run birch-swinnerton-dyer'
+  'exec /home/ryan/IdeaProjects/research/math-prize-problems/clay-max.sh __run yang-mills'
+  'exec /home/ryan/.local/bin/codex resume 01a02c06-b75c-7553-8daf-d45ae8e52258'
+  'exec env PATH=/home/ryan/.local/bin:/usr/local/bin:/usr/bin:/bin /home/ryan/.local/bin/claude-max --model fable --resume 6d2436ec-a5aa-4ab7-a4e2-5b8b76bd7d9f'
+  'exec env PATH=/home/ryan/.local/bin:/usr/local/bin:/usr/bin:/bin /home/ryan/.local/bin/claude-qwen --resume 265df46d-f95a-4532-9cd5-59f3cabbac76'
+  'exec env CODEX_HOME=/home/ryan/.codex /home/ryan/.local/bin/codex resume -C /home/ryan/IdeaProjects/qwen-kernel -m gpt-5.6-sol -c model_reasoning_effort=\"xhigh\" 01a03c8d-0826-7561-8a84-c16d95ac7a49'
+)
+
+max_resume_tmux() {
+  if [[ -n ${ATMUX_MAX_TMUX_SOCKET:-} ]]; then
+    command tmux -L "$ATMUX_MAX_TMUX_SOCKET" "$@"
+  else
+    command tmux "$@"
+  fi
+}
+
+max_resume_sleep() { command sleep "$@"; }
+max_resume_now() { printf '%s\n' "$SECONDS"; }
+max_resume_service_active() { /usr/bin/systemctl --user is-active --quiet "$1"; }
+max_resume_http_ready() { /usr/bin/curl --fail --silent --max-time 2 --output /dev/null "$1"; }
+max_resume_lan_ready() { /home/ryan/.local/libexec/atmux-wait-max-lan; }
+max_resume_marker_write() { printf '%s\n' "$1" >"$2"; }
+max_resume_marker_chmod() { chmod 600 "$1"; }
+max_resume_marker_move() { mv -f -- "$1" "$2"; }
+max_resume_valid_tmux_id() { [[ $1 =~ ^\$[0-9]+$ ]]; }
+
+max_resume_option() {
+  local scope=$1
+  local target=$2
+  local option=$3
+  if [[ $scope == pane ]]; then
+    max_resume_tmux show-options -p -q -v -t "$target" "$option" 2>/dev/null
+  else
+    max_resume_tmux show-options -q -v -t "$target" "$option" 2>/dev/null
+  fi
+}
+
+max_resume_resolve_session() {
+  max_resume_tmux display-message -p -t "=$1:" '#{session_id}' 2>/dev/null
+}
+
+max_resume_session_owned() {
+  local session_id=$1
+  local session_name=$2
+  local resolved_id resolved_name
+  max_resume_valid_tmux_id "$session_id" || return 1
+  max_resume_tmux has-session -t "$session_id" 2>/dev/null || return 1
+  max_resume_tmux has-session -t "=$session_name" 2>/dev/null || return 1
+  resolved_name=$(max_resume_tmux display-message -p -t "$session_id" '#{session_name}' 2>/dev/null) || return 1
+  resolved_id=$(max_resume_resolve_session "$session_name") || return 1
+  [[ $resolved_name == "$session_name" && $resolved_id == "$session_id" ]]
+}
+
+max_resume_session_matches() {
+  local index=$1
+  local session_id pane_id path
+  session_id=$(max_resume_resolve_session "${max_resume_names[index]}") || return 1
+  max_resume_session_owned "$session_id" "${max_resume_names[index]}" || return 1
+  mapfile -t pane_ids < <(max_resume_tmux list-panes -t "$session_id" -F '#{pane_id}' 2>/dev/null)
+  [[ ${#pane_ids[@]} -eq 1 ]] || return 1
+  pane_id=${pane_ids[0]}
+  path=$(max_resume_tmux display-message -p -t "$pane_id" '#{pane_current_path}' 2>/dev/null) || return 1
+  [[ $path == "${max_resume_directories[index]}" ]] || return 1
+  [[ $(max_resume_option session "$session_id" @atmux_recovery_identity) == "${max_resume_identities[index]}" ]] || return 1
+  [[ $(max_resume_option session "$session_id" @atmux_recovery_harness) == "${max_resume_harnesses[index]}" ]] || return 1
+  [[ $(max_resume_option pane "$pane_id" @atmux_profile) == "${max_resume_profiles[index]}" ]] || return 1
+  if [[ -n ${max_resume_models[index]} ]]; then
+    [[ $(max_resume_option pane "$pane_id" @atmux_model) == "${max_resume_models[index]}" ]] || return 1
+  fi
+  if [[ -n ${max_resume_efforts[index]} ]]; then
+    [[ $(max_resume_option pane "$pane_id" @atmux_effort) == "${max_resume_efforts[index]}" ]] || return 1
+  fi
+  if [[ -n ${max_resume_modes[index]} ]]; then
+    [[ $(max_resume_option pane "$pane_id" @atmux_mode) == "${max_resume_modes[index]}" ]] || return 1
+  fi
+}
+
+max_resume_set_identity() {
+  local index=$1
+  local session_id=$2
+  local pane_id
+  pane_id=$(max_resume_tmux list-panes -t "$session_id" -F '#{pane_id}' 2>/dev/null) || return 1
+  [[ -n $pane_id && $pane_id != *$'\n'* ]] || return 1
+  max_resume_tmux set-option -q -t "$session_id" @atmux_recovery_identity "${max_resume_identities[index]}"
+  max_resume_tmux set-option -q -t "$session_id" @atmux_recovery_harness "${max_resume_harnesses[index]}"
+  max_resume_tmux set-option -p -q -t "$pane_id" @atmux_profile "${max_resume_profiles[index]}"
+  if [[ -n ${max_resume_models[index]} ]]; then
+    max_resume_tmux set-option -p -q -t "$pane_id" @atmux_model "${max_resume_models[index]}"
+  fi
+  if [[ -n ${max_resume_efforts[index]} ]]; then
+    max_resume_tmux set-option -p -q -t "$pane_id" @atmux_effort "${max_resume_efforts[index]}"
+  fi
+  if [[ -n ${max_resume_modes[index]} ]]; then
+    max_resume_tmux set-option -p -q -t "$pane_id" @atmux_mode "${max_resume_modes[index]}"
+  fi
+}
+
+max_resume_rollback() {
+  local index session_id session_name
+  for ((index = ${#max_resume_created_ids[@]} - 1; index >= 0; index--)); do
+    session_id=${max_resume_created_ids[index]}
+    session_name=${max_resume_created_names[index]}
+    if max_resume_session_owned "$session_id" "$session_name"; then
+      max_resume_tmux kill-session -t "$session_id" 2>/dev/null || true
+      printf 'Rolled back incomplete Max recovery session: %s\n' "$session_name" >&2
+    fi
+  done
+  max_resume_created_ids=()
+  max_resume_created_names=()
+  max_resume_created_indices=()
+  max_resume_created_at=()
+}
+
+max_resume_recover_one() {
+  local index=$1
+  local session_name=${max_resume_names[index]}
+  local directory=${max_resume_directories[index]}
+  local created_id
+  if max_resume_tmux has-session -t "=$session_name" 2>/dev/null; then
+    if ! max_resume_session_matches "$index"; then
+      printf 'Refusing Max recovery identity collision: %s\n' "$session_name" >&2
+      return 1
+    fi
+    printf 'Preserved existing Max session: %s\n' "$session_name"
+    return 0
+  fi
+  if ! created_id=$(max_resume_tmux new-session -d -P -F '#{session_id}' \
+      -s "$session_name" -c "$directory" "${max_resume_commands[index]}"); then
+    printf 'Failed to create Max recovery session: %s\n' "$session_name" >&2
+    return 1
+  fi
+  max_resume_valid_tmux_id "$created_id" || {
+    printf 'Max recovery returned an invalid tmux identity: %s\n' "$session_name" >&2
+    return 1
+  }
+  max_resume_created_ids+=("$created_id")
+  max_resume_created_names+=("$session_name")
+  max_resume_created_indices+=("$index")
+  max_resume_created_at+=("$(max_resume_now)")
+  max_resume_set_identity "$index" "$created_id" || return 1
+  max_resume_sleep 2
+  if [[ $session_name == qwen-cve-59270 ]] && ! max_resume_wait_for_split_stack 30; then
+    printf 'Max Qwen split backend became unhealthy after launch\n' >&2
+    return 1
+  fi
+  max_resume_session_matches "$index" || {
+    printf 'Max recovery command exited or changed identity during startup: %s\n' "$session_name" >&2
+    return 1
+  }
+  printf 'Recovered Max session: %s\n' "$session_name"
+}
+
+max_resume_split_stack_ready() {
+  local service endpoint
+  for service in \
+    claude-qwen-proxy.service \
+    qwen-kernel-prefill-router.service \
+    qwen-kernel-decode-halo.service \
+    qwen-kernel-prefill-xtx.service; do
+    max_resume_service_active "$service" || return 1
+  done
+  for endpoint in \
+    http://127.0.0.1:8091/health \
+    http://127.0.0.1:8092/health \
+    http://127.0.0.1:8191/health \
+    http://127.0.0.1:8192/health; do
+    max_resume_http_ready "$endpoint" || return 1
+  done
+}
+
+max_resume_wait_for_split_stack() {
+  local timeout deadline
+  timeout=$1
+  deadline=$((SECONDS + timeout))
+  while ((SECONDS < deadline)); do
+    max_resume_split_stack_ready && return 0
+    max_resume_sleep 1
+  done
+  max_resume_split_stack_ready
+}
+
+max_resume_wait_for_health() {
+  local deadline=$((SECONDS + 480))
+  max_resume_lan_ready
+  while ((SECONDS < deadline)); do
+    if max_resume_http_ready http://127.0.0.1:7345/api/v1/health \
+      && max_resume_split_stack_ready; then
+      return 0
+    fi
+    max_resume_sleep 1
+  done
+  printf 'Max atmux and Qwen split-stack readiness timed out\n' >&2
+  return 1
+}
+
+max_resume_owned_file() { [[ -f $1 && ! -L $1 && -r $1 && -O $1 ]]; }
+
+max_resume_codex_transcript() {
+  local identity=$1
+  local -a matches=()
+  mapfile -d '' matches < <(find "$max_resume_codex_home/sessions" -xdev -type f \
+    -name "*${identity}.jsonl" -print0 2>/dev/null)
+  [[ ${#matches[@]} -eq 1 ]] && max_resume_owned_file "${matches[0]}"
+}
+
+max_resume_validate_roster() {
+  local index directory
+  [[ -x /home/ryan/.local/bin/codex ]] || return 1
+  [[ -x /home/ryan/.local/bin/claude-max ]] || return 1
+  [[ -x /home/ryan/.local/bin/claude-qwen ]] || return 1
+  [[ -x $max_resume_clay_script ]] || return 1
+  for directory in "${max_resume_directories[@]}"; do
+    [[ -d $directory && $(readlink -f -- "$directory") == "$directory" ]] || return 1
+  done
+  for index in 0 1 2 3 4 5 8; do
+    max_resume_codex_transcript "${max_resume_identities[index]}" || return 1
+  done
+  max_resume_owned_file \
+    "/home/ryan/.claude-max/projects/-home-ryan-IdeaProjects-research-math-prize-problems/${max_resume_identities[6]}.jsonl" || return 1
+  max_resume_owned_file \
+    "/home/ryan/.claude-qwen/projects/-home-ryan-IdeaProjects-research-cve-research/${max_resume_identities[7]}.jsonl" || return 1
+}
+
+max_resume_preflight_existing() {
+  local index
+  for index in "${!max_resume_names[@]}"; do
+    if max_resume_tmux has-session -t "=${max_resume_names[index]}" 2>/dev/null \
+      && ! max_resume_session_matches "$index"; then
+      printf 'Refusing Max recovery identity collision: %s\n' "${max_resume_names[index]}" >&2
+      return 1
+    fi
+  done
+}
+
+max_resume_all_sessions_valid() {
+  local index
+  for index in "${!max_resume_names[@]}"; do
+    max_resume_session_matches "$index" || return 1
+  done
+}
+
+max_resume_wait_for_created_stability() {
+  local minimum_seconds=$1
+  local array_index roster_index now created_at all_stable
+  while :; do
+    now=$(max_resume_now)
+    all_stable=1
+    for array_index in "${!max_resume_created_indices[@]}"; do
+      roster_index=${max_resume_created_indices[array_index]}
+      created_at=${max_resume_created_at[array_index]}
+      max_resume_session_matches "$roster_index" || {
+        printf 'Max recovery session exited during stability verification: %s\n' \
+          "${max_resume_names[roster_index]}" >&2
+        return 1
+      }
+      if ((now - created_at < minimum_seconds)); then
+        all_stable=0
+      fi
+    done
+    ((all_stable == 1)) && return 0
+    max_resume_sleep 1
+  done
+}
+
+max_resume_run_roster() {
+  local index
+  for index in "${!max_resume_names[@]}"; do
+    max_resume_recover_one "$index" || return 1
+  done
+}
+
+max_resume_persist_marker() {
+  local boot_id=$1 marker_tmp="${max_resume_marker}.tmp.${BASHPID}"
+  if ! max_resume_marker_write "$boot_id" "$marker_tmp" \
+    || ! max_resume_marker_chmod "$marker_tmp" \
+    || ! max_resume_marker_move "$marker_tmp" "$max_resume_marker"; then
+    rm -f -- "$marker_tmp"
+    printf 'Max recovery could not persist its boot marker\n' >&2
+    return 1
+  fi
+}
+
+max_resume_check() {
+  max_resume_validate_roster || {
+    printf 'Max recovery roster validation failed\n' >&2
+    return 1
+  }
+  max_resume_preflight_existing
+  local index missing=0
+  for index in "${!max_resume_names[@]}"; do
+    if max_resume_session_matches "$index"; then
+      printf 'valid\t%s\n' "${max_resume_names[index]}"
+    else
+      printf 'missing\t%s\n' "${max_resume_names[index]}"
+      ((missing += 1))
+    fi
+  done
+  printf 'Max recovery check: %d of %d sessions missing\n' "$missing" "${#max_resume_names[@]}"
+}
+
+max_resume_main() {
+  local action=${1:---recover} boot_id marker_boot_id=
+  if [[ $action == --check ]]; then
+    max_resume_check
+    return
+  fi
+  [[ $action == --recover ]] || {
+    printf 'Usage: resume-max-at-boot [--check|--recover]\n' >&2
+    return 2
+  }
+  boot_id=$(<"$max_resume_boot_id_file")
+  [[ -r $max_resume_marker ]] && marker_boot_id=$(<"$max_resume_marker")
+  max_resume_validate_roster || {
+    printf 'Max recovery roster validation failed\n' >&2
+    return 1
+  }
+  max_resume_preflight_existing
+  if [[ $marker_boot_id == "$boot_id" ]] && max_resume_all_sessions_valid; then
+    printf 'Max recovery already completed and verified for this machine boot\n'
+    return 0
+  fi
+  if [[ $marker_boot_id == "$boot_id" ]]; then
+    printf 'Max recovery marker is stale; repairing missing sessions for this boot\n'
+  fi
+  install -d -m 700 "$max_resume_runtime_dir"
+  max_resume_wait_for_health
+  max_resume_run_roster || {
+    max_resume_rollback
+    return 1
+  }
+  max_resume_wait_for_created_stability 60 || {
+    max_resume_rollback
+    return 1
+  }
+  max_resume_all_sessions_valid || {
+    printf 'Max recovery final roster verification failed\n' >&2
+    max_resume_rollback
+    return 1
+  }
+  max_resume_wait_for_split_stack 30 || {
+    printf 'Max Qwen split backend failed final recovery health verification\n' >&2
+    max_resume_rollback
+    return 1
+  }
+  max_resume_persist_marker "$boot_id" || {
+    max_resume_rollback
+    return 1
+  }
+  max_resume_created_ids=()
+  max_resume_created_names=()
+  max_resume_created_indices=()
+  max_resume_created_at=()
+  printf 'Max recovery completed and verified for this machine boot\n'
+}
+
+max_resume_exit_trap() {
+  local exit_status=$?
+  trap - EXIT HUP INT TERM
+  ((exit_status == 0)) || max_resume_rollback
+  exit "$exit_status"
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  trap max_resume_exit_trap EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  max_resume_main "$@"
+fi

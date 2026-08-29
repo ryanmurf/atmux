@@ -320,7 +320,8 @@ fn render_launcher_steps(frame: &mut Frame<'_>, launcher: &Launcher, area: Rect)
         (LaunchStage::Directory, "1 directory"),
         (LaunchStage::Harness, "2 harness"),
         (LaunchStage::Profile, "3 profile"),
-        (LaunchStage::Name, "4 name"),
+        (LaunchStage::Mode, "4 mode"),
+        (LaunchStage::Name, "5 name"),
     ];
     let mut spans = Vec::new();
     for (index, (stage, label)) in labels.into_iter().enumerate() {
@@ -396,6 +397,14 @@ fn render_launcher_stage(frame: &mut Frame<'_>, launcher: &Launcher, area: Rect)
                 launcher.profile_selected,
             );
         }
+        LaunchStage::Mode => {
+            let modes = launcher
+                .modes
+                .iter()
+                .map(crate::config::ProfileMode::display_label)
+                .collect::<Vec<_>>();
+            render_choice_list(frame, area, " Model mode ", &modes, launcher.mode_selected);
+        }
         LaunchStage::Name => {
             render_launch_name(frame, launcher, area);
         }
@@ -429,6 +438,16 @@ fn render_launch_name(frame: &mut Frame<'_>, launcher: &Launcher, area: Rect) {
                     .profiles
                     .get(launcher.profile_selected)
                     .map_or("", |profile| profile.name.as_str()),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("mode     ", Style::default().fg(MUTED)),
+            Span::raw(
+                launcher
+                    .modes
+                    .get(launcher.mode_selected)
+                    .map(crate::config::ProfileMode::display_label)
+                    .unwrap_or_default(),
             ),
         ]),
         Line::from(""),

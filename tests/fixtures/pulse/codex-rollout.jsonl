@@ -1,0 +1,2 @@
+{"timestamp":"2026-08-08T12:00:00Z","type":"fixture","payload":{"rate_limits":{"primary":{"used_percent":9.0,"window_minutes":300,"reset_at":1786262400},"secondary":{"used_percent":22.0,"window_minutes":10080,"reset_at":1786838400}}}}
+{"timestamp":"2026-08-08T18:00:00Z","type":"fixture","payload":{"nested":{"rate_limits":{"primary":{"used_percent":41.0,"window_minutes":10080,"reset_at":1786838400},"secondary":null}}}}
