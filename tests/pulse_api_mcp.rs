@@ -926,9 +926,9 @@ async fn invalidation_stream_is_bounded_account_scoped_and_reconnect_safe() {
     test.seed().await;
     let hub = PulseInvalidationHub::new(&[account(1), account(2)]);
     let api = test.api().with_invalidations(hub.clone());
-    let app = atmux::pulse::api::router(api.clone());
+    let router = atmux::pulse::api::router(api.clone());
 
-    let unknown = app
+    let unknown = router
         .clone()
         .oneshot(
             Request::builder()
@@ -942,7 +942,7 @@ async fn invalidation_stream_is_bounded_account_scoped_and_reconnect_safe() {
     assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
 
     for invalid in ["not-a-revision".to_owned(), "9".repeat(1_000)] {
-        let response = app
+        let response = router
             .clone()
             .oneshot(
                 Request::builder()
@@ -956,7 +956,7 @@ async fn invalidation_stream_is_bounded_account_scoped_and_reconnect_safe() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    let response = app
+    let response = router
         .clone()
         .oneshot(
             Request::builder()
@@ -979,7 +979,7 @@ async fn invalidation_stream_is_bounded_account_scoped_and_reconnect_safe() {
     );
     assert!(!first.contains("SECRET_CANARY_ENV"), "{first}");
 
-    let reconnect = app
+    let reconnect = router
         .oneshot(
             Request::builder()
                 .uri("/api/v1/pulse/accounts/1/events")
@@ -1028,9 +1028,9 @@ async fn pricing_delete_reverts_to_seeded_default_with_rest_mcp_and_idor_parity(
         .unwrap();
     let mut account_one = hub.subscribe(account(1)).unwrap();
     let mut account_two = hub.subscribe(account(2)).unwrap();
-    let app = atmux::pulse::api::router(api.clone());
+    let router = atmux::pulse::api::router(api.clone());
 
-    let deleted = app
+    let deleted = router
         .clone()
         .oneshot(
             Request::builder()
@@ -1066,7 +1066,7 @@ async fn pricing_delete_reverts_to_seeded_default_with_rest_mcp_and_idor_parity(
         "revert must preserve seeded defaults"
     );
 
-    let cross_account_miss = app
+    let cross_account_miss = router
         .clone()
         .oneshot(
             Request::builder()
@@ -1077,7 +1077,7 @@ async fn pricing_delete_reverts_to_seeded_default_with_rest_mcp_and_idor_parity(
         )
         .await
         .unwrap();
-    let nonexistent_miss = app
+    let nonexistent_miss = router
         .oneshot(
             Request::builder()
                 .method("DELETE")

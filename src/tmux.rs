@@ -2369,7 +2369,7 @@ fn native_claude_version_executable_in(executable: &str, home: &Path, expected_u
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _, symlink};
+    use std::os::unix::fs::{FileTypeExt as _, symlink};
 
     use super::*;
 

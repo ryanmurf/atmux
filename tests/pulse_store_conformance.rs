@@ -1161,6 +1161,15 @@ CREATE TABLE token_usage (\
     PRIMARY KEY(account_id,profile,machine,session_id,model,settings_hash,day,source_json)\
 ) STRICT;";
 
+#[cfg(feature = "pulse-postgres")]
+const POSTGRES_V4_TOKEN_USAGE_FIXTURE: &str = "\
+CREATE TABLE atmux_pulse.token_usage (\
+    account_id BIGINT NOT NULL, profile TEXT NOT NULL, machine TEXT NOT NULL,\
+    session_id TEXT NOT NULL, model TEXT NOT NULL, settings_hash TEXT NOT NULL,\
+    day DATE NOT NULL, source JSONB NOT NULL,\
+    PRIMARY KEY(account_id,profile,machine,session_id,model,settings_hash,day,source)\
+);";
+
 async fn assert_sqlite_v4_duplicate_provenance_upgrade() {
     let id = NEXT_DATABASE.fetch_add(1, Ordering::Relaxed);
     let directory = std::env::temp_dir().join(format!(
@@ -1300,6 +1309,10 @@ async fn assert_postgres_v4_duplicate_provenance_upgrade(url: &str) {
         )
         .await
         .expect("create populated v4 PostgreSQL schema");
+    client
+        .batch_execute(POSTGRES_V4_TOKEN_USAGE_FIXTURE)
+        .await
+        .expect("create v4 PostgreSQL token usage table");
     drop(client);
     driver
         .await
@@ -1340,12 +1353,31 @@ async fn assert_postgres_v4_duplicate_provenance_upgrade(url: &str) {
             .get::<_, i64>(0),
         1
     );
+    assert_postgres_v7_token_usage_migrated(&client).await;
     drop(client);
     driver
         .await
         .expect("join PostgreSQL inspection driver")
         .expect("drive PostgreSQL inspection connection");
     reset_postgres(url).await;
+}
+
+#[cfg(feature = "pulse-postgres")]
+async fn assert_postgres_v7_token_usage_migrated(client: &tokio_postgres::Client) {
+    let columns = client
+        .query_one(
+            "SELECT COUNT(*) FROM information_schema.columns \
+             WHERE table_schema='atmux_pulse' AND table_name='token_usage' \
+               AND column_name='write_revision'",
+            &[],
+        )
+        .await
+        .expect("inspect migrated PostgreSQL token usage table")
+        .get::<_, i64>(0);
+    assert_eq!(
+        columns, 1,
+        "the v4 fixture must continue through the token_usage v7 migration"
+    );
 }
 
 #[tokio::test]

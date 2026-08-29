@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 
-use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, RenameFlags};
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, RawMode, RenameFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{io::AsyncReadExt, process::Command};
@@ -575,7 +575,7 @@ fn restore_after_failed_exchange(
     installed: &Metadata,
 ) -> WorkspaceResult<()> {
     const MAX_RECOVERY_EXCHANGES: usize = 64;
-    let mut expected_target = FileIdentity::from_metadata(installed);
+    let mut expected_target = FileIdentity::from_metadata(installed)?;
     for _ in 0..MAX_RECOVERY_EXCHANGES {
         let candidate = named_identity(parent, temporary_name)?;
         exchange_files(parent, temporary_name, target_name).map_err(|_| {
@@ -603,13 +603,26 @@ struct FileIdentity {
 }
 
 impl FileIdentity {
-    fn from_metadata(metadata: &Metadata) -> Self {
-        Self {
+    fn from_metadata(metadata: &Metadata) -> WorkspaceResult<Self> {
+        Ok(Self {
             device: metadata.dev(),
             inode: metadata.ino(),
-            file_type: FileType::from_raw_mode(metadata.mode()),
-        }
+            file_type: FileType::from_raw_mode(checked_raw_mode(metadata.mode())?),
+        })
     }
+}
+
+fn checked_mode<T>(mode: u32) -> Option<T>
+where
+    T: TryFrom<u32>,
+{
+    T::try_from(mode).ok()
+}
+
+fn checked_raw_mode(mode: u32) -> WorkspaceResult<RawMode> {
+    checked_mode(mode).ok_or_else(|| {
+        WorkspaceError::internal("project file mode could not be represented safely")
+    })
 }
 
 fn named_identity(parent: &File, name: &OsStr) -> WorkspaceResult<FileIdentity> {
@@ -718,7 +731,8 @@ fn prepare_temporary(
         )
         .map_err(|_| WorkspaceError::internal("project file ownership could not be preserved"))?;
     }
-    rustix::fs::fchmod(&*temporary, Mode::from_raw_mode(original.mode() & 0o7_777))
+    let permissions = checked_raw_mode(original.mode() & 0o7_777)?;
+    rustix::fs::fchmod(&*temporary, Mode::from_raw_mode(permissions))
         .map_err(|_| WorkspaceError::internal("project file permissions could not be preserved"))?;
     apply_security_metadata(temporary, security)?;
     let copied_security = read_security_metadata(temporary)?;
@@ -1856,7 +1870,7 @@ mod tests {
     use super::*;
     use std::{
         fs::OpenOptions,
-        os::unix::fs::{PermissionsExt, symlink},
+        os::unix::fs::symlink,
         process::Command as StdCommand,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1876,6 +1890,15 @@ mod tests {
 
     fn files_at(root: &Path, path: Option<&str>) -> WorkspaceResult<FilesResponse> {
         files_blocking(root, &[root.to_path_buf()], path)
+    }
+
+    #[test]
+    fn mode_conversion_is_checked_before_using_platform_raw_mode() {
+        assert_eq!(checked_mode::<u16>(0o100_644), Some(0o100_644));
+        assert_eq!(checked_mode::<u16>(u32::from(u16::MAX) + 1), None);
+
+        let raw_mode = checked_raw_mode(0o100_644).unwrap();
+        assert!(FileType::from_raw_mode(raw_mode).is_file());
     }
 
     #[test]
@@ -1923,7 +1946,7 @@ mod tests {
             .set_xattr("user.atmux-test", b"preserved")
             .unwrap();
         let mut permissions = fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o750);
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o750);
         fs::set_permissions(&path, permissions).unwrap();
         let FilesResponse::File {
             content_hash,
@@ -1963,7 +1986,8 @@ mod tests {
         );
         assert_eq!(line_count, Some(3));
         assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            std::os::unix::fs::PermissionsExt::mode(&fs::metadata(&path).unwrap().permissions())
+                & 0o777,
             0o750
         );
         assert_eq!(
@@ -2363,7 +2387,7 @@ mod tests {
         )
         .unwrap();
         let mut permissions = fs::metadata(&hook).unwrap().permissions();
-        permissions.set_mode(0o700);
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
         fs::set_permissions(&hook, permissions).unwrap();
         git(&root, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
         git(&root, &["config", "diff.external", hook.to_str().unwrap()]);

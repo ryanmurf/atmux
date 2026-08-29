@@ -1401,7 +1401,7 @@ fn parse_memory_size(value: &str) -> Option<u64> {
 
 #[cfg(any(target_os = "macos", test))]
 fn parse_decimal_scaled(value: &str, multiplier: u64) -> Option<u64> {
-    let (whole, fraction) = value.split_once('.').map_or((value, ""), |parts| parts);
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
     let whole = whole.parse::<u64>().ok()?.checked_mul(multiplier)?;
     if fraction.is_empty() {
         return Some(whole);

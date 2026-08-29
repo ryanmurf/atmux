@@ -385,8 +385,8 @@ pub async fn serve(
     let app = routes(state.clone());
     #[cfg(feature = "pulse")]
     let app = match pulse_api {
-        Some(api) => app.merge(pulse_routes(
-            api,
+        Some(pulse) => app.merge(pulse_routes(
+            pulse,
             pulse_receiver,
             pulse_federation,
             state.allowed_origins.clone(),

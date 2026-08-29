@@ -366,6 +366,9 @@ fn observation_json(changed: bool, overview: &Overview) -> Result<String, String
     serde_json::to_string(&value).map_err(|error| error.to_string())
 }
 
+// `tool_handler` generates an async trait method without an await point. Keep
+// the exception local to the macro expansion until rmcp emits a ready future.
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for AtmuxMcp {
     fn get_info(&self) -> ServerInfo {
