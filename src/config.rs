@@ -347,10 +347,9 @@ pub struct AgentResourcesConfig {
 
 impl AgentResourcesConfig {
     fn validate(self) -> Result<()> {
-        #[cfg(not(target_os = "linux"))]
-        if self.memory_max_bytes.is_some() || self.memory_override_max_bytes.is_some() {
-            bail!("[agent_resources] memory limits require Linux with systemd and cgroup v2");
-        }
+        // Validate the policy shape on every platform before reporting whether
+        // the platform can enforce it. This keeps unsafe sentinel values and
+        // malformed bounds from being hidden by a generic availability error.
         for (key, value) in [
             ("memory_max_bytes", self.memory_max_bytes),
             ("memory_override_max_bytes", self.memory_override_max_bytes),
@@ -378,6 +377,10 @@ impl AgentResourcesConfig {
             .is_some_and(|ceiling| ceiling % (1024 * 1024 * 1024) != 0)
         {
             bail!("[agent_resources].memory_override_max_bytes must be a whole number of GiB");
+        }
+        #[cfg(not(target_os = "linux"))]
+        if self.memory_max_bytes.is_some() || self.memory_override_max_bytes.is_some() {
+            bail!("[agent_resources] memory limits require Linux with systemd and cgroup v2");
         }
         Ok(())
     }
