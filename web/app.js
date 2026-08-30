@@ -20,6 +20,10 @@ const MAX_COLLAPSED_TOOL_RUN = 24;
 const COLLAPSIBLE_COORDINATION_TOOLS = new Set([
   "followup_task", "list_agents", "send_message", "wait_agent",
 ]);
+const INTERNAL_TOOL_ALIASES = new Map([
+  ["exec_command", "exec"],
+  ["exec", "exec"],
+]);
 const BENIGN_COORDINATION_STATUSES = new Set([
   "ok", "sent", "queued", "delivered", "acknowledged", "waiting", "idle", "running",
   "complete", "completed", "success", "succeeded", "timed out", "timeout", "no update",
@@ -1176,9 +1180,14 @@ function transcriptItemKind(item) {
 function normalizedToolName(item) {
   const raw = String(item?.tool_name || "Tool").trim() || "Tool";
   const lower = raw.toLowerCase();
-  for (const name of COLLAPSIBLE_COORDINATION_TOOLS) {
+  for (const name of [
+    ...COLLAPSIBLE_COORDINATION_TOOLS,
+    ...INTERNAL_TOOL_ALIASES.keys(),
+  ]) {
     if (lower === name || lower.endsWith(`.${name}`) || lower.endsWith(`/${name}`)
-      || lower.endsWith(`:${name}`) || lower.endsWith(`__${name}`)) return name;
+      || lower.endsWith(`:${name}`) || lower.endsWith(`__${name}`)) {
+      return INTERNAL_TOOL_ALIASES.get(name) || name;
+    }
   }
   return lower;
 }
@@ -1235,9 +1244,92 @@ function coordinationStatusJsonHasInvalidPrimitive(value, depth = 0) {
 }
 
 function collapsibleCoordinationTool(item) {
-  return transcriptItemKind(item) === "tool"
-    && COLLAPSIBLE_COORDINATION_TOOLS.has(normalizedToolName(item))
-    && ["sent", "status"].includes(coordinationResultSignal(item));
+  return internalToolGroupKey(item) === "coordination";
+}
+
+function execJsonResultClass(value, depth = 0) {
+  if (depth > 5 || value === null || typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    const results = value.slice(0, 64).map((entry) => execJsonResultClass(entry, depth + 1));
+    if (results.includes("error")) return "error";
+    if (results.includes("success")) return "success";
+    return results.includes("pending") ? "pending" : null;
+  }
+  let observed = null;
+  for (const [key, entry] of Object.entries(value).slice(0, 64)) {
+    if (/^(?:exit_code|exitCode|exit_status)$/.test(key)
+      && (typeof entry === "number" || (typeof entry === "string" && /^-?\d+$/.test(entry.trim())))) {
+      const code = Number(entry);
+      if (!Number.isFinite(code) || code !== 0) return "error";
+      observed = "success";
+      continue;
+    }
+    if (/^(?:status|code)$/.test(key)
+      && (typeof entry === "number" || (typeof entry === "string" && /^-?\d+$/.test(entry.trim())))) {
+      const code = Number(entry);
+      if (!Number.isFinite(code) || code !== 0) return "error";
+      // A generic zero code is not enough to prove process success.
+      continue;
+    }
+    if ((key === "is_error" && entry === true)
+      || ((key === "success" || key === "ok") && entry === false)) return "error";
+    if ((key === "success" || key === "ok") && entry === true) observed = "success";
+    if (/^(?:status|state)$/.test(key) && typeof entry === "string") {
+      const status = entry.trim().toLowerCase().replace(/[.!]$/, "");
+      if (/^(?:error|failed|failure|timed out|timeout|cancelled|canceled|rejected)$/.test(status)) return "error";
+      if (/^(?:ok|success|succeeded|complete|completed)$/.test(status)) observed = "success";
+      else if (/^(?:pending|queued|running|waiting)$/.test(status) && !observed) observed = "pending";
+    }
+    const nested = execJsonResultClass(entry, depth + 1);
+    if (nested === "error") return "error";
+    if (nested === "success") observed = "success";
+    else if (nested === "pending" && !observed) observed = "pending";
+  }
+  return observed;
+}
+
+function execResultClass(item) {
+  if (normalizedToolName(item) !== "exec") return null;
+  const output = typeof item?.tool_output === "string" ? item.tool_output.trim() : "";
+  if (!output) return null;
+  if (/\b(?:timed?\s*out|timeout)\b/i.test(output)
+    || coordinationResultSignal(item) === "error") return "error";
+
+  let jsonResult = null;
+  try { jsonResult = execJsonResultClass(JSON.parse(output)); } catch { /* Plain tool output. */ }
+  if (jsonResult === "error") return "error";
+
+  const exitCodes = [...output.matchAll(/(?:\b(?:process|command|script)\s+exited\s+with\s+(?:code|status)|\bexit(?:ed)?[_ -]+(?:code|status))[\s:=]*(-?\d+)\b/gi)]
+    .map((match) => Number(match[1]));
+  if (exitCodes.some((code) => !Number.isFinite(code) || code !== 0)) return "error";
+  if (exitCodes.length || jsonResult === "success") return "success";
+  if (jsonResult === "pending") return "pending";
+  if (/^(?:ok|success|succeeded|complete|completed)[.!]?$/i.test(output)) return "success";
+  if (/^(?:pending|queued|running|waiting)[.!]?$/i.test(output)) return "pending";
+  // Command output alone does not prove the tool call completed successfully.
+  return null;
+}
+
+function toolResultSignal(item) {
+  const execClass = execResultClass(item);
+  if (execClass === "error") return "error";
+  if (execClass === "success" || execClass === "pending") return "status";
+  return coordinationResultSignal(item);
+}
+
+function internalToolGroupKey(item) {
+  if (transcriptItemKind(item) !== "tool") return null;
+  if (typeof item?.tool_name !== "string" || !item.tool_name.trim()) return null;
+  const name = normalizedToolName(item);
+  if (COLLAPSIBLE_COORDINATION_TOOLS.has(name)) {
+    const signal = coordinationResultSignal(item);
+    return ["sent", "status"].includes(signal) ? "coordination" : null;
+  }
+  if (name !== "exec") return null;
+  const execClass = execResultClass(item);
+  return execClass === "success" || execClass === "pending"
+    ? `repeat:exec:${execClass}`
+    : null;
 }
 
 function coordinationToolCounts(messages) {
@@ -1254,11 +1346,12 @@ function compactTranscriptItems(messages, maxRun = MAX_COLLAPSED_TOOL_RUN) {
   const source = Array.isArray(messages) ? messages : [];
   const boundedMax = Math.max(2, Math.min(Number.isInteger(maxRun) ? maxRun : MAX_COLLAPSED_TOOL_RUN, MAX_COLLAPSED_TOOL_RUN));
   for (let index = 0; index < source.length;) {
-    if (!collapsibleCoordinationTool(source[index])) {
+    const groupKey = internalToolGroupKey(source[index]);
+    if (!groupKey) {
       items.push({ kind: "item", message: source[index] }); index += 1; continue;
     }
     let end = index;
-    while (end < source.length && collapsibleCoordinationTool(source[end])) end += 1;
+    while (end < source.length && internalToolGroupKey(source[end]) === groupKey) end += 1;
     let cursor = index;
     while (cursor < end) {
       const remaining = end - cursor;
@@ -1281,10 +1374,12 @@ function compactTranscriptItems(messages, maxRun = MAX_COLLAPSED_TOOL_RUN) {
   return items;
 }
 
-function coordinationGroupSummary(group) {
+function toolGroupSummary(group) {
   const calls = group?.messages?.length || 0;
-  const counts = (group?.counts || []).map(({ name, count }) => `${name} ×${count}`).join(" · ");
-  return `${calls} coordination calls · ${counts} · no errors`;
+  const counts = group?.counts || [];
+  if (counts.length === 1) return `${counts[0].name} ×${calls}`;
+  const labels = counts.map(({ name, count }) => `${name} ×${count}`).join(" · ");
+  return `${calls} internal calls · ${labels}`;
 }
 
 function dictationDelivery(paneId, prefix, finalText) {
@@ -1666,9 +1761,12 @@ if (typeof module !== "undefined" && module.exports) {
     transcriptItemKind,
     normalizedToolName,
     coordinationResultSignal,
+    execResultClass,
+    toolResultSignal,
     collapsibleCoordinationTool,
+    internalToolGroupKey,
     compactTranscriptItems,
-    coordinationGroupSummary,
+    toolGroupSummary,
     diffLineKind,
     safeLinkUrl,
     sortSessions,
@@ -2077,7 +2175,7 @@ function initialize() {
     details.open = expandedTools.has(details.dataset.transcriptId);
     const summary = document.createElement("summary");
     const name = String(message.tool_name || "Tool");
-    const resultSignal = coordinationResultSignal(message);
+    const resultSignal = toolResultSignal(message);
     const suffix = resultSignal === "error" ? "error"
       : resultSignal === "approval" ? "approval required"
         : message.tool_output ? "result" : "";
@@ -2096,14 +2194,18 @@ function initialize() {
     return details;
   }
 
-  function renderCoordinationGroup(group, expandedTools) {
+  function renderToolGroup(group, expandedTools) {
     const details = document.createElement("details");
     details.className = "tool-card tool-call-group";
     details.dataset.transcriptId = group.id;
     details.open = expandedTools.has(group.id);
     const summary = document.createElement("summary");
     summary.className = "tool-call-group-summary";
-    summary.textContent = coordinationGroupSummary(group);
+    summary.textContent = toolGroupSummary(group);
+    summary.setAttribute(
+      "aria-label",
+      `${summary.textContent}; ${group.messages.length} calls and results`,
+    );
     // Mobile browsers may scroll an expanding <details> to keep its newly
     // exposed body visible. The reader chose this visible summary, so retain
     // their exact Conversation offset while revealing the original calls.
@@ -2156,7 +2258,7 @@ function initialize() {
     );
     for (const item of transcriptItems) {
       if (item.kind === "tool-group") {
-        nodes.push(renderCoordinationGroup(item, expandedTools));
+        nodes.push(renderToolGroup(item, expandedTools));
         continue;
       }
       const message = item.message;

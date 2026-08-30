@@ -169,6 +169,7 @@ button.code-line-number:hover, button.code-line-number:focus-visible, button.cod
 .markdown-body { padding: 8px 12px 10px; color: #e2edef; font-size: 13.5px; line-height: 1.55; overflow-wrap: anywhere; }
 .tool-card { width: 100%; max-width: none; margin: 0 0 6px; border: 1px solid #263840; border-radius: 6px; background: #0c151a; overflow: hidden; }
 .tool-card > summary { padding: 6px 10px; cursor: pointer; color: #9eb2b9; font: 11.5px/1.4 "SFMono-Regular", Consolas, monospace; user-select: none; }
+.tool-card > summary:focus-visible { outline: 2px solid var(--cyan); outline-offset: -2px; }
 .tool-card[open] > summary { border-bottom: 1px solid #263840; color: #c7d8dc; }
 .tool-call-group { border-color: #34515b; background: #0b171c; }
 .tool-call-group > .tool-call-group-summary { min-height: 34px; display: list-item; padding: 8px 10px; color: #b8d2d8; font-weight: 650; touch-action: manipulation; }

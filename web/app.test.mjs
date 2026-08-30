@@ -118,9 +118,12 @@ const {
   transcriptItemKind,
   normalizedToolName,
   coordinationResultSignal,
+  execResultClass,
+  toolResultSignal,
   collapsibleCoordinationTool,
+  internalToolGroupKey,
   compactTranscriptItems,
-  coordinationGroupSummary,
+  toolGroupSummary,
   diffLineKind,
   utf8ByteLength,
   validateImageSelection,
@@ -276,6 +279,82 @@ test("adjacent low-signal coordination calls collapse without crossing prose or 
   assert.equal(compacted[6].message.id, "wait-single");
 });
 
+test("adjacent exec variants collapse as exec ×4 without crossing narrative or failures", () => {
+  const exec = (id, name, output) => ({
+    id, kind: "tool", role: "tool", tool_name: name,
+    tool_input: `{ "cmd": "printf ${id}" }`, tool_output: output,
+  });
+  const messages = [
+    { id: "human", role: "user", markdown: "Human plan stays visible" },
+    exec("exec-1", "functions.exec", '{"exit_code":0,"output":"command one output"}'),
+    exec("exec-2", "exec_command", "Process exited with code 0"),
+    exec("exec-3", "tools/exec", "ok"),
+    exec("exec-4", "functions.exec_command", '{"result":{"exit_code":0}}'),
+    { id: "agent", role: "assistant", markdown: "Agent interpretation stays visible" },
+    exec("exec-error", "exec", "Error: command exited with status 1"),
+  ];
+  const compacted = compactTranscriptItems(messages);
+  assert.deepEqual(compacted.map((item) => item.kind), ["item", "tool-group", "item", "item"]);
+  assert.deepEqual(compacted[1].messages.map((item) => item.id), ["exec-1", "exec-2", "exec-3", "exec-4"]);
+  assert.deepEqual(compacted[1].counts, [{ name: "exec", count: 4 }]);
+  assert.equal(toolGroupSummary(compacted[1]), "exec ×4");
+  assert.equal(compacted[0].message.markdown, "Human plan stays visible");
+  assert.equal(compacted[2].message.markdown, "Agent interpretation stays visible");
+  assert.equal(compacted[3].message.id, "exec-error");
+});
+
+test("exec failures and unknown output fail open while safe statuses stay compatible", () => {
+  const tool = (id, name, output) => ({
+    id, kind: "tool", role: "tool", tool_name: name, tool_output: output,
+  });
+  const messages = [
+    tool("timeout", "exec", "timed out"),
+    tool("ok-after-timeout", "exec", "ok"),
+    tool("json-error", "exec_command", '{"exit_code":1}'),
+    tool("json-ok", "exec_command", '{"exit_code":0}'),
+    tool("process-error", "functions.exec", "Process exited with code 1"),
+    tool("tool-failure", "functions.exec", "tool-call failure"),
+    tool("unknown-1", "exec", "command printed useful output"),
+    tool("unknown-2", "exec", "another useful result"),
+    tool("pending-1", "exec", "running"),
+    tool("pending-2", "exec_command", '{"status":"running"}'),
+  ];
+  assert.deepEqual(messages.map(execResultClass), [
+    "error", "success", "error", "success", "error", "error", null, null,
+    "pending", "pending",
+  ]);
+  assert.equal(toolResultSignal(messages[0]), "error");
+  assert.equal(toolResultSignal(messages[2]), "error");
+  assert.equal(toolResultSignal(messages[4]), "error");
+  assert.equal(execResultClass(tool("generic-zero", "exec", '{"code":0}')), null);
+  assert.equal(execResultClass(tool("explicit-ok", "exec", '{"ok":true}')), "success");
+  assert.deepEqual(messages.map(internalToolGroupKey), [
+    null, "repeat:exec:success", null, "repeat:exec:success", null, null, null, null,
+    "repeat:exec:pending", "repeat:exec:pending",
+  ]);
+  const compacted = compactTranscriptItems(messages);
+  assert.deepEqual(compacted.map((item) => item.kind), [
+    "item", "item", "item", "item", "item", "item", "item", "item", "tool-group",
+  ]);
+  assert.equal(toolGroupSummary(compacted.at(-1)), "exec ×2");
+});
+
+test("meaningful non-exec tools never collapse even when repeated", () => {
+  const calls = [
+    ["patch", "apply_patch"],
+    ["web", "web.run"],
+    ["plan", "update_plan"],
+  ].flatMap(([prefix, name]) => [1, 2].map((index) => ({
+    id: `${prefix}-${index}`, kind: "tool", role: "tool", tool_name: name,
+    tool_output: index === 1 ? "ok" : "completed",
+  })));
+  assert.ok(calls.every((item) => internalToolGroupKey(item) === null));
+  assert.deepEqual(
+    compactTranscriptItems(calls).map((item) => item.message.id),
+    calls.map((item) => item.id),
+  );
+});
+
 test("meaningful results, approvals, and lifecycle tools always remain visible", () => {
   const tool = (id, name, output) => ({ id, kind: "tool", role: "tool", tool_name: name, tool_output: output });
   const protectedItems = [
@@ -329,7 +408,7 @@ test("coordination groups are bounded at 24 and preserve every call in exact ord
   assert.ok(groups.every((group) => group.messages.length >= 2 && group.messages.length <= 24));
 });
 
-test("coordination summaries normalize namespaces and expose per-tool counts and status", () => {
+test("tool summaries normalize namespaces and expose per-tool counts", () => {
   const messages = [
     { id: "a", kind: "tool", tool_name: "functions.collaboration.wait_agent" },
     { id: "b", kind: "tool", tool_name: "mcp__send_message", tool_output: "sent" },
@@ -338,14 +417,15 @@ test("coordination summaries normalize namespaces and expose per-tool counts and
   const [group] = compactTranscriptItems(messages);
   assert.equal(normalizedToolName(messages[0]), "wait_agent");
   assert.equal(normalizedToolName(messages[1]), "send_message");
-  assert.equal(coordinationGroupSummary(group), "3 coordination calls · wait_agent ×2 · send_message ×1 · no errors");
+  assert.equal(toolGroupSummary(group), "3 internal calls · wait_agent ×2 · send_message ×1");
 });
 
 test("coordination compaction stays inside Conversation and uses text-only DOM rendering", () => {
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
   const renderer = source.slice(source.indexOf("function renderToolCard"), source.indexOf("function flushPendingTranscriptRender"));
   assert.match(renderer, /compactTranscriptItems\(/);
-  assert.match(renderer, /summary\.textContent = coordinationGroupSummary\(group\)/);
+  assert.match(renderer, /summary\.textContent = toolGroupSummary\(group\)/);
+  assert.match(renderer, /\$\{summary\.textContent\}; \$\{group\.messages\.length\} calls and results/);
   assert.match(renderer, /pre\.textContent = value/);
   assert.match(renderer, /state\.transcriptRequest === transcriptGeneration/);
   assert.match(renderer, /details\.isConnected/);
