@@ -1026,6 +1026,65 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       () => cdp.evaluate("document.querySelectorAll('#file-viewer .code-line').length === 320"),
       "source preview did not render",
     );
+    const mobileFileDefaults = await cdp.evaluate(`(() => {
+      const viewer = document.getElementById('file-viewer');
+      const source = viewer.querySelector('.code-source');
+      const line = viewer.querySelector('.code-line-content');
+      const head = viewer.querySelector('.code-viewer-head');
+      const controls = viewer.querySelector('.file-display-controls');
+      return {
+        wrap: viewer.querySelector('.file-wrap-toggle').getAttribute('aria-pressed'),
+        size: viewer.querySelector('.file-text-size').value,
+        fontSize: getComputedStyle(source).fontSize,
+        lineWhiteSpace: getComputedStyle(line).whiteSpace,
+        sourceOverflow: source.scrollWidth - viewer.clientWidth,
+        documentOverflow: document.documentElement.scrollWidth - innerWidth,
+        controlsInHeader: controls.closest('.code-viewer-head') === head,
+        wrapLabel: viewer.querySelector('.file-wrap-toggle').getAttribute('title'),
+        sizeLabel: viewer.querySelector('.file-text-size').getAttribute('aria-label'),
+      };
+    })()`);
+    assert.deepEqual(mobileFileDefaults, {
+      wrap: "true",
+      size: "small",
+      fontSize: "10.5px",
+      lineWhiteSpace: "pre-wrap",
+      sourceOverflow: 0,
+      documentOverflow: 0,
+      controlsInHeader: true,
+      wrapLabel: "Wrap long file lines",
+      sizeLabel: "File text size",
+    });
+    const noWrapFile = await cdp.evaluate(`(() => {
+      const viewer = document.getElementById('file-viewer');
+      viewer.querySelector('.file-wrap-toggle').click();
+      const size = viewer.querySelector('.file-text-size');
+      size.value = 'large';
+      size.dispatchEvent(new Event('change', { bubbles: true }));
+      const source = viewer.querySelector('.code-source');
+      return {
+        wrap: viewer.querySelector('.file-wrap-toggle').getAttribute('aria-pressed'),
+        size: size.value,
+        fontSize: getComputedStyle(source).fontSize,
+        sourceOverflow: source.scrollWidth - viewer.clientWidth,
+        documentOverflow: document.documentElement.scrollWidth - innerWidth,
+        stored: localStorage.getItem('atmux.file-reader-preferences'),
+      };
+    })()`);
+    assert.equal(noWrapFile.wrap, "false", JSON.stringify(noWrapFile));
+    assert.equal(noWrapFile.size, "large", JSON.stringify(noWrapFile));
+    assert.equal(noWrapFile.fontSize, "15px", JSON.stringify(noWrapFile));
+    assert.ok(noWrapFile.sourceOverflow > 0, JSON.stringify(noWrapFile));
+    assert.equal(noWrapFile.documentOverflow, 0, JSON.stringify(noWrapFile));
+    assert.equal(noWrapFile.stored, '{"wrap":false,"size":"large"}');
+    await cdp.evaluate(`(() => {
+      const viewer = document.getElementById('file-viewer');
+      viewer.querySelector('.file-wrap-toggle').click();
+      const size = viewer.querySelector('.file-text-size');
+      size.value = 'small';
+      size.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    })()`);
     const messagesBeforeReference = messageRequests.length;
     const referenceState = await cdp.evaluate(`(() => {
       const viewer = document.getElementById('file-viewer');
@@ -1075,12 +1134,20 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       document.getElementById('mobile-back').click();
       return {
         editor: document.querySelector('#file-viewer .file-editor').value,
+        editorFontSize: getComputedStyle(document.querySelector('#file-viewer .file-editor')).fontSize,
+        editorWrap: document.querySelector('#file-viewer .file-editor').getAttribute('wrap'),
+        persistedSize: document.querySelector('#file-viewer .file-text-size').value,
+        persistedWrap: document.querySelector('#file-viewer .file-wrap-toggle').getAttribute('aria-pressed'),
         mode: document.getElementById('files-view').getAttribute('aria-selected'),
         agent: document.getElementById('agent-name').textContent,
         prompts: window.__discardPrompts,
       };
     })()`).then((guarded) => {
       assert.match(guarded.editor, /\/\/ guarded draft$/);
+      assert.equal(guarded.editorFontSize, "10.5px", JSON.stringify(guarded));
+      assert.equal(guarded.editorWrap, "soft", JSON.stringify(guarded));
+      assert.equal(guarded.persistedSize, "small", JSON.stringify(guarded));
+      assert.equal(guarded.persistedWrap, "true", JSON.stringify(guarded));
       assert.equal(guarded.mode, "true");
       assert.equal(guarded.agent, "codex-main");
       assert.equal(guarded.prompts.length, 4, JSON.stringify(guarded));
@@ -1234,7 +1301,8 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       };
     })()`);
     assert.equal(filesBeforeStatus.internalY, true);
-    assert.equal(filesBeforeStatus.internalX, true);
+    assert.equal(filesBeforeStatus.internalX, false);
+    assert.equal(filesBeforeStatus.left, 0);
     assert.ok(filesBeforeStatus.source.includes('<script>safe 1</script>'));
     assert.equal(await cdp.evaluate("Boolean(document.querySelector('#file-viewer script, #file-viewer img'))"), false);
     emitOverviewPatch([{

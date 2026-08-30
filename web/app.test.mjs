@@ -66,6 +66,8 @@ const {
   projectEntryKind,
   fileCanEdit,
   fileEditHasUnsavedWork,
+  fileReaderPreferences,
+  fileReaderPreferenceJson,
   fileReferenceBlock,
   insertComposerReference,
   nextFileLineSelection,
@@ -990,6 +992,24 @@ test("line-range references are bounded, labelled, fenced, and preserve the whol
   assert.ok(bounded.length < MAX_FILE_REFERENCE_CHARS + 200);
 });
 
+test("file reader preferences default by viewport and persist only bounded choices", () => {
+  assert.deepEqual(fileReaderPreferences(null, true), { wrap: true, size: "small" });
+  assert.deepEqual(fileReaderPreferences(null, false), { wrap: false, size: "medium" });
+  assert.deepEqual(fileReaderPreferences('{"wrap":false,"size":"large"}', true), {
+    wrap: false,
+    size: "large",
+  });
+  assert.deepEqual(fileReaderPreferences({ wrap: true, size: "huge" }, false), {
+    wrap: true,
+    size: "medium",
+  });
+  assert.deepEqual(fileReaderPreferences("not json", true), { wrap: true, size: "small" });
+  assert.equal(
+    fileReaderPreferenceJson({ wrap: true, size: "small", ignored: "value" }),
+    '{"wrap":true,"size":"small"}',
+  );
+});
+
 test("Files and Git are accessible lazy tabs with text-only source rendering", () => {
   const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
@@ -1028,10 +1048,15 @@ test("Files and Git are accessible lazy tabs with text-only source rendering", (
   assert.match(source, /function renderAgentBranch/);
   assert.match(source, /state\.projectView !== view \|\| view\.paneId !== paneId/);
   assert.match(source, /token\.textContent = segment\.text/);
+  assert.match(source, /localStorage\.setItem\([\s\S]*FILE_READER_STORAGE_KEY/);
+  assert.match(source, /editor\.wrap = state\.fileReaderPreferences\.wrap \? "soft" : "off"/);
   assert.doesNotMatch(source, /\.innerHTML\s*=/);
   assert.match(css, /\.project-panel \{[^}]*min-height: 0;[^}]*overflow: hidden;[^}]*overscroll-behavior: contain;/s);
   assert.match(css, /\.code-viewer \{[^}]*overflow: auto;[^}]*overscroll-behavior: contain;[^}]*overflow-anchor: none;/s);
   assert.match(css, /\.view-switch \{[^}]*overflow-x: auto;/s);
+  assert.match(css, /\.code-viewer\.file-wrap \.code-line-content \{[^}]*white-space: pre-wrap;[^}]*overflow-wrap: anywhere;/s);
+  assert.match(css, /\.code-viewer\.file-wrap \.file-editor \{[^}]*white-space: pre-wrap;[^}]*overflow-x: hidden;/s);
+  assert.match(css, /\.code-viewer\.file-size-small \{[^}]*--file-font-size: 10\.5px;/s);
 });
 
 test("conversation rendering never assigns agent content through innerHTML", () => {
