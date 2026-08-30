@@ -24,9 +24,6 @@ const INTERNAL_TOOL_ALIASES = new Map([
   ["exec_command", "exec"],
   ["exec", "exec"],
 ]);
-const ALWAYS_VISIBLE_INTERNAL_TOOLS = new Set([
-  "create_goal", "interrupt_agent", "request_user_input", "spawn_agent", "update_goal",
-]);
 const BENIGN_COORDINATION_STATUSES = new Set([
   "ok", "sent", "queued", "delivered", "acknowledged", "waiting", "idle", "running",
   "complete", "completed", "success", "succeeded", "timed out", "timeout", "no update",
@@ -1156,7 +1153,6 @@ function normalizedToolName(item) {
   for (const name of [
     ...COLLAPSIBLE_COORDINATION_TOOLS,
     ...INTERNAL_TOOL_ALIASES.keys(),
-    ...ALWAYS_VISIBLE_INTERNAL_TOOLS,
   ]) {
     if (lower === name || lower.endsWith(`.${name}`) || lower.endsWith(`/${name}`)
       || lower.endsWith(`:${name}`) || lower.endsWith(`__${name}`)) {
@@ -1221,20 +1217,89 @@ function collapsibleCoordinationTool(item) {
   return internalToolGroupKey(item) === "coordination";
 }
 
+function execJsonResultClass(value, depth = 0) {
+  if (depth > 5 || value === null || typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    const results = value.slice(0, 64).map((entry) => execJsonResultClass(entry, depth + 1));
+    if (results.includes("error")) return "error";
+    if (results.includes("success")) return "success";
+    return results.includes("pending") ? "pending" : null;
+  }
+  let observed = null;
+  for (const [key, entry] of Object.entries(value).slice(0, 64)) {
+    if (/^(?:exit_code|exitCode|exit_status)$/.test(key)
+      && (typeof entry === "number" || (typeof entry === "string" && /^-?\d+$/.test(entry.trim())))) {
+      const code = Number(entry);
+      if (!Number.isFinite(code) || code !== 0) return "error";
+      observed = "success";
+      continue;
+    }
+    if (/^(?:status|code)$/.test(key)
+      && (typeof entry === "number" || (typeof entry === "string" && /^-?\d+$/.test(entry.trim())))) {
+      const code = Number(entry);
+      if (!Number.isFinite(code) || code !== 0) return "error";
+      // A generic zero code is not enough to prove process success.
+      continue;
+    }
+    if ((key === "is_error" && entry === true)
+      || ((key === "success" || key === "ok") && entry === false)) return "error";
+    if ((key === "success" || key === "ok") && entry === true) observed = "success";
+    if (/^(?:status|state)$/.test(key) && typeof entry === "string") {
+      const status = entry.trim().toLowerCase().replace(/[.!]$/, "");
+      if (/^(?:error|failed|failure|timed out|timeout|cancelled|canceled|rejected)$/.test(status)) return "error";
+      if (/^(?:ok|success|succeeded|complete|completed)$/.test(status)) observed = "success";
+      else if (/^(?:pending|queued|running|waiting)$/.test(status) && !observed) observed = "pending";
+    }
+    const nested = execJsonResultClass(entry, depth + 1);
+    if (nested === "error") return "error";
+    if (nested === "success") observed = "success";
+    else if (nested === "pending" && !observed) observed = "pending";
+  }
+  return observed;
+}
+
+function execResultClass(item) {
+  if (normalizedToolName(item) !== "exec") return null;
+  const output = typeof item?.tool_output === "string" ? item.tool_output.trim() : "";
+  if (!output) return null;
+  if (/\b(?:timed?\s*out|timeout)\b/i.test(output)
+    || coordinationResultSignal(item) === "error") return "error";
+
+  let jsonResult = null;
+  try { jsonResult = execJsonResultClass(JSON.parse(output)); } catch { /* Plain tool output. */ }
+  if (jsonResult === "error") return "error";
+
+  const exitCodes = [...output.matchAll(/(?:\b(?:process|command|script)\s+exited\s+with\s+(?:code|status)|\bexit(?:ed)?[_ -]+(?:code|status))[\s:=]*(-?\d+)\b/gi)]
+    .map((match) => Number(match[1]));
+  if (exitCodes.some((code) => !Number.isFinite(code) || code !== 0)) return "error";
+  if (exitCodes.length || jsonResult === "success") return "success";
+  if (jsonResult === "pending") return "pending";
+  if (/^(?:ok|success|succeeded|complete|completed)[.!]?$/i.test(output)) return "success";
+  if (/^(?:pending|queued|running|waiting)[.!]?$/i.test(output)) return "pending";
+  // Command output alone does not prove the tool call completed successfully.
+  return null;
+}
+
+function toolResultSignal(item) {
+  const execClass = execResultClass(item);
+  if (execClass === "error") return "error";
+  if (execClass === "success" || execClass === "pending") return "status";
+  return coordinationResultSignal(item);
+}
+
 function internalToolGroupKey(item) {
   if (transcriptItemKind(item) !== "tool") return null;
   if (typeof item?.tool_name !== "string" || !item.tool_name.trim()) return null;
   const name = normalizedToolName(item);
-  if (ALWAYS_VISIBLE_INTERNAL_TOOLS.has(name)) return null;
-  const signal = coordinationResultSignal(item);
-  if (["error", "approval"].includes(signal)) return null;
   if (COLLAPSIBLE_COORDINATION_TOOLS.has(name)) {
+    const signal = coordinationResultSignal(item);
     return ["sent", "status"].includes(signal) ? "coordination" : null;
   }
-  // Non-coordination tools collapse only with adjacent calls of the same
-  // normalized tool and result class. This keeps commands/results in order
-  // without merging across a different meaningful action.
-  return `repeat:${name}:${signal}`;
+  if (name !== "exec") return null;
+  const execClass = execResultClass(item);
+  return execClass === "success" || execClass === "pending"
+    ? `repeat:exec:${execClass}`
+    : null;
 }
 
 function coordinationToolCounts(messages) {
@@ -1663,6 +1728,8 @@ if (typeof module !== "undefined" && module.exports) {
     transcriptItemKind,
     normalizedToolName,
     coordinationResultSignal,
+    execResultClass,
+    toolResultSignal,
     collapsibleCoordinationTool,
     internalToolGroupKey,
     compactTranscriptItems,
@@ -2070,7 +2137,7 @@ function initialize() {
     details.open = expandedTools.has(details.dataset.transcriptId);
     const summary = document.createElement("summary");
     const name = String(message.tool_name || "Tool");
-    const resultSignal = coordinationResultSignal(message);
+    const resultSignal = toolResultSignal(message);
     const suffix = resultSignal === "error" ? "error"
       : resultSignal === "approval" ? "approval required"
         : message.tool_output ? "result" : "";

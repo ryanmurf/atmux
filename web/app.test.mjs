@@ -115,6 +115,8 @@ const {
   transcriptItemKind,
   normalizedToolName,
   coordinationResultSignal,
+  execResultClass,
+  toolResultSignal,
   collapsibleCoordinationTool,
   internalToolGroupKey,
   compactTranscriptItems,
@@ -281,10 +283,10 @@ test("adjacent exec variants collapse as exec ×4 without crossing narrative or 
   });
   const messages = [
     { id: "human", role: "user", markdown: "Human plan stays visible" },
-    exec("exec-1", "functions.exec", "command one output"),
-    exec("exec-2", "exec_command", "command two output"),
-    exec("exec-3", "tools/exec", "command three output"),
-    exec("exec-4", "functions.exec_command", "command four output"),
+    exec("exec-1", "functions.exec", '{"exit_code":0,"output":"command one output"}'),
+    exec("exec-2", "exec_command", "Process exited with code 0"),
+    exec("exec-3", "tools/exec", "ok"),
+    exec("exec-4", "functions.exec_command", '{"result":{"exit_code":0}}'),
     { id: "agent", role: "assistant", markdown: "Agent interpretation stays visible" },
     exec("exec-error", "exec", "Error: command exited with status 1"),
   ];
@@ -298,39 +300,56 @@ test("adjacent exec variants collapse as exec ×4 without crossing narrative or 
   assert.equal(compacted[3].message.id, "exec-error");
 });
 
-test("general tool grouping respects tool, result-class, lifecycle, and error boundaries", () => {
+test("exec failures and unknown output fail open while safe statuses stay compatible", () => {
   const tool = (id, name, output) => ({
     id, kind: "tool", role: "tool", tool_name: name, tool_output: output,
   });
   const messages = [
-    tool("patch-result", "apply_patch", "updated one file"),
-    tool("patch-status-1", "apply_patch", "ok"),
-    tool("patch-status-2", "apply_patch", "complete"),
-    tool("web-1", "web.run", "first useful result"),
-    tool("web-2", "web.run", "second useful result"),
-    tool("spawn-1", "spawn_agent", "queued"),
-    tool("spawn-2", "spawn_agent", "queued"),
-    tool("web-error", "web.run", "failed: upstream unavailable"),
+    tool("timeout", "exec", "timed out"),
+    tool("ok-after-timeout", "exec", "ok"),
+    tool("json-error", "exec_command", '{"exit_code":1}'),
+    tool("json-ok", "exec_command", '{"exit_code":0}'),
+    tool("process-error", "functions.exec", "Process exited with code 1"),
+    tool("tool-failure", "functions.exec", "tool-call failure"),
+    tool("unknown-1", "exec", "command printed useful output"),
+    tool("unknown-2", "exec", "another useful result"),
+    tool("pending-1", "exec", "running"),
+    tool("pending-2", "exec_command", '{"status":"running"}'),
   ];
+  assert.deepEqual(messages.map(execResultClass), [
+    "error", "success", "error", "success", "error", "error", null, null,
+    "pending", "pending",
+  ]);
+  assert.equal(toolResultSignal(messages[0]), "error");
+  assert.equal(toolResultSignal(messages[2]), "error");
+  assert.equal(toolResultSignal(messages[4]), "error");
+  assert.equal(execResultClass(tool("generic-zero", "exec", '{"code":0}')), null);
+  assert.equal(execResultClass(tool("explicit-ok", "exec", '{"ok":true}')), "success");
   assert.deepEqual(messages.map(internalToolGroupKey), [
-    "repeat:apply_patch:meaningful",
-    "repeat:apply_patch:status",
-    "repeat:apply_patch:status",
-    "repeat:web.run:meaningful",
-    "repeat:web.run:meaningful",
-    null,
-    null,
-    null,
+    null, "repeat:exec:success", null, "repeat:exec:success", null, null, null, null,
+    "repeat:exec:pending", "repeat:exec:pending",
   ]);
   const compacted = compactTranscriptItems(messages);
   assert.deepEqual(compacted.map((item) => item.kind), [
-    "item", "tool-group", "tool-group", "item", "item", "item",
+    "item", "item", "item", "item", "item", "item", "item", "item", "tool-group",
   ]);
-  assert.equal(toolGroupSummary(compacted[1]), "apply_patch ×2");
-  assert.equal(toolGroupSummary(compacted[2]), "web.run ×2");
-  assert.deepEqual(compacted.slice(3).map((item) => item.message.id), [
-    "spawn-1", "spawn-2", "web-error",
-  ]);
+  assert.equal(toolGroupSummary(compacted.at(-1)), "exec ×2");
+});
+
+test("meaningful non-exec tools never collapse even when repeated", () => {
+  const calls = [
+    ["patch", "apply_patch"],
+    ["web", "web.run"],
+    ["plan", "update_plan"],
+  ].flatMap(([prefix, name]) => [1, 2].map((index) => ({
+    id: `${prefix}-${index}`, kind: "tool", role: "tool", tool_name: name,
+    tool_output: index === 1 ? "ok" : "completed",
+  })));
+  assert.ok(calls.every((item) => internalToolGroupKey(item) === null));
+  assert.deepEqual(
+    compactTranscriptItems(calls).map((item) => item.message.id),
+    calls.map((item) => item.id),
+  );
 });
 
 test("meaningful results, approvals, and lifecycle tools always remain visible", () => {

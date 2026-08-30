@@ -1583,10 +1583,21 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
         { id: "tool-wait-2", role: "tool", kind: "tool", tool_name: "collaboration.wait_agent", tool_output: "timed out" },
         { id: "tool-send-1", role: "tool", kind: "tool", tool_name: "send_message", tool_input: "<img src=x onerror=alert(1)>", tool_output: "delivered" },
         { id: "tool-agent-middle", role: "assistant", markdown: "This prose splits coordination runs" },
-        { id: "tool-exec-1", role: "tool", kind: "tool", tool_name: "functions.exec", tool_input: "<img src=x onerror=exec(1)>", tool_output: "first command output" },
-        { id: "tool-exec-2", role: "tool", kind: "tool", tool_name: "exec_command", tool_input: "second command", tool_output: "second command output" },
-        { id: "tool-exec-3", role: "tool", kind: "tool", tool_name: "tools/exec", tool_input: "third command", tool_output: "third <script>safe</script> output" },
-        { id: "tool-exec-4", role: "tool", kind: "tool", tool_name: "functions.exec_command", tool_input: "fourth command", tool_output: "fourth command output" },
+        { id: "tool-exec-1", role: "tool", kind: "tool", tool_name: "functions.exec", tool_input: "<img src=x onerror=exec(1)>", tool_output: '{"exit_code":0,"output":"first command output"}' },
+        { id: "tool-exec-2", role: "tool", kind: "tool", tool_name: "exec_command", tool_input: "second command", tool_output: "Process exited with code 0" },
+        { id: "tool-exec-3", role: "tool", kind: "tool", tool_name: "tools/exec", tool_input: "third command", tool_output: '{"exit_code":0,"output":"third <script>safe</script> output"}' },
+        { id: "tool-exec-4", role: "tool", kind: "tool", tool_name: "functions.exec_command", tool_input: "fourth command", tool_output: "ok" },
+        { id: "tool-exec-timeout", role: "tool", kind: "tool", tool_name: "exec", tool_output: "timed out" },
+        { id: "tool-exec-ok-after-timeout", role: "tool", kind: "tool", tool_name: "exec", tool_output: "ok" },
+        { id: "tool-exec-json-error", role: "tool", kind: "tool", tool_name: "exec_command", tool_output: '{"exit_code":1}' },
+        { id: "tool-exec-json-ok", role: "tool", kind: "tool", tool_name: "exec_command", tool_output: '{"exit_code":0}' },
+        { id: "tool-exec-process-error", role: "tool", kind: "tool", tool_name: "exec", tool_output: "Process exited with code 1" },
+        { id: "tool-apply-1", role: "tool", kind: "tool", tool_name: "apply_patch", tool_output: "ok" },
+        { id: "tool-apply-2", role: "tool", kind: "tool", tool_name: "apply_patch", tool_output: "completed" },
+        { id: "tool-web-1", role: "tool", kind: "tool", tool_name: "web.run", tool_output: "ok" },
+        { id: "tool-web-2", role: "tool", kind: "tool", tool_name: "web.run", tool_output: "completed" },
+        { id: "tool-plan-1", role: "tool", kind: "tool", tool_name: "update_plan", tool_output: "ok" },
+        { id: "tool-plan-2", role: "tool", kind: "tool", tool_name: "update_plan", tool_output: "completed" },
         { id: "tool-exec-error", role: "tool", kind: "tool", tool_name: "exec", tool_output: "Error: command failed with status 1" },
         { id: "tool-exec-split-1", role: "tool", kind: "tool", tool_name: "exec", tool_output: "result before another tool" },
         { id: "tool-patch-split", role: "tool", kind: "tool", tool_name: "apply_patch", tool_output: "updated a different resource" },
@@ -1635,8 +1646,16 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
           conversation.querySelector('[data-transcript-id="tool-wait-' + suffix + '"] > summary')?.textContent),
         meaningfulSeparate: Boolean(conversation.querySelector('[data-transcript-id="tool-wait-meaningful"]')),
         execErrorSummary: conversation.querySelector('[data-transcript-id="tool-exec-error"] > summary')?.textContent,
-        splitToolsSeparate: ['tool-exec-split-1', 'tool-patch-split', 'tool-exec-split-2']
-          .every((id) => Boolean(conversation.querySelector('[data-transcript-id="' + id + '"]'))),
+        execBoundarySummaries: ['timeout', 'ok-after-timeout', 'json-error', 'json-ok', 'process-error']
+          .map((suffix) => conversation.querySelector('[data-transcript-id="tool-exec-' + suffix + '"] > summary')?.textContent),
+        splitToolsSeparate: [
+          'tool-exec-split-1', 'tool-patch-split', 'tool-exec-split-2',
+          'tool-apply-1', 'tool-apply-2', 'tool-web-1', 'tool-web-2', 'tool-plan-1', 'tool-plan-2',
+        ]
+          .every((id) => {
+            const node = conversation.querySelector('[data-transcript-id="' + id + '"]');
+            return Boolean(node) && !node.closest('.tool-call-group');
+          }),
         markupInjected: Boolean(conversation.querySelector('img, script')),
         escapedInputVisible: first.textContent.includes('<img src=x onerror=alert(1)>'),
         before,
@@ -1657,6 +1676,9 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     ], JSON.stringify(compactTools));
     assert.equal(compactTools.meaningfulSeparate, true, JSON.stringify(compactTools));
     assert.equal(compactTools.execErrorSummary, "exec · error", JSON.stringify(compactTools));
+    assert.deepEqual(compactTools.execBoundarySummaries, [
+      "exec · error", "exec · result", "exec_command · error", "exec_command · result", "exec · error",
+    ], JSON.stringify(compactTools));
     assert.equal(compactTools.splitToolsSeparate, true, JSON.stringify(compactTools));
     assert.equal(compactTools.markupInjected, false, JSON.stringify(compactTools));
     assert.equal(compactTools.escapedInputVisible, true, JSON.stringify(compactTools));
