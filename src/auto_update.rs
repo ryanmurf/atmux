@@ -7,10 +7,11 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     future::Future,
     io::{Read as _, Write as _},
+    os::unix::ffi::OsStringExt as _,
     os::unix::fs::{
         DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
     },
@@ -24,6 +25,7 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use directories::ProjectDirs;
 use fs2::FileExt as _;
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::process::Command;
@@ -32,6 +34,8 @@ const STATE_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 256 * 1024;
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_INSTALL_URL: &str = "https://chatgpt.com/codex/install.sh";
+const CODEX_INSTALL_COMMAND: &str = "umask 077 && exec /bin/sh \"$1\"";
+const CODEX_INSTALL_ARGV0: &str = "atmux-codex-installer";
 pub(crate) const PENDING_OPTION: &str = "@atmux_cli_update_pending";
 const MARKER_VERSION: &str = "cu2";
 static TEMP_ID: AtomicU64 = AtomicU64::new(1);
@@ -454,6 +458,392 @@ impl CodexUpdateFiles {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexPermissionStage {
+    DirectoryOpened,
+    TargetOpened,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SymlinkIdentity {
+    device: u64,
+    inode: u64,
+    target: PathBuf,
+}
+
+struct PublicLauncherState {
+    local: DirectoryIdentity,
+    bin: DirectoryIdentity,
+    link: SymlinkIdentity,
+}
+
+struct PackageChain<'a> {
+    home: &'a File,
+    euid: u32,
+    codex: DirectoryIdentity,
+    names: Vec<OsString>,
+    identities: Vec<DirectoryIdentity>,
+}
+
+impl PackageChain<'_> {
+    fn repair_child(
+        &mut self,
+        parent: &File,
+        name: &OsStr,
+        path: &Path,
+        stage: &mut impl FnMut(CodexPermissionStage, &Path) -> Result<()>,
+    ) -> Result<File> {
+        let directory = open_owner_directory(parent, name, path)?;
+        stage(CodexPermissionStage::DirectoryOpened, path)?;
+        self.names.push(name.to_os_string());
+        self.identities
+            .push(validate_owner_directory(&directory, path, self.euid, true)?);
+        self.reopen()?;
+        Ok(directory)
+    }
+
+    fn reopen(&self) -> Result<File> {
+        reopen_package_chain(
+            self.home,
+            &self.codex,
+            &self.names,
+            &self.identities,
+            self.euid,
+        )
+    }
+}
+
+/// Repairs only package-directory permissions left behind by an earlier
+/// official Codex install that inherited a permissive service umask. Lookup
+/// is anchored at a trusted HOME descriptor and follows the installer's exact
+/// fixed layout without canonicalizing through the writable tree. `.codex`,
+/// `.local`, files, and symlinks are validated but never chmodded.
+fn reconcile_codex_package_permissions(home: &Path) -> Result<bool> {
+    reconcile_codex_package_permissions_with(home, |_, _| Ok(()))
+}
+
+fn reconcile_codex_package_permissions_with(
+    home: &Path,
+    mut stage: impl FnMut(CodexPermissionStage, &Path) -> Result<()>,
+) -> Result<bool> {
+    let euid = rustix::process::geteuid().as_raw();
+    let home_directory = File::open(home)?;
+    let _home_identity = validate_owner_directory(&home_directory, home, euid, false)?;
+    let Some(public) = validate_public_launcher(&home_directory, home, euid, &mut stage)? else {
+        return Ok(false);
+    };
+    repair_codex_package_tree(&home_directory, home, euid, &mut stage)?;
+    validate_public_launcher_final(&home_directory, home, euid, &public)?;
+    Ok(true)
+}
+
+fn validate_public_launcher(
+    home_directory: &File,
+    home: &Path,
+    euid: u32,
+    stage: &mut impl FnMut(CodexPermissionStage, &Path) -> Result<()>,
+) -> Result<Option<PublicLauncherState>> {
+    let local_path = home.join(".local");
+    let Ok(local_directory) =
+        open_owner_directory(home_directory, OsStr::new(".local"), &local_path)
+    else {
+        return Ok(None);
+    };
+    let local_identity = validate_owner_directory(&local_directory, &local_path, euid, false)?;
+    let local_bin_path = local_path.join("bin");
+    let Ok(local_bin_directory) =
+        open_owner_directory(&local_directory, OsStr::new("bin"), &local_bin_path)
+    else {
+        return Ok(None);
+    };
+    let local_bin_identity =
+        validate_owner_directory(&local_bin_directory, &local_bin_path, euid, false)?;
+    stage(CodexPermissionStage::DirectoryOpened, &local_bin_path)?;
+    let expected_launcher_target = home.join(".codex/packages/standalone/current/bin/codex");
+    let Ok(launcher_link) = validated_symlink(&local_bin_directory, OsStr::new("codex"), euid)
+    else {
+        return Ok(None);
+    };
+    if launcher_link.target != expected_launcher_target {
+        return Ok(None);
+    }
+    Ok(Some(PublicLauncherState {
+        local: local_identity,
+        bin: local_bin_identity,
+        link: launcher_link,
+    }))
+}
+
+fn repair_codex_package_tree(
+    home_directory: &File,
+    home: &Path,
+    euid: u32,
+    stage: &mut impl FnMut(CodexPermissionStage, &Path) -> Result<()>,
+) -> Result<()> {
+    let codex_path = home.join(".codex");
+    let codex_directory = open_owner_directory(home_directory, OsStr::new(".codex"), &codex_path)?;
+    let codex_identity = validate_owner_directory(&codex_directory, &codex_path, euid, false)?;
+    let mut chain = PackageChain {
+        home: home_directory,
+        euid,
+        codex: codex_identity,
+        names: Vec::new(),
+        identities: Vec::new(),
+    };
+    let packages_path = codex_path.join("packages");
+    let packages_directory = chain.repair_child(
+        &codex_directory,
+        OsStr::new("packages"),
+        &packages_path,
+        stage,
+    )?;
+
+    let standalone_path = packages_path.join("standalone");
+    let standalone_directory = chain.repair_child(
+        &packages_directory,
+        OsStr::new("standalone"),
+        &standalone_path,
+        stage,
+    )?;
+
+    // Only this expected symlink is accepted inside the package ancestry. Its
+    // absolute target must name exactly one bounded release directory.
+    let current_link = validated_symlink(&standalone_directory, OsStr::new("current"), euid)?;
+    let releases_path = standalone_path.join("releases");
+    let release_name = codex_release_name(&current_link, &releases_path)?;
+    let releases_root = chain.repair_child(
+        &standalone_directory,
+        OsStr::new("releases"),
+        &releases_path,
+        stage,
+    )?;
+    let release_path = releases_path.join(&release_name);
+    let version_directory =
+        chain.repair_child(&releases_root, &release_name, &release_path, stage)?;
+    let bin_path = release_path.join("bin");
+    let bin_directory =
+        chain.repair_child(&version_directory, OsStr::new("bin"), &bin_path, stage)?;
+
+    let target_path = bin_path.join("codex");
+    let target = open_owner_executable(&bin_directory, OsStr::new("codex"), &target_path)?;
+    stage(CodexPermissionStage::TargetOpened, &target_path)?;
+    let target_identity = validate_owner_executable(&target, &target_path, euid)?;
+
+    let final_directory = chain.reopen()?;
+    let final_target = open_owner_executable(&final_directory, OsStr::new("codex"), &target_path)?;
+    let final_identity = validate_owner_executable(&final_target, &target_path, euid)?;
+    if final_identity != target_identity
+        || validated_symlink(&standalone_directory, OsStr::new("current"), euid)? != current_link
+    {
+        bail!("Codex package layout changed during permission repair");
+    }
+    Ok(())
+}
+
+fn codex_release_name(current: &SymlinkIdentity, releases: &Path) -> Result<OsString> {
+    let relative = current.target.strip_prefix(releases).map_err(|_| {
+        anyhow::anyhow!("Codex current link does not target the fixed releases directory")
+    })?;
+    let mut components = relative.components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(release)), None)
+            if !release.is_empty()
+                && release.as_encoded_bytes().len() <= 160
+                && release.as_encoded_bytes().iter().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                }) =>
+        {
+            Ok(release.to_os_string())
+        }
+        _ => bail!("Codex current link has an invalid release component"),
+    }
+}
+
+fn validate_public_launcher_final(
+    home_directory: &File,
+    home: &Path,
+    euid: u32,
+    expected: &PublicLauncherState,
+) -> Result<()> {
+    let local_path = home.join(".local");
+    let local_bin_path = local_path.join("bin");
+    let final_local_directory =
+        open_owner_directory(home_directory, OsStr::new(".local"), &local_path)?;
+    let final_local_identity =
+        validate_owner_directory(&final_local_directory, &local_path, euid, false)?;
+    let final_local_bin_directory =
+        open_owner_directory(&final_local_directory, OsStr::new("bin"), &local_bin_path)?;
+    let final_local_bin_identity =
+        validate_owner_directory(&final_local_bin_directory, &local_bin_path, euid, false)?;
+    if final_local_identity != expected.local
+        || final_local_bin_identity != expected.bin
+        || validated_symlink(&final_local_bin_directory, OsStr::new("codex"), euid)?
+            != expected.link
+    {
+        bail!("Codex public launcher changed during package permission repair");
+    }
+    Ok(())
+}
+
+fn reopen_package_chain(
+    home: &File,
+    codex_identity: &DirectoryIdentity,
+    names: &[OsString],
+    identities: &[DirectoryIdentity],
+    euid: u32,
+) -> Result<File> {
+    let mut current = open_owner_directory(home, OsStr::new(".codex"), Path::new(".codex"))?;
+    if validate_owner_directory(&current, Path::new(".codex"), euid, false)? != *codex_identity {
+        bail!("Codex package anchor changed during permission repair");
+    }
+    for (name, expected) in names.iter().zip(identities) {
+        current = open_owner_directory(&current, name, Path::new(".codex/packages"))?;
+        if validate_owner_directory(&current, Path::new(".codex/packages"), euid, false)?
+            != *expected
+        {
+            bail!("Codex package directory changed during permission repair");
+        }
+    }
+    Ok(current)
+}
+
+fn open_owner_directory(parent: &File, name: &std::ffi::OsStr, path: &Path) -> Result<File> {
+    rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .with_context(|| {
+        format!(
+            "could not safely open Codex package directory {}",
+            path.display()
+        )
+    })
+}
+
+fn open_owner_executable(parent: &File, name: &std::ffi::OsStr, path: &Path) -> Result<File> {
+    let before = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if !FileType::from_raw_mode(before.st_mode).is_file() {
+        bail!(
+            "Codex package launcher {} is not a regular file",
+            path.display()
+        );
+    }
+    let file: File = rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NOCTTY,
+        Mode::empty(),
+    )?
+    .into();
+    let metadata = file.metadata()?;
+    if before.st_dev as u64 != metadata.dev() || before.st_ino as u64 != metadata.ino() {
+        bail!(
+            "Codex package launcher {} changed while opening",
+            path.display()
+        );
+    }
+    Ok(file)
+}
+
+fn validated_symlink(parent: &File, name: &std::ffi::OsStr, euid: u32) -> Result<SymlinkIdentity> {
+    let before = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if !FileType::from_raw_mode(before.st_mode).is_symlink()
+        || before.st_uid != euid
+        || before.st_nlink != 1
+    {
+        bail!("Codex installer link is not a safe euid-owned symlink");
+    }
+    let target = PathBuf::from(OsString::from_vec(
+        rustix::fs::readlinkat(parent, name, Vec::new())?.into_bytes(),
+    ));
+    let after = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if before.st_dev != after.st_dev
+        || before.st_ino != after.st_ino
+        || before.st_uid != after.st_uid
+        || before.st_nlink != after.st_nlink
+        || !FileType::from_raw_mode(after.st_mode).is_symlink()
+    {
+        bail!("Codex installer link changed while validating");
+    }
+    Ok(SymlinkIdentity {
+        device: before.st_dev as u64,
+        inode: before.st_ino as u64,
+        target,
+    })
+}
+
+fn validate_owner_directory(
+    directory: &File,
+    path: &Path,
+    euid: u32,
+    repair_writable: bool,
+) -> Result<DirectoryIdentity> {
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir()
+        || metadata.uid() != euid
+        || metadata.permissions().mode() & 0o700 != 0o700
+    {
+        bail!(
+            "Codex package directory {} is not an euid-owned searchable directory",
+            path.display()
+        );
+    }
+    if metadata.permissions().mode() & 0o022 != 0 {
+        if !repair_writable {
+            bail!(
+                "Codex package parent {} is writable by another uid; inspect it manually",
+                path.display()
+            );
+        }
+        let repaired = metadata.permissions().mode() & 0o7777 & !0o022;
+        rustix::fs::fchmod(directory, Mode::from_raw_mode(repaired))?;
+    }
+    let verified = directory.metadata()?;
+    if !verified.is_dir()
+        || verified.uid() != euid
+        || verified.dev() != metadata.dev()
+        || verified.ino() != metadata.ino()
+        || verified.permissions().mode() & 0o022 != 0
+    {
+        bail!(
+            "Codex package directory {} changed during permission repair",
+            path.display()
+        );
+    }
+    Ok(DirectoryIdentity {
+        device: verified.dev(),
+        inode: verified.ino(),
+    })
+}
+
+fn validate_owner_executable(file: &File, path: &Path, euid: u32) -> Result<DirectoryIdentity> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != euid
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o111 == 0
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        bail!(
+            "Codex package launcher {} changed or is not a safe executable",
+            path.display()
+        );
+    }
+    Ok(DirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
 /// Cross-process pane mutation gate shared by every atmux owner process.
 /// The in-memory gate remains useful for request ordering; this advisory lock
 /// closes the old/new service overlap during restarts and rolling deploys.
@@ -721,7 +1111,7 @@ pub(crate) fn pane_action(
 }
 
 pub(crate) async fn inspect(harness: Harness) -> Result<Option<ExecutableIdentity>> {
-    let Some(path) = resolve_launcher(harness) else {
+    let Some(path) = resolve_launcher_with_recovery(harness)? else {
         return Ok(None);
     };
     let version = bounded_output(&path, &["--version"], VERSION_TIMEOUT).await?;
@@ -818,16 +1208,31 @@ async fn update_codex(timeout: Duration, lock: &OwnerLock) -> Result<()> {
         .await?;
         reject_symlink_or_unowned(&files.script)?;
         reject_secure_empty_file(&files.curl_config)?;
+        let installer_arguments = codex_installer_arguments(script_path)?;
         bounded_system_output(
             Path::new("/bin/sh"),
-            &[script_path],
+            &installer_arguments,
             timeout,
             &files.curl_home,
         )
         .await?;
+        let home = trusted_owner_home().context("owner HOME is not trusted after Codex update")?;
+        reconcile_codex_package_permissions(&home).with_context(|| {
+            format!(
+                "Codex was installed, but package permissions could not be reconciled safely under {}",
+                home.join(".codex/packages").display()
+            )
+        })?;
         Ok(())
     }
     .await
+}
+
+fn codex_installer_arguments(script: &str) -> Result<[&str; 4]> {
+    if !Path::new(script).is_absolute() || script.starts_with('-') {
+        bail!("Codex installer path must be absolute and non-option");
+    }
+    Ok(["-c", CODEX_INSTALL_COMMAND, CODEX_INSTALL_ARGV0, script])
 }
 
 fn codex_download_arguments<'a>(timeout_seconds: &'a str, script: &'a str) -> [&'a str; 14] {
@@ -898,11 +1303,33 @@ async fn run_bounded_output(
 
 fn resolve_launcher(harness: Harness) -> Option<PathBuf> {
     let home = trusted_owner_home()?;
+    resolve_launcher_at(&home, harness)
+}
+
+fn resolve_launcher_at(home: &Path, harness: Harness) -> Option<PathBuf> {
     let euid = rustix::process::geteuid().as_raw();
-    let candidates = owner_launcher_candidates(&home, harness);
+    let candidates = owner_launcher_candidates(home, harness);
     candidates
         .iter()
-        .find_map(|candidate| trusted_owner_executable(candidate, &home, euid))
+        .find_map(|candidate| trusted_owner_executable(candidate, home, euid))
+}
+
+fn resolve_launcher_with_recovery(harness: Harness) -> Result<Option<PathBuf>> {
+    let Some(home) = trusted_owner_home() else {
+        return Ok(None);
+    };
+    resolve_launcher_with_recovery_at(&home, harness)
+}
+
+fn resolve_launcher_with_recovery_at(home: &Path, harness: Harness) -> Result<Option<PathBuf>> {
+    let resolved = resolve_launcher_at(home, harness);
+    if resolved.is_some() || harness != Harness::Codex {
+        return Ok(resolved);
+    }
+    if !reconcile_codex_package_permissions(home)? {
+        return Ok(None);
+    }
+    Ok(resolve_launcher_at(home, harness))
 }
 
 fn trusted_owner_home() -> Option<PathBuf> {
@@ -1798,6 +2225,87 @@ mod tests {
         }
     }
 
+    struct TestCodexInstall {
+        home: PathBuf,
+        release: String,
+        outside: PathBuf,
+    }
+
+    impl TestCodexInstall {
+        fn new(package_mode: u32) -> Self {
+            let home = PathBuf::from("/tmp").join(format!(
+                "atu-{}-{}",
+                std::process::id(),
+                TEMP_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&home).unwrap();
+            fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+            for relative in [".local", ".local/bin", ".codex"] {
+                let path = home.join(relative);
+                fs::create_dir(&path).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let release = "r1".to_owned();
+            let package_directories = [
+                home.join(".codex/packages"),
+                home.join(".codex/packages/standalone"),
+                home.join(".codex/packages/standalone/releases"),
+                home.join(".codex/packages/standalone/releases")
+                    .join(&release),
+                home.join(".codex/packages/standalone/releases")
+                    .join(&release)
+                    .join("bin"),
+            ];
+            for path in &package_directories {
+                fs::create_dir(path).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(package_mode)).unwrap();
+            }
+            let executable = package_directories.last().unwrap().join("codex");
+            fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+            std::os::unix::fs::symlink(
+                home.join(".codex/packages/standalone/releases")
+                    .join(&release),
+                home.join(".codex/packages/standalone/current"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                home.join(".codex/packages/standalone/current/bin/codex"),
+                home.join(".local/bin/codex"),
+            )
+            .unwrap();
+            let outside = home.join("outside");
+            fs::create_dir(&outside).unwrap();
+            fs::set_permissions(&outside, fs::Permissions::from_mode(0o777)).unwrap();
+            Self {
+                home,
+                release,
+                outside,
+            }
+        }
+
+        fn package_directories(&self) -> [PathBuf; 5] {
+            let releases = self.home.join(".codex/packages/standalone/releases");
+            [
+                self.home.join(".codex/packages"),
+                self.home.join(".codex/packages/standalone"),
+                releases.clone(),
+                releases.join(&self.release),
+                releases.join(&self.release).join("bin"),
+            ]
+        }
+
+        fn executable(&self) -> PathBuf {
+            self.package_directories().last().unwrap().join("codex")
+        }
+    }
+
+    impl Drop for TestCodexInstall {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.home);
+        }
+    }
+
     #[test]
     fn real_system_launchers_accept_linux_and_macos_layouts() {
         for requested in ["/bin/sh", "/usr/bin/curl"] {
@@ -1830,6 +2338,17 @@ mod tests {
             ]
         );
         assert_eq!(MaintenanceConfig::default().update_timeout_seconds, 180);
+        assert_eq!(
+            codex_installer_arguments("/owner/state/codex-install-1").unwrap(),
+            [
+                "-c",
+                "umask 077 && exec /bin/sh \"$1\"",
+                "atmux-codex-installer",
+                "/owner/state/codex-install-1",
+            ]
+        );
+        assert!(codex_installer_arguments("relative/install.sh").is_err());
+        assert!(codex_installer_arguments("-installer").is_err());
         assert!(
             MaintenanceConfig {
                 update_timeout_seconds: 901,
@@ -1837,6 +2356,241 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+    }
+
+    #[test]
+    fn fixed_installer_shell_applies_secure_umask_to_nested_directories_and_executable() {
+        let root = std::env::temp_dir().join(format!(
+            "atmux-installer-umask-test-{}-{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let script = root.join("installer.sh");
+        fs::write(
+            &script,
+            b"mkdir -p \"$HOME/output/one/two\"\nprintf '#!/bin/sh\\nexit 0\\n' > \"$HOME/output/one/two/tool\"\nchmod +x \"$HOME/output/one/two/tool\"\n",
+        )
+        .unwrap();
+        let script_text = script.to_str().unwrap();
+        let arguments = codex_installer_arguments(script_text).unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .args(arguments)
+            .env_clear()
+            .env("HOME", &root)
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        for path in [
+            root.join("output"),
+            root.join("output/one"),
+            root.join("output/one/two"),
+        ] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let tool = root.join("output/one/two/tool");
+        assert_eq!(
+            fs::metadata(&tool).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(
+            std::process::Command::new(&tool)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preexisting_permissive_codex_package_tree_recovers_before_vendor_update() {
+        let fixture = TestCodexInstall::new(0o775);
+        fs::set_permissions(
+            fixture.home.join(".codex"),
+            fs::Permissions::from_mode(0o711),
+        )
+        .unwrap();
+        fs::set_permissions(
+            fixture.home.join(".local"),
+            fs::Permissions::from_mode(0o711),
+        )
+        .unwrap();
+        assert!(resolve_launcher_at(&fixture.home, Harness::Codex).is_none());
+
+        let recovered = resolve_launcher_with_recovery_at(&fixture.home, Harness::Codex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered, fixture.executable());
+        for path in fixture.package_directories() {
+            assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o022, 0);
+        }
+        assert_eq!(
+            fs::metadata(fixture.home.join(".codex"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o711
+        );
+        assert_eq!(
+            fs::metadata(fixture.home.join(".local"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o711
+        );
+        assert_eq!(
+            fs::metadata(&fixture.outside).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        assert!(
+            std::process::Command::new(recovered)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn package_repair_preserves_special_directory_bits_while_clearing_write() {
+        let fixture = TestCodexInstall::new(0o775);
+        let releases = fixture.home.join(".codex/packages/standalone/releases");
+        fs::set_permissions(&releases, fs::Permissions::from_mode(0o3775)).unwrap();
+        reconcile_codex_package_permissions(&fixture.home).unwrap();
+        assert_eq!(
+            fs::metadata(releases).unwrap().permissions().mode() & 0o7777,
+            0o3755
+        );
+    }
+
+    #[test]
+    fn package_repair_rejects_non_fixed_release_shape_without_touching_outside() {
+        let fixture = TestCodexInstall::new(0o775);
+        let current = fixture.home.join(".codex/packages/standalone/current");
+        fs::remove_file(&current).unwrap();
+        std::os::unix::fs::symlink(
+            fixture
+                .home
+                .join(".codex/packages/standalone/releases")
+                .join(&fixture.release)
+                .join("extra"),
+            current,
+        )
+        .unwrap();
+        assert!(reconcile_codex_package_permissions(&fixture.home).is_err());
+        assert_eq!(
+            fs::metadata(&fixture.outside).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+    }
+
+    #[test]
+    fn package_repair_detects_directory_symlink_swap_and_never_chmods_target() {
+        let fixture = TestCodexInstall::new(0o775);
+        let packages = fixture.home.join(".codex/packages");
+        let displaced = fixture.home.join(".codex/packages-displaced");
+        let outside = fixture.outside.clone();
+        let mut swapped = false;
+        let result = reconcile_codex_package_permissions_with(&fixture.home, |stage, path| {
+            if !swapped && stage == CodexPermissionStage::DirectoryOpened && path == packages {
+                fs::rename(&packages, &displaced)?;
+                std::os::unix::fs::symlink(&outside, &packages)?;
+                swapped = true;
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            fs::metadata(outside).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+    }
+
+    #[test]
+    fn package_repair_detects_public_launcher_parent_swap() {
+        let fixture = TestCodexInstall::new(0o775);
+        let bin = fixture.home.join(".local/bin");
+        let displaced = fixture.home.join(".local/bin-displaced");
+        let expected_target = fixture
+            .home
+            .join(".codex/packages/standalone/current/bin/codex");
+        let mut swapped = false;
+        let result = reconcile_codex_package_permissions_with(&fixture.home, |stage, path| {
+            if !swapped && stage == CodexPermissionStage::DirectoryOpened && path == bin {
+                fs::rename(&bin, &displaced)?;
+                fs::create_dir(&bin)?;
+                fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))?;
+                std::os::unix::fs::symlink(&expected_target, bin.join("codex"))?;
+                swapped = true;
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn package_repair_detects_target_swap_after_descriptor_open() {
+        let fixture = TestCodexInstall::new(0o775);
+        let target = fixture.executable();
+        let displaced = target.with_extension("old");
+        let mut swapped = false;
+        let result = reconcile_codex_package_permissions_with(&fixture.home, |stage, path| {
+            if !swapped && stage == CodexPermissionStage::TargetOpened && path == target {
+                fs::rename(&target, &displaced)?;
+                fs::write(&target, b"#!/bin/sh\nexit 0\n")?;
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
+                swapped = true;
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn package_repair_rejects_hardlinked_special_and_wrong_owner_targets() {
+        let hardlinked = TestCodexInstall::new(0o775);
+        let second_link = hardlinked.executable().with_extension("hardlink");
+        fs::hard_link(hardlinked.executable(), second_link).unwrap();
+        assert!(reconcile_codex_package_permissions(&hardlinked.home).is_err());
+
+        let special = TestCodexInstall::new(0o775);
+        let target = special.executable();
+        fs::remove_file(&target).unwrap();
+        std::os::unix::net::UnixListener::bind(&target).unwrap();
+        assert!(reconcile_codex_package_permissions(&special.home).is_err());
+
+        let wrong_owner = TestCodexInstall::new(0o775);
+        let target = wrong_owner.executable();
+        let file = File::open(&target).unwrap();
+        assert!(
+            validate_owner_executable(
+                &file,
+                &target,
+                rustix::process::geteuid().as_raw().wrapping_add(1),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn package_repair_rejects_hardlinked_launcher_symlink() {
+        let fixture = TestCodexInstall::new(0o775);
+        let launcher = fixture.home.join(".local/bin/codex");
+        fs::hard_link(&launcher, fixture.home.join(".local/bin/codex-second-link")).unwrap();
+        assert!(!reconcile_codex_package_permissions(&fixture.home).unwrap());
+        assert_eq!(
+            fs::metadata(fixture.home.join(".codex/packages"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o775
         );
     }
 
@@ -1876,15 +2630,23 @@ mod tests {
     fn each_fixed_spawn_is_revalidated_immediately_before_command_construction() {
         let curl_home = TestCurlHome::new();
         let shell_resolver = QueuedSystemResolver::stable(direct_macos_shell_resolution());
+        let installer_arguments = codex_installer_arguments("/owner/state/install").unwrap();
         let (shell, shell_command) = validated_system_command_with(
             Path::new("/bin/sh"),
-            &["/owner/state/install"],
+            &installer_arguments,
             &shell_resolver,
             &curl_home.0,
         )
         .unwrap();
         assert_eq!(shell, Path::new("/bin/sh"));
         assert_eq!(shell_command.as_std().get_program(), Path::new("/bin/sh"));
+        assert_eq!(
+            shell_command.as_std().get_args().collect::<Vec<_>>(),
+            installer_arguments
+                .iter()
+                .map(OsStr::new)
+                .collect::<Vec<_>>()
+        );
         assert!(shell_resolver.0.lock().unwrap().is_empty());
 
         let curl_resolver = QueuedSystemResolver::stable(direct_curl_resolution());
@@ -1923,6 +2685,9 @@ mod tests {
             Some(&Some(std::ffi::OsStr::new("1")))
         );
         assert_eq!(fs::metadata(curl_home.0.join(".curlrc")).unwrap().len(), 0);
+
+        let shell_environment: BTreeMap<_, _> = shell_command.as_std().get_envs().collect();
+        assert_eq!(shell_environment, environment);
 
         fs::write(curl_home.0.join(".curlrc"), b"proxy = hostile.invalid\n").unwrap();
         assert!(
