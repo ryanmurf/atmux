@@ -108,6 +108,11 @@ const {
   WORKING_TO_WAITING_HOLD_MS,
   suggestedSessionName,
   transcriptItemKind,
+  normalizedToolName,
+  coordinationResultSignal,
+  collapsibleCoordinationTool,
+  compactTranscriptItems,
+  coordinationGroupSummary,
   diffLineKind,
   utf8ByteLength,
   validateImageSelection,
@@ -233,6 +238,112 @@ test("streaming redraws use semantic transcript anchors and explicit reader inte
   assert.match(source, /if \(pane\.hidden\) return;\s*state\.paneReadingScrollTop = pane\.scrollTop;/s);
   assert.match(css, /#pane \{[^}]*height: 100%;[^}]*min-height: 0;[^}]*max-height: 100%;[^}]*overflow: auto;[^}]*overscroll-behavior: contain;[^}]*overflow-anchor: none;/s);
   assert.match(css, /\.conversation \{[^}]*overscroll-behavior: contain;/s);
+});
+
+test("adjacent low-signal coordination calls collapse without crossing prose or error boundaries", () => {
+  const tool = (id, toolName, toolOutput = null) => ({
+    id, kind: "tool", role: "tool", tool_name: toolName, tool_input: `{ "id": "${id}" }`, tool_output: toolOutput,
+  });
+  const messages = [
+    { id: "human", role: "user", markdown: "Keep this visible" },
+    tool("wait-1", "collaboration.wait_agent", "timed out"),
+    tool("send-1", "send_message", "delivered"),
+    tool("follow-1", "functions.collaboration.followup_task", '{"status":"completed"}'),
+    { id: "agent", role: "assistant", markdown: "Agent prose stays visible" },
+    tool("error", "wait_agent", "Error: failed to contact agent"),
+    tool("wait-2", "wait_agent"),
+    tool("list-1", "list_agents", '[{"path":"/root/a","status":"waiting"}]'),
+    tool("exec", "exec_command", "ok"),
+    tool("wait-single", "wait_agent"),
+  ];
+  const compacted = compactTranscriptItems(messages);
+  assert.deepEqual(compacted.map((item) => item.kind), [
+    "item", "tool-group", "item", "item", "tool-group", "item", "item",
+  ]);
+  assert.deepEqual(compacted[1].messages.map((item) => item.id), ["wait-1", "send-1", "follow-1"]);
+  assert.deepEqual(compacted[4].messages.map((item) => item.id), ["wait-2", "list-1"]);
+  assert.equal(compacted[2].message.id, "agent");
+  assert.equal(compacted[3].message.id, "error");
+  assert.equal(compacted[5].message.id, "exec");
+  assert.equal(compacted[6].message.id, "wait-single");
+});
+
+test("meaningful results, approvals, and lifecycle tools always remain visible", () => {
+  const tool = (id, name, output) => ({ id, kind: "tool", role: "tool", tool_name: name, tool_output: output });
+  const protectedItems = [
+    tool("meaningful", "wait_agent", "Agent completed the migration and verified the deployment."),
+    tool("approval", "wait_agent", "Approval required before continuing"),
+    tool("spawn", "spawn_agent", "queued"),
+    tool("interrupt", "interrupt_agent", "ok"),
+  ];
+  assert.deepEqual(protectedItems.map(collapsibleCoordinationTool), [false, false, false, false]);
+  assert.deepEqual(protectedItems.map((item) => coordinationResultSignal(item)), [
+    "meaningful", "approval", "status", "status",
+  ]);
+  assert.ok(compactTranscriptItems(protectedItems).every((item) => item.kind === "item"));
+});
+
+test("coordination status JSON fails closed for unknown and negative states", () => {
+  const tool = (id, output) => ({
+    id, kind: "tool", role: "tool", tool_name: "wait_agent", tool_output: output,
+  });
+  const benign = [
+    tool("completed", '{"status":"completed"}'),
+    tool("agents", '{"agents":[{"path":"/root/a","status":"waiting"}]}'),
+  ];
+  assert.deepEqual(benign.map(coordinationResultSignal), ["status", "status"]);
+  assert.equal(compactTranscriptItems(benign)[0].kind, "tool-group");
+
+  const unsafe = [
+    tool("cancelled", '{"status":"cancelled"}'),
+    tool("forbidden", '{"state":"forbidden"}'),
+    tool("unavailable", '{"status":"unavailable"}'),
+    tool("not-found", '{"state":"not_found"}'),
+    tool("numeric", '{"status":500}'),
+    tool("boolean", '{"status":false}'),
+    tool("null", '{"state":null}'),
+    tool("unknown", '{"status":"paused"}'),
+    tool("prose", '{"status":"the agent wrote a useful answer"}'),
+  ];
+  assert.deepEqual(unsafe.map(coordinationResultSignal), [
+    "error", "error", "error", "error", "error", "error", "error", "meaningful", "meaningful",
+  ]);
+  assert.ok(compactTranscriptItems(unsafe).every((item) => item.kind === "item"));
+});
+
+test("coordination groups are bounded at 24 and preserve every call in exact order", () => {
+  const calls = Array.from({ length: 49 }, (_, index) => ({
+    id: `wait-${index}`, kind: "tool", role: "tool", tool_name: "wait_agent",
+  }));
+  const groups = compactTranscriptItems(calls);
+  assert.deepEqual(groups.map((group) => group.messages.length), [24, 23, 2]);
+  assert.deepEqual(groups.flatMap((group) => group.messages.map((item) => item.id)), calls.map((item) => item.id));
+  assert.ok(groups.every((group) => group.messages.length >= 2 && group.messages.length <= 24));
+});
+
+test("coordination summaries normalize namespaces and expose per-tool counts and status", () => {
+  const messages = [
+    { id: "a", kind: "tool", tool_name: "functions.collaboration.wait_agent" },
+    { id: "b", kind: "tool", tool_name: "mcp__send_message", tool_output: "sent" },
+    { id: "c", kind: "tool", tool_name: "wait_agent", tool_output: "ok" },
+  ];
+  const [group] = compactTranscriptItems(messages);
+  assert.equal(normalizedToolName(messages[0]), "wait_agent");
+  assert.equal(normalizedToolName(messages[1]), "send_message");
+  assert.equal(coordinationGroupSummary(group), "3 coordination calls · wait_agent ×2 · send_message ×1 · no errors");
+});
+
+test("coordination compaction stays inside Conversation and uses text-only DOM rendering", () => {
+  const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  const renderer = source.slice(source.indexOf("function renderToolCard"), source.indexOf("function flushPendingTranscriptRender"));
+  assert.match(renderer, /compactTranscriptItems\(/);
+  assert.match(renderer, /summary\.textContent = coordinationGroupSummary\(group\)/);
+  assert.match(renderer, /pre\.textContent = value/);
+  assert.match(renderer, /state\.transcriptRequest === transcriptGeneration/);
+  assert.match(renderer, /details\.isConnected/);
+  assert.match(renderer, /details\.closest\("#conversation"\) === conversation/);
+  assert.doesNotMatch(renderer, /innerHTML/);
+  assert.doesNotMatch(source.slice(source.indexOf("function drawPane"), source.indexOf("function drawConversation")), /compactTranscriptItems\(/);
 });
 
 test("applyPanePatch returns a new line array for a matching revision", () => {

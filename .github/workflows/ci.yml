@@ -28,7 +28,9 @@ jobs:
           node-version: '22'
       - run: node --check web/app.js
       - run: node --test web/app.test.mjs
-      - run: node --test tests/web_mobile_pulse_browser.mjs
+      - name: Run browser integration tests
+        run: node --test tests/web_mobile_pulse_browser.mjs
+        timeout-minutes: 3
 
   helm:
     name: Gateway chart safety

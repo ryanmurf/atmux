@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -7,6 +8,9 @@ import { extname, join, resolve } from "node:path";
 import test from "node:test";
 
 const WEB_ROOT = resolve(import.meta.dirname, "../web");
+const CDP_COMMAND_TIMEOUT_MS = 15_000;
+const CHROME_START_TIMEOUT_MS = 30_000;
+const CLEANUP_TIMEOUT_MS = 5_000;
 let transcriptFixture = null;
 let paneSnapshotContent = "";
 const paneStreams = new Set();
@@ -15,6 +19,7 @@ const launchRequests = [];
 const launchSessionRequests = [];
 let failLiveModels = false;
 let launchOptionsDelayMs = 0;
+let launchResponseDelayMs = 0;
 let overviewRevision = 1;
 let delayProjectFilePane = null;
 let delayFileSavePane = null;
@@ -303,9 +308,16 @@ function mockApi(url, response, request) {
       let parsed = null;
       try { parsed = JSON.parse(body); } catch { /* asserted by the browser test */ }
       launchRequests.push({ method: request.method, pathname, body: parsed });
-      if (String(parsed?.name || "").includes("-copy")) {
-        errorJson(response, 409, "duplicate fixture intentionally not persisted");
-      } else json(response, { ok: true });
+      const reply = () => {
+        if (String(parsed?.name || "").includes("-copy")) {
+          errorJson(response, 409, "duplicate fixture intentionally not persisted");
+        } else json(response, { ok: true });
+      };
+      if (launchResponseDelayMs > 0) {
+        const delayMs = launchResponseDelayMs;
+        launchResponseDelayMs = 0;
+        setTimeout(reply, delayMs);
+      } else reply();
     });
     return true;
   }
@@ -439,33 +451,144 @@ async function waitFor(check, message, timeoutMs = 10_000) {
   throw new Error(message);
 }
 
+async function withDeadline(promise, timeoutMs, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function childExit(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolveExit) => child.once("exit", resolveExit));
+}
+
+async function stopChrome(chrome) {
+  if (!chrome || chrome.exitCode !== null || chrome.signalCode !== null) return;
+  const exited = childExit(chrome);
+  chrome.kill("SIGTERM");
+  try {
+    await withDeadline(exited, CLEANUP_TIMEOUT_MS, "Chrome ignored SIGTERM during browser-test cleanup");
+    return;
+  } catch {
+    // A wedged browser must not pin the CI worker indefinitely. Escalate only
+    // after giving normal shutdown a bounded opportunity to preserve profiles.
+  }
+  if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGKILL");
+  await withDeadline(exited, CLEANUP_TIMEOUT_MS, "Chrome did not exit after SIGKILL during browser-test cleanup");
+}
+
+async function stopServer(server) {
+  if (!server?.listening) return;
+  const closed = new Promise((resolveClose, rejectClose) => {
+    server.close((error) => {
+      if (error) rejectClose(error);
+      else resolveClose();
+    });
+  });
+  // Node's server.close() does not wait out active SSE responses on every
+  // supported runtime. Force only this disposable fixture's connections.
+  server.closeAllConnections?.();
+  await withDeadline(closed, CLEANUP_TIMEOUT_MS, "fixture HTTP server did not close");
+}
+
+async function cleanupBrowserHarness({ cdp, chrome, server, profileDirectory }) {
+  const errors = [];
+  try { cdp?.socket.close(); } catch (error) { errors.push(error); }
+  try { await stopChrome(chrome); } catch (error) { errors.push(error); }
+  for (const response of [...paneStreams, ...overviewStreams]) {
+    try { response.end(); } catch (error) { errors.push(error); }
+  }
+  try { await stopServer(server); } catch (error) { errors.push(error); }
+  try {
+    await withDeadline(
+      rm(profileDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }),
+      CLEANUP_TIMEOUT_MS,
+      "temporary Chrome profile cleanup timed out",
+    );
+  } catch (error) { errors.push(error); }
+  if (errors.length) throw new AggregateError(errors, "browser-test cleanup failed");
+}
+
+test("Chrome cleanup cannot miss an exit emitted while signaling", async () => {
+  class SynchronousExitChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    signals = [];
+
+    kill(signal) {
+      this.signals.push(signal);
+      this.signalCode = signal;
+      this.emit("exit", null, signal);
+      return true;
+    }
+  }
+
+  const chrome = new SynchronousExitChild();
+  await stopChrome(chrome);
+  assert.deepEqual(chrome.signals, ["SIGTERM"]);
+});
+
 async function launchChrome(profileDirectory) {
   const chrome = spawn("google-chrome", [
     "--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
     "--window-size=390,844", "--force-device-scale-factor=1",
     "--remote-debugging-port=0", `--user-data-dir=${profileDirectory}`, "about:blank",
-  ], { stdio: ["ignore", "ignore", "pipe"] });
-  let stderr = "";
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+  let chromeOutput = "";
+  chrome.stdout.setEncoding("utf8");
   chrome.stderr.setEncoding("utf8");
-  chrome.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-16_384); });
-  const browserSocket = await waitFor(() => {
-    const match = stderr.match(/DevTools listening on (ws:\/\/[^\s]+)/);
-    return match?.[1] || null;
-  }, "Chrome did not expose its DevTools endpoint");
-  return { chrome, browserSocket };
+  const captureChromeOutput = (chunk) => {
+    chromeOutput = `${chromeOutput}${chunk}`.slice(-16_384);
+  };
+  chrome.stdout.on("data", captureChromeOutput);
+  chrome.stderr.on("data", captureChromeOutput);
+  try {
+    const browserSocket = await waitFor(() => {
+      if (chrome.exitCode !== null || chrome.signalCode !== null) {
+        throw new Error(`Chrome exited before exposing DevTools: ${chromeOutput || "no output"}`);
+      }
+      const match = chromeOutput.match(/DevTools listening on (ws:\/\/[^\s]+)/);
+      return match?.[1] || null;
+    }, "Chrome did not expose its DevTools endpoint", CHROME_START_TIMEOUT_MS);
+    return { chrome, browserSocket };
+  } catch (error) {
+    if (chromeOutput) error.message = `${error.message}\nChrome output:\n${chromeOutput}`;
+    try { await stopChrome(chrome); } catch (cleanupError) {
+      error.cleanupError = cleanupError;
+    }
+    throw error;
+  }
 }
 
 async function openCdp(browserSocket, pageUrl) {
   const endpoint = new URL(browserSocket);
-  const target = await fetch(`http://${endpoint.host}/json/new?${encodeURIComponent(pageUrl)}`, { method: "PUT" })
+  const target = await fetch(`http://${endpoint.host}/json/new?${encodeURIComponent(pageUrl)}`, {
+    method: "PUT",
+    signal: AbortSignal.timeout(CDP_COMMAND_TIMEOUT_MS),
+  })
     .then((response) => response.json());
   const socket = new WebSocket(target.webSocketDebuggerUrl);
-  await new Promise((resolveOpen, rejectOpen) => {
+  await withDeadline(new Promise((resolveOpen, rejectOpen) => {
     socket.addEventListener("open", resolveOpen, { once: true });
     socket.addEventListener("error", rejectOpen, { once: true });
-  });
+  }), CDP_COMMAND_TIMEOUT_MS, "CDP WebSocket did not open");
   let nextId = 1;
   const pending = new Map();
+  const rejectPending = (reason) => {
+    for (const { rejectMessage } of pending.values()) rejectMessage(reason);
+    pending.clear();
+  };
+  socket.addEventListener("close", () => rejectPending(new Error("CDP WebSocket closed")));
+  socket.addEventListener("error", () => rejectPending(new Error("CDP WebSocket failed")));
   socket.addEventListener("message", (event) => {
     const message = JSON.parse(event.data);
     if (!message.id || !pending.has(message.id)) return;
@@ -474,11 +597,16 @@ async function openCdp(browserSocket, pageUrl) {
     if (message.error) rejectMessage(new Error(message.error.message));
     else resolveMessage(message.result);
   });
-  const send = (method, params = {}) => new Promise((resolveMessage, rejectMessage) => {
+  const send = (method, params = {}) => withDeadline(new Promise((resolveMessage, rejectMessage) => {
     const id = nextId++;
     pending.set(id, { resolveMessage, rejectMessage });
-    socket.send(JSON.stringify({ id, method, params }));
-  });
+    try {
+      socket.send(JSON.stringify({ id, method, params }));
+    } catch (error) {
+      pending.delete(id);
+      rejectMessage(error);
+    }
+  }), CDP_COMMAND_TIMEOUT_MS, `CDP command timed out: ${method}`);
   const evaluate = async (expression) => {
     const result = await send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
     if (result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails));
@@ -487,7 +615,7 @@ async function openCdp(browserSocket, pageUrl) {
   return { socket, send, evaluate };
 }
 
-test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dashboard", async () => {
+test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dashboard", { timeout: 120_000 }, async () => {
   launchRequests.length = 0;
   launchSessionRequests.length = 0;
   fileSaveRequests.length = 0;
@@ -498,6 +626,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
   nextFileSaveConflict = false;
   failLiveModels = false;
   launchOptionsDelayMs = 0;
+  launchResponseDelayMs = 0;
   overviewRevision = 1;
   const transcript = (start, count, hash) => ({
     available: true,
@@ -516,10 +645,16 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     { length: 220 },
     (_, index) => `pane-line-${String(index).padStart(3, "0")}`,
   ).join("\n");
-  const { server, port } = await startServer();
-  const { chrome, browserSocket } = await launchChrome(profileDirectory);
+  let server;
+  let port;
+  let chrome;
   let cdp;
+  let testError = null;
   try {
+    ({ server, port } = await startServer());
+    const browser = await launchChrome(profileDirectory);
+    chrome = browser.chrome;
+    const { browserSocket } = browser;
     cdp = await openCdp(browserSocket, `http://127.0.0.1:${port}/?session=tron~%25100`);
     await cdp.send("Page.enable");
     await waitFor(
@@ -1369,6 +1504,159 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.ok(Math.abs(rawAfterViewNavigation.bottom - rawAfterViewNavigation.terminalBottom) <= 1, JSON.stringify(rawAfterViewNavigation));
     await cdp.evaluate("document.getElementById('conversation-view').click(); true");
 
+    // Conversation mode compacts only adjacent, low-signal coordination calls.
+    // Prose and meaningful/error results remain prominent, and expanding a
+    // compact run restores every original tool card without moving the reader.
+    transcriptFixture = {
+      available: true,
+      source: "codex",
+      changed: true,
+      content_hash: "coordination-tools",
+      truncated: false,
+      messages: [
+        ...Array.from({ length: 10 }, (_, index) => ({
+          id: `tool-prefix-${index}`, role: "assistant", markdown: `Agent context ${index} ${"readable context ".repeat(8)}`,
+        })),
+        { id: "tool-human-before", role: "user", markdown: "Human request remains visible" },
+        { id: "tool-agent-before", role: "assistant", markdown: "Agent explanation remains visible" },
+        { id: "tool-wait-1", role: "tool", kind: "tool", tool_name: "wait_agent", tool_input: "agent-a" },
+        { id: "tool-wait-2", role: "tool", kind: "tool", tool_name: "collaboration.wait_agent", tool_output: "timed out" },
+        { id: "tool-send-1", role: "tool", kind: "tool", tool_name: "send_message", tool_input: "<img src=x onerror=alert(1)>", tool_output: "delivered" },
+        { id: "tool-agent-middle", role: "assistant", markdown: "This prose splits coordination runs" },
+        { id: "tool-send-2", role: "tool", kind: "tool", tool_name: "send_message" },
+        { id: "tool-follow-1", role: "tool", kind: "tool", tool_name: "followup_task", tool_output: '{"status":"completed"}' },
+        { id: "tool-wait-error", role: "tool", kind: "tool", tool_name: "wait_agent", tool_output: "Error: failed to receive approval" },
+        { id: "tool-wait-cancelled", role: "tool", kind: "tool", tool_name: "wait_agent", tool_output: '{"status":"cancelled"}' },
+        { id: "tool-wait-numeric", role: "tool", kind: "tool", tool_name: "wait_agent", tool_output: '{"status":500}' },
+        { id: "tool-wait-boolean", role: "tool", kind: "tool", tool_name: "wait_agent", tool_output: '{"status":false}' },
+        { id: "tool-wait-null", role: "tool", kind: "tool", tool_name: "wait_agent", tool_output: '{"state":null}' },
+        { id: "tool-wait-meaningful", role: "tool", kind: "tool", tool_name: "wait_agent", tool_output: "Agent completed the deployment and verified every session." },
+        { id: "tool-list-1", role: "tool", kind: "tool", tool_name: "list_agents", tool_output: '[{"path":"/root/a","status":"waiting"}]' },
+        { id: "tool-wait-3", role: "tool", kind: "tool", tool_name: "wait_agent", tool_output: "ok" },
+        { id: "tool-human-after", role: "user", markdown: "Latest human follow-up remains visible" },
+        ...Array.from({ length: 14 }, (_, index) => ({
+          id: `tool-suffix-${index}`, role: "assistant", markdown: `Later agent answer ${index} ${"more visible prose ".repeat(8)}`,
+        })),
+      ],
+    };
+    await waitFor(
+      () => cdp.evaluate("document.querySelectorAll('#conversation .tool-call-group').length === 3"),
+      "coordination tool runs did not collapse on mobile",
+      5_000,
+    );
+    const compactTools = await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      const groups = [...conversation.querySelectorAll('.tool-call-group')];
+      const first = groups[0];
+      const bounds = conversation.getBoundingClientRect();
+      conversation.scrollTop += first.getBoundingClientRect().top - bounds.top - 18;
+      conversation.dispatchEvent(new Event('scroll'));
+      const before = conversation.scrollTop;
+      first.querySelector(':scope > summary').click();
+      return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve({
+        groupSummaries: groups.map((group) => group.querySelector(':scope > summary').textContent),
+        open: first.open,
+        order: [...first.querySelectorAll('.tool-card-group-item')].map((node) => node.dataset.transcriptId),
+        humanVisible: conversation.textContent.includes('Human request remains visible')
+          && conversation.textContent.includes('Latest human follow-up remains visible'),
+        agentVisible: conversation.textContent.includes('Agent explanation remains visible')
+          && conversation.textContent.includes('This prose splits coordination runs'),
+        errorSummary: conversation.querySelector('[data-transcript-id="tool-wait-error"] > summary')?.textContent,
+        cancelledSummary: conversation.querySelector('[data-transcript-id="tool-wait-cancelled"] > summary')?.textContent,
+        malformedStatusSummaries: ['numeric', 'boolean', 'null'].map((suffix) =>
+          conversation.querySelector('[data-transcript-id="tool-wait-' + suffix + '"] > summary')?.textContent),
+        meaningfulSeparate: Boolean(conversation.querySelector('[data-transcript-id="tool-wait-meaningful"]')),
+        markupInjected: Boolean(conversation.querySelector('img, script')),
+        escapedInputVisible: first.textContent.includes('<img src=x onerror=alert(1)>'),
+        before,
+        after: conversation.scrollTop,
+      }))));
+    })()`);
+    assert.equal(compactTools.open, true, JSON.stringify(compactTools));
+    assert.deepEqual(compactTools.order, ["tool-wait-1", "tool-wait-2", "tool-send-1"]);
+    assert.ok(compactTools.groupSummaries[0].includes("wait_agent ×2"), JSON.stringify(compactTools));
+    assert.ok(compactTools.groupSummaries[0].includes("send_message ×1"), JSON.stringify(compactTools));
+    assert.ok(compactTools.groupSummaries.every((summary) => summary.endsWith("no errors")), JSON.stringify(compactTools));
+    assert.equal(compactTools.humanVisible, true, JSON.stringify(compactTools));
+    assert.equal(compactTools.agentVisible, true, JSON.stringify(compactTools));
+    assert.equal(compactTools.errorSummary, "wait_agent · error", JSON.stringify(compactTools));
+    assert.equal(compactTools.cancelledSummary, "wait_agent · error", JSON.stringify(compactTools));
+    assert.deepEqual(compactTools.malformedStatusSummaries, [
+      "wait_agent · error", "wait_agent · error", "wait_agent · error",
+    ], JSON.stringify(compactTools));
+    assert.equal(compactTools.meaningfulSeparate, true, JSON.stringify(compactTools));
+    assert.equal(compactTools.markupInjected, false, JSON.stringify(compactTools));
+    assert.equal(compactTools.escapedInputVisible, true, JSON.stringify(compactTools));
+    assert.ok(Math.abs(compactTools.after - compactTools.before) <= 1, JSON.stringify(compactTools));
+
+    // A stale expansion callback must not mutate a freshly reconnected
+    // transcript even when it is still the same pane. Hold the queued callback,
+    // force the pane stream's resync path, then invoke the old callback against
+    // the new Conversation generation.
+    const staleExpansionSetup = await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      const group = conversation.querySelector('.tool-call-group');
+      group.dataset.oldGeneration = 'true';
+      const original = window.requestAnimationFrame;
+      window.__staleToolExpansionCallbacks = [];
+      window.requestAnimationFrame = (callback) => {
+        window.__staleToolExpansionCallbacks.push(callback);
+        return window.__staleToolExpansionCallbacks.length;
+      };
+      const capturedScroll = conversation.scrollTop;
+      group.querySelector(':scope > summary').click();
+      window.requestAnimationFrame = original;
+      return { capturedScroll, queued: window.__staleToolExpansionCallbacks.length };
+    })()`);
+    assert.equal(staleExpansionSetup.queued, 1, JSON.stringify(staleExpansionSetup));
+    const currentPaneStream = [...paneStreams].at(-1);
+    assert.ok(currentPaneStream, "same-pane reconnect test requires the current pane stream");
+    currentPaneStream.write(`event: pane.patch\ndata: ${JSON.stringify({
+      base_revision: 999, revision: 1_000, start_line: 0, delete_lines: 0, lines: [],
+    })}\n\n`);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('stream-state').textContent === 'Live' && document.querySelectorAll('#conversation .tool-call-group:not([data-old-generation])').length === 3"),
+      "same-pane reconnect did not replace the old tool group generation",
+      5_000,
+    );
+    const staleExpansionResult = await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      const desired = ${staleExpansionSetup.capturedScroll} > 300 ? 120 : 600;
+      conversation.scrollTop = desired;
+      conversation.dispatchEvent(new Event('scroll'));
+      const before = conversation.scrollTop;
+      const callbacks = window.__staleToolExpansionCallbacks.splice(0);
+      for (const callback of callbacks) callback(performance.now());
+      return {
+        before,
+        after: conversation.scrollTop,
+        oldConnected: Boolean(document.querySelector('[data-old-generation]')),
+        groupCount: document.querySelectorAll('#conversation .tool-call-group').length,
+      };
+    })()`);
+    assert.equal(staleExpansionResult.oldConnected, false, JSON.stringify(staleExpansionResult));
+    assert.equal(staleExpansionResult.groupCount, 3, JSON.stringify(staleExpansionResult));
+    assert.ok(Math.abs(staleExpansionResult.after - staleExpansionResult.before) <= 1, JSON.stringify({ staleExpansionSetup, staleExpansionResult }));
+
+    // A pane change clears group expansion/content synchronously; an identical
+    // transcript id from another owner cannot inherit the previous pane DOM.
+    transcriptFixture = {
+      available: true, source: "codex", changed: true, content_hash: "pane-b-prose", truncated: false,
+      messages: [{ id: "pane-b-agent", role: "assistant", markdown: "Different pane conversation" }],
+    };
+    await cdp.evaluate("document.getElementById('mobile-back').click(); true");
+    await waitFor(() => cdp.evaluate("!document.body.classList.contains('has-selection')"), "tool grouping test did not return to agent list");
+    const groupClearedOnPaneChange = await cdp.evaluate(`(() => {
+      document.querySelector('.session-button[data-session-id="midnight~%5"]').click();
+      return !document.querySelector('#conversation .tool-call-group');
+    })()`);
+    assert.equal(groupClearedOnPaneChange, true, "pane A tool group remained visible under pane B");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('conversation').textContent.includes('Different pane conversation')"),
+      "pane B conversation did not replace pane A tool groups",
+      5_000,
+    );
+
     const composerBeforeFocus = await cdp.evaluate(`(() => {
       const box = document.getElementById('composer').getBoundingClientRect();
       return { top: box.top, bottom: box.bottom };
@@ -1533,6 +1821,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(launchRequests.length, 0, "cancelling confirmation must not send a launch request");
     assert.equal(await cdp.evaluate("document.getElementById('launch-dialog').open"), true);
 
+    launchResponseDelayMs = 150;
     await cdp.evaluate(`(() => {
       document.getElementById('launch-session').value = '';
       window.__normalLaunchConfirmCalls = 0;
@@ -1540,9 +1829,24 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       document.getElementById('launch-form').requestSubmit();
       return true;
     })()`);
-    await waitFor(() => launchRequests.length === 1, "ordinary launch request was not sent");
+    await waitFor(
+      () => launchRequests.length === 1 && cdp.evaluate(`(() => {
+        const form = document.getElementById('launch-form');
+        return document.getElementById('launch-dialog').open
+          && form.querySelector('button[type=submit]').disabled;
+      })()`),
+      "ordinary launch did not remain pending until its response",
+    );
+    await waitFor(
+      () => cdp.evaluate(`(() => {
+        const form = document.getElementById('launch-form');
+        return !document.getElementById('launch-dialog').open
+          && !form.querySelector('button[type=submit]').disabled
+          && document.getElementById('toast').textContent.includes('Launched');
+      })()`),
+      "ordinary launch response did not close the dialog and restore submit state",
+    );
     assert.equal(await cdp.evaluate("window.__normalLaunchConfirmCalls"), 0);
-    assert.equal(await cdp.evaluate("document.getElementById('launch-dialog').open"), false);
     assert.deepEqual(
       await cdp.evaluate("JSON.parse(localStorage.getItem('atmux.launch-directories'))"),
       { tron: ["/workspace/custom"] },
@@ -1598,12 +1902,18 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     }
     assert.ok(dashboard.reportSummary.includes("claude-max"));
     assert.ok(dashboard.reportSummary.includes("1,500,000 tokens · $4.00"));
+  } catch (error) {
+    testError = error;
+    throw error;
   } finally {
-    cdp?.socket.close();
-    chrome.kill("SIGTERM");
-    await new Promise((resolveExit) => chrome.once("exit", resolveExit));
-    await new Promise((resolveClose) => server.close(resolveClose));
-    await rm(profileDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    try {
+      await cleanupBrowserHarness({ cdp, chrome, server, profileDirectory });
+    } catch (cleanupError) {
+      if (!testError) throw cleanupError;
+      // Preserve the functional assertion/command failure as the primary test
+      // result while still making teardown trouble visible in CI diagnostics.
+      console.error(cleanupError);
+    }
     transcriptFixture = null;
     paneSnapshotContent = "";
     paneStreams.clear();

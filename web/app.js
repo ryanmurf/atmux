@@ -16,6 +16,15 @@ const MAX_FILE_REFERENCE_CHARS = 12_000;
 const MAX_FILE_REFERENCE_LINES = 200;
 const CONTENT_HASH_PATTERN = /^[a-f0-9]{64}$/;
 const LIVE_TAIL_TOLERANCE = 2;
+const MAX_COLLAPSED_TOOL_RUN = 24;
+const COLLAPSIBLE_COORDINATION_TOOLS = new Set([
+  "followup_task", "list_agents", "send_message", "wait_agent",
+]);
+const BENIGN_COORDINATION_STATUSES = new Set([
+  "ok", "sent", "queued", "delivered", "acknowledged", "waiting", "idle", "running",
+  "complete", "completed", "success", "succeeded", "timed out", "timeout", "no update",
+  "no updates", "no activity",
+]);
 const LAUNCH_DIRECTORY_STORAGE_KEY = "atmux.launch-directories";
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg"]);
 const COMPOSITE_SEPARATOR = "~";
@@ -1118,6 +1127,120 @@ function transcriptItemKind(item) {
   return item?.kind === "tool" || item?.role === "tool" ? "tool" : "message";
 }
 
+function normalizedToolName(item) {
+  const raw = String(item?.tool_name || "Tool").trim() || "Tool";
+  const lower = raw.toLowerCase();
+  for (const name of COLLAPSIBLE_COORDINATION_TOOLS) {
+    if (lower === name || lower.endsWith(`.${name}`) || lower.endsWith(`/${name}`)
+      || lower.endsWith(`:${name}`) || lower.endsWith(`__${name}`)) return name;
+  }
+  return lower;
+}
+
+function coordinationResultSignal(item) {
+  const output = typeof item?.tool_output === "string" ? item.tool_output.trim() : "";
+  if (!output) return "sent";
+  if (/(?:\b(?:error|failed|failure|denied|blocked|rejected|exception|unauthori[sz]ed|forbidden|unavailable|invalid|cancelled|canceled)\b|not[_ -]?found)/i.test(output)) return "error";
+  if (/\b(?:approval|approve|confirm|permission)\b/i.test(output)) return "approval";
+  if (/^(?:ok|sent|queued|delivered|acknowledged|waiting|idle|running|complete(?:d)?|timed?\s*out|timeout|no updates?|no activity)[.!]?$/i.test(output)) {
+    return "status";
+  }
+  try {
+    const value = JSON.parse(output);
+    if (coordinationStatusJson(value)) return "status";
+    if (coordinationStatusJsonHasInvalidPrimitive(value)) return "error";
+  } catch { /* Plain status text is handled above. */ }
+  return "meaningful";
+}
+
+function coordinationStatusJson(value, depth = 0, key = "") {
+  if (depth > 4) return false;
+  if (/^(?:status|state)$/.test(key)) {
+    if (typeof value !== "string") return false;
+    return BENIGN_COORDINATION_STATUSES.has(value.trim().toLowerCase().replace(/[.!]$/, ""));
+  }
+  if (value === null || typeof value === "boolean" || typeof value === "number") return true;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase().replace(/[.!]$/, "");
+    if (!key) return BENIGN_COORDINATION_STATUSES.has(normalized);
+    if (/^(?:id|agent_id|target|task|task_name|name|path|parent|model|reasoning_effort|started_at|finished_at|updated_at)$/.test(key)) {
+      return value.length <= 160 && /^[a-z0-9_./:%+~-]+$/i.test(value);
+    }
+    if (/^(?:completed|running|waiting|idle)$/.test(key)) {
+      return BENIGN_COORDINATION_STATUSES.has(normalized) || (value.length <= 160 && /^[a-z0-9_./:%+~-]+$/i.test(value));
+    }
+    return false;
+  }
+  if (Array.isArray(value)) return value.length <= 32 && value.every((entry) => coordinationStatusJson(entry, depth + 1, key));
+  if (typeof value !== "object") return false;
+  const entries = Object.entries(value);
+  if (entries.length > 32) return false;
+  const safeKeys = /^(?:status|state|id|agent_id|agents|target|task|tasks|task_name|name|path|parent|children|model|reasoning_effort|started_at|finished_at|updated_at|count|total|delivered|queued|acknowledged|timeout|timed_out|completed|running|waiting|idle)$/;
+  return entries.every(([childKey, entry]) => safeKeys.test(childKey)
+    && coordinationStatusJson(entry, depth + 1, childKey));
+}
+
+function coordinationStatusJsonHasInvalidPrimitive(value, depth = 0) {
+  if (depth > 4 || value === null || typeof value !== "object") return false;
+  if (Array.isArray(value)) return value.some((entry) => coordinationStatusJsonHasInvalidPrimitive(entry, depth + 1));
+  return Object.entries(value).some(([key, entry]) => (
+    /^(?:status|state)$/.test(key) && typeof entry !== "string"
+  ) || coordinationStatusJsonHasInvalidPrimitive(entry, depth + 1));
+}
+
+function collapsibleCoordinationTool(item) {
+  return transcriptItemKind(item) === "tool"
+    && COLLAPSIBLE_COORDINATION_TOOLS.has(normalizedToolName(item))
+    && ["sent", "status"].includes(coordinationResultSignal(item));
+}
+
+function coordinationToolCounts(messages) {
+  const counts = new Map();
+  for (const message of messages) {
+    const name = normalizedToolName(message);
+    counts.set(name, (counts.get(name) || 0) + 1);
+  }
+  return [...counts].map(([name, count]) => ({ name, count }));
+}
+
+function compactTranscriptItems(messages, maxRun = MAX_COLLAPSED_TOOL_RUN) {
+  const items = [];
+  const source = Array.isArray(messages) ? messages : [];
+  const boundedMax = Math.max(2, Math.min(Number.isInteger(maxRun) ? maxRun : MAX_COLLAPSED_TOOL_RUN, MAX_COLLAPSED_TOOL_RUN));
+  for (let index = 0; index < source.length;) {
+    if (!collapsibleCoordinationTool(source[index])) {
+      items.push({ kind: "item", message: source[index] }); index += 1; continue;
+    }
+    let end = index;
+    while (end < source.length && collapsibleCoordinationTool(source[end])) end += 1;
+    let cursor = index;
+    while (cursor < end) {
+      const remaining = end - cursor;
+      const size = remaining === boundedMax + 1 ? boundedMax - 1 : Math.min(boundedMax, remaining);
+      if (size < 2) {
+        items.push({ kind: "item", message: source[cursor] }); cursor += 1; continue;
+      }
+      const grouped = source.slice(cursor, cursor + size);
+      const firstId = String(grouped[0]?.id || cursor);
+      items.push({
+        kind: "tool-group",
+        id: `tool-group:${firstId}`,
+        messages: grouped,
+        counts: coordinationToolCounts(grouped),
+      });
+      cursor += size;
+    }
+    index = end;
+  }
+  return items;
+}
+
+function coordinationGroupSummary(group) {
+  const calls = group?.messages?.length || 0;
+  const counts = (group?.counts || []).map(({ name, count }) => `${name} ×${count}`).join(" · ");
+  return `${calls} coordination calls · ${counts} · no errors`;
+}
+
 function dictationDelivery(paneId, prefix, finalText) {
   const spoken = String(finalText || "").trim();
   if (!paneId || !spoken) return null;
@@ -1448,6 +1571,11 @@ if (typeof module !== "undefined" && module.exports) {
     savedSessionPreview,
     selectionTouchesPane,
     transcriptItemKind,
+    normalizedToolName,
+    coordinationResultSignal,
+    collapsibleCoordinationTool,
+    compactTranscriptItems,
+    coordinationGroupSummary,
     diffLineKind,
     safeLinkUrl,
     sortSessions,
@@ -1841,6 +1969,67 @@ function initialize() {
     }
   }
 
+  function renderToolCard(message, expandedTools, grouped = false) {
+    const details = document.createElement("details");
+    details.className = "tool-card";
+    if (grouped) details.classList.add("tool-card-group-item");
+    details.dataset.transcriptId = String(message.id || "");
+    details.open = expandedTools.has(details.dataset.transcriptId);
+    const summary = document.createElement("summary");
+    const name = String(message.tool_name || "Tool");
+    const resultSignal = coordinationResultSignal(message);
+    const suffix = resultSignal === "error" ? "error"
+      : resultSignal === "approval" ? "approval required"
+        : message.tool_output ? "result" : "";
+    summary.textContent = [name, suffix].filter(Boolean).join(" · ");
+    details.append(summary);
+    const body = document.createElement("div");
+    body.className = "tool-body";
+    for (const [label, value] of [["Input", message.tool_input], ["Result", message.tool_output]]) {
+      if (!value) continue;
+      const section = document.createElement("section");
+      const heading = document.createElement("span"); heading.textContent = label;
+      const pre = document.createElement("pre"); pre.textContent = value;
+      section.append(heading, pre); body.append(section);
+    }
+    if (body.childNodes.length) details.append(body);
+    return details;
+  }
+
+  function renderCoordinationGroup(group, expandedTools) {
+    const details = document.createElement("details");
+    details.className = "tool-card tool-call-group";
+    details.dataset.transcriptId = group.id;
+    details.open = expandedTools.has(group.id);
+    const summary = document.createElement("summary");
+    summary.className = "tool-call-group-summary";
+    summary.textContent = coordinationGroupSummary(group);
+    // Mobile browsers may scroll an expanding <details> to keep its newly
+    // exposed body visible. The reader chose this visible summary, so retain
+    // their exact Conversation offset while revealing the original calls.
+    summary.addEventListener("click", () => {
+      const paneId = state.selected;
+      const transcriptGeneration = state.transcriptRequest;
+      const scrollTop = conversation.scrollTop;
+      requestAnimationFrame(() => {
+        if (state.selected === paneId
+          && state.transcriptRequest === transcriptGeneration
+          && state.viewMode === "conversation"
+          && details.isConnected
+          && details.closest("#conversation") === conversation) {
+          conversation.scrollTop = scrollTop;
+          state.transcriptFollowing = false;
+          state.transcriptExpectedScrollTop = scrollTop;
+        }
+      });
+    });
+    const body = document.createElement("div");
+    body.className = "tool-call-group-items";
+    for (const message of group.messages) body.append(renderToolCard(message, expandedTools, true));
+    details.append(summary, body);
+    return details;
+  }
+
   function drawConversation() {
     if (state.transcriptPointerDown || selectionTouchesPane(conversation, window.getSelection())) {
       state.pendingTranscriptRender = true;
@@ -1862,28 +2051,18 @@ function initialize() {
       notice.textContent = "Showing the newest bounded part of this session log.";
       nodes.push(notice);
     }
-    for (const message of state.transcript.available ? state.transcript.messages : []) {
+    const transcriptItems = compactTranscriptItems(
+      state.transcript.available ? state.transcript.messages : [],
+    );
+    for (const item of transcriptItems) {
+      if (item.kind === "tool-group") {
+        nodes.push(renderCoordinationGroup(item, expandedTools));
+        continue;
+      }
+      const message = item.message;
       if (!message) continue;
       if (transcriptItemKind(message) === "tool") {
-        const details = document.createElement("details");
-        details.className = "tool-card";
-        details.dataset.transcriptId = String(message.id || "");
-        details.open = expandedTools.has(details.dataset.transcriptId);
-        const summary = document.createElement("summary");
-        const name = String(message.tool_name || "Tool");
-        summary.textContent = message.tool_output ? `${name} · result` : name;
-        details.append(summary);
-        const body = document.createElement("div");
-        body.className = "tool-body";
-        for (const [label, value] of [["Input", message.tool_input], ["Result", message.tool_output]]) {
-          if (!value) continue;
-          const section = document.createElement("section");
-          const heading = document.createElement("span"); heading.textContent = label;
-          const pre = document.createElement("pre"); pre.textContent = value;
-          section.append(heading, pre); body.append(section);
-        }
-        if (body.childNodes.length) details.append(body);
-        nodes.push(details);
+        nodes.push(renderToolCard(message, expandedTools));
         continue;
       }
       if (message.role !== "user" && message.role !== "assistant") continue;
