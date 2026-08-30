@@ -32,6 +32,7 @@ const MAX_GPU_DIAGNOSTICS: usize = 24;
 const MAX_GPU_UNAVAILABLE: usize = 20;
 const MAX_TEMPERATURES: usize = 64;
 const MAX_TEXT_BYTES: usize = 160;
+const UPTIME_SAMPLE_SECONDS: u64 = 60;
 #[cfg(any(target_os = "linux", test))]
 const MAX_SYSFS_BYTES: usize = 16 * 1024;
 #[cfg(any(target_os = "linux", test))]
@@ -227,6 +228,12 @@ pub struct MachineMetrics {
     pub cpu_percent: Option<u8>,
     pub memory_used_bytes: u64,
     pub memory_total_bytes: u64,
+    /// Seconds since this machine last booted.
+    pub uptime_seconds: Option<u64>,
+    /// Kernel release reported by this machine's operating system.
+    pub kernel_version: Option<String>,
+    /// Human-readable operating-system name and version.
+    pub os_version: Option<String>,
     pub gpus: Vec<GpuMetrics>,
     pub temperatures: Vec<TemperatureReading>,
     pub gpu_diagnostics: Vec<GpuDiagnostic>,
@@ -238,6 +245,9 @@ struct MachineMetricsWire {
     cpu_percent: Option<u8>,
     memory_used_bytes: u64,
     memory_total_bytes: u64,
+    uptime_seconds: Option<u64>,
+    kernel_version: Option<String>,
+    os_version: Option<String>,
     gpus: Vec<GpuMetrics>,
     temperatures: Vec<TemperatureReading>,
     gpu_diagnostics: Vec<GpuDiagnostic>,
@@ -248,6 +258,9 @@ struct MachineMetricsOutput {
     cpu_percent: Option<u8>,
     memory_used_bytes: u64,
     memory_total_bytes: u64,
+    uptime_seconds: Option<u64>,
+    kernel_version: Option<String>,
+    os_version: Option<String>,
     gpus: Vec<GpuMetrics>,
     temperatures: Vec<TemperatureReading>,
     gpu_diagnostics: Vec<GpuDiagnostic>,
@@ -299,6 +312,9 @@ impl Serialize for MachineMetrics {
             cpu_percent: valid_percent(self.cpu_percent),
             memory_used_bytes: self.memory_used_bytes,
             memory_total_bytes: self.memory_total_bytes,
+            uptime_seconds: self.uptime_seconds,
+            kernel_version: bounded_optional(self.kernel_version.clone()),
+            os_version: bounded_optional(self.os_version.clone()),
             gpus,
             temperatures,
             gpu_diagnostics,
@@ -317,6 +333,9 @@ impl<'de> Deserialize<'de> for MachineMetrics {
             cpu_percent: valid_percent(wire.cpu_percent),
             memory_used_bytes: wire.memory_used_bytes,
             memory_total_bytes: wire.memory_total_bytes,
+            uptime_seconds: wire.uptime_seconds,
+            kernel_version: bounded_optional(wire.kernel_version),
+            os_version: bounded_optional(wire.os_version),
             gpus: wire.gpus.into_iter().take(MAX_GPU_DEVICES).collect(),
             temperatures: wire
                 .temperatures
@@ -350,6 +369,8 @@ impl<'de> Deserialize<'de> for MachineMetrics {
 pub struct HardwareSampler {
     system: System,
     components: Components,
+    kernel_version: Option<String>,
+    os_version: Option<String>,
     gpu_sample: GpuSample,
     gpu_sampled_at: Option<Instant>,
 }
@@ -362,6 +383,8 @@ impl Default for HardwareSampler {
         Self {
             system,
             components: Components::new_with_refreshed_list(),
+            kernel_version: bounded_optional(System::kernel_version()),
+            os_version: bounded_optional(System::long_os_version().or_else(System::os_version)),
             gpu_sample: GpuSample::default(),
             gpu_sampled_at: None,
         }
@@ -399,6 +422,9 @@ impl HardwareSampler {
             cpu_percent: finite_percent(self.system.global_cpu_usage()),
             memory_used_bytes: self.system.used_memory(),
             memory_total_bytes: self.system.total_memory(),
+            uptime_seconds: Some(quantized_uptime(System::uptime())),
+            kernel_version: self.kernel_version.clone(),
+            os_version: self.os_version.clone(),
             gpus: self.gpu_sample.gpus.clone(),
             temperatures,
             gpu_diagnostics: self.gpu_sample.diagnostics.clone(),
@@ -526,6 +552,10 @@ fn finite_nonnegative(value: Option<f32>) -> Option<f32> {
 
 fn round_one_decimal(value: f32) -> f32 {
     (value * 10.0).round() / 10.0
+}
+
+fn quantized_uptime(seconds: u64) -> u64 {
+    seconds / UPTIME_SAMPLE_SECONDS * UPTIME_SAMPLE_SECONDS
 }
 
 fn bounded_optional(value: Option<String>) -> Option<String> {
@@ -1850,7 +1880,40 @@ mod tests {
         let metrics: MachineMetrics = serde_json::from_str(json).unwrap();
         assert_eq!(metrics.gpus[0].name, "legacy GPU");
         assert_eq!(metrics.gpus[0].id, "legacy GPU");
+        assert_eq!(metrics.uptime_seconds, None);
+        assert_eq!(metrics.kernel_version, None);
+        assert_eq!(metrics.os_version, None);
         assert!(metrics.gpu_diagnostics.is_empty());
+    }
+
+    #[test]
+    fn machine_system_metrics_round_trip_and_bound_owner_text() {
+        let serialized = serde_json::to_value(MachineMetrics {
+            uptime_seconds: Some(183_840),
+            kernel_version: Some("6.8.0-48-generic".to_owned()),
+            os_version: Some("x".repeat(MAX_TEXT_BYTES + 50)),
+            ..MachineMetrics::default()
+        })
+        .unwrap();
+        assert_eq!(serialized["uptime_seconds"], 183_840);
+        assert_eq!(serialized["kernel_version"], "6.8.0-48-generic");
+        assert_eq!(
+            serialized["os_version"].as_str().unwrap().len(),
+            MAX_TEXT_BYTES
+        );
+
+        let metrics: MachineMetrics = serde_json::from_value(serialized).unwrap();
+        assert_eq!(metrics.uptime_seconds, Some(183_840));
+        assert_eq!(metrics.kernel_version.as_deref(), Some("6.8.0-48-generic"));
+        assert_eq!(metrics.os_version.unwrap().len(), MAX_TEXT_BYTES);
+    }
+
+    #[test]
+    fn sampled_uptime_changes_only_at_minute_boundaries() {
+        assert_eq!(quantized_uptime(0), 0);
+        assert_eq!(quantized_uptime(59), 0);
+        assert_eq!(quantized_uptime(60), 60);
+        assert_eq!(quantized_uptime(183_899), 183_840);
     }
 
     #[test]

@@ -1394,6 +1394,31 @@ function memoryValue(used, total) {
   return `${Number.isFinite(used) && used >= 0 ? formatBytes(used) : "—"} / ${formatBytes(total)}`;
 }
 
+function formatUptime(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "Unavailable";
+  // Owners publish at minute granularity; flooring also keeps mixed-version
+  // payloads stable at the precision shown in the UI.
+  const totalMinutes = Math.floor(seconds / 60);
+  if (totalMinutes < 1) return "<1m";
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const minutes = totalMinutes % 60;
+  const parts = [];
+  if (days) parts.push(`${days}d`);
+  if (hours) parts.push(`${hours}h`);
+  if (minutes) parts.push(`${minutes}m`);
+  return parts.join(" ");
+}
+
+function systemMetricLines(metrics = {}) {
+  const displayText = (value) => typeof value === "string" && value.trim() ? value.trim() : "Unavailable";
+  return [
+    `Uptime · ${formatUptime(metrics.uptime_seconds)}`,
+    `Kernel · ${displayText(metrics.kernel_version)}`,
+    `OS · ${displayText(metrics.os_version)}`,
+  ];
+}
+
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes < 0) return "—";
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -1548,6 +1573,8 @@ if (typeof module !== "undefined" && module.exports) {
     gpuSummary,
     gpuDetailLines,
     gpuDiagnosticLines,
+    formatUptime,
+    systemMetricLines,
     markdownBlocks,
     messageFitsByteLimit,
     moveMessageHistory,
@@ -3387,6 +3414,7 @@ function initialize() {
     const cards = [
       metricCard("CPU", metrics.cpu_percent == null ? "—" : `${metrics.cpu_percent}%`, "Current total utilization"),
       metricCard("Memory", memoryValue(metrics.memory_used_bytes, metrics.memory_total_bytes), "Used / total"),
+      metricListCard("System", systemMetricLines(metrics)),
       gpuMetricCard(metrics.gpus, metrics.gpu_diagnostics),
       metricListCard("Temperatures", temperatureLines(metrics.temperatures)),
     ];

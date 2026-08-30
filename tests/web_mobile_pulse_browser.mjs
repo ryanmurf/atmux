@@ -31,6 +31,8 @@ const fileSaveRequests = [];
 const messageRequests = [];
 const projectFileContents = new Map();
 const projectFileVersions = new Map();
+const LONG_KERNEL_VERSION = "k".repeat(160);
+const LONG_OS_VERSION = "o".repeat(160);
 
 function fixtureProjectFile(paneId) {
   if (!projectFileContents.has(paneId)) {
@@ -99,7 +101,14 @@ function mockApi(url, response, request) {
       mockSession("midnight", "%7", "beta-planner", "waiting"),
       ],
       machines: [
-        { id: "tron", label: "Tron", kind: "local", online: true, sessions: 1 },
+        {
+          id: "tron", label: "Tron", kind: "local", online: true, sessions: 1,
+          metrics: {
+            uptime_seconds: 183_840,
+            kernel_version: LONG_KERNEL_VERSION,
+            os_version: LONG_OS_VERSION,
+          },
+        },
         { id: "midnight", label: "Midnight", kind: "remote", online: true, sessions: 2 },
       ],
       health: null,
@@ -716,6 +725,55 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       true,
     );
     await cdp.evaluate("document.querySelector('#launch-dialog .dialog-cancel').click(); true");
+
+    // Machine details expose owner-sampled system identity without inventing a
+    // coordinator Home machine. Values are rendered as text, not owner markup.
+    await cdp.evaluate("document.getElementById('mobile-back').click(); true");
+    await waitFor(
+      () => cdp.evaluate("!document.body.classList.contains('has-selection')"),
+      "agent menu did not open for machine telemetry",
+    );
+    const machineLabels = await cdp.evaluate(
+      "[...document.querySelectorAll('.machine-label')].map((node) => node.textContent)",
+    );
+    assert.deepEqual(machineLabels, ["Tron", "Midnight"]);
+    await cdp.evaluate(`(() => {
+      [...document.querySelectorAll('.machine-header')]
+        .find((node) => node.querySelector('.machine-label')?.textContent === 'Tron')
+        .click();
+      return true;
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("!document.getElementById('machine-view').hidden"),
+      "machine detail did not open",
+    );
+    const systemCard = await cdp.evaluate(`(() => {
+      const cards = [...document.querySelectorAll('#machine-metrics .metric-card')];
+      const card = cards.find((node) => node.querySelector('h2')?.textContent === 'System');
+      return {
+        lines: [...card.querySelectorAll('li')].map((node) => node.textContent),
+        injectedMarkup: Boolean(card.querySelector('script, img')),
+        documentOverflow: document.documentElement.scrollWidth - innerWidth,
+        viewOverflow: document.getElementById('machine-view').scrollWidth
+          - document.getElementById('machine-view').clientWidth,
+        cardOverflow: card.scrollWidth - card.clientWidth,
+      };
+    })()`);
+    assert.deepEqual(systemCard.lines, [
+      "Uptime · 2d 3h 4m",
+      `Kernel · ${LONG_KERNEL_VERSION}`,
+      `OS · ${LONG_OS_VERSION}`,
+    ]);
+    assert.equal(systemCard.injectedMarkup, false);
+    assert.ok(systemCard.documentOverflow <= 1, JSON.stringify(systemCard));
+    assert.ok(systemCard.viewOverflow <= 1, JSON.stringify(systemCard));
+    assert.ok(systemCard.cardOverflow <= 1, JSON.stringify(systemCard));
+    await cdp.evaluate("document.getElementById('machine-mobile-back').click(); true");
+    await cdp.evaluate("document.querySelector('.session-button[data-session-id=\"tron~%100\"]').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('agent-name').textContent === 'codex-main'"),
+      "original test agent did not reopen after machine telemetry",
+    );
 
     await cdp.evaluate("document.getElementById('quick-actions-open').click(); true");
     await waitFor(

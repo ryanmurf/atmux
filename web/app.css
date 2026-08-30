@@ -236,12 +236,13 @@ dialog::backdrop { background: #000a; }
 .launch-sessions { min-width: 0; display: grid; gap: 6px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: #0a1115; }
 .launch-sessions .dialog-note { color: var(--muted); }
 .machine-view { height: 100%; overflow: auto; padding: 16px; }
-.metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 22px; }
-.metric-card { min-height: 112px; padding: 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.metrics-grid { min-width: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 22px; }
+.metric-card { min-width: 0; min-height: 112px; padding: 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
 .metric-card h2 { margin: 0 0 12px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .07em; }
 .metric-value { font-size: 24px; font-weight: 750; letter-spacing: -.03em; }
 .metric-sub { margin-top: 5px; color: var(--muted); font-size: 12px; }
-.metric-list { display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; color: var(--muted); font-size: 13px; }
+.metric-list { min-width: 0; display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; color: var(--muted); font-size: 13px; }
+.metric-list li { min-width: 0; overflow-wrap: anywhere; }
 .metric-list strong { color: var(--text); font-weight: 650; }
 .gpu-metric-card { grid-column: span 2; display: grid; align-content: start; gap: 8px; }
 .gpu-metric-card h2 { margin-bottom: 4px; }

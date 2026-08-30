@@ -5528,10 +5528,23 @@ mod tests {
             cpu_percent: Some(42),
             memory_used_bytes: 4,
             memory_total_bytes: 8,
+            uptime_seconds: Some(183_840),
+            kernel_version: Some("6.8.0-48-generic".to_owned()),
+            os_version: Some("Linux (Ubuntu 24.04)".to_owned()),
             ..MachineMetrics::default()
         };
         control.set_machine_metrics("gpu-box", metrics.clone());
         assert_eq!(control.overview().machines[1].metrics, metrics);
+
+        // The browser/API model exposes owner-local system telemetry without a
+        // separate coordinator lookup.
+        let encoded = serde_json::to_value(control.overview()).unwrap();
+        let api_metrics = &encoded["machines"][1]["metrics"];
+        assert_eq!(api_metrics["uptime_seconds"], 183_840);
+        assert_eq!(api_metrics["kernel_version"], "6.8.0-48-generic");
+        assert_eq!(api_metrics["os_version"], "Linux (Ubuntu 24.04)");
+        let decoded: Overview = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.machines[1].metrics, metrics);
 
         control.remove_discovered_machine("gpu-box");
         assert_eq!(control.overview().machines.len(), 1);

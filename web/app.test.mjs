@@ -32,11 +32,13 @@ const {
   duplicateSessionName,
   filterDirectories,
   followsLiveTail,
+  formatUptime,
   formatRelativeTime,
   groupSessionsByMachine,
   gpuSummary,
   gpuDetailLines,
   gpuDiagnosticLines,
+  systemMetricLines,
   harnessesForProfiles,
   highlightCode,
   inlineTokens,
@@ -1520,6 +1522,28 @@ test("formatRelativeTime degrades gracefully across scales and bad input", () =>
   assert.equal(formatRelativeTime(now + 10_000, now), "0s ago");
   assert.equal(formatRelativeTime(undefined, now), "");
   assert.equal(formatRelativeTime(now, undefined), "");
+});
+
+test("system telemetry formats compact uptime and explicit unavailable values", () => {
+  assert.equal(formatUptime(183_840), "2d 3h 4m");
+  assert.equal(formatUptime(183_899), "2d 3h 4m");
+  assert.equal(formatUptime(3_600), "1h");
+  assert.equal(formatUptime(59), "<1m");
+  assert.equal(formatUptime(undefined), "Unavailable");
+  assert.deepEqual(systemMetricLines({
+    uptime_seconds: 183_840,
+    kernel_version: "6.8.0-48-generic",
+    os_version: "Linux (Ubuntu 24.04)",
+  }), [
+    "Uptime · 2d 3h 4m",
+    "Kernel · 6.8.0-48-generic",
+    "OS · Linux (Ubuntu 24.04)",
+  ]);
+  assert.deepEqual(systemMetricLines({}), [
+    "Uptime · Unavailable",
+    "Kernel · Unavailable",
+    "OS · Unavailable",
+  ]);
 });
 
 test("isMachineControllable blocks control only for a known-offline machine", () => {

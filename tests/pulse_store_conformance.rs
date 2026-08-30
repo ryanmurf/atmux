@@ -11,15 +11,14 @@ use std::{
 use atmux::pulse::{
     Account, AccountId, AgentSettings, AlertSubscription, AlertType, CollectionOutcome,
     ContextSession, Fraction, GeminiQuota, Instant, Machine, MachineName, Percent, Profile,
-    ProfileName, PulseConfig, PulseDatabaseConfig, QuotaWindow, QuotaWindowKind, RefreshPolicy,
-    SessionId, TokenGrain, TokenSource, UsageSnapshot, Vendor,
+    ProfileName, QuotaWindow, QuotaWindowKind, RefreshPolicy, SessionId, TokenGrain, TokenSource,
+    UsageSnapshot, Vendor,
     error::PulseErrorKind,
     federation::{FederatedPulseRow, FederatedRecord, PulseOrigin},
     ingest::{
         IngestTokenManager, MAX_ACTIVE_INGEST_TOKENS, PUSH_VERSION, PushBatch, PushEnvelope,
         REPORTER_VERSION,
     },
-    ops::open_doctor_store,
     store::{
         AlertEventInput, AlertReplyInput, ImportProvenance, IngestBatch, IngestLimits,
         IngestReplay, IngestToken, MAX_REPORTER_DESTINATIONS_PER_ACCOUNT, PricingRule,
@@ -31,7 +30,9 @@ use atmux::pulse::{
 };
 
 #[cfg(feature = "pulse-postgres")]
-use atmux::pulse::store::PostgresStore;
+use atmux::pulse::{
+    PulseConfig, PulseDatabaseConfig, ops::open_doctor_store, store::PostgresStore,
+};
 
 #[cfg(feature = "pulse-postgres")]
 static POSTGRES_TEST_LOCK: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>> =
