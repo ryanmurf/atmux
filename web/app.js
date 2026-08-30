@@ -253,33 +253,49 @@ function parseCompositeId(id) {
   return { machine: id.slice(0, index), pane: id.slice(index + 1) };
 }
 
-function sessionMachineId(session) {
-  return session.machine || parseCompositeId(session.id).machine || "local";
+function sessionMachineId(session, localMachineId = "local") {
+  return session.machine || parseCompositeId(session.id).machine || localMachineId;
+}
+
+/// A launch needs both an owner-configured profile and a project root. The
+/// latter is also the capability that makes bounded folder browsing possible.
+function isLaunchCapableMachine(machine) {
+  const profiles = Array.isArray(machine?.profiles) ? machine.profiles : [];
+  const directories = Array.isArray(machine?.directories) ? machine.directories : [];
+  return machine?.online === true
+    && harnessesForProfiles(profiles).length > 0
+    && directories.some(validRememberedLaunchDirectory);
 }
 
 /// Chooses the launch target from the current navigation context when that
-/// machine is online, otherwise preserving the launcher's first-online
-/// fallback. The session may be a federated `machine~pane` id without an
-/// explicit `machine` field during initial route hydration.
-function preferredLaunchMachineId(machines, selectedMachineId, selectedSession) {
+/// owner is online and launch-capable, otherwise using the first owner that is.
+/// A bare pre-federation pane id belongs to the coordinator identified by the
+/// overview, rather than an assumed machine literally named `local`.
+function preferredLaunchMachineId(
+  machines,
+  selectedMachineId,
+  selectedSession,
+  localMachineId = "local",
+) {
   const available = Array.isArray(machines) ? machines : [];
   const contextualId = selectedMachineId
-    || (selectedSession ? sessionMachineId(selectedSession) : null);
+    || (selectedSession ? sessionMachineId(selectedSession, localMachineId) : null);
   const contextual = available.find((machine) => machine?.id === contextualId);
-  if (contextual?.online) return contextual.id;
-  return available.find((machine) => machine?.online)?.id || available[0]?.id || null;
+  if (isLaunchCapableMachine(contextual)) return contextual.id;
+  return available.find(isLaunchCapableMachine)?.id || null;
 }
 
 /// Groups sessions under their owning machine, preserving the server's machine
 /// order (this machine first) and appending any machine the overview omitted.
 function groupSessionsByMachine(sessions, machines) {
   const known = Array.isArray(machines) ? machines : [];
+  const localMachineId = known.find((machine) => machine?.kind === "local")?.id || "local";
   const groups = new Map();
   for (const machine of known) {
     groups.set(machine.id, { machine, sessions: [] });
   }
   for (const session of sortSessions(sessions)) {
-    const id = sessionMachineId(session);
+    const id = sessionMachineId(session, localMachineId);
     if (!groups.has(id)) {
       groups.set(id, { machine: { id, label: id, kind: "remote", online: true }, sessions: [] });
     }
@@ -1528,6 +1544,7 @@ if (typeof module !== "undefined" && module.exports) {
     highlightCode,
     inlineTokens,
     machineStatusLabel,
+    isLaunchCapableMachine,
     gpuSummary,
     gpuDetailLines,
     gpuDiagnosticLines,
@@ -1807,7 +1824,8 @@ function initialize() {
 
   function machineOf(session) {
     if (!session) return null;
-    const id = sessionMachineId(session);
+    const localMachineId = state.machines.find((machine) => machine.kind === "local")?.id || "local";
+    const id = sessionMachineId(session, localMachineId);
     return state.machines.find((machine) => machine.id === id) || null;
   }
 
@@ -5327,15 +5345,25 @@ function initialize() {
     state.launchOptions = options;
     const machines = launchMachines(options);
     $("launch-machine").replaceChildren(...machines.map((machine) =>
-      option(machine.id, machine.online ? machine.label : `${machine.label} (offline)`, !machine.online)));
+      option(
+        machine.id,
+        !machine.online
+          ? `${machine.label} (offline)`
+          : (isLaunchCapableMachine(machine) ? machine.label : `${machine.label} (launch unavailable)`),
+        !isLaunchCapableMachine(machine),
+      )));
     const selectedSession = sourceSession || state.sessions.get(state.selected)
       || (state.selected ? { id: state.selected } : null);
-    $("launch-machine").value = preferredLaunchMachineId(
+    const localMachineId = state.machines.find((machine) => machine.kind === "local")?.id || "local";
+    const preferredMachineId = preferredLaunchMachineId(
       machines,
       state.selectedMachine,
       selectedSession,
+      localMachineId,
     );
-    $("launch-machine-row").hidden = machines.length < 2;
+    $("launch-machine").value = preferredMachineId || "";
+    $("launch-machine").disabled = !preferredMachineId;
+    $("launch-machine-row").hidden = machines.length < 2 && Boolean(preferredMachineId);
     $("launch-directory").value = "";
     $("launch-directory").dataset.selectedDirectory = "";
     clearLaunchSessions();
@@ -5369,18 +5397,23 @@ function initialize() {
 
   function fallbackLaunchMachine() {
     return {
-      id: $("launch-machine").value || "local",
-      directories: state.launchOptions?.directories || [],
-      profiles: state.launchOptions?.profiles || [],
-      project_preferences: state.launchOptions?.project_preferences || {},
-      note: null,
+      id: "",
+      online: false,
+      directories: [],
+      profiles: [],
+      project_preferences: {},
+      note: "No online machine currently has both runnable agent profiles and configured project folders.",
     };
   }
 
   function applyLaunchMachine() {
-    const machines = state.launchOptions?.machines || [];
-    const selected = machines.find((machine) => machine.id === $("launch-machine").value)
-      || fallbackLaunchMachine();
+    const machines = launchMachines(state.launchOptions);
+    const candidate = machines.find((machine) => machine.id === $("launch-machine").value);
+    const selected = isLaunchCapableMachine(candidate) ? candidate : fallbackLaunchMachine();
+    const available = isLaunchCapableMachine(selected);
+    for (const id of [
+      "launch-directory", "launch-browse", "launch-harness", "launch-profile", "launch-mode", "launch-name",
+    ]) $(id).disabled = !available;
     $("launch-directory").value = "";
     $("launch-directory").dataset.selectedDirectory = "";
     state.launchNamePristine = true;
@@ -5390,9 +5423,9 @@ function initialize() {
   }
 
   function currentLaunchMachine() {
-    const machines = state.launchOptions?.machines || [];
-    return machines.find((machine) => machine.id === $("launch-machine").value)
-      || fallbackLaunchMachine();
+    const machines = launchMachines(state.launchOptions);
+    const selected = machines.find((machine) => machine.id === $("launch-machine").value);
+    return isLaunchCapableMachine(selected) ? selected : fallbackLaunchMachine();
   }
 
   function renderLaunchDirectories(selected = currentLaunchMachine()) {
@@ -5497,7 +5530,7 @@ function initialize() {
   ) {
     const profiles = profilesForHarness(selected.profiles, $("launch-harness").value);
     const button = $("launch-form").querySelector("button[type=submit]");
-    button.disabled = !directory || !profiles.length;
+    button.disabled = !isLaunchCapableMachine(selected) || !directory || !profiles.length;
     const note = $("launch-note");
     const listed = availableLaunchDirectories(selected, state.rememberedLaunchDirectories)
       .includes(directory);

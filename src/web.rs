@@ -2870,6 +2870,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn coordinator_only_api_and_sse_never_present_home_as_an_owner() {
+        let mut config = Config::default();
+        config.node.id = "home".to_owned();
+        config.node.label = Some("Home".to_owned());
+        config.node.coordinator_only = true;
+        config.profiles.clear();
+        config.general.project_roots.clear();
+        config.general.favorite_dirs.clear();
+        config.general.switch_on_launch = false;
+        let control = crate::control::test_control_with_config(&["tron"], config);
+        let (app, _shutdown) = real_app(control);
+
+        let health = app
+            .clone()
+            .oneshot(api("GET", "/api/v1/health", None))
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        let health = axum::body::to_bytes(health.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&health).unwrap()["ok"],
+            true
+        );
+
+        for (uri, machine_path) in [
+            ("/api/v1/sessions", Some("machines")),
+            ("/api/v1/machines", None),
+            ("/api/v1/launch-options", Some("machines")),
+        ] {
+            let response = app.clone().oneshot(api("GET", uri, None)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), MAX_REQUEST_BODY_BYTES)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let machines = machine_path.map_or(&value, |field| &value[field]);
+            assert_eq!(machines.as_array().unwrap().len(), 1, "{uri}: {value}");
+            assert_eq!(machines[0]["id"], "tron", "{uri}: {value}");
+            assert!(!body.windows(4).any(|window| window == b"home"), "{uri}");
+            if uri == "/api/v1/launch-options" {
+                assert_eq!(value["directories"], serde_json::json!([]));
+                assert_eq!(value["profiles"], serde_json::json!([]));
+            }
+        }
+
+        let events = app
+            .clone()
+            .oneshot(api("GET", "/api/v1/events", None))
+            .await
+            .unwrap();
+        let snapshot = read_events(events, 1, Duration::from_millis(200)).await;
+        assert!(snapshot.contains("\"id\":\"tron\""), "{snapshot}");
+        assert!(!snapshot.contains("\"id\":\"home\""), "{snapshot}");
+
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/sessions",
+                Some(r#"{"name":"x","directory":"/tmp","profile_id":"profile-0"}"#),
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/home~%251/messages",
+                Some(r#"{"text":"hello","submit":true}"#),
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
     async fn read_events(response: Response, limit: usize, budget: Duration) -> String {
         use http_body_util::BodyExt;
 

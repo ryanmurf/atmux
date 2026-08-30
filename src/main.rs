@@ -31,6 +31,12 @@ enum Commands {
     },
     /// Print the active configuration path.
     ConfigPath,
+    /// Internal fail-closed bridge for fixed recovery scripts.
+    #[command(hide = true)]
+    ScopedExec {
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
     /// Check tmux, configuration, folders, and launcher profiles.
     Doctor,
     /// Run the streaming web dashboard and stateless MCP server.
@@ -123,6 +129,9 @@ async fn main() -> Result<()> {
             println!("{}", config_path.display());
             return Ok(());
         }
+        Some(Commands::ScopedExec { command }) => {
+            return Tmux::scoped_exec(&config_path, command);
+        }
         Some(Commands::Doctor) => return doctor(&config_path),
         Some(Commands::Web {
             bind,
@@ -151,6 +160,12 @@ fn doctor(config_path: &std::path::Path) -> Result<()> {
     println!("✓ tmux       available");
     let (config, path) = Config::load(Some(config_path))?;
     println!("✓ config     {}", path.display());
+    match Tmux::check_agent_resources(&config.agent_resources)? {
+        Some(memory_max_bytes) => println!(
+            "✓ MemoryMax  {memory_max_bytes} bytes (systemd user-scope probe passed and was collected)"
+        ),
+        None => println!("- MemoryMax  disabled for agent scopes"),
+    }
     let folders = config.directories();
     println!("✓ folders    {} discovered", folders.len());
     let harnesses = config.harnesses();
@@ -472,6 +487,51 @@ fn run(mut app: App) -> Result<()> {
 
 struct TerminalSession {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use clap::CommandFactory as _;
+
+    use super::*;
+
+    #[test]
+    fn scoped_exec_preserves_every_trailing_argument() {
+        let cli = Cli::try_parse_from([
+            "atmux",
+            "--config",
+            "/tmp/atmux.toml",
+            "scoped-exec",
+            "--",
+            "/usr/bin/printf",
+            "$FOO",
+            "${FOO}",
+            "$$",
+            "quoted value",
+            "--not-an-atmux-option",
+        ])
+        .unwrap();
+        let Some(Commands::ScopedExec { command }) = cli.command else {
+            panic!("expected scoped-exec");
+        };
+        assert_eq!(
+            command,
+            [
+                "/usr/bin/printf",
+                "$FOO",
+                "${FOO}",
+                "$$",
+                "quoted value",
+                "--not-an-atmux-option",
+            ]
+        );
+    }
+
+    #[test]
+    fn scoped_exec_is_hidden_from_operator_help() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("scoped-exec"));
+    }
 }
 
 impl TerminalSession {

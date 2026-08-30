@@ -32,6 +32,7 @@ assert_unique_top_level_keys() {
 }
 
 "$helm_bin" lint "$chart"
+grep -Eq '^version: 0\.4\.1$' "$chart/Chart.yaml"
 "$helm_bin" template atmux-web "$chart" --namespace murphytek >"$work/default.yaml"
 assert_unique_top_level_keys "$work/default.yaml"
 
@@ -56,6 +57,24 @@ test "$(grep -Ec '^kind: NetworkPolicy$' "$work/default.yaml")" -eq 1
 "$helm_bin" template atmux-web "$chart" --namespace murphytek \
   "${enabled_values[@]}" >"$work/enabled.yaml"
 assert_unique_top_level_keys "$work/enabled.yaml"
+
+# The rollout checksum must follow the rendered TOML itself, including a
+# template-only change made with identical release values.
+mutated_chart="$work/chart-template-change"
+cp -R "$chart" "$mutated_chart"
+sed -i 's/coordinator_only = true/coordinator_only = false/' \
+  "$mutated_chart/templates/_helpers.tpl"
+"$helm_bin" template atmux-web "$mutated_chart" --namespace murphytek \
+  "${enabled_values[@]}" >"$work/template-change.yaml"
+baseline_checksum="$(sed -n 's/.*checksum\/server-config: "\([a-f0-9]\{64\}\)".*/\1/p' "$work/enabled.yaml")"
+changed_checksum="$(sed -n 's/.*checksum\/server-config: "\([a-f0-9]\{64\}\)".*/\1/p' "$work/template-change.yaml")"
+test -n "$baseline_checksum"
+test -n "$changed_checksum"
+if test "$baseline_checksum" = "$changed_checksum"; then
+  echo "server config checksum ignored a template-only TOML change" >&2
+  exit 1
+fi
+grep -Fq 'coordinator_only = false' "$work/template-change.yaml"
 
 test "$(grep -Ec '^kind: Ingress$' "$work/enabled.yaml")" -eq 1
 test "$(grep -Ec '^kind: PersistentVolumeClaim$' "$work/enabled.yaml")" -eq 1
@@ -100,6 +119,7 @@ grep -Fq 'name: atmux-server-config' "$work/enabled.yaml"
 grep -Fq 'project_roots = []' "$work/enabled.yaml"
 grep -Fq 'switch_on_launch = false' "$work/enabled.yaml"
 grep -Fq 'id = "home"' "$work/enabled.yaml"
+grep -Fq 'coordinator_only = true' "$work/enabled.yaml"
 grep -Fq 'cert_file = "/etc/atmux/tls/tls.crt"' "$work/enabled.yaml"
 grep -Fq 'allow_unauthenticated_loopback = false' "$work/enabled.yaml"
 grep -Fq 'proxy_token_file = "/etc/atmux/proxy-token/token"' "$work/enabled.yaml"

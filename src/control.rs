@@ -38,6 +38,7 @@ use crate::{
     recovery::{RecoveryRunner, RecoveryStartError, RecoveryStatus},
     remote::{self, RemoteMachine, encode_segment},
     status::{AgentKind, AgentStatus},
+    systemd_scope,
     tmux::{RESERVED_SERVICE_SESSION, Session, Tmux, UnsupportedModelControl, known_models},
     transcript::Transcript,
     workspace::{FileWriteRequest, FilesResponse, GitResponse, WorkspaceErrorKind},
@@ -185,6 +186,12 @@ pub struct SessionSummary {
     /// Safe, abbreviated tmux start command for the session detail header.
     #[serde(default)]
     pub launch_command: String,
+    /// Owner-reported transient systemd scope for this process generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub systemd_scope: Option<String>,
+    /// Owner-reported scope `MemoryMax` in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_max_bytes: Option<u64>,
     pub windows: u32,
     pub window_index: u32,
     pub pane_index: u32,
@@ -207,6 +214,8 @@ impl SessionSummary {
             title: session.title.clone(),
             command: session.command.clone(),
             launch_command: session.launch_command.clone(),
+            systemd_scope: session.systemd_scope.clone(),
+            memory_max_bytes: session.memory_max_bytes,
             windows: session.windows,
             window_index: session.window_index,
             pane_index: session.pane_index,
@@ -712,7 +721,10 @@ impl ControlPlane {
     ///
     /// Returns an error when tmux is unavailable or the initial scan fails.
     pub async fn start(config: Config) -> Result<Self> {
-        Tmux::check()?;
+        config.validate_coordinator_only()?;
+        if !config.node.coordinator_only {
+            Tmux::check()?;
+        }
         config.validate_federation()?;
         config.validate_auto_compact()?;
         config.maintenance.validate()?;
@@ -773,10 +785,12 @@ impl ControlPlane {
                 local_claude_resume_attempts: AtomicU64::new(0),
             }),
         };
-        control.refresh().await?;
-        control.spawn_monitor();
-        control.spawn_auto_compact();
-        control.spawn_maintenance();
+        if !control.inner.config.node.coordinator_only {
+            control.refresh().await?;
+            control.spawn_monitor();
+            control.spawn_auto_compact();
+            control.spawn_maintenance();
+        }
         for machine in control.remote_machines() {
             control.start_watcher(machine);
         }
@@ -791,6 +805,7 @@ impl ControlPlane {
     /// owner-scoped status request.
     pub async fn recovery_status(&self, machine: &str) -> Result<RecoveryStatus> {
         if machine == self.inner.local_id {
+            self.ensure_local_owner_enabled()?;
             return Ok(self.inner.recovery.status().await);
         }
         let remote = self.remote_machine(machine)?;
@@ -812,6 +827,7 @@ impl ControlPlane {
     /// when the owning machine is unknown, offline, or rejects the request.
     pub async fn start_recovery(&self, machine: &str) -> Result<RecoveryStatus> {
         if machine == self.inner.local_id {
+            self.ensure_local_owner_enabled()?;
             return self
                 .inner
                 .recovery
@@ -961,7 +977,7 @@ impl ControlPlane {
     /// Whether an id names this coordinator or one of its configured machines.
     #[must_use]
     pub fn has_machine(&self, machine: &str) -> bool {
-        machine == self.inner.local_id
+        (machine == self.inner.local_id && !self.inner.config.node.coordinator_only)
             || self
                 .inner
                 .machines
@@ -1528,6 +1544,24 @@ impl ControlPlane {
                             remaining.push(plan);
                             continue;
                         }
+                        // A configured cgroup policy must be usable before
+                        // the durable at-most-once claim. If the user manager
+                        // is temporarily unavailable, retain the plan so a
+                        // later maintenance pass can retry without ever
+                        // launching an unbounded replacement.
+                        let scope = match systemd_scope::prepare(
+                            &self.inner.config.agent_resources,
+                            &pane_id,
+                        ) {
+                            Ok(scope) => scope,
+                            Err(error) => {
+                                eprintln!(
+                                    "atmux CLI update scope preflight for {pane_id} failed: {error:#}"
+                                );
+                                remaining.push(plan);
+                                continue;
+                            }
+                        };
                         attempts += 1;
                         let claimed = PendingMarker {
                             harness,
@@ -1559,6 +1593,7 @@ impl ControlPlane {
                             &profile,
                             &mode,
                             &exact_target,
+                            scope,
                         ) {
                             Ok(()) => {
                                 let _ = Tmux::clear_cli_update_marker(&pane_id);
@@ -1677,6 +1712,9 @@ impl ControlPlane {
     }
 
     pub(crate) fn apply_refresh(&self, sessions: Vec<Session>) -> bool {
+        if self.inner.config.node.coordinator_only {
+            return false;
+        }
         self.inner
             .resume_leases
             .lock()
@@ -1701,6 +1739,9 @@ impl ControlPlane {
     }
 
     fn record_health_error(&self, message: String) {
+        if self.inner.config.node.coordinator_only {
+            return;
+        }
         let mut state = self
             .inner
             .state
@@ -1714,6 +1755,9 @@ impl ControlPlane {
     }
 
     fn apply_local_metrics(&self, metrics: MachineMetrics) {
+        if self.inner.config.node.coordinator_only {
+            return;
+        }
         let mut state = self.write_state();
         if state.metrics != metrics {
             state.metrics = metrics;
@@ -1744,28 +1788,28 @@ impl ControlPlane {
     #[must_use]
     pub fn overview(&self) -> Overview {
         let state = self.read_state();
-        let mut sessions = state
-            .sessions
-            .iter()
-            .map(|session| {
+        let mut sessions = Vec::new();
+        let mut machines = Vec::new();
+        if !self.inner.config.node.coordinator_only {
+            sessions.extend(state.sessions.iter().map(|session| {
                 SessionSummary::from_local(
                     &self.inner.local_id,
                     self.local_identity(&session.pane_id),
                     session,
                 )
-            })
-            .collect::<Vec<_>>();
-        let mut machines = vec![MachineSummary {
-            id: self.inner.local_id.clone(),
-            label: self.inner.local_label.clone(),
-            kind: MachineKind::Local,
-            online: state.health.is_none(),
-            sessions: sessions.len(),
-            health: state.health.clone(),
-            last_seen_ms: None,
-            address: None,
-            metrics: state.metrics.clone(),
-        }];
+            }));
+            machines.push(MachineSummary {
+                id: self.inner.local_id.clone(),
+                label: self.inner.local_label.clone(),
+                kind: MachineKind::Local,
+                online: state.health.is_none(),
+                sessions: sessions.len(),
+                health: state.health.clone(),
+                last_seen_ms: None,
+                address: None,
+                metrics: state.metrics.clone(),
+            });
+        }
         for machine in self.remote_machines() {
             let remote = state.remotes.get(&machine.id);
             let mirrored = remote
@@ -1788,7 +1832,9 @@ impl ControlPlane {
         Overview {
             revision: state.revision,
             sessions,
-            health: state.health.clone(),
+            health: (!self.inner.config.node.coordinator_only)
+                .then(|| state.health.clone())
+                .flatten(),
             machines,
         }
     }
@@ -2308,34 +2354,44 @@ impl ControlPlane {
 
     #[must_use]
     pub fn launch_options(&self) -> LaunchOptions {
-        let directory_paths = self.inner.config.directories();
+        let directory_paths = if self.inner.config.node.coordinator_only {
+            Vec::new()
+        } else {
+            self.inner.config.directories()
+        };
         let directories = directory_paths
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         let project_preferences = project_preferences(&directory_paths);
-        let profiles = self
-            .inner
-            .config
-            .profiles
-            .iter()
-            .enumerate()
-            .map(|(index, profile)| ProfileOption {
-                id: format!("profile-{index}"),
-                name: profile.name.clone(),
-                harness: profile.harness.clone(),
-                modes: profile.modes.iter().map(profile_mode_option).collect(),
-            })
-            .collect::<Vec<_>>();
-        let mut machines = vec![MachineLaunchOptions {
-            id: self.inner.local_id.clone(),
-            label: self.inner.local_label.clone(),
-            online: true,
-            directories: directories.clone(),
-            profiles: profiles.clone(),
-            project_preferences: project_preferences.clone(),
-            note: None,
-        }];
+        let profiles = if self.inner.config.node.coordinator_only {
+            Vec::new()
+        } else {
+            self.inner
+                .config
+                .profiles
+                .iter()
+                .enumerate()
+                .map(|(index, profile)| ProfileOption {
+                    id: format!("profile-{index}"),
+                    name: profile.name.clone(),
+                    harness: profile.harness.clone(),
+                    modes: profile.modes.iter().map(profile_mode_option).collect(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut machines = Vec::new();
+        if !self.inner.config.node.coordinator_only {
+            machines.push(MachineLaunchOptions {
+                id: self.inner.local_id.clone(),
+                label: self.inner.local_label.clone(),
+                online: true,
+                directories: directories.clone(),
+                profiles: profiles.clone(),
+                project_preferences: project_preferences.clone(),
+                note: None,
+            });
+        }
         let state = self.read_state();
         for machine in self.remote_machines() {
             let remote = state.remotes.get(&machine.id);
@@ -2398,6 +2454,8 @@ impl ControlPlane {
                 .map_err(|error| upstream(&error));
         }
 
+        self.ensure_local_owner_enabled()?;
+
         let config = self.inner.config.clone();
         let machine = self.inner.local_id.clone();
         let path = path.map(str::to_owned);
@@ -2437,6 +2495,7 @@ impl ControlPlane {
                 .await
                 .map_err(|error| upstream(&error));
         }
+        self.ensure_local_owner_enabled()?;
         if directory.is_empty()
             || directory.len() > MAX_BROWSE_PATH_BYTES
             || directory.chars().any(char::is_control)
@@ -2661,6 +2720,7 @@ impl ControlPlane {
                 let expected_generation = prompt_lock.generation.load(Ordering::Acquire);
                 let status = self.inner.config.status.clone();
                 let capture_lines = self.inner.config.general.preview_lines;
+                let resources = self.inner.config.agent_resources;
                 local_claude_resume(
                     tokio::task::spawn_blocking(move || {
                         let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
@@ -2675,15 +2735,17 @@ impl ControlPlane {
                             )
                             .into());
                         }
+                        let scope = systemd_scope::prepare(&resources, &pane_id)?;
                         begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
                         let (session, resume, claude_program) =
                             fresh_claude_resume_target(&pane_id, &status, capture_lines)?;
-                        Tmux.resume_claude(
+                        Tmux::resume_claude(
                             &pane_id,
                             &session.path,
                             &claude_program,
                             &resume.config_dir,
                             &resume.session_id,
+                            scope,
                         )?;
                         Ok(())
                     })
@@ -2922,6 +2984,7 @@ impl ControlPlane {
                 .await
                 .map_err(|error| upstream(&error));
         }
+        self.ensure_local_owner_enabled()?;
         if self
             .read_state()
             .sessions
@@ -2961,10 +3024,12 @@ impl ControlPlane {
             None => None,
         };
         let name = request.name;
+        let resources = self.inner.config.agent_resources;
         let launch_lease = resume_lease.clone();
         let launched = local_tmux(
             tokio::task::spawn_blocking(move || {
                 let launched = (|| {
+                    let scope = systemd_scope::prepare(&resources, &name)?;
                     project::remember_launch(&directory, &name, &profile)?;
                     match (resume.as_ref(), launch_lease.as_deref()) {
                         (Some(candidate), Some(lease)) => Tmux::launch_resumed(
@@ -2974,8 +3039,11 @@ impl ControlPlane {
                             mode.as_ref(),
                             candidate,
                             lease,
+                            scope,
                         ),
-                        (None, None) => Tmux.launch(&name, &directory, &profile, mode.as_ref()),
+                        (None, None) => {
+                            Tmux::launch(&name, &directory, &profile, mode.as_ref(), scope)
+                        }
                         _ => Err(anyhow::anyhow!(
                             "saved-conversation launch invariant was violated"
                         )),
@@ -3152,6 +3220,16 @@ impl ControlPlane {
             })
     }
 
+    fn ensure_local_owner_enabled(&self) -> Result<()> {
+        if self.inner.config.node.coordinator_only {
+            return Err(bad_request(format!(
+                "machine {} is a coordinator-only node and has no local owner capabilities",
+                self.inner.local_id
+            )));
+        }
+        Ok(())
+    }
+
     fn resolve(&self, id: &str) -> Result<Target> {
         self.find_target(id)?
             .ok_or_else(|| not_found(format!("no agent session matches {id}")))
@@ -3165,6 +3243,11 @@ impl ControlPlane {
     /// scope a bare id to one machine build a composite id with
     /// [`ControlPlane::reference`] first.
     fn find_target(&self, id: &str) -> Result<Option<Target>> {
+        if self.inner.config.node.coordinator_only
+            && split_composite(id).is_some_and(|(machine, _)| machine == self.inner.local_id)
+        {
+            self.ensure_local_owner_enabled()?;
+        }
         let (scope, bare) = match split_composite(id) {
             Some((machine, pane)) if self.has_machine(machine) => (Some(machine), pane),
             _ => (None, id),
@@ -3699,6 +3782,8 @@ fn observable_session_equal(left: &Session, right: &Session) -> bool {
         && left.path == right.path
         && left.command == right.command
         && left.launch_command == right.launch_command
+        && left.systemd_scope == right.systemd_scope
+        && left.memory_max_bytes == right.memory_max_bytes
         && left.windows == right.windows
         && left.window_index == right.window_index
         && left.pane_index == right.pane_index
@@ -3731,6 +3816,8 @@ fn observable_summary_equal(left: &SessionSummary, right: &SessionSummary) -> bo
         && left.path == right.path
         && left.command == right.command
         && left.launch_command == right.launch_command
+        && left.systemd_scope == right.systemd_scope
+        && left.memory_max_bytes == right.memory_max_bytes
         && left.windows == right.windows
         && left.window_index == right.window_index
         && left.pane_index == right.pane_index
@@ -4148,6 +4235,8 @@ pub(crate) fn test_control(machines: &[&str]) -> ControlPlane {
 
 #[cfg(test)]
 pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> ControlPlane {
+    let local_id = config.node.id.clone();
+    let local_label = config.node_label();
     let remotes = machines
         .iter()
         .map(|id| {
@@ -4181,8 +4270,8 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
     ControlPlane {
         inner: Arc::new(Inner {
             config,
-            local_id: crate::machine::LOCAL_MACHINE_ID.to_owned(),
-            local_label: "This machine".to_owned(),
+            local_id: local_id.clone(),
+            local_label,
             bare_local_ids: handles.is_empty(),
             configured_machine_ids: handles.keys().cloned().collect(),
             machines: RwLock::new(handles),
@@ -4203,7 +4292,7 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
             resume_leases: Mutex::new(ResumeLeaseState::default()),
             revisions,
             refresh_now: Notify::new(),
-            recovery: RecoveryRunner::production(crate::machine::LOCAL_MACHINE_ID),
+            recovery: RecoveryRunner::production(&local_id),
             deny_local_claude_resume: true,
             local_claude_resume_attempts: AtomicU64::new(0),
         }),
@@ -4238,6 +4327,8 @@ pub(crate) fn test_session(name: &str, pane_id: &str, content: &str) -> Session 
         agent: crate::status::AgentKind::Codex,
         profile: "Default".to_owned(),
         resume_lease: None,
+        systemd_scope: None,
+        memory_max_bytes: None,
         status: crate::status::AgentStatus::Working,
     }
 }
@@ -4265,6 +4356,8 @@ mod tests {
             title: "title".to_owned(),
             command: "codex".to_owned(),
             launch_command: "codex".to_owned(),
+            systemd_scope: None,
+            memory_max_bytes: None,
             windows: 1,
             window_index: 0,
             pane_index: 0,
@@ -4326,6 +4419,8 @@ mod tests {
             agent: AgentKind::Codex,
             profile: "Default".to_owned(),
             resume_lease: None,
+            systemd_scope: None,
+            memory_max_bytes: None,
             status: AgentStatus::Working,
         }
     }
@@ -4338,12 +4433,52 @@ mod tests {
         hasher.finish()
     }
 
+    #[test]
+    fn scope_metadata_is_observable_and_reported_without_breaking_old_payloads() {
+        let unmanaged = session("ready");
+        let mut managed = unmanaged.clone();
+        managed.systemd_scope = Some("atmux-tmux-spawn-1-2-0123456789abcdef.scope".to_owned());
+        managed.memory_max_bytes = Some(34_359_738_368);
+        assert!(!observable_session_equal(&unmanaged, &managed));
+
+        let summary = SessionSummary::from_local(LOCAL_MACHINE_ID, "%1".to_owned(), &managed);
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            json["systemd_scope"],
+            "atmux-tmux-spawn-1-2-0123456789abcdef.scope"
+        );
+        assert_eq!(json["memory_max_bytes"], 34_359_738_368_u64);
+
+        let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("systemd_scope");
+        legacy.as_object_mut().unwrap().remove("memory_max_bytes");
+        let decoded: SessionSummary = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.systemd_scope, None);
+        assert_eq!(decoded.memory_max_bytes, None);
+    }
+
     fn local_control() -> ControlPlane {
         control_with_machines(&[])
     }
 
     fn control_with_machines(machines: &[&str]) -> ControlPlane {
         super::test_control(machines)
+    }
+
+    fn coordinator_only_config() -> Config {
+        let mut config = Config::default();
+        config.node.id = "home".to_owned();
+        config.node.label = Some("Home".to_owned());
+        config.node.coordinator_only = true;
+        config.profiles.clear();
+        config.general.project_roots.clear();
+        config.general.favorite_dirs.clear();
+        config.general.switch_on_launch = false;
+        config
+    }
+
+    fn coordinator_only_control(machines: &[&str]) -> ControlPlane {
+        super::test_control_with_config(machines, coordinator_only_config())
     }
 
     #[test]
@@ -4397,6 +4532,8 @@ mod tests {
             title: name.to_owned(),
             command: "claude".to_owned(),
             launch_command: "claude".to_owned(),
+            systemd_scope: None,
+            memory_max_bytes: None,
             windows: 1,
             window_index: 0,
             pane_index: 0,
@@ -5001,6 +5138,68 @@ mod tests {
         assert_eq!(options.machines[1].directories, ["/srv/models"]);
         assert_eq!(options.machines[1].profiles[0].harness, "claude");
         assert!(options.machines[1].note.is_none());
+    }
+
+    #[tokio::test]
+    async fn coordinator_only_omits_and_rejects_every_local_owner_surface() {
+        let control = coordinator_only_control(&["tron"]);
+        assert!(!control.apply_refresh(vec![session("must stay hidden")]));
+        control.apply_machine_sessions(
+            "tron",
+            vec![remote_summary("tron", "%4", "remote-agent", "aaaa")],
+            None,
+        );
+
+        let overview = control.overview();
+        assert_eq!(overview.machines.len(), 1);
+        assert_eq!(overview.machines[0].id, "tron");
+        assert_eq!(overview.sessions.len(), 1);
+        assert_eq!(overview.sessions[0].machine, "tron");
+        assert!(overview.health.is_none());
+        assert!(!control.has_machine("home"));
+        assert!(control.has_machine("tron"));
+        assert_eq!(control.machine_revision("home"), None);
+
+        let options = control.launch_options();
+        assert!(options.directories.is_empty());
+        assert!(options.profiles.is_empty());
+        assert_eq!(options.machines.len(), 1);
+        assert_eq!(options.machines[0].id, "tron");
+
+        let launch = control
+            .launch(LaunchRequest {
+                name: "local-agent".to_owned(),
+                directory: "/tmp".to_owned(),
+                profile_id: "profile-0".to_owned(),
+                mode_id: None,
+                machine: None,
+                resume_session_id: None,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(launch.contains("coordinator-only"), "{launch}");
+
+        let mutation = control
+            .send_text("home~%1", "hello".to_owned(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(mutation.contains("coordinator-only"), "{mutation}");
+        assert!(control.reference("%1", Some("home")).is_err());
+        assert!(control.recovery_status("home").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn coordinator_only_start_succeeds_without_initializing_a_local_owner() {
+        let control = ControlPlane::start(coordinator_only_config())
+            .await
+            .unwrap();
+        assert_eq!(control.local_id(), "home");
+        assert!(control.overview().machines.is_empty());
+        assert!(control.overview().sessions.is_empty());
+        assert!(control.overview().health.is_none());
+        assert!(!control.has_machine("home"));
     }
 
     #[tokio::test]

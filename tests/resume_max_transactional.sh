@@ -14,6 +14,13 @@ printf '%s\n' test-boot >"$ATMUX_MAX_BOOT_ID_FILE"
 # shellcheck disable=SC1091
 source "$repo_root/deploy/systemd/resume-max-at-boot"
 
+for command in "${max_resume_commands[@]}"; do
+  [[ $command == "exec /home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec -- "* ]] || {
+    printf 'Max recovery command bypasses scoped-exec: %s\n' "$command" >&2
+    exit 1
+  }
+done
+
 max_resume_tmux() { "$repo_root/tests/fixtures/max_recovery_tmux.sh" "$@"; }
 max_resume_validate_roster() { return 0; }
 fake_now=0

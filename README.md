@@ -105,6 +105,60 @@ is cleared only after the same native session reports a context value back at
 or below the threshold, preventing duplicate compactions across polls and
 coordinators.
 
+### Per-agent memory isolation
+
+Linux owner nodes can place every newly launched agent process tree in its own
+transient systemd user scope with a cgroup `MemoryMax`:
+
+```toml
+[agent_resources]
+memory_max_bytes = 34359738368 # 32 GiB; example only, size per host
+```
+
+This policy is deliberately disabled when the key is absent. When configured,
+atmux runs a bounded property preflight and fails the launch before starting an
+agent if `/usr/bin/systemd-run`, the systemd user manager, cgroup v2 memory
+controller, or `MemoryMax` is unavailable. The supported minimum is systemd
+236 (`--collect`); no newer expansion-control option is required. atmux derives
+the user bus only from the effective uid, validates the owner-private
+`/run/user/<uid>` directory and owner socket, and supplies that same fixed bus
+environment to both the preflight and pane command. It does not trust bus
+variables inherited by the service or tmux server. Enabling the policy on
+macOS or another non-Linux host is also an error.
+
+Zero, systemd's `u64::MAX` infinity sentinel, and a limit at or above the
+smaller of host `MemTotal` and any inherited cgroup-v2 `memory.max` are
+rejected: a configured value must be a real per-worker cap. `atmux doctor`
+performs the same bounded, collected probe and prints the configured byte
+limit. Each normal launch, saved-conversation launch, explicit Claude resume,
+maintenance relaunch, and checked-in recovery path receives a unique
+`atmux-tmux-spawn-*.scope`; the foreground scope runner preserves the pane's
+terminal I/O while the whole descendant process tree shares the limit.
+
+The exact scope name and byte limit are retained in tmux pane metadata and
+reported in session API summaries. `systemctl --user show <scope> -p
+MemoryMax -p MemoryCurrent` can inspect a live worker. Scope arguments are
+fixed argv. Every literal `$` in an agent argument is doubled using systemd's
+documented portable `$$` escape, so `$FOO`, `${FOO}`, `$$`, spaces, and quotes
+reach the agent literally even on releases predating
+`--expand-environment=no`. The argv is shell-quoted only for tmux's required
+command-string transport.
+
+The hidden `atmux scoped-exec -- <command>...` bridge is reserved for the
+owner-validated Quick Resume/boot scripts. It reloads the active configuration,
+requires memory isolation to be enabled, preflights once, records scope
+metadata on `TMUX_PANE`, and then replaces itself with the exact scope argv.
+Tron's live `/home/ryan/resume-tron.sh` must replace its raw `send()` function
+with `deploy/systemd/resume-tron-scoped-exec-block.bash` before Quick Resume is
+available; atmux rejects the old script shape. Max's checked-in boot recovery
+already uses the bridge for every roster entry. There is no unbounded recovery
+fallback.
+
+Choose a limit below host capacity but above the largest legitimate native or
+GPU build, leaving memory for the OS, tmux, atmux, caches, and other workers.
+Roll it out on one Linux owner at a time after verifying its user manager and
+cgroup delegation. Keep this setting absent on Midnight/macOS.
+
 ### Owner-local CLI maintenance
 
 Each owner can check its native Claude and Codex installations every 30
@@ -301,6 +355,46 @@ One `atmux web` process can act as a **coordinator** that aggregates the live st
 machines running `atmux web` as **nodes**. Nothing is copied or synchronized: the coordinator
 subscribes to each node's existing change-only event stream and forwards commands back to the
 machine that owns the session. tmux processes never leave the machine they run on.
+
+For a coordinator that must never act as an owner machine (for example, the
+Kubernetes deployment), enable the explicit fail-closed mode:
+
+```toml
+profiles = []
+
+[general]
+project_roots = []
+favorite_dirs = []
+switch_on_launch = false
+
+[node]
+id = "home"
+label = "Home"
+coordinator_only = true
+
+[discovery]
+enabled = false
+
+[auto_compact]
+enabled = false
+
+[maintenance]
+enabled = false
+
+[pulse]
+collect = false
+serve = true
+receive = false
+```
+
+In this mode the node id still identifies Pulse and the federation client, but
+the coordinator does not open tmux or sample local hardware. Its machine,
+sessions, metrics, launch inputs, and local mutation targets are absent from
+REST, SSE, and MCP. Startup rejects local profiles, project/favorite roots,
+discovery, maintenance, auto-compaction, Pulse collection/receive/push, or
+owner-local agent resource limits or Pulse credential references. Omitting
+`coordinator_only` preserves the existing default (`false`) and all host
+behavior.
 
 ```text
        browser / MCP client

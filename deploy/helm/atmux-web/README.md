@@ -129,9 +129,13 @@ server:
     size: 2Gi
 ```
 
-The generated coordinator configuration deliberately has no **agent-launch**
-profiles or project roots and disables discovery, local collection, Pulse receive,
-maintenance, and auto-compaction. It is not an agent runtime. The PVC stores
+The generated coordinator configuration sets `[node].coordinator_only = true`.
+Atmux therefore never opens tmux, samples or presents the Pod as a machine,
+publishes Pod-local sessions/metrics/launch inputs, or accepts Pod-local owner
+mutations. Validation also requires no **agent-launch** profiles or project
+roots and disables discovery, local collection, Pulse receive/push reporting,
+maintenance, auto-compaction, and local agent resource scopes. It is not an
+agent runtime. The PVC stores
 Pulse SQLite data and coordinator state; it does not and cannot persist a PTY
 or process through Pod replacement. Its secret-free Pulse profile names and
 vendors match account 4 on the owner nodes so pull federation can attach those

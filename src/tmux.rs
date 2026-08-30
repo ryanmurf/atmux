@@ -4,7 +4,10 @@ use std::{
     env, fs,
     hash::{DefaultHasher, Hash, Hasher},
     io::Write,
-    os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+    os::unix::{
+        fs::{MetadataExt as _, PermissionsExt as _},
+        process::CommandExt as _,
+    },
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -16,9 +19,10 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    config::{AgentProfile, ProfileMode, StatusConfig},
+    config::{AgentProfile, AgentResourcesConfig, ProfileMode, StatusConfig},
     old_sessions::{self, ResumeCandidate},
     status::{self, AgentKind, AgentStatus},
+    systemd_scope::{self, PreparedScope},
 };
 
 static BUFFER_ID: AtomicU64 = AtomicU64::new(1);
@@ -178,6 +182,10 @@ pub struct Session {
     pub profile: String,
     /// Stable opaque saved-conversation lease persisted only in tmux metadata.
     pub(crate) resume_lease: Option<String>,
+    /// Unique transient systemd scope containing this agent process generation.
+    pub systemd_scope: Option<String>,
+    /// Scope-level cgroup `MemoryMax`, in bytes.
+    pub memory_max_bytes: Option<u64>,
     pub status: AgentStatus,
 }
 
@@ -211,6 +219,8 @@ struct RawPane {
     agent_version: String,
     profile: String,
     resume_lease: String,
+    systemd_scope: String,
+    memory_max_bytes: String,
 }
 
 impl RawPane {
@@ -227,6 +237,54 @@ fn pane_rank(pane: &RawPane, agent: AgentKind) -> (bool, u8) {
 pub struct Tmux;
 
 impl Tmux {
+    /// Replaces this process with one exact command in a configured agent scope.
+    ///
+    /// This is the fail-closed bridge used by fixed boot/Quick Resume scripts:
+    /// it loads the active configuration itself, requires an enabled memory
+    /// policy, preflights the user scope, publishes metadata on the owning pane,
+    /// and only then performs an argv-preserving `exec`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for absent isolation, an unsafe/missing pane identity,
+    /// failed scope preflight/metadata, or an empty/unexecutable command.
+    pub fn scoped_exec(config_path: &Path, command: Vec<String>) -> Result<()> {
+        if command.is_empty() {
+            bail!("scoped-exec requires a command after --");
+        }
+        let (config, _) = crate::config::Config::load(Some(config_path))?;
+        if config.agent_resources.memory_max_bytes.is_none() {
+            bail!(
+                "scoped-exec requires [agent_resources].memory_max_bytes; recovery is fail-closed"
+            );
+        }
+        let pane_id = env::var("TMUX_PANE")
+            .ok()
+            .filter(|pane_id| valid_tmux_pane_id(pane_id))
+            .context("scoped-exec requires a valid TMUX_PANE")?;
+        let scope = systemd_scope::prepare(&config.agent_resources, &pane_id)?;
+        let invocation = scope.wrap(command)?;
+        publish_scope_metadata(&pane_id, &scope)?;
+        let (program, arguments) = invocation
+            .split_first()
+            .context("scoped-exec produced an empty command")?;
+        let error = Command::new(program).args(arguments).exec();
+        Err(error).with_context(|| format!("could not execute scoped agent through {program}"))
+    }
+
+    /// Probes configured agent cgroup support without touching tmux.
+    ///
+    /// The transient probe scope is bounded, immediately collected, and uses
+    /// the same `MemoryMax` property as a real launch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when isolation is configured but the systemd user
+    /// manager, scope support, or `MemoryMax` property is unavailable.
+    pub fn check_agent_resources(resources: &AgentResourcesConfig) -> Result<Option<u64>> {
+        systemd_scope::prepare(resources, "doctor").map(|scope| scope.memory_max_bytes())
+    }
+
     /// Runs an integration probe against one explicit tmux socket without
     /// mutating process-global environment or the user's default server.
     ///
@@ -273,6 +331,7 @@ impl Tmux {
     /// # Errors
     ///
     /// Returns an error when tmux session metadata cannot be queried.
+    #[allow(clippy::too_many_lines)] // One scan keeps pane metadata and process state coherent.
     pub fn sessions_with_capture(
         &self,
         previous_hashes: &HashMap<String, u64>,
@@ -300,6 +359,8 @@ impl Tmux {
             "#{@atmux_profile}",
             "#{@atmux_resume_lease}",
             "#{@atmux_identity}",
+            "#{@atmux_systemd_scope}",
+            "#{@atmux_memory_max_bytes}",
         ]
         .join("\t");
         let (raw_output, summary) = Self::run(["list-panes", "-a", "-F", &format])?;
@@ -348,6 +409,8 @@ impl Tmux {
             );
             let pane_identity =
                 ensure_pane_identity(&pane.pane_id, &pane.pane_identity).unwrap_or_default();
+            let (systemd_scope, memory_max_bytes) =
+                scope_metadata(&pane.systemd_scope, &pane.memory_max_bytes);
             sessions.push(Session {
                 name: pane.name,
                 attached: pane.attached,
@@ -370,6 +433,8 @@ impl Tmux {
                 profile: agent_profile_label(&pane.start_command, &pane.profile, agent),
                 resume_lease: valid_resume_lease(&pane.resume_lease)
                     .then(|| pane.resume_lease.clone()),
+                systemd_scope,
+                memory_max_bytes,
                 status: agent_status,
             });
         }
@@ -451,14 +516,16 @@ impl Tmux {
     /// # Errors
     ///
     /// Returns an error for an invalid directory or a failed tmux launch.
-    pub fn launch(
-        &self,
+    pub(crate) fn launch(
         name: &str,
         directory: &Path,
         profile: &AgentProfile,
         mode: Option<&ProfileMode>,
+        // Consume the one-launch plan so a successful preflight cannot be
+        // reused for another process generation.
+        #[allow(clippy::needless_pass_by_value)] scope: PreparedScope,
     ) -> Result<()> {
-        Self::launch_inner(name, directory, profile, mode, None, None)
+        Self::launch_inner(name, directory, profile, mode, None, None, scope)
     }
 
     /// Creates a detached session that resumes one owner-revalidated native
@@ -475,6 +542,7 @@ impl Tmux {
         mode: Option<&ProfileMode>,
         resume: &ResumeCandidate,
         resume_lease: &str,
+        scope: PreparedScope,
     ) -> Result<()> {
         if !valid_resume_lease(resume_lease) {
             bail!("saved-conversation lease is invalid");
@@ -486,9 +554,11 @@ impl Tmux {
             mode,
             Some(resume),
             Some(resume_lease),
+            scope,
         )
     }
 
+    #[allow(clippy::needless_pass_by_value)] // Enforce one preflight per process generation.
     fn launch_inner(
         name: &str,
         directory: &Path,
@@ -496,6 +566,7 @@ impl Tmux {
         mode: Option<&ProfileMode>,
         resume: Option<&ResumeCandidate>,
         resume_lease: Option<&str>,
+        scope: PreparedScope,
     ) -> Result<()> {
         if !command_available(&profile.command) {
             bail!(
@@ -504,6 +575,7 @@ impl Tmux {
             );
         }
         let invocation = Self::build_launch_invocation(profile, mode, resume)?;
+        let invocation = scope.wrap(invocation)?;
         let shell_command = shell_words::join(invocation);
         let directory = directory
             .to_str()
@@ -563,6 +635,10 @@ impl Tmux {
                 lease,
             ])
         {
+            let _ = Self::output(["kill-session", "-t", &session_id]);
+            return Err(error);
+        }
+        if let Err(error) = publish_scope_metadata(&pane_id, &scope) {
             let _ = Self::output(["kill-session", "-t", &session_id]);
             return Err(error);
         }
@@ -687,13 +763,16 @@ impl Tmux {
     ///
     /// Returns an error when the current Claude launcher is unavailable, the
     /// server-derived values are malformed, or tmux rejects the respawn.
-    pub fn resume_claude(
-        &self,
+    #[allow(clippy::needless_pass_by_value)] // Enforce one preflight per process generation.
+    pub(crate) fn resume_claude(
         pane_id: &str,
         directory: &Path,
         claude_program: &Path,
         config_dir: &Path,
         session_id: &str,
+        // Consume the one-launch plan so a successful preflight cannot be
+        // reused for another process generation.
+        scope: PreparedScope,
     ) -> Result<()> {
         let claude_program = crate::config::revalidate_resume_claude_program(claude_program)
             .ok_or_else(|| {
@@ -704,7 +783,10 @@ impl Tmux {
         let directory = directory
             .to_str()
             .with_context(|| format!("directory is not valid UTF-8: {}", directory.display()))?;
-        let command = claude_resume_command(&claude_program, config_dir, session_id)?;
+        let invocation = claude_resume_invocation(&claude_program, config_dir, session_id)?;
+        let invocation = scope.wrap(invocation)?;
+        let command = shell_words::join(invocation);
+        publish_scope_metadata(pane_id, &scope)?;
         Self::output(respawn_pane_args(pane_id, directory, &command))?;
         Ok(())
     }
@@ -712,6 +794,8 @@ impl Tmux {
     /// Replaces one exact idle native Claude/Codex process after its owner CLI
     /// changed. All launch values are server-resolved configuration and native
     /// log identity; the old pane start command is never replayed.
+    #[allow(clippy::needless_pass_by_value)] // Enforce one preflight per process generation.
+    #[allow(clippy::too_many_arguments)] // All values are independently revalidated owner state.
     pub(crate) fn resume_after_cli_update(
         pane_id: &str,
         directory: &Path,
@@ -720,6 +804,9 @@ impl Tmux {
         profile: &AgentProfile,
         mode: &ProfileMode,
         target: &crate::transcript::NativeResumeTarget,
+        // Consume the one-launch plan so a successful preflight cannot be
+        // reused for another process generation.
+        scope: PreparedScope,
     ) -> Result<()> {
         if !crate::auto_update::revalidate_launcher(harness, launcher) {
             bail!("the updated native launcher changed during maintenance preflight");
@@ -758,10 +845,12 @@ impl Tmux {
         exact_profile.command = launcher.to_string_lossy().into_owned();
         let mut invocation = Self::build_launch_invocation(&exact_profile, Some(mode), None)?;
         invocation.extend(resume_args);
+        let invocation = scope.wrap(invocation)?;
         let command = shell_words::join(invocation);
         let directory = directory
             .to_str()
             .with_context(|| format!("directory is not valid UTF-8: {}", directory.display()))?;
+        publish_scope_metadata(pane_id, &scope)?;
         Self::output(respawn_pane_args(pane_id, directory, &command))?;
         Ok(())
     }
@@ -1343,11 +1432,11 @@ pub(crate) fn valid_claude_effort(effort: &str) -> bool {
     matches!(effort, "low" | "medium" | "high" | "xhigh" | "max")
 }
 
-fn claude_resume_command(
+fn claude_resume_invocation(
     claude_program: &Path,
     config_dir: &Path,
     session_id: &str,
-) -> Result<String> {
+) -> Result<Vec<String>> {
     if !valid_claude_resume_session_id(session_id) {
         bail!("the Claude session id is invalid");
     }
@@ -1369,15 +1458,22 @@ fn claude_resume_command(
     if !claude_program.starts_with('/') {
         bail!("the Claude launcher path is not absolute");
     }
-    // `shell_words::join` emits the one shell command tmux expects while
-    // preserving each server-derived argument as data.
-    Ok(shell_words::join([
+    Ok(vec![
         "env".to_owned(),
         format!("CLAUDE_CONFIG_DIR={config_dir}"),
         claude_program.to_owned(),
         "--resume".to_owned(),
         session_id.to_owned(),
-    ]))
+    ])
+}
+
+#[cfg(test)]
+fn claude_resume_command(
+    claude_program: &Path,
+    config_dir: &Path,
+    session_id: &str,
+) -> Result<String> {
+    claude_resume_invocation(claude_program, config_dir, session_id).map(shell_words::join)
 }
 
 fn valid_claude_resume_session_id(value: &str) -> bool {
@@ -1808,7 +1904,57 @@ fn parse_pane(line: &str) -> Option<RawPane> {
         profile: fields.get(17).copied().unwrap_or_default().to_owned(),
         resume_lease: fields.get(18).copied().unwrap_or_default().to_owned(),
         pane_identity: fields.get(19).copied().unwrap_or_default().to_owned(),
+        systemd_scope: fields.get(20).copied().unwrap_or_default().to_owned(),
+        memory_max_bytes: fields.get(21).copied().unwrap_or_default().to_owned(),
     })
+}
+
+fn scope_metadata(scope: &str, memory_max_bytes: &str) -> (Option<String>, Option<u64>) {
+    let memory_max_bytes = memory_max_bytes
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0);
+    if systemd_scope::valid_scope_name(scope) && memory_max_bytes.is_some() {
+        (Some(scope.to_owned()), memory_max_bytes)
+    } else {
+        (None, None)
+    }
+}
+
+fn publish_scope_metadata(pane_id: &str, scope: &PreparedScope) -> Result<()> {
+    match scope.metadata() {
+        Some((unit, memory_max_bytes)) => Tmux::output([
+            "set-option",
+            "-p",
+            "-t",
+            pane_id,
+            "@atmux_systemd_scope",
+            unit,
+            ";",
+            "set-option",
+            "-p",
+            "-t",
+            pane_id,
+            "@atmux_memory_max_bytes",
+            &memory_max_bytes.to_string(),
+        ]),
+        None => Tmux::output([
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            pane_id,
+            "@atmux_systemd_scope",
+            ";",
+            "set-option",
+            "-p",
+            "-u",
+            "-t",
+            pane_id,
+            "@atmux_memory_max_bytes",
+        ]),
+    }
+    .map(|_| ())
 }
 
 fn valid_pane_identity(value: &str) -> bool {
@@ -1947,6 +2093,9 @@ fn launch_command_label(start_command: &str) -> String {
         && let Ok(inner) = shell_words::split(&words[0])
     {
         words = inner;
+    }
+    if let Some(agent_words) = systemd_scope::agent_argv(&words) {
+        words = agent_words;
     }
 
     let mut executable = None;
@@ -2432,6 +2581,53 @@ mod tests {
         }
     }
 
+    fn disposable_tmux(label: &str) -> DisposableTmux {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket = format!("atmux-test-{label}-{}-{nonce}", std::process::id());
+        let socket_base = env::var_os("TMUX_TMPDIR").map_or_else(env::temp_dir, PathBuf::from);
+        DisposableTmux {
+            socket_path: socket_base
+                .join(format!("tmux-{}", rustix::process::geteuid().as_raw()))
+                .join(&socket),
+            directory: env::temp_dir().join(format!(
+                "atmux-test-{label}-agent-{}-{nonce}",
+                std::process::id()
+            )),
+            socket,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixed_user_systemctl(arguments: &[&str]) -> Output {
+        let uid = rustix::process::geteuid().as_raw();
+        Command::new("/usr/bin/env")
+            .arg(format!("XDG_RUNTIME_DIR=/run/user/{uid}"))
+            .arg(format!(
+                "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus"
+            ))
+            .arg("/usr/bin/systemctl")
+            .args(arguments)
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .output()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    struct TestScopeCleanup(Option<String>);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for TestScopeCleanup {
+        fn drop(&mut self) {
+            if let Some(unit) = self.0.as_deref() {
+                let _ = fixed_user_systemctl(&["--user", "stop", unit]);
+            }
+        }
+    }
+
     #[test]
     fn parses_tmux_pane() {
         let line =
@@ -2462,6 +2658,292 @@ mod tests {
         assert!(valid_resume_lease(&pane.resume_lease));
         assert!(!valid_resume_lease("lease-v1-not-a-digest"));
         assert!(!valid_resume_lease(&format!("lease-v1-{}", "A".repeat(64))));
+    }
+
+    #[test]
+    fn parses_scope_metadata_only_as_a_valid_complete_pair() {
+        let unit = "atmux-tmux-spawn-12-34-0123456789abcdef.scope";
+        let line = format!(
+            "solo\t0\t1\t123\t0\t1\t0\t1\t42\tcodex\tcodex\t/tmp\tsolo\t%0\t\t\t\tDefault\t\t\t{unit}\t34359738368"
+        );
+        let pane = parse_pane(&line).unwrap();
+        assert_eq!(
+            scope_metadata(&pane.systemd_scope, &pane.memory_max_bytes),
+            (Some(unit.to_owned()), Some(34_359_738_368))
+        );
+        assert_eq!(
+            scope_metadata("bad;scope.scope", "34359738368"),
+            (None, None)
+        );
+        assert_eq!(scope_metadata(unit, "0"), (None, None));
+        assert_eq!(scope_metadata(unit, "not-a-number"), (None, None));
+    }
+
+    #[test]
+    fn launch_discovers_captures_submits_and_kills_on_an_isolated_server() {
+        let probe = disposable_tmux("launch");
+        fs::create_dir(&probe.directory).unwrap();
+        let command = probe.directory.join("codex");
+        fs::write(
+            &command,
+            concat!(
+                "#!/bin/sh\n",
+                "printf 'atmux-smoke-ready\\n'\n",
+                "IFS= read -r first\n",
+                "IFS= read -r second\n",
+                "printf 'received:%s|%s\\n' \"$first\" \"$second\"\n",
+                "sleep 10\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o700)).unwrap();
+        let profile = AgentProfile {
+            name: "Launch smoke".to_owned(),
+            harness: "codex".to_owned(),
+            command: command.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            inherit_discovered: false,
+            modes: Vec::new(),
+        };
+
+        Tmux::with_socket_for_test(&probe.socket, || {
+            Tmux::launch(
+                "agent",
+                &probe.directory,
+                &profile,
+                None,
+                systemd_scope::prepare(&AgentResourcesConfig::default(), "launch-smoke")?,
+            )?;
+            let sessions = Tmux.sessions(&HashMap::new(), &StatusConfig::default())?;
+            let session = sessions
+                .iter()
+                .find(|session| session.name == "agent")
+                .context("launched session was not discovered")?;
+            let identity = Tmux::output([
+                "show-options",
+                "-p",
+                "-q",
+                "-v",
+                "-t",
+                &session.pane_id,
+                "@atmux_identity",
+            ])?;
+            assert!(valid_pane_identity(identity.trim()));
+            let ready = wait_for_capture(&session.pane_id, |content| {
+                content
+                    .contains("atmux-smoke-ready")
+                    .then(|| content.to_owned())
+            })?;
+            assert!(ready.contains("atmux-smoke-ready"));
+            Tmux.send_text(
+                &session.pane_id,
+                "hello from atmux\nsecond literal line",
+                true,
+            )?;
+            let submitted = wait_for_capture(&session.pane_id, |content| {
+                content
+                    .contains("received:hello from atmux|second literal line")
+                    .then(|| content.to_owned())
+            })?;
+            assert!(submitted.contains("received:hello from atmux|second literal line"));
+            Tmux.kill("agent")
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn launch_reports_an_immediately_exiting_command() {
+        let probe = disposable_tmux("exit");
+        fs::create_dir(&probe.directory).unwrap();
+        let profile = AgentProfile {
+            name: "Immediate exit".to_owned(),
+            harness: "codex".to_owned(),
+            command: "/bin/sh".to_owned(),
+            args: vec!["-lc".to_owned(), "exit 7".to_owned()],
+            env: BTreeMap::new(),
+            inherit_discovered: false,
+            modes: Vec::new(),
+        };
+        let error = Tmux::with_socket_for_test(&probe.socket, || {
+            Tmux::launch(
+                "agent",
+                &probe.directory,
+                &profile,
+                None,
+                systemd_scope::prepare(&AgentResourcesConfig::default(), "exit-smoke")?,
+            )
+        })
+        .expect_err("an immediately exiting command must not be reported as launched");
+        assert!(
+            error.to_string().contains("exited before it became ready"),
+            "unexpected launch error: {error:#}"
+        );
+    }
+
+    /// Real transport proof for the fail-closed path. The disposable named
+    /// socket is intentionally unrelated to the user's protected default tmux
+    /// server. The test starts with no ambient bus variables, removes them
+    /// from the isolated tmux global environment, and verifies that the fixed
+    /// wrapper still creates a bounded process-tree scope with working PTY IO.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires tmux and an active systemd user manager"]
+    #[allow(clippy::too_many_lines)] // One linear real-host assertion sequence.
+    fn scoped_launch_uses_fixed_bus_preserves_pty_and_cleans_up() {
+        let probe = disposable_tmux("systemd-scope");
+        fs::create_dir(&probe.directory).unwrap();
+        let command = probe.directory.join("codex");
+        fs::write(
+            &command,
+            concat!(
+                "#!/bin/sh\n",
+                "if test -t 0 && test -t 1; then echo pty=yes; else echo pty=no; fi\n",
+                "printf 'xdg=%s\\n' \"$XDG_RUNTIME_DIR\"\n",
+                "printf 'dbus=%s\\n' \"$DBUS_SESSION_BUS_ADDRESS\"\n",
+                "printf 'agent-pid=%s\\n' \"$$\"\n",
+                "cat /proc/self/cgroup\n",
+                "IFS= read -r input\n",
+                "printf 'received=%s\\n' \"$input\"\n",
+                "sleep 30\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o700)).unwrap();
+        let profile = AgentProfile {
+            name: "Bounded launch".to_owned(),
+            harness: "codex".to_owned(),
+            command: command.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            inherit_discovered: false,
+            modes: Vec::new(),
+        };
+        let resources = AgentResourcesConfig {
+            memory_max_bytes: Some(64 * 1024 * 1024),
+        };
+
+        let initial_server = Command::new("tmux")
+            .args([
+                "-L",
+                &probe.socket,
+                "new-session",
+                "-d",
+                "-s",
+                "cleanup-canary",
+                "/bin/sleep 2147483647",
+            ])
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .status()
+            .unwrap();
+        assert!(initial_server.success());
+
+        Tmux::with_socket_for_test(&probe.socket, || {
+            Tmux::output(["set-environment", "-gu", "XDG_RUNTIME_DIR"])?;
+            Tmux::output(["set-environment", "-gu", "DBUS_SESSION_BUS_ADDRESS"])?;
+            for variable in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+                let (output, _) = Tmux::run(["show-environment", "-g", variable])?;
+                assert!(!output.status.success(), "tmux retained {variable}");
+            }
+
+            let scope = systemd_scope::prepare(&resources, "isolated-real-tmux")?;
+            let unit = scope
+                .metadata()
+                .map(|(unit, _)| unit.to_owned())
+                .context("configured policy produced no scope unit")?;
+            let mut scope_cleanup = TestScopeCleanup(Some(unit.clone()));
+            Tmux::launch("bounded", &probe.directory, &profile, None, scope)?;
+
+            let sessions = Tmux.sessions(&HashMap::new(), &StatusConfig::default())?;
+            let session = sessions
+                .iter()
+                .find(|session| session.name == "bounded")
+                .context("bounded session was not discovered")?;
+            assert_eq!(session.systemd_scope.as_deref(), Some(unit.as_str()));
+            assert_eq!(session.memory_max_bytes, Some(64 * 1024 * 1024));
+
+            let capture = wait_for_capture(&session.pane_id, |content| {
+                content.contains("agent-pid=").then(|| content.to_owned())
+            })?;
+            assert!(capture.contains("pty=yes"), "{capture}");
+            let uid = rustix::process::geteuid().as_raw();
+            assert!(
+                capture.contains(&format!("xdg=/run/user/{uid}")),
+                "{capture}"
+            );
+            assert!(
+                capture.contains(&format!("dbus=unix:path=/run/user/{uid}/bus")),
+                "{capture}"
+            );
+            let agent_pid = capture
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("agent-pid="))
+                .context("capture omitted the scoped agent pid")?;
+            let agent_pid = agent_pid.parse::<u32>()?;
+
+            let memory =
+                fixed_user_systemctl(&["--user", "show", &unit, "--property=MemoryMax", "--value"]);
+            assert!(memory.status.success(), "{:?}", memory.stderr);
+            assert_eq!(String::from_utf8(memory.stdout)?.trim(), "67108864");
+            let control_group = fixed_user_systemctl(&[
+                "--user",
+                "show",
+                &unit,
+                "--property=ControlGroup",
+                "--value",
+            ]);
+            assert!(control_group.status.success(), "{:?}", control_group.stderr);
+            let control_group = String::from_utf8(control_group.stdout)?;
+            let processes = fs::read_to_string(
+                Path::new("/sys/fs/cgroup")
+                    .join(control_group.trim().trim_start_matches('/'))
+                    .join("cgroup.procs"),
+            )?;
+            assert!(
+                processes
+                    .lines()
+                    .any(|process| process.parse::<u32>().ok() == Some(agent_pid)),
+                "agent {agent_pid} was outside {unit}: {processes}"
+            );
+
+            Tmux.send_text(&session.pane_id, "pty round trip", true)?;
+            let submitted = wait_for_capture(&session.pane_id, |content| {
+                content
+                    .contains("received=pty round trip")
+                    .then(|| content.to_owned())
+            })?;
+            assert!(submitted.contains("received=pty round trip"));
+
+            Tmux.kill("bounded")?;
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let loaded = fixed_user_systemctl(&[
+                    "--user",
+                    "show",
+                    &unit,
+                    "--property=LoadState",
+                    "--value",
+                ]);
+                assert!(loaded.status.success(), "{:?}", loaded.stderr);
+                let loaded = String::from_utf8_lossy(&loaded.stdout);
+                if loaded.trim().is_empty() || loaded.trim() == "not-found" {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    bail!(
+                        "systemd scope {unit} remained loaded after tmux pane cleanup: {}",
+                        loaded.trim()
+                    );
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            scope_cleanup.0 = None;
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
@@ -2523,6 +3005,7 @@ mod tests {
                 None,
                 &candidate,
                 &lease,
+                systemd_scope::prepare(&AgentResourcesConfig::default(), "lease-fixture")?,
             )?;
             let sessions = Tmux.sessions(&HashMap::new(), &StatusConfig::default())?;
             let resumed = sessions
@@ -2700,6 +3183,31 @@ mod tests {
     }
 
     #[test]
+    fn launch_label_looks_through_the_fixed_systemd_scope_wrapper() {
+        let scope = systemd_scope::fixture_scope(
+            "atmux-tmux-spawn-1-2-0123456789abcdef.scope",
+            34_359_738_368,
+        );
+        let invocation = scope
+            .wrap(vec![
+                "env".to_owned(),
+                "CODEX_HOME=/home/ryan/.codex-max".to_owned(),
+                "/home/ryan/.local/bin/codex".to_owned(),
+                "resume".to_owned(),
+                "opaque-secret".to_owned(),
+            ])
+            .unwrap();
+        let command = shell_words::join(invocation);
+
+        assert_eq!(
+            launch_command_label(&command),
+            "CODEX_HOME=/home/ryan/.codex-max · /home/ryan/.local/bin/codex"
+        );
+        assert!(!launch_command_label(&command).contains("systemd-run"));
+        assert!(!launch_command_label(&command).contains("opaque-secret"));
+    }
+
+    #[test]
     fn submit_sends_exactly_one_enter() {
         assert_eq!(submission_keys(true), ["Enter"]);
         assert!(submission_keys(false).is_empty());
@@ -2797,15 +3305,15 @@ mod tests {
             .map(PathBuf::from)
             .unwrap()
             .join(".local/share/claude/versions/atmux-definitely-missing");
-        let error = Tmux
-            .resume_claude(
-                "%4294967295",
-                Path::new("/tmp"),
-                &missing,
-                Path::new("/tmp/.claude"),
-                "11111111-1111-1111-1111-111111111111",
-            )
-            .unwrap_err();
+        let error = Tmux::resume_claude(
+            "%4294967295",
+            Path::new("/tmp"),
+            &missing,
+            Path::new("/tmp/.claude"),
+            "11111111-1111-1111-1111-111111111111",
+            systemd_scope::prepare(&AgentResourcesConfig::default(), "missing-claude").unwrap(),
+        )
+        .unwrap_err();
         assert!(
             error
                 .chain()

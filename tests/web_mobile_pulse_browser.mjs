@@ -20,6 +20,7 @@ const launchSessionRequests = [];
 let failLiveModels = false;
 let launchOptionsDelayMs = 0;
 let launchResponseDelayMs = 0;
+let launchMachinesUnavailable = false;
 let overviewRevision = 1;
 let delayProjectFilePane = null;
 let delayFileSavePane = null;
@@ -249,8 +250,8 @@ function mockApi(url, response, request) {
       machines: [
         {
           id: "local", label: "This machine", online: true,
-          directories: ["/local/project"],
-          profiles: [{ id: "profile-0", name: "Default", harness: "codex" }],
+          directories: [],
+          profiles: [],
           project_preferences: {}, note: null,
         },
         {
@@ -267,6 +268,14 @@ function mockApi(url, response, request) {
         },
       ],
     };
+    if (launchMachinesUnavailable) {
+      value.machines = value.machines.map((machine) => ({
+        ...machine,
+        directories: [],
+        profiles: [],
+        note: "No launch configuration is available on this owner.",
+      }));
+    }
     if (launchOptionsDelayMs > 0) setTimeout(() => json(response, value), launchOptionsDelayMs);
     else json(response, value);
     return true;
@@ -693,25 +702,18 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(mobile.branch, "Git · feature/tron~%100/<script>alert(1)</script>");
     assert.equal(mobile.overflowX, 0, JSON.stringify(mobile));
 
-    // The first launch option is local, but this federated `tron~pane` session
-    // supplies stronger context. A manual change remains selected while the
-    // dialog is open and still drives the per-machine project list.
+    // The first launch option is online but cannot launch. The federated
+    // `tron~pane` owner remains the contextual target and Home/local cannot be
+    // selected accidentally.
     await cdp.evaluate("document.getElementById('launch-open').click(); true");
     await waitFor(
       () => cdp.evaluate("document.getElementById('launch-dialog').open"),
       "contextual launch dialog did not open",
     );
     assert.equal(await cdp.evaluate("document.getElementById('launch-machine').value"), "tron");
-    await cdp.evaluate(`(() => {
-      const machine = document.getElementById('launch-machine');
-      machine.value = 'local';
-      machine.dispatchEvent(new Event('change', { bubbles: true }));
-      return machine.value;
-    })()`);
-    assert.equal(await cdp.evaluate("document.getElementById('launch-machine').value"), "local");
-    assert.deepEqual(
-      await cdp.evaluate("[...document.querySelectorAll('#launch-directory-options option')].map((option) => option.value)"),
-      ["/local/project"],
+    assert.equal(
+      await cdp.evaluate("document.querySelector('#launch-machine option[value=local]').disabled"),
+      true,
     );
     await cdp.evaluate("document.querySelector('#launch-dialog .dialog-cancel').click(); true");
 
@@ -1765,8 +1767,8 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     );
     assert.equal(
       await cdp.evaluate("document.getElementById('launch-machine').value"),
-      "local",
-      "without a selected agent or machine the launcher keeps the first-online fallback",
+      "tron",
+      "without context the launcher skips the first online but unconfigured owner",
     );
     await cdp.evaluate(`(() => {
       const machine = document.getElementById('launch-machine');
@@ -1856,18 +1858,37 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       () => cdp.evaluate("document.getElementById('launch-dialog').open"),
       "reopened launch dialog did not open",
     );
-    assert.equal(await cdp.evaluate("document.getElementById('launch-machine').value"), "local");
-    await cdp.evaluate(`(() => {
-      const machine = document.getElementById('launch-machine');
-      machine.value = 'tron';
-      machine.dispatchEvent(new Event('change', { bubbles: true }));
-      return true;
-    })()`);
+    assert.equal(await cdp.evaluate("document.getElementById('launch-machine').value"), "tron");
     await waitFor(
       () => cdp.evaluate("[...document.querySelectorAll('#launch-directory-options option')].some((option) => option.value === '/workspace/custom')"),
       "remembered folder did not return to the project picker",
     );
     await cdp.evaluate("document.querySelector('#launch-dialog .dialog-cancel').click(); true");
+
+    launchMachinesUnavailable = true;
+    await cdp.evaluate("document.getElementById('launch-open').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('launch-dialog').open"),
+      "unavailable launch dialog did not open",
+    );
+    const unavailableLaunch = await cdp.evaluate(`({
+      machine: document.getElementById('launch-machine').value,
+      machineDisabled: document.getElementById('launch-machine').disabled,
+      projectDisabled: document.getElementById('launch-directory').disabled,
+      browseDisabled: document.getElementById('launch-browse').disabled,
+      submitDisabled: document.querySelector('#launch-form button[type=submit]').disabled,
+      note: document.getElementById('launch-note').textContent,
+    })`);
+    assert.deepEqual(unavailableLaunch, {
+      machine: "",
+      machineDisabled: true,
+      projectDisabled: true,
+      browseDisabled: true,
+      submitDisabled: true,
+      note: "No online machine currently has both runnable agent profiles and configured project folders.",
+    });
+    await cdp.evaluate("document.querySelector('#launch-dialog .dialog-cancel').click(); true");
+    launchMachinesUnavailable = false;
 
     await cdp.evaluate("localStorage.removeItem('atmux.pulse-account'); true");
     await cdp.send("Page.navigate", { url: `http://127.0.0.1:${port}/?view=usage` });
@@ -1916,6 +1937,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     }
     transcriptFixture = null;
     paneSnapshotContent = "";
+    launchMachinesUnavailable = false;
     paneStreams.clear();
     overviewStreams.clear();
   }

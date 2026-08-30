@@ -56,15 +56,15 @@ readonly -a max_resume_models=(
 readonly -a max_resume_efforts=(max max max max max max '' '' xhigh)
 readonly -a max_resume_modes=(sol-max sol-max sol-max sol-max sol-max sol-max fable '' sol-xhigh)
 readonly -a max_resume_commands=(
-  'exec /home/ryan/IdeaProjects/research/math-prize-problems/clay-max.sh __run p-vs-np'
-  'exec /home/ryan/IdeaProjects/research/math-prize-problems/clay-max.sh __run navier-stokes'
-  'exec /home/ryan/IdeaProjects/research/math-prize-problems/clay-max.sh __run hodge-conjecture'
-  'exec /home/ryan/IdeaProjects/research/math-prize-problems/clay-max.sh __run birch-swinnerton-dyer'
-  'exec /home/ryan/IdeaProjects/research/math-prize-problems/clay-max.sh __run yang-mills'
-  'exec /home/ryan/.local/bin/codex resume 01a02c06-b75c-7553-8daf-d45ae8e52258'
-  'exec env PATH=/home/ryan/.local/bin:/usr/local/bin:/usr/bin:/bin /home/ryan/.local/bin/claude-max --model fable --resume 6d2436ec-a5aa-4ab7-a4e2-5b8b76bd7d9f'
-  'exec env PATH=/home/ryan/.local/bin:/usr/local/bin:/usr/bin:/bin /home/ryan/.local/bin/claude-qwen --resume 265df46d-f95a-4532-9cd5-59f3cabbac76'
-  'exec env CODEX_HOME=/home/ryan/.codex /home/ryan/.local/bin/codex resume -C /home/ryan/IdeaProjects/qwen-kernel -m gpt-5.6-sol -c model_reasoning_effort=\"xhigh\" 01a03c8d-0826-7561-8a84-c16d95ac7a49'
+  'exec /home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec -- /home/ryan/IdeaProjects/research/math-prize-problems/clay-max.sh __run p-vs-np'
+  'exec /home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec -- /home/ryan/IdeaProjects/research/math-prize-problems/clay-max.sh __run navier-stokes'
+  'exec /home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec -- /home/ryan/IdeaProjects/research/math-prize-problems/clay-max.sh __run hodge-conjecture'
+  'exec /home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec -- /home/ryan/IdeaProjects/research/math-prize-problems/clay-max.sh __run birch-swinnerton-dyer'
+  'exec /home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec -- /home/ryan/IdeaProjects/research/math-prize-problems/clay-max.sh __run yang-mills'
+  'exec /home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec -- /home/ryan/.local/bin/codex resume 01a02c06-b75c-7553-8daf-d45ae8e52258'
+  'exec /home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec -- /usr/bin/env PATH=/home/ryan/.local/bin:/usr/local/bin:/usr/bin:/bin /home/ryan/.local/bin/claude-max --model fable --resume 6d2436ec-a5aa-4ab7-a4e2-5b8b76bd7d9f'
+  'exec /home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec -- /usr/bin/env PATH=/home/ryan/.local/bin:/usr/local/bin:/usr/bin:/bin /home/ryan/.local/bin/claude-qwen --resume 265df46d-f95a-4532-9cd5-59f3cabbac76'
+  'exec /home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec -- /usr/bin/env CODEX_HOME=/home/ryan/.codex /home/ryan/.local/bin/codex resume -C /home/ryan/IdeaProjects/qwen-kernel -m gpt-5.6-sol -c model_reasoning_effort=\"xhigh\" 01a03c8d-0826-7561-8a84-c16d95ac7a49'
 )
 
 max_resume_tmux() {

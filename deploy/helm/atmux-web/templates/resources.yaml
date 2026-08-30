@@ -269,71 +269,7 @@ metadata:
   name: {{ $name }}-server-config
 data:
   config.toml: |
-    [general]
-    project_roots = []
-    favorite_dirs = []
-    refresh_ms = 750
-    preview_lines = 160
-    switch_on_launch = false
-
-    [auto_compact]
-    enabled = false
-    inactivity_minutes = 15
-    input_tokens = 200000
-    poll_seconds = 30
-
-    [maintenance]
-    enabled = false
-    interval_minutes = 30
-    update_timeout_seconds = 180
-    relaunch_limit = 4
-
-    [node]
-    id = {{ $serverNodeId | quote }}
-    label = {{ $serverNodeLabel | quote }}
-
-    [node.tls]
-    cert_file = "/etc/atmux/tls/tls.crt"
-    key_file = "/etc/atmux/tls/tls.key"
-    ca_file = "/etc/atmux/tls/ca.crt"
-
-    [discovery]
-    enabled = false
-
-    [web]
-    allow_unauthenticated_loopback = false
-    proxy_token_file = "/etc/atmux/proxy-token/token"
-
-    [pulse]
-    collect = false
-    serve = {{ $serverPulseServe }}
-    receive = false
-
-    [pulse.database]
-    sqlite_path = "/var/lib/atmux/data/pulse.sqlite3"
-    {{- range $account := $serverPulseAccounts }}
-
-    [[pulse.accounts]]
-    id = {{ get $account "id" }}
-    identity = {{ get $account "identity" | quote }}
-    {{- with get $account "displayName" }}
-    display_name = {{ . | quote }}
-    {{- end }}
-    {{- range $profile := get $account "profiles" | default list }}
-
-    [[pulse.accounts.profiles]]
-    name = {{ get $profile "name" | quote }}
-    vendor = {{ get $profile "vendor" | quote }}
-    {{- end }}
-    {{- end }}
-    {{- range $machine := $serverMachines }}
-
-    [[machines]]
-    id = {{ $machine.id | quote }}
-    label = {{ $machine.label | quote }}
-    url = {{ printf "https://%s:%v" $machine.address $machine.port | quote }}
-    token_file = {{ printf "/etc/atmux/federation-tokens/%s.token" $machine.id | quote }}
-    {{- end }}
+{{ include "atmux-web.serverConfig" . | indent 4 }}
 ---
 {{- end }}
 apiVersion: v1
@@ -387,7 +323,7 @@ spec:
       annotations:
         checksum/allowed-emails: {{ join "\n" $allowedEmails | sha256sum | quote }}
         {{- if $serverEnabled }}
-        checksum/server-config: {{ toJson $server | sha256sum | quote }}
+        checksum/server-config: {{ include "atmux-web.serverConfig" . | sha256sum | quote }}
         atmux.dev/secret-revision: {{ $serverSecretRevision | quote }}
         {{- end }}
     spec:

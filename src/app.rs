@@ -13,6 +13,7 @@ use crate::{
     config::{AgentProfile, Config, ProfileMode},
     project::{self, ProjectPreferences},
     status::AgentStatus,
+    systemd_scope,
     tmux::{Session, Tmux},
 };
 
@@ -619,9 +620,9 @@ impl App {
             .context("no agent profile selected")?
             .clone();
         let mode = launcher.modes.get(launcher.mode_selected).cloned();
+        let scope = systemd_scope::prepare(&self.config.agent_resources, &name)?;
         project::remember_launch(&directory, &name, &profile)?;
-        self.tmux
-            .launch(&name, &directory, &profile, mode.as_ref())?;
+        Tmux::launch(&name, &directory, &profile, mode.as_ref(), scope)?;
         self.message = Some((
             format!(
                 "launched {} · {} · {}{}",

@@ -1,5 +1,4 @@
 use std::{
-    collections::{BTreeMap, HashMap},
     env, fs,
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
@@ -10,7 +9,6 @@ use std::{
 
 use atmux::{
     attachment::{EncodedImage, ImageMessageRequest, deliver},
-    config::{AgentProfile, StatusConfig},
     tmux::Tmux,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -101,41 +99,39 @@ fn wait_for_capture(tmux: &Tmux, pane_id: &str, expected: &str) -> String {
     }
 }
 
-fn exercise_model_shaped_pane(tmux: &Tmux, directory: &Path, harness: &str) {
+fn exercise_model_shaped_pane(tmux: &Tmux, socket: &str, directory: &Path, harness: &str) {
     let name = format!("image-{harness}");
-    let profile = AgentProfile {
-        name: format!("{harness} image smoke"),
-        harness: harness.to_owned(),
-        command: "/bin/sh".to_owned(),
-        args: vec![
-            "-lc".to_owned(),
-            concat!(
-                "printf 'image-smoke-ready\\n'; ",
-                "IFS= read -r instruction; IFS= read -r path_line; ",
-                "IFS= read -r separator; IFS= read -r label; IFS= read -r prompt; ",
-                "attachment_path=${path_line#- }; ",
-                "if [ -r \"$attachment_path\" ]; then ",
-                "bytes=$(wc -c < \"$attachment_path\" | tr -d ' '); ",
-                "rm -f -- \"$attachment_path\"; ",
-                "printf 'attachment-readable:%s:%s\\n' \"$bytes\" \"$prompt\"; ",
-                "else printf 'attachment-unreadable\\n'; fi; sleep 10"
-            )
-            .to_owned(),
-        ],
-        env: BTreeMap::new(),
-        inherit_discovered: false,
-        modes: Vec::new(),
-    };
-    tmux.launch(&name, directory, &profile, None).unwrap();
-    let sessions = tmux
-        .sessions(&HashMap::default(), &StatusConfig::default())
+    let script = concat!(
+        "printf 'image-smoke-ready\\n'; ",
+        "IFS= read -r instruction; IFS= read -r path_line; ",
+        "IFS= read -r separator; IFS= read -r label; IFS= read -r prompt; ",
+        "attachment_path=${path_line#- }; ",
+        "if [ -r \"$attachment_path\" ]; then ",
+        "bytes=$(wc -c < \"$attachment_path\" | tr -d ' '); ",
+        "rm -f -- \"$attachment_path\"; ",
+        "printf 'attachment-readable:%s:%s\\n' \"$bytes\" \"$prompt\"; ",
+        "else printf 'attachment-unreadable\\n'; fi; sleep 10"
+    );
+    let command = shell_words::join(["/bin/sh", "-lc", script]);
+    let directory = directory.to_str().expect("UTF-8 fixture directory");
+    let status = Command::new("tmux")
+        .args([
+            "-L",
+            socket,
+            "new-session",
+            "-d",
+            "-s",
+            name.as_str(),
+            "-c",
+            directory,
+            command.as_str(),
+        ])
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .status()
         .unwrap();
-    let pane_id = sessions
-        .iter()
-        .find(|session| session.name == name)
-        .expect("image smoke session")
-        .pane_id
-        .clone();
+    assert!(status.success());
+    let pane_id = format!("{name}:0.0");
     wait_for_capture(tmux, &pane_id, "image-smoke-ready");
 
     deliver(
@@ -176,8 +172,8 @@ fn image_messages_reach_claude_and_codex_shaped_tmux_panes() {
     };
     let probe = isolated_socket();
     Tmux::with_socket_for_test(&probe.socket, || {
-        exercise_model_shaped_pane(&tmux, &probe.directory, "claude");
-        exercise_model_shaped_pane(&tmux, &probe.directory, "codex");
+        exercise_model_shaped_pane(&tmux, &probe.socket, &probe.directory, "claude");
+        exercise_model_shaped_pane(&tmux, &probe.socket, &probe.directory, "codex");
         Ok(())
     })
     .unwrap();

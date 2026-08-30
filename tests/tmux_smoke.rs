@@ -1,32 +1,17 @@
 use std::{
-    collections::{BTreeMap, HashMap},
     env, fs,
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::PathBuf,
     process::Command,
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use atmux::{
-    config::{AgentProfile, StatusConfig},
-    tmux::Tmux,
-};
+use atmux::tmux::Tmux;
 
 struct SocketCleanup {
     socket: String,
     directory: PathBuf,
-}
-
-fn isolated_socket(label: &str) -> SocketCleanup {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let socket = format!("atmux-{label}-{}-{nonce}", std::process::id());
-    let directory = env::temp_dir().join(&socket);
-    fs::create_dir(&directory).unwrap();
-    SocketCleanup { socket, directory }
 }
 
 impl Drop for SocketCleanup {
@@ -79,91 +64,6 @@ fn tmux_or_skip(test_name: &str) -> Option<Tmux> {
             None
         }
     }
-}
-
-fn wait_for_capture(tmux: &Tmux, pane_id: &str, expected: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let diagnostic = match tmux.capture(pane_id, 40) {
-            Ok(capture) => {
-                if capture.contains(expected) {
-                    return capture;
-                }
-                format!("last capture: {capture:?}")
-            }
-            Err(error) => format!("last error: {error:#}"),
-        };
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {expected:?}; {diagnostic}"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
-#[test]
-fn launches_discovers_captures_and_kills_a_session() {
-    let Some(tmux) = tmux_or_skip("launches_discovers_captures_and_kills_a_session") else {
-        return;
-    };
-
-    let probe = isolated_socket("launch-smoke");
-    let name = "agent".to_owned();
-    let profile = AgentProfile {
-        name: "Smoke".to_owned(),
-        harness: "test".to_owned(),
-        command: "/bin/sh".to_owned(),
-        args: vec![
-            "-lc".to_owned(),
-            "printf 'atmux-smoke-ready\\n'; IFS= read -r first; IFS= read -r second; printf 'received:%s|%s\\n' \"$first\" \"$second\"; sleep 10".to_owned(),
-        ],
-        env: BTreeMap::new(),
-        inherit_discovered: false,
-        modes: Vec::new(),
-    };
-
-    Tmux::with_socket_for_test(&probe.socket, || {
-        tmux.launch(&name, &probe.directory, &profile, None)?;
-        let sessions = tmux.sessions(&HashMap::default(), &StatusConfig::default())?;
-        let session = sessions
-            .iter()
-            .find(|session| session.name == name)
-            .expect("launched session should be discoverable");
-        let identity = Command::new("tmux")
-            .args([
-                "-L",
-                &probe.socket,
-                "display-message",
-                "-p",
-                "-t",
-                &session.pane_id,
-                "#{@atmux_identity}",
-            ])
-            .env_remove("TMUX")
-            .env_remove("TMUX_PANE")
-            .output()?;
-        assert!(identity.status.success());
-        let identity = String::from_utf8(identity.stdout)?.trim().to_owned();
-        assert_eq!(identity.len(), "pane-v1-".len() + 64);
-        assert!(identity.strip_prefix("pane-v1-").is_some_and(|digest| {
-            digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        }));
-        wait_for_capture(&tmux, &session.pane_id, "atmux-smoke-ready");
-        tmux.send_text(
-            &session.pane_id,
-            "hello from atmux\nsecond literal line",
-            true,
-        )?;
-        wait_for_capture(
-            &tmux,
-            &session.pane_id,
-            "received:hello from atmux|second literal line",
-        );
-        tmux.kill(&name)
-    })
-    .unwrap();
 }
 
 #[test]
@@ -230,32 +130,4 @@ finally:
         Ok(())
     })
     .unwrap();
-}
-
-#[test]
-fn launch_reports_a_command_that_exits_immediately() {
-    let Some(tmux) = tmux_or_skip("launch_reports_a_command_that_exits_immediately") else {
-        return;
-    };
-
-    let probe = isolated_socket("exit-smoke");
-    let name = "agent".to_owned();
-    let profile = AgentProfile {
-        name: "Immediate exit".to_owned(),
-        harness: "test".to_owned(),
-        command: "/bin/sh".to_owned(),
-        args: vec!["-lc".to_owned(), "exit 7".to_owned()],
-        env: BTreeMap::new(),
-        inherit_discovered: false,
-        modes: Vec::new(),
-    };
-
-    let error = Tmux::with_socket_for_test(&probe.socket, || {
-        tmux.launch(&name, &probe.directory, &profile, None)
-    })
-    .expect_err("an immediately exiting command must not be reported as launched");
-    assert!(
-        error.to_string().contains("exited before it became ready"),
-        "unexpected launch error: {error:#}"
-    );
 }

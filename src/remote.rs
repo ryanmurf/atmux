@@ -1069,6 +1069,8 @@ mod tests {
             title: name.to_owned(),
             command: "codex".to_owned(),
             launch_command: "codex".to_owned(),
+            systemd_scope: None,
+            memory_max_bytes: None,
             windows: 1,
             window_index: 0,
             pane_index: 0,

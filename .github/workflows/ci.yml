@@ -182,7 +182,9 @@ jobs:
         run: tmux -V
       - name: Test transactional Quick Resume helper
         if: runner.os == 'Linux'
-        run: bash tests/resume_tron_transactional.sh
+        run: |
+          bash tests/resume_tron_transactional.sh
+          bash tests/resume_tron_scoped_exec.sh
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --check

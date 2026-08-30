@@ -41,6 +41,7 @@ const {
   highlightCode,
   inlineTokens,
   isMachineControllable,
+  isLaunchCapableMachine,
   isManualDirectory,
   rememberedLaunchDirectories,
   rememberLaunchDirectory,
@@ -1357,32 +1358,55 @@ test("parseCompositeId splits machine~pane without mangling bare tmux identifier
 test("sessionMachineId prefers the explicit field and falls back to the composite id", () => {
   assert.equal(sessionMachineId({ id: "gpu-box~%1", machine: "gpu-box" }), "gpu-box");
   assert.equal(sessionMachineId({ id: "gpu-box~%1" }), "gpu-box");
-  // A pre-federation payload still lands under the local machine.
+  // A pre-federation payload lands under the coordinator named by the overview.
+  assert.equal(sessionMachineId({ id: "%1" }, "tron"), "tron");
+  // Older callers without overview context retain their compatibility default.
   assert.equal(sessionMachineId({ id: "%1" }), "local");
 });
 
-test("preferredLaunchMachineId uses the selected machine or federated session with safe fallbacks", () => {
+test("preferredLaunchMachineId skips online owners that cannot actually launch", () => {
+  const profile = { id: "profile-default", name: "Default", harness: "codex" };
   const machines = [
-    machine("local", "This machine", true),
-    machine("midnight", "Midnight", true),
-    machine("max", "Max", false),
+    machine("home", "Home", true, { directories: [], profiles: [] }),
+    machine("midnight", "Midnight", true, { directories: ["/work/midnight"], profiles: [profile] }),
+    machine("max", "Max", false, { directories: ["/work/max"], profiles: [profile] }),
   ];
   assert.equal(preferredLaunchMachineId(machines, "midnight", null), "midnight");
+  assert.equal(
+    preferredLaunchMachineId(machines, "home", null),
+    "midnight",
+    "an online but unconfigured contextual machine is not a launch target",
+  );
   assert.equal(
     preferredLaunchMachineId(machines, null, { id: "midnight~%7" }),
     "midnight",
   );
   assert.equal(
     preferredLaunchMachineId(machines, null, { id: "max~%9", machine: "max" }),
-    "local",
-    "an offline contextual machine falls back to the first online target",
+    "midnight",
+    "an offline contextual machine falls back to the first launch-capable target",
   );
-  assert.equal(preferredLaunchMachineId(machines, null, null), "local");
+  assert.equal(preferredLaunchMachineId(machines, null, null), "midnight");
   assert.equal(
-    preferredLaunchMachineId([machine("max", "Max", false)], null, null),
-    "max",
-    "the existing first-machine fallback remains when every target is offline",
+    preferredLaunchMachineId([
+      machines[0],
+      machine("max", "Max", true, { directories: ["/work/max"], profiles: [profile] }),
+      machine("tron", "Tron", true, { directories: ["/work/tron"], profiles: [profile] }),
+    ], null, { id: "%9" }, "tron"),
+    "tron",
+    "a bare hydrated pane uses the overview's local owner instead of a hardcoded local id",
   );
+  assert.equal(isLaunchCapableMachine(machines[0]), false);
+  assert.equal(isLaunchCapableMachine(machines[1]), true);
+  assert.equal(
+    isLaunchCapableMachine(machine("profiles-only", "Profiles", true, { directories: [], profiles: [profile] })),
+    false,
+  );
+  assert.equal(
+    isLaunchCapableMachine(machine("folders-only", "Folders", true, { directories: ["/work"], profiles: [] })),
+    false,
+  );
+  assert.equal(preferredLaunchMachineId([machines[0], machines[2]], null, null), null);
   assert.equal(preferredLaunchMachineId([], null, null), null);
 });
 
@@ -1414,6 +1438,13 @@ test("groupSessionsByMachine keeps a single-machine dashboard identical to befor
   const groups = groupSessionsByMachine(sessions, [machine("local", "This machine", true)]);
   assert.equal(groups.length, 1);
   assert.deepEqual(groups[0].sessions, sortSessions(sessions));
+});
+
+test("groupSessionsByMachine assigns legacy bare panes to the overview's local owner", () => {
+  const localOwner = { ...machine("tron", "Tron", true), kind: "local" };
+  const groups = groupSessionsByMachine([session("%1", "waiting", "legacy")], [localOwner]);
+  assert.deepEqual(groups.map((group) => group.machine.id), ["tron"]);
+  assert.deepEqual(groups[0].sessions.map((item) => item.id), ["%1"]);
 });
 
 test("machineStatusLabel reports counts when online and last-seen when offline", () => {

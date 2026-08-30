@@ -26,6 +26,10 @@ use tokio::{io::AsyncWriteExt, process::Command, sync::Mutex};
 const TRON_MACHINE_ID: &str = "tron";
 const TRON_RESUME_SCRIPT: &str = "/home/ryan/resume-tron.sh";
 const SCRIPT_MARKER: &str = "ATMUX_QUICK_RESUME_IDEMPOTENT_V1";
+const SCOPED_EXEC_MARKER: &str = "ATMUX_QUICK_RESUME_SCOPED_EXEC_V1";
+const SCOPED_EXEC_PREFIX: &str =
+    "/home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec --";
+const SCOPED_EXEC_SEND_FRAGMENT: &str = "\"exec /home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec -- $2\" Enter";
 const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
 const RUN_TIMEOUT: Duration = Duration::from_secs(180);
 #[cfg(not(test))]
@@ -45,6 +49,7 @@ const TRON_HOME: &str = "/home/ryan";
 const REQUIRED_RECOVERY_COMMANDS: &[&str] = &[
     "/usr/bin/bash",
     "/usr/bin/tmux",
+    "/home/ryan/.local/bin/atmux",
     "/home/ryan/.asdf/shims/codex",
     "/home/ryan/.local/bin/claude",
     "/home/ryan/.local/bin/claude-hd",
@@ -416,9 +421,25 @@ fn validate_script(path: &Path) -> Result<ValidatedScript, ()> {
     }
     let mut contents = Vec::with_capacity(usize::try_from(metadata.len()).map_err(|_| ())?);
     file.read_to_end(&mut contents).map_err(|_| ())?;
-    if !contents
-        .split(|byte| *byte == b'\n')
-        .any(|line| line == format!("# {SCRIPT_MARKER}").as_bytes())
+    let lines = contents.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+    let scoped_send_lines = lines
+        .iter()
+        .filter(|line| {
+            line.windows(b"\"exec ".len())
+                .any(|window| window == b"\"exec ")
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    if ![SCRIPT_MARKER, SCOPED_EXEC_MARKER].iter().all(|marker| {
+        let expected = format!("# {marker}");
+        lines.contains(&expected.as_bytes())
+    }) || !contents
+        .windows(SCOPED_EXEC_PREFIX.len())
+        .any(|window| window == SCOPED_EXEC_PREFIX.as_bytes())
+        || scoped_send_lines.len() != 1
+        || !scoped_send_lines[0]
+            .windows(SCOPED_EXEC_SEND_FRAGMENT.len())
+            .any(|window| window == SCOPED_EXEC_SEND_FRAGMENT.as_bytes())
     {
         return Err(());
     }
@@ -551,7 +572,11 @@ mod tests {
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
         let path = directory.join("resume.sh");
         let mut file = File::create(&path).unwrap();
-        writeln!(file, "#!/usr/bin/env bash\n# {SCRIPT_MARKER}\n{body}").unwrap();
+        writeln!(
+            file,
+            "#!/usr/bin/env bash\n# {SCRIPT_MARKER}\n# {SCOPED_EXEC_MARKER}\n# {SCOPED_EXEC_PREFIX}\n# {SCOPED_EXEC_SEND_FRAGMENT}\n{body}"
+        )
+        .unwrap();
         let mut permissions = file.metadata().unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&path, permissions).unwrap();
@@ -683,7 +708,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "#!/usr/bin/env bash\n# {SCRIPT_MARKER}\n(trap '' TERM; while :; do sleep 30; done) &\nprintf '%s' \"$!\" > {}\nwait\n",
+                "#!/usr/bin/env bash\n# {SCRIPT_MARKER}\n# {SCOPED_EXEC_MARKER}\n# {SCOPED_EXEC_PREFIX}\n# {SCOPED_EXEC_SEND_FRAGMENT}\n(trap '' TERM; while :; do sleep 30; done) &\nprintf '%s' \"$!\" > {}\nwait\n",
                 shell_words::quote(&pid_file.display().to_string()),
             ),
         )
@@ -712,18 +737,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn safety_marker_and_machine_scope_fail_closed() {
+    async fn scoped_exec_marker_and_machine_scope_fail_closed() {
         let path = fixture_script(":");
         let wrong_machine = RecoveryRunner::production("midnight");
         assert!(!wrong_machine.status().await.available);
 
-        fs::write(&path, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+        fs::write(
+            &path,
+            format!("#!/usr/bin/env bash\n# {SCRIPT_MARKER}\nexit 0\n"),
+        )
+        .unwrap();
         let runner = RecoveryRunner::fixture("tron", path.clone(), Duration::from_secs(1));
         assert!(!runner.status().await.available);
         assert!(matches!(
             runner.start().await,
             Err(RecoveryStartError::Unavailable(_))
         ));
+        remove_fixture(&path);
+    }
+
+    #[test]
+    fn checked_in_tron_bridge_passes_validation_and_raw_variants_fail() {
+        let path = fixture_script(":");
+        let block = fs::read_to_string(
+            std::env::current_dir()
+                .unwrap()
+                .join("deploy/systemd/resume-tron-scoped-exec-block.bash"),
+        )
+        .unwrap();
+        fs::write(
+            &path,
+            format!("#!/usr/bin/env bash\n# {SCRIPT_MARKER}\n{block}\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(validate_script(&path).is_ok());
+
+        let raw = block.replace(SCOPED_EXEC_SEND_FRAGMENT, "\"exec $2\" Enter");
+        fs::write(
+            &path,
+            format!("#!/usr/bin/env bash\n# {SCRIPT_MARKER}\n{raw}\n"),
+        )
+        .unwrap();
+        assert!(validate_script(&path).is_err());
+
+        let duplicate =
+            format!("{block}\ntmux send-keys -t \"$created_session_id\" \"exec $2\" Enter\n");
+        fs::write(
+            &path,
+            format!("#!/usr/bin/env bash\n# {SCRIPT_MARKER}\n{duplicate}\n"),
+        )
+        .unwrap();
+        assert!(validate_script(&path).is_err());
         remove_fixture(&path);
     }
 

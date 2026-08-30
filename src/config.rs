@@ -80,6 +80,12 @@ inactivity_minutes = 15
 input_tokens = 200000
 poll_seconds = 30
 
+# Optional per-agent process-tree memory isolation on Linux. When configured,
+# every new launch and in-place relaunch must enter its own transient systemd
+# user scope with this MemoryMax. Leave unset on macOS and non-systemd hosts.
+[agent_resources]
+# memory_max_bytes = 34359738368 # 32 GiB
+
 # Owner-local native CLI maintenance. Each owner runs one scheduler; federated
 # coordinators never update another machine. Disabled until explicitly enabled.
 [maintenance]
@@ -95,6 +101,10 @@ relaunch_limit = 4
 # [node]
 # id = "local"
 # label = "This machine"
+# Run only as a federation/Pulse coordinator. This removes this process's
+# machine, tmux sessions, launch inputs, metrics, and owner-local mutations
+# from the API. The fail-closed restrictions are documented in the README.
+# coordinator_only = false
 # Require this bearer token for API and MCP access from both remote and local
 # callers. Unauthenticated loopback is a separate, explicit [web] opt-in.
 # token_env = "ATMUX_NODE_TOKEN"
@@ -179,6 +189,8 @@ pub struct Config {
     #[serde(default)]
     pub auto_compact: AutoCompactConfig,
     #[serde(default)]
+    pub agent_resources: AgentResourcesConfig,
+    #[serde(default)]
     pub maintenance: MaintenanceConfig,
     #[serde(default)]
     pub node: NodeConfig,
@@ -226,6 +238,9 @@ pub struct WebConfig {
 pub struct NodeConfig {
     pub id: String,
     pub label: Option<String>,
+    /// Disable every owner-local tmux/launch capability while retaining this
+    /// process's node identity for federation, Pulse, and authenticated web.
+    pub coordinator_only: bool,
     pub token_env: Option<String>,
     pub token_file: Option<PathBuf>,
     pub tls: Option<TlsConfig>,
@@ -236,6 +251,7 @@ impl Default for NodeConfig {
         Self {
             id: LOCAL_MACHINE_ID.to_owned(),
             label: None,
+            coordinator_only: false,
             token_env: None,
             token_file: None,
             tls: None,
@@ -311,6 +327,30 @@ pub struct AutoCompactConfig {
     pub inactivity_minutes: u64,
     pub input_tokens: u64,
     pub poll_seconds: u64,
+}
+
+/// Opt-in process-tree resource isolation for locally launched agents.
+///
+/// A configured memory maximum is fail-closed: atmux will not launch or
+/// relaunch an agent unless a systemd user scope accepts `MemoryMax`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AgentResourcesConfig {
+    pub memory_max_bytes: Option<u64>,
+}
+
+impl AgentResourcesConfig {
+    fn validate(self) -> Result<()> {
+        if self.memory_max_bytes == Some(0) {
+            bail!("[agent_resources].memory_max_bytes must be greater than zero");
+        }
+        if self.memory_max_bytes == Some(u64::MAX) {
+            bail!(
+                "[agent_resources].memory_max_bytes cannot be u64::MAX because systemd treats it as infinity"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for AutoCompactConfig {
@@ -403,6 +443,12 @@ impl Config {
         let mut config: Self = toml::from_str(&source)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         config.normalize();
+        config.validate_coordinator_only().with_context(|| {
+            format!(
+                "invalid coordinator-only configuration in {}",
+                path.display()
+            )
+        })?;
         config
             .validate_federation()
             .with_context(|| format!("invalid federation configuration in {}", path.display()))?;
@@ -412,6 +458,9 @@ impl Config {
         config
             .validate_auto_compact()
             .with_context(|| format!("invalid auto-compact configuration in {}", path.display()))?;
+        config.agent_resources.validate().with_context(|| {
+            format!("invalid agent resource configuration in {}", path.display())
+        })?;
         config
             .maintenance
             .validate()
@@ -499,6 +548,84 @@ impl Config {
         }
         if self.web.proxy_token_env.is_some() && self.web.proxy_token_file.is_some() {
             bail!("[web] sets both proxy_token_env and proxy_token_file; choose one");
+        }
+        Ok(())
+    }
+
+    /// Ensures a coordinator-only process cannot silently regain any local
+    /// owner capability through an otherwise-valid configuration field.
+    ///
+    /// Remote federation and Pulse serving remain available. Pulse account
+    /// names may be configured so pulled rows can be associated with their
+    /// identities, but local stores, credentials, collection, receive, and
+    /// push reporting remain forbidden.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `[node].coordinator_only` is enabled alongside an
+    /// owner-local profile, root, discovery, scheduler, or Pulse capability.
+    pub fn validate_coordinator_only(&self) -> Result<()> {
+        if !self.node.coordinator_only {
+            return Ok(());
+        }
+        if !self.profiles.is_empty() {
+            bail!("[node].coordinator_only requires profiles = []");
+        }
+        if !self.general.project_roots.is_empty() || !self.general.favorite_dirs.is_empty() {
+            bail!(
+                "[node].coordinator_only requires empty [general].project_roots and favorite_dirs"
+            );
+        }
+        if self.general.switch_on_launch {
+            bail!("[node].coordinator_only requires [general].switch_on_launch = false");
+        }
+        if self.discovery.enabled {
+            bail!("[node].coordinator_only requires [discovery].enabled = false");
+        }
+        if self.auto_compact.enabled {
+            bail!("[node].coordinator_only requires [auto_compact].enabled = false");
+        }
+        if self.agent_resources.memory_max_bytes.is_some() {
+            bail!("[node].coordinator_only forbids [agent_resources].memory_max_bytes");
+        }
+        if self.maintenance.enabled {
+            bail!("[node].coordinator_only requires [maintenance].enabled = false");
+        }
+        #[cfg(feature = "pulse")]
+        {
+            if self.pulse.collect {
+                bail!("[node].coordinator_only requires [pulse].collect = false");
+            }
+            if self.pulse.receive {
+                bail!("[node].coordinator_only requires [pulse].receive = false");
+            }
+            if self.pulse.report_to.is_some()
+                || self.pulse.report_token_env.is_some()
+                || self.pulse.report_token_file.is_some()
+                || self.pulse.report_node_token_env.is_some()
+                || self.pulse.report_node_token_file.is_some()
+            {
+                bail!("[node].coordinator_only forbids Pulse push reporting");
+            }
+            if self
+                .pulse
+                .accounts
+                .iter()
+                .flat_map(|account| &account.profiles)
+                .any(|profile| {
+                    profile.config_dir.is_some()
+                        || profile.api_key_env.is_some()
+                        || profile.api_key_file.is_some()
+                })
+                || self.pulse.credentials.gemini_oauth_client_id_env.is_some()
+                || self
+                    .pulse
+                    .credentials
+                    .gemini_oauth_client_secret_env
+                    .is_some()
+            {
+                bail!("[node].coordinator_only forbids owner-local Pulse credential references");
+            }
         }
         Ok(())
     }
@@ -711,7 +838,11 @@ impl Config {
                 *path = expand_tilde(path);
             }
         }
-        self.discover_profiles();
+        // A coordinator must not infer local launch capability merely because
+        // an agent executable happens to be present in its container image.
+        if !self.node.coordinator_only {
+            self.discover_profiles();
+        }
     }
 
     fn discover_profiles(&mut self) {
@@ -1586,6 +1717,37 @@ mod tests {
         let config: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
         assert_eq!(config.profiles.len(), 2);
         assert_eq!(config.general.refresh_ms, 750);
+        assert_eq!(config.agent_resources.memory_max_bytes, None);
+    }
+
+    #[test]
+    fn agent_memory_max_is_explicit_and_nonzero() {
+        let configured: Config = toml::from_str(
+            r"
+[agent_resources]
+memory_max_bytes = 34359738368
+",
+        )
+        .unwrap();
+        assert_eq!(
+            configured.agent_resources.memory_max_bytes,
+            Some(34_359_738_368)
+        );
+        configured.agent_resources.validate().unwrap();
+
+        let disabled = AgentResourcesConfig {
+            memory_max_bytes: None,
+        };
+        disabled.validate().unwrap();
+        let invalid = AgentResourcesConfig {
+            memory_max_bytes: Some(0),
+        };
+        assert!(invalid.validate().is_err());
+        let infinity = AgentResourcesConfig {
+            memory_max_bytes: Some(u64::MAX),
+        };
+        let error = infinity.validate().unwrap_err().to_string();
+        assert!(error.contains("infinity"));
     }
 
     #[test]
@@ -1806,6 +1968,92 @@ poll_seconds = 60
         ] {
             let invalid: Config = toml::from_str(source).unwrap();
             assert!(invalid.validate_auto_compact().is_err(), "{source}");
+        }
+    }
+
+    fn coordinator_only_config() -> Config {
+        toml::from_str(
+            r#"
+profiles = []
+
+[general]
+project_roots = []
+favorite_dirs = []
+switch_on_launch = false
+
+[node]
+id = "home"
+coordinator_only = true
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn coordinator_only_is_opt_in_and_does_not_discover_local_profiles() {
+        let default: Config = toml::from_str("profiles = []").unwrap();
+        assert!(!default.node.coordinator_only);
+
+        let mut coordinator = coordinator_only_config();
+        coordinator.normalize();
+        assert!(coordinator.profiles.is_empty());
+        coordinator.validate_coordinator_only().unwrap();
+    }
+
+    #[test]
+    fn coordinator_only_rejects_every_local_owner_capability() {
+        let assert_rejected = |config: Config, expected: &str| {
+            let error = config.validate_coordinator_only().unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        };
+
+        let mut config = coordinator_only_config();
+        config.profiles.push(Config::default().profiles[0].clone());
+        assert_rejected(config, "profiles = []");
+
+        let mut config = coordinator_only_config();
+        config.general.project_roots.push(PathBuf::from("/srv"));
+        assert_rejected(config, "project_roots");
+
+        let mut config = coordinator_only_config();
+        config.general.switch_on_launch = true;
+        assert_rejected(config, "switch_on_launch");
+
+        let mut config = coordinator_only_config();
+        config.discovery.enabled = true;
+        assert_rejected(config, "[discovery].enabled");
+
+        let mut config = coordinator_only_config();
+        config.auto_compact.enabled = true;
+        assert_rejected(config, "[auto_compact].enabled");
+
+        let mut config = coordinator_only_config();
+        config.agent_resources.memory_max_bytes = Some(1024);
+        assert_rejected(config, "[agent_resources].memory_max_bytes");
+
+        let mut config = coordinator_only_config();
+        config.maintenance.enabled = true;
+        assert_rejected(config, "[maintenance].enabled");
+
+        #[cfg(feature = "pulse")]
+        {
+            let mut config = coordinator_only_config();
+            config.pulse.collect = true;
+            assert_rejected(config, "[pulse].collect");
+
+            let mut config = coordinator_only_config();
+            config.pulse.receive = true;
+            assert_rejected(config, "[pulse].receive");
+
+            let mut config = coordinator_only_config();
+            config.pulse.report_to = Some("http://127.0.0.1:9000".to_owned());
+            assert_rejected(config, "push reporting");
+
+            let mut config = coordinator_only_config();
+            config.pulse.credentials.gemini_oauth_client_id_env = Some("CLIENT_ID".to_owned());
+            config.pulse.credentials.gemini_oauth_client_secret_env =
+                Some("CLIENT_SECRET".to_owned());
+            assert_rejected(config, "owner-local Pulse credential references");
         }
     }
 
