@@ -6,11 +6,14 @@
 //! program, URL, argument, or environment assignment here.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
+    ffi::OsString,
     fs::{self, File, OpenOptions},
     future::Future,
     io::{Read as _, Write as _},
-    os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
+    os::unix::fs::{
+        DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+    },
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -389,6 +392,68 @@ pub(crate) struct OwnerLock {
     temp_dir: PathBuf,
 }
 
+enum TempArtifact {
+    File(PathBuf),
+    Directory(PathBuf),
+}
+
+#[derive(Default)]
+struct TempCleanup(Vec<TempArtifact>);
+
+impl TempCleanup {
+    fn file(&mut self, path: &Path) {
+        self.0.push(TempArtifact::File(path.to_path_buf()));
+    }
+
+    fn directory(&mut self, path: &Path) {
+        self.0.push(TempArtifact::Directory(path.to_path_buf()));
+    }
+}
+
+impl Drop for TempCleanup {
+    fn drop(&mut self) {
+        for artifact in self.0.iter().rev() {
+            match artifact {
+                TempArtifact::File(path) => {
+                    let _ = fs::remove_file(path);
+                }
+                TempArtifact::Directory(path) => {
+                    let _ = fs::remove_dir(path);
+                }
+            }
+        }
+    }
+}
+
+struct CodexUpdateFiles {
+    script: PathBuf,
+    curl_home: PathBuf,
+    curl_config: PathBuf,
+    _cleanup: TempCleanup,
+}
+
+impl CodexUpdateFiles {
+    fn prepare(lock: &OwnerLock) -> Result<Self> {
+        let mut cleanup = TempCleanup::default();
+        let (script, script_file) = lock.create_temp_file("codex-install")?;
+        drop(script_file);
+        cleanup.file(&script);
+
+        let curl_home = lock.create_temp_directory("curl-home")?;
+        cleanup.directory(&curl_home);
+        let curl_config = curl_home.join(".curlrc");
+        cleanup.file(&curl_config);
+        drop(create_secure_empty_file(&curl_config)?);
+
+        Ok(Self {
+            script,
+            curl_home,
+            curl_config,
+            _cleanup: cleanup,
+        })
+    }
+}
+
 /// Cross-process pane mutation gate shared by every atmux owner process.
 /// The in-memory gate remains useful for request ordering; this advisory lock
 /// closes the old/new service overlap during restarts and rolling deploys.
@@ -511,6 +576,14 @@ impl OwnerLock {
             std::process::id(),
             TEMP_ID.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    fn create_temp_directory(&self, label: &str) -> Result<PathBuf> {
+        create_exclusive_temp_directory(std::iter::repeat_with(|| self.temp_path(label)).take(16))
+    }
+
+    fn create_temp_file(&self, label: &str) -> Result<(PathBuf, File)> {
+        create_exclusive_temp_file(std::iter::repeat_with(|| self.temp_path(label)).take(16))
     }
 }
 
@@ -728,41 +801,68 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 async fn update_codex(timeout: Duration, lock: &OwnerLock) -> Result<()> {
-    let curl = trusted_system_program(Path::new("/usr/bin/curl"))?;
-    let shell = trusted_system_program(Path::new("/bin/sh"))?;
-    let script = lock.temp_path("codex-install");
-    // Pre-create with owner-only permissions; curl opens this exact regular
-    // file rather than choosing its mode under the service's ambient umask.
-    drop(secure_open(&script)?);
-    let result = async {
-        bounded_output(
-            &curl,
-            &[
-                "--fail",
-                "--silent",
-                "--show-error",
-                "--location",
-                "--max-time",
-                &timeout.as_secs().to_string(),
-                "--output",
-                script.to_str().context("maintenance path is not UTF-8")?,
-                CODEX_INSTALL_URL,
-            ],
+    let files = CodexUpdateFiles::prepare(lock)?;
+    async {
+        let timeout_seconds = timeout.as_secs().to_string();
+        let script_path = files
+            .script
+            .to_str()
+            .context("maintenance path is not UTF-8")?;
+        let curl_arguments = codex_download_arguments(&timeout_seconds, script_path);
+        bounded_system_output(
+            Path::new("/usr/bin/curl"),
+            &curl_arguments,
             timeout,
+            &files.curl_home,
         )
         .await?;
-        reject_symlink_or_unowned(&script)?;
-        bounded_output(
-            &shell,
-            &[script.to_str().context("maintenance path is not UTF-8")?],
+        reject_symlink_or_unowned(&files.script)?;
+        reject_secure_empty_file(&files.curl_config)?;
+        bounded_system_output(
+            Path::new("/bin/sh"),
+            &[script_path],
             timeout,
+            &files.curl_home,
         )
         .await?;
         Ok(())
     }
-    .await;
-    let _ = fs::remove_file(script);
-    result
+    .await
+}
+
+fn codex_download_arguments<'a>(timeout_seconds: &'a str, script: &'a str) -> [&'a str; 14] {
+    [
+        // curl only honors this switch before every other argument. It blocks
+        // owner-controlled ~/.curlrc and CURL_HOME configuration.
+        "--disable",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--max-time",
+        timeout_seconds,
+        "--output",
+        script,
+        CODEX_INSTALL_URL,
+    ]
+}
+
+/// Re-resolves and validates one of the two fixed system launchers immediately
+/// before constructing its child process. The trusted namespace makes the
+/// remaining validation-to-exec window unavailable to an unprivileged service
+/// user; a privileged/root actor is outside this boundary.
+async fn bounded_system_output(
+    requested: &Path,
+    args: &[&str],
+    timeout: Duration,
+    curl_home: &Path,
+) -> Result<String> {
+    let (program, command) = validated_system_command(requested, args, curl_home)?;
+    run_bounded_output(command, &program, timeout).await
 }
 
 async fn bounded_output(program: &Path, args: &[&str], timeout: Duration) -> Result<String> {
@@ -773,6 +873,14 @@ async fn bounded_output(program: &Path, args: &[&str], timeout: Duration) -> Res
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    run_bounded_output(command, program, timeout).await
+}
+
+async fn run_bounded_output(
+    mut command: Command,
+    program: &Path,
+    timeout: Duration,
+) -> Result<String> {
     let output = tokio::time::timeout(timeout, command.output())
         .await
         .with_context(|| format!("{} exceeded its maintenance deadline", program.display()))??;
@@ -789,23 +897,39 @@ async fn bounded_output(program: &Path, args: &[&str], timeout: Duration) -> Res
 }
 
 fn resolve_launcher(harness: Harness) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)?
-        .canonicalize()
-        .ok()?;
-    let metadata = fs::symlink_metadata(&home).ok()?;
+    let home = trusted_owner_home()?;
     let euid = rustix::process::geteuid().as_raw();
-    if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != euid
-        || metadata.permissions().mode() & 0o022 != 0
-    {
-        return None;
-    }
     let candidates = owner_launcher_candidates(&home, harness);
     candidates
         .iter()
         .find_map(|candidate| trusted_owner_executable(candidate, &home, euid))
+}
+
+fn trusted_owner_home() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)?
+        .canonicalize()
+        .ok()?;
+    let euid = rustix::process::geteuid().as_raw();
+    let nodes = home
+        .ancestors()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|path| system_node(path, None))
+        .collect::<Result<Vec<_>>>()
+        .ok()?;
+    owner_home_nodes_trusted(&nodes, euid).then_some(home)
+}
+
+fn owner_home_nodes_trusted(nodes: &[SystemNode], euid: u32) -> bool {
+    nodes.last().is_some_and(|node| node.uid == euid)
+        && nodes.iter().all(|node| {
+            node.path.is_absolute()
+                && node.kind == SystemNodeKind::Directory
+                && (node.uid == 0 || node.uid == euid)
+                && node.mode & 0o022 == 0
+        })
 }
 
 fn owner_launcher_candidates(home: &Path, harness: Harness) -> [PathBuf; 2] {
@@ -857,23 +981,307 @@ fn trusted_owner_executable(candidate: &Path, home: &Path, euid: u32) -> Option<
         .then_some(canonical)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SystemNodeKind {
+    Directory,
+    Symlink,
+    File,
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SystemNode {
+    path: PathBuf,
+    kind: SystemNodeKind,
+    uid: u32,
+    mode: u32,
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+    link_target: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SystemProgramResolution {
+    canonical_path: PathBuf,
+    nodes: Vec<SystemNode>,
+}
+
+trait SystemProgramResolver {
+    fn resolve(&self, requested: &Path) -> Result<SystemProgramResolution>;
+}
+
+struct OsSystemProgramResolver;
+
+impl SystemProgramResolver for OsSystemProgramResolver {
+    fn resolve(&self, requested: &Path) -> Result<SystemProgramResolution> {
+        resolve_system_program(requested)
+    }
+}
+
+trait SystemPathAccess {
+    fn node(&self, path: &Path) -> Result<SystemNode>;
+    fn read_link(&self, path: &Path) -> Result<PathBuf>;
+}
+
+struct OsSystemPathAccess;
+
+impl SystemPathAccess for OsSystemPathAccess {
+    fn node(&self, path: &Path) -> Result<SystemNode> {
+        system_node(path, None)
+    }
+
+    fn read_link(&self, path: &Path) -> Result<PathBuf> {
+        Ok(fs::read_link(path)?)
+    }
+}
+
+/// Only the hard-coded vendor updater dependencies can cross this boundary.
+/// Each resolution records the complete symlink namespace and canonical
+/// ancestry. Comparing two consecutive resolutions detects changes during
+/// validation, but is not an atomic-exec primitive. Security comes from every
+/// traversed object being rooted in a root-owned, non-group/world-writable
+/// namespace; replacing it requires root. Root compromise, malicious mounts,
+/// and platform ACL semantics not represented by POSIX mode bits are outside
+/// this service-user boundary. The final result is used immediately by
+/// `Command`, leaving only that privileged-attacker validation-to-exec window.
 fn trusted_system_program(path: &Path) -> Result<PathBuf> {
-    let link_metadata = fs::symlink_metadata(path)
+    trusted_system_program_with(path, &OsSystemProgramResolver)
+}
+
+fn validated_system_command(
+    path: &Path,
+    args: &[&str],
+    curl_home: &Path,
+) -> Result<(PathBuf, Command)> {
+    let home = trusted_owner_home().context("owner HOME is not trusted for CLI maintenance")?;
+    reject_secure_owner_directory(curl_home)?;
+    reject_secure_empty_file(&curl_home.join(".curlrc"))?;
+    // System-program resolution is deliberately the final filesystem action
+    // before Command construction.
+    let program = trusted_system_program(path)?;
+    Ok(system_command(program, args, &home, curl_home))
+}
+
+#[cfg(test)]
+fn validated_system_command_with(
+    path: &Path,
+    args: &[&str],
+    resolver: &impl SystemProgramResolver,
+    curl_home: &Path,
+) -> Result<(PathBuf, Command)> {
+    let home = trusted_owner_home().context("owner HOME is not trusted for CLI maintenance")?;
+    reject_secure_owner_directory(curl_home)?;
+    reject_secure_empty_file(&curl_home.join(".curlrc"))?;
+    let program = trusted_system_program_with(path, resolver)?;
+    // Keep command construction adjacent to the second validation pass. No
+    // network, filesystem, or async operation belongs in this gap.
+    Ok(system_command(program, args, &home, curl_home))
+}
+
+fn system_command(
+    program: PathBuf,
+    args: &[&str],
+    home: &Path,
+    curl_home: &Path,
+) -> (PathBuf, Command) {
+    let mut command = Command::new(&program);
+    command
+        .args(args)
+        // Do not let CURL_HOME, CURL_CA_BUNDLE, SSL_CERT_FILE, ENV, BASH_ENV,
+        // shell functions, or a service PATH alter these privileged updater
+        // dependencies. HOME is the independently validated owner directory
+        // required by the official installer; PATH is fixed to system tools.
+        .env_clear()
+        .env("HOME", home)
+        // /usr/sbin is required by install.sh's macOS Rosetta `sysctl` probe.
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("CURL_HOME", curl_home)
+        .env("CODEX_NON_INTERACTIVE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    (program, command)
+}
+
+fn trusted_system_program_with(
+    path: &Path,
+    resolver: &impl SystemProgramResolver,
+) -> Result<PathBuf> {
+    if path != Path::new("/bin/sh") && path != Path::new("/usr/bin/curl") {
+        bail!("required system program path is not allow-listed");
+    }
+    let first = resolver
+        .resolve(path)
         .with_context(|| format!("required system program {} is unavailable", path.display()))?;
-    if link_metadata.uid() != 0 || link_metadata.permissions().mode() & 0o022 != 0 {
+    validate_system_resolution(path, &first)?;
+    let second = resolver.resolve(path).with_context(|| {
+        format!(
+            "required system program {} changed during validation",
+            path.display()
+        )
+    })?;
+    validate_system_resolution(path, &second)?;
+    if first != second {
+        bail!(
+            "required system program {} changed during validation",
+            path.display()
+        );
+    }
+    Ok(second.canonical_path)
+}
+
+fn validate_system_resolution(path: &Path, resolution: &SystemProgramResolution) -> Result<()> {
+    if !resolution.canonical_path.is_absolute() || resolution.nodes.is_empty() {
         bail!("required system program {} is not trusted", path.display());
     }
-    let canonical = path.canonicalize()?;
-    let metadata = fs::symlink_metadata(&canonical)?;
-    if !canonical.is_absolute()
-        || !metadata.is_file()
-        || metadata.uid() != 0
-        || metadata.permissions().mode() & 0o111 == 0
-        || metadata.permissions().mode() & 0o022 != 0
-    {
-        bail!("required system program {} is not trusted", path.display());
+    for (index, node) in resolution.nodes.iter().enumerate() {
+        let is_last = index + 1 == resolution.nodes.len();
+        if !node.path.is_absolute() || node.uid != 0 {
+            bail!("required system program {} is not trusted", path.display());
+        }
+        match node.kind {
+            SystemNodeKind::Directory if !is_last => {
+                if node.mode & 0o022 != 0 {
+                    bail!("required system program {} is not trusted", path.display());
+                }
+            }
+            // POSIX reports symlinks as mode 0777 on Linux and macOS. Their
+            // ownership and trusted parent control replacement; their mode is
+            // intentionally not treated as an access-control bitmask.
+            SystemNodeKind::Symlink if !is_last => {
+                if node.link_target.is_none() {
+                    bail!("required system program {} is not trusted", path.display());
+                }
+            }
+            SystemNodeKind::File if is_last => {
+                if node.path != resolution.canonical_path
+                    || node.mode & 0o111 == 0
+                    || node.mode & 0o022 != 0
+                {
+                    bail!("required system program {} is not trusted", path.display());
+                }
+            }
+            _ => bail!("required system program {} is not trusted", path.display()),
+        }
     }
-    Ok(canonical)
+    Ok(())
+}
+
+fn resolve_system_program(requested: &Path) -> Result<SystemProgramResolution> {
+    resolve_system_program_with(requested, &OsSystemPathAccess)
+}
+
+fn resolve_system_program_with(
+    requested: &Path,
+    access: &impl SystemPathAccess,
+) -> Result<SystemProgramResolution> {
+    let mut pending = path_components(requested, true)?;
+    let mut resolved = PathBuf::from("/");
+    let mut nodes = vec![access.node(Path::new("/"))?];
+    let mut symlinks = 0_u8;
+
+    while let Some(component) = pending.pop_front() {
+        match component {
+            ResolutionComponent::Parent => {
+                // Absolute POSIX lookup clamps `..` at `/`; later components
+                // are still checked, so an escape toward `/tmp` is rejected
+                // when its writable ancestry is encountered.
+                resolved.pop();
+                if resolved.as_os_str().is_empty() {
+                    resolved.push("/");
+                }
+            }
+            ResolutionComponent::Normal(component) => {
+                let candidate = resolved.join(component);
+                let mut node = access.node(&candidate)?;
+                if node.kind == SystemNodeKind::Symlink {
+                    symlinks = symlinks.saturating_add(1);
+                    if symlinks > 40 {
+                        bail!("too many system program symlinks");
+                    }
+                    let target = access.read_link(&candidate)?;
+                    if target.as_os_str().is_empty() {
+                        bail!("system program symlink has an empty target");
+                    }
+                    node.link_target = Some(target.clone());
+                    nodes.push(node);
+                    let absolute = target.is_absolute();
+                    let mut target_components = path_components(&target, absolute)?;
+                    target_components.append(&mut pending);
+                    pending = target_components;
+                    if absolute {
+                        resolved = PathBuf::from("/");
+                    }
+                } else {
+                    resolved = candidate;
+                    nodes.push(node);
+                }
+            }
+        }
+    }
+
+    Ok(SystemProgramResolution {
+        canonical_path: resolved,
+        nodes,
+    })
+}
+
+#[derive(Debug)]
+enum ResolutionComponent {
+    Parent,
+    Normal(OsString),
+}
+
+fn path_components(path: &Path, require_absolute: bool) -> Result<VecDeque<ResolutionComponent>> {
+    if require_absolute && !path.is_absolute() {
+        bail!("system program path must be absolute");
+    }
+    let mut components = VecDeque::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => components.push_back(ResolutionComponent::Parent),
+            std::path::Component::Normal(value) => {
+                components.push_back(ResolutionComponent::Normal(value.to_os_string()));
+            }
+            std::path::Component::Prefix(_) => bail!("unsupported system program path prefix"),
+        }
+    }
+    Ok(components)
+}
+
+fn system_node(path: &Path, link_target: Option<PathBuf>) -> Result<SystemNode> {
+    let metadata = fs::symlink_metadata(path)?;
+    let file_type = metadata.file_type();
+    let kind = if file_type.is_dir() {
+        SystemNodeKind::Directory
+    } else if file_type.is_symlink() {
+        SystemNodeKind::Symlink
+    } else if file_type.is_file() {
+        SystemNodeKind::File
+    } else {
+        SystemNodeKind::Other
+    };
+    Ok(SystemNode {
+        path: path.to_path_buf(),
+        kind,
+        uid: metadata.uid(),
+        mode: metadata.permissions().mode(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+        link_target,
+    })
 }
 
 fn digest_file(path: &Path) -> Result<String> {
@@ -893,6 +1301,93 @@ fn digest_file(path: &Path) -> Result<String> {
 fn secure_owner_directory(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    reject_secure_owner_directory(path)
+}
+
+fn create_exclusive_temp_directory(
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Result<PathBuf> {
+    for path in candidates {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&path) {
+            Ok(()) => {
+                reject_secure_owner_directory(&path)?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error).context("could not create CLI maintenance directory"),
+        }
+    }
+    bail!("could not allocate a fresh CLI maintenance directory")
+}
+
+fn create_secure_empty_file(path: &Path) -> Result<File> {
+    let file = open_new_empty_file(path)?;
+    if let Err(error) = validate_new_empty_file(path, &file) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(file)
+}
+
+fn create_exclusive_temp_file(
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Result<(PathBuf, File)> {
+    for path in candidates {
+        match open_new_empty_file(&path) {
+            Ok(file) => {
+                if let Err(error) = validate_new_empty_file(&path, &file) {
+                    drop(file);
+                    let _ = fs::remove_file(&path);
+                    return Err(error);
+                }
+                return Ok((path, file));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error).context("could not create CLI maintenance file"),
+        }
+    }
+    bail!("could not allocate a fresh CLI maintenance file")
+}
+
+fn open_new_empty_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+}
+
+fn validate_new_empty_file(path: &Path, file: &File) -> Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() != 0
+        || metadata.nlink() != 1
+    {
+        bail!("CLI maintenance file {} is unsafe", path.display());
+    }
+    Ok(())
+}
+
+fn reject_secure_empty_file(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() != 0
+        || metadata.nlink() != 1
+    {
+        bail!("CLI maintenance file {} is unsafe", path.display());
+    }
+    Ok(())
+}
+
+fn reject_secure_owner_directory(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
@@ -1152,6 +1647,534 @@ mod tests {
             ["resume", id]
         );
         assert!(resume_arguments(Harness::Claude, "$(unsafe)").is_err());
+    }
+
+    fn system_test_node(
+        path: &str,
+        kind: SystemNodeKind,
+        uid: u32,
+        mode: u32,
+        inode: u64,
+        link_target: Option<&str>,
+    ) -> SystemNode {
+        SystemNode {
+            path: PathBuf::from(path),
+            kind,
+            uid,
+            mode,
+            device: 1,
+            inode,
+            size: 1,
+            modified_seconds: 10,
+            modified_nanoseconds: 20,
+            changed_seconds: 30,
+            changed_nanoseconds: 40,
+            link_target: link_target.map(PathBuf::from),
+        }
+    }
+
+    fn trusted_shell_resolution() -> SystemProgramResolution {
+        SystemProgramResolution {
+            canonical_path: PathBuf::from("/usr/bin/dash"),
+            nodes: vec![
+                system_test_node("/", SystemNodeKind::Directory, 0, 0o755, 1, None),
+                system_test_node(
+                    "/bin",
+                    SystemNodeKind::Symlink,
+                    0,
+                    0o777,
+                    2,
+                    Some("usr/bin"),
+                ),
+                system_test_node("/usr", SystemNodeKind::Directory, 0, 0o755, 3, None),
+                system_test_node("/usr/bin", SystemNodeKind::Directory, 0, 0o755, 4, None),
+                system_test_node(
+                    "/usr/bin/sh",
+                    SystemNodeKind::Symlink,
+                    0,
+                    0o777,
+                    5,
+                    Some("dash"),
+                ),
+                system_test_node("/usr/bin/dash", SystemNodeKind::File, 0, 0o755, 6, None),
+            ],
+        }
+    }
+
+    fn direct_macos_shell_resolution() -> SystemProgramResolution {
+        SystemProgramResolution {
+            canonical_path: PathBuf::from("/bin/sh"),
+            nodes: vec![
+                system_test_node("/", SystemNodeKind::Directory, 0, 0o755, 1, None),
+                system_test_node("/bin", SystemNodeKind::Directory, 0, 0o755, 2, None),
+                system_test_node("/bin/sh", SystemNodeKind::File, 0, 0o755, 3, None),
+            ],
+        }
+    }
+
+    fn direct_curl_resolution() -> SystemProgramResolution {
+        SystemProgramResolution {
+            canonical_path: PathBuf::from("/usr/bin/curl"),
+            nodes: vec![
+                system_test_node("/", SystemNodeKind::Directory, 0, 0o755, 1, None),
+                system_test_node("/usr", SystemNodeKind::Directory, 0, 0o755, 2, None),
+                system_test_node("/usr/bin", SystemNodeKind::Directory, 0, 0o755, 3, None),
+                system_test_node("/usr/bin/curl", SystemNodeKind::File, 0, 0o755, 4, None),
+            ],
+        }
+    }
+
+    struct SyntheticPathAccess {
+        nodes: BTreeMap<PathBuf, SystemNode>,
+    }
+
+    impl SyntheticPathAccess {
+        fn new(nodes: impl IntoIterator<Item = SystemNode>) -> Self {
+            Self {
+                nodes: nodes
+                    .into_iter()
+                    .map(|node| (node.path.clone(), node))
+                    .collect(),
+            }
+        }
+    }
+
+    impl SystemPathAccess for SyntheticPathAccess {
+        fn node(&self, path: &Path) -> Result<SystemNode> {
+            let mut node = self
+                .nodes
+                .get(path)
+                .cloned()
+                .with_context(|| format!("injected path {} is missing", path.display()))?;
+            node.link_target = None;
+            Ok(node)
+        }
+
+        fn read_link(&self, path: &Path) -> Result<PathBuf> {
+            self.nodes
+                .get(path)
+                .and_then(|node| node.link_target.clone())
+                .with_context(|| format!("injected symlink {} is missing", path.display()))
+        }
+    }
+
+    struct QueuedSystemResolver(Mutex<VecDeque<SystemProgramResolution>>);
+
+    impl QueuedSystemResolver {
+        fn stable(resolution: SystemProgramResolution) -> Self {
+            Self(Mutex::new(VecDeque::from([resolution.clone(), resolution])))
+        }
+    }
+
+    impl SystemProgramResolver for QueuedSystemResolver {
+        fn resolve(&self, _requested: &Path) -> Result<SystemProgramResolution> {
+            self.0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .context("injected system resolution was not configured")
+        }
+    }
+
+    struct TestCurlHome(PathBuf);
+
+    impl TestCurlHome {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "atmux-curl-home-test-{}-{}",
+                std::process::id(),
+                TEMP_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            create_exclusive_temp_directory([path.clone()]).unwrap();
+            drop(create_secure_empty_file(&path.join(".curlrc")).unwrap());
+            Self(path)
+        }
+    }
+
+    impl Drop for TestCurlHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(self.0.join(".curlrc"));
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn real_system_launchers_accept_linux_and_macos_layouts() {
+        for requested in ["/bin/sh", "/usr/bin/curl"] {
+            let trusted = trusted_system_program(Path::new(requested)).unwrap();
+            assert_eq!(trusted, fs::canonicalize(requested).unwrap());
+            assert!(trusted.is_absolute());
+        }
+    }
+
+    #[test]
+    fn codex_installer_download_is_fixed_and_deadline_bounded() {
+        let arguments = codex_download_arguments("180", "/owner/state/codex-install-1");
+        assert_eq!(
+            arguments,
+            [
+                "--disable",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--location",
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
+                "--max-time",
+                "180",
+                "--output",
+                "/owner/state/codex-install-1",
+                "https://chatgpt.com/codex/install.sh",
+            ]
+        );
+        assert_eq!(MaintenanceConfig::default().update_timeout_seconds, 180);
+        assert!(
+            MaintenanceConfig {
+                update_timeout_seconds: 901,
+                ..MaintenanceConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn root_owned_0777_symlinks_are_trusted_but_user_paths_are_not() {
+        let resolver = QueuedSystemResolver::stable(trusted_shell_resolution());
+        assert_eq!(
+            trusted_system_program_with(Path::new("/bin/sh"), &resolver).unwrap(),
+            Path::new("/usr/bin/dash")
+        );
+
+        let unused = QueuedSystemResolver(Mutex::new(VecDeque::new()));
+        assert!(
+            trusted_system_program_with(Path::new("/tmp/curl"), &unused)
+                .unwrap_err()
+                .to_string()
+                .contains("not allow-listed")
+        );
+    }
+
+    #[test]
+    fn synthetic_linux_merged_usr_and_direct_macos_layouts_resolve() {
+        let linux_expected = trusted_shell_resolution();
+        let linux_access = SyntheticPathAccess::new(linux_expected.nodes.clone());
+        let linux = resolve_system_program_with(Path::new("/bin/sh"), &linux_access).unwrap();
+        assert_eq!(linux, linux_expected);
+        validate_system_resolution(Path::new("/bin/sh"), &linux).unwrap();
+
+        let macos_expected = direct_macos_shell_resolution();
+        let macos_access = SyntheticPathAccess::new(macos_expected.nodes.clone());
+        let macos = resolve_system_program_with(Path::new("/bin/sh"), &macos_access).unwrap();
+        assert_eq!(macos, macos_expected);
+        validate_system_resolution(Path::new("/bin/sh"), &macos).unwrap();
+    }
+
+    #[test]
+    fn each_fixed_spawn_is_revalidated_immediately_before_command_construction() {
+        let curl_home = TestCurlHome::new();
+        let shell_resolver = QueuedSystemResolver::stable(direct_macos_shell_resolution());
+        let (shell, shell_command) = validated_system_command_with(
+            Path::new("/bin/sh"),
+            &["/owner/state/install"],
+            &shell_resolver,
+            &curl_home.0,
+        )
+        .unwrap();
+        assert_eq!(shell, Path::new("/bin/sh"));
+        assert_eq!(shell_command.as_std().get_program(), Path::new("/bin/sh"));
+        assert!(shell_resolver.0.lock().unwrap().is_empty());
+
+        let curl_resolver = QueuedSystemResolver::stable(direct_curl_resolution());
+        let arguments = codex_download_arguments("180", "/owner/state/install");
+        let (curl, curl_command) = validated_system_command_with(
+            Path::new("/usr/bin/curl"),
+            &arguments,
+            &curl_resolver,
+            &curl_home.0,
+        )
+        .unwrap();
+        assert_eq!(curl, Path::new("/usr/bin/curl"));
+        assert_eq!(
+            curl_command.as_std().get_program(),
+            Path::new("/usr/bin/curl")
+        );
+        assert_eq!(
+            curl_command.as_std().get_args().next(),
+            Some(std::ffi::OsStr::new("--disable"))
+        );
+        assert!(curl_resolver.0.lock().unwrap().is_empty());
+
+        let environment: BTreeMap<_, _> = curl_command.as_std().get_envs().collect();
+        assert_eq!(environment.len(), 4);
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("PATH")),
+            Some(&Some(std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin")))
+        );
+        assert!(environment.contains_key(std::ffi::OsStr::new("HOME")));
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("CURL_HOME")),
+            Some(&Some(curl_home.0.as_os_str()))
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("CODEX_NON_INTERACTIVE")),
+            Some(&Some(std::ffi::OsStr::new("1")))
+        );
+        assert_eq!(fs::metadata(curl_home.0.join(".curlrc")).unwrap().len(), 0);
+
+        fs::write(curl_home.0.join(".curlrc"), b"proxy = hostile.invalid\n").unwrap();
+        assert!(
+            validated_system_command_with(
+                Path::new("/bin/sh"),
+                &["/owner/state/install"],
+                &QueuedSystemResolver::stable(direct_macos_shell_resolution()),
+                &curl_home.0,
+            )
+            .is_err(),
+            "a config changed before spawn must fail closed"
+        );
+    }
+
+    #[test]
+    fn stale_curl_home_collision_is_never_reused() {
+        let root = std::env::temp_dir().join(format!(
+            "atmux-curl-collision-test-{}-{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        secure_owner_directory(&root).unwrap();
+        let stale = root.join("stale");
+        let fresh = root.join("fresh");
+        create_exclusive_temp_directory([stale.clone()]).unwrap();
+        fs::write(stale.join(".curlrc"), b"proxy = hostile.invalid\n").unwrap();
+
+        let selected = create_exclusive_temp_directory([stale.clone(), fresh.clone()]).unwrap();
+        assert_eq!(selected, fresh);
+        assert_eq!(
+            fs::read(stale.join(".curlrc")).unwrap(),
+            b"proxy = hostile.invalid\n"
+        );
+        let config = selected.join(".curlrc");
+        drop(create_secure_empty_file(&config).unwrap());
+        assert_eq!(fs::metadata(&config).unwrap().len(), 0);
+
+        let _ = fs::remove_file(config);
+        let _ = fs::remove_dir(selected);
+        let _ = fs::remove_file(stale.join(".curlrc"));
+        let _ = fs::remove_dir(stale);
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn stale_script_collision_retries_and_partial_cleanup_is_reverse_ordered() {
+        let root = std::env::temp_dir().join(format!(
+            "atmux-script-collision-test-{}-{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        secure_owner_directory(&root).unwrap();
+        let stale = root.join("stale-script");
+        let fresh = root.join("fresh-script");
+        fs::write(&stale, b"stale installer bytes").unwrap();
+        let (selected, file) = create_exclusive_temp_file([stale.clone(), fresh.clone()]).unwrap();
+        assert_eq!(selected, fresh);
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        assert_eq!(file.metadata().unwrap().nlink(), 1);
+        drop(file);
+        assert_eq!(fs::read(&stale).unwrap(), b"stale installer bytes");
+
+        let partial = root.join("partial");
+        create_exclusive_temp_directory([partial.clone()]).unwrap();
+        let partial_file = partial.join(".curlrc");
+        drop(create_secure_empty_file(&partial_file).unwrap());
+        {
+            let mut cleanup = TempCleanup::default();
+            cleanup.directory(&partial);
+            cleanup.file(&partial_file);
+        }
+        assert!(!partial_file.exists());
+        assert!(!partial.exists());
+
+        let _ = fs::remove_file(selected);
+        let _ = fs::remove_file(stale);
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn owner_home_requires_a_non_writable_root_or_owner_ancestor_chain() {
+        let euid = 501;
+        let trusted = vec![
+            system_test_node("/", SystemNodeKind::Directory, 0, 0o755, 1, None),
+            system_test_node("/Users", SystemNodeKind::Directory, 0, 0o755, 2, None),
+            system_test_node(
+                "/Users/ryan",
+                SystemNodeKind::Directory,
+                euid,
+                0o700,
+                3,
+                None,
+            ),
+        ];
+        assert!(owner_home_nodes_trusted(&trusted, euid));
+
+        let mut writable_ancestor = trusted.clone();
+        writable_ancestor[1].mode = 0o777;
+        assert!(!owner_home_nodes_trusted(&writable_ancestor, euid));
+
+        let mut foreign_ancestor = trusted.clone();
+        foreign_ancestor[1].uid = 502;
+        assert!(!owner_home_nodes_trusted(&foreign_ancestor, euid));
+
+        let mut root_owned_terminal = trusted;
+        root_owned_terminal.last_mut().unwrap().uid = 0;
+        assert!(!owner_home_nodes_trusted(&root_owned_terminal, euid));
+    }
+
+    #[test]
+    fn writable_ancestor_target_and_unowned_symlink_are_rejected() {
+        let mut writable_parent = trusted_shell_resolution();
+        writable_parent.nodes[3].mode = 0o775;
+        assert!(
+            trusted_system_program_with(
+                Path::new("/bin/sh"),
+                &QueuedSystemResolver::stable(writable_parent)
+            )
+            .is_err()
+        );
+
+        let mut writable_target = trusted_shell_resolution();
+        writable_target.nodes.last_mut().unwrap().mode = 0o775;
+        assert!(
+            trusted_system_program_with(
+                Path::new("/bin/sh"),
+                &QueuedSystemResolver::stable(writable_target)
+            )
+            .is_err()
+        );
+
+        let mut unowned_symlink = trusted_shell_resolution();
+        unowned_symlink.nodes[1].uid = 501;
+        assert!(
+            trusted_system_program_with(
+                Path::new("/bin/sh"),
+                &QueuedSystemResolver::stable(unowned_symlink)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn relative_escape_into_writable_namespace_is_rejected() {
+        let mut escaped = trusted_shell_resolution();
+        escaped.canonical_path = PathBuf::from("/tmp/sh");
+        escaped.nodes = vec![
+            system_test_node("/", SystemNodeKind::Directory, 0, 0o755, 1, None),
+            system_test_node("/bin", SystemNodeKind::Directory, 0, 0o755, 2, None),
+            system_test_node(
+                "/bin/sh",
+                SystemNodeKind::Symlink,
+                0,
+                0o777,
+                3,
+                Some("../../tmp/sh"),
+            ),
+            system_test_node("/tmp", SystemNodeKind::Directory, 0, 0o1777, 4, None),
+            system_test_node("/tmp/sh", SystemNodeKind::File, 0, 0o755, 5, None),
+        ];
+        assert!(
+            trusted_system_program_with(
+                Path::new("/bin/sh"),
+                &QueuedSystemResolver::stable(escaped)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn symlink_loop_and_more_than_forty_links_are_rejected() {
+        let loop_access = SyntheticPathAccess::new([
+            system_test_node("/", SystemNodeKind::Directory, 0, 0o755, 1, None),
+            system_test_node("/bin", SystemNodeKind::Directory, 0, 0o755, 2, None),
+            system_test_node("/bin/sh", SystemNodeKind::Symlink, 0, 0o777, 3, Some("sh")),
+        ]);
+        assert!(
+            resolve_system_program_with(Path::new("/bin/sh"), &loop_access)
+                .unwrap_err()
+                .to_string()
+                .contains("too many")
+        );
+
+        let mut deep_nodes = vec![
+            system_test_node("/", SystemNodeKind::Directory, 0, 0o755, 1, None),
+            system_test_node("/bin", SystemNodeKind::Directory, 0, 0o755, 2, None),
+            system_test_node(
+                "/bin/sh",
+                SystemNodeKind::Symlink,
+                0,
+                0o777,
+                3,
+                Some("link-0"),
+            ),
+        ];
+        for index in 0_u64..40 {
+            deep_nodes.push(system_test_node(
+                &format!("/bin/link-{index}"),
+                SystemNodeKind::Symlink,
+                0,
+                0o777,
+                index + 4,
+                Some(&format!("link-{}", index + 1)),
+            ));
+        }
+        let deep_access = SyntheticPathAccess::new(deep_nodes);
+        assert!(
+            resolve_system_program_with(Path::new("/bin/sh"), &deep_access)
+                .unwrap_err()
+                .to_string()
+                .contains("too many")
+        );
+    }
+
+    #[test]
+    fn terminal_non_regular_non_executable_and_non_root_nodes_are_rejected() {
+        for mutate in [
+            |node: &mut SystemNode| node.kind = SystemNodeKind::Other,
+            |node: &mut SystemNode| node.mode = 0o644,
+            |node: &mut SystemNode| node.uid = 501,
+        ] {
+            let mut resolution = direct_macos_shell_resolution();
+            mutate(resolution.nodes.last_mut().unwrap());
+            assert!(validate_system_resolution(Path::new("/bin/sh"), &resolution).is_err());
+        }
+    }
+
+    #[test]
+    fn metadata_and_readlink_target_swaps_between_validation_passes_are_rejected() {
+        let before = trusted_shell_resolution();
+        let mut after = before.clone();
+        after.nodes.last_mut().unwrap().inode += 1;
+        let resolver = QueuedSystemResolver(Mutex::new(VecDeque::from([before, after])));
+        assert!(
+            trusted_system_program_with(Path::new("/bin/sh"), &resolver)
+                .unwrap_err()
+                .to_string()
+                .contains("changed during validation")
+        );
+
+        let before = trusted_shell_resolution();
+        let mut after = before.clone();
+        after.nodes[4].link_target = Some(PathBuf::from("bash"));
+        after.nodes.last_mut().unwrap().path = PathBuf::from("/usr/bin/bash");
+        after.canonical_path = PathBuf::from("/usr/bin/bash");
+        let resolver = QueuedSystemResolver(Mutex::new(VecDeque::from([before, after])));
+        assert!(
+            trusted_system_program_with(Path::new("/bin/sh"), &resolver)
+                .unwrap_err()
+                .to_string()
+                .contains("changed during validation")
+        );
     }
 
     #[test]
