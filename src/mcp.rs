@@ -272,7 +272,7 @@ impl AtmuxMcp {
 
     #[tool(
         name = "agent_launch",
-        description = "Launch an allowlisted atmux profile and project on a chosen machine. Get valid machine, directory, and profile_id values from agents_launch_options; omitting machine uses the coordinator's own tmux server."
+        description = "Launch an allowlisted atmux profile and project on a chosen machine. Get valid machine, directory, profile_id, and optional memory_max_bytes values from agents_launch_options; omitting machine uses the coordinator's own tmux server. The owning machine revalidates every memory limit."
     )]
     async fn agent_launch(
         &self,
@@ -295,7 +295,7 @@ impl AtmuxMcp {
 
     #[tool(
         name = "agents_launch_options",
-        description = "List per-machine project directories and agent profiles accepted by agent_launch. Offline machines report a note instead of inputs."
+        description = "List per-machine project directories, agent profiles, and bounded memory choices accepted by agent_launch. Offline machines report a note instead of inputs."
     )]
     async fn agents_launch_options(&self) -> Result<String, String> {
         serde_json::to_string(&self.control.launch_options()).map_err(|error| error.to_string())
@@ -757,6 +757,7 @@ mod tests {
         )
         .unwrap();
         assert!(request.machine.is_none());
+        assert!(request.memory_max_bytes.is_none());
 
         let targeted: LaunchRequest = serde_json::from_str(
             r#"{"name":"review","directory":"/tmp","profile_id":"profile-0","machine":"gpu-box"}"#,

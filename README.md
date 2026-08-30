@@ -113,6 +113,9 @@ transient systemd user scope with a cgroup `MemoryMax`:
 ```toml
 [agent_resources]
 memory_max_bytes = 34359738368 # 32 GiB; example only, size per host
+# Optional: permit New Agent / Duplicate to select a whole-GiB cap no larger
+# than this explicit owner ceiling. Absence keeps overrides disabled.
+memory_override_max_bytes = 51539607552 # 48 GiB
 ```
 
 This policy is deliberately disabled when the key is absent. When configured,
@@ -135,6 +138,34 @@ maintenance relaunch, and checked-in recovery path receives a unique
 `atmux-tmux-spawn-*.scope`; the foreground scope runner preserves the pane's
 terminal I/O while the whole descendant process tree shares the limit.
 
+`memory_max_bytes` is always the default. `memory_override_max_bytes` is an
+explicit opt-in ceiling for the New Agent memory picker; it requires a default
+and may not be lower than that default. Overrides are whole GiB, greater than
+zero, and are revalidated by the pane's owning node against both the current
+configuration and effective host/cgroup ceiling. A federation coordinator only
+forwards the requested number and cannot expand the owner's policy. The picker
+offers Default, bounded presets, and a bounded custom GiB value. Older clients
+omit the request and therefore continue to receive the default; older nodes
+omit the capability, so the picker stays owner-managed and a new coordinator
+rejects any explicit override before contacting that owner. This prevents an
+older serde decoder from silently ignoring the additive request field.
+Explicit caps are forwarded only through the versioned memory-launch route;
+there is no fallback to the legacy launch endpoint if an owner was downgraded
+after advertising support.
+
+`atmux doctor` reports the effective advertised override ceiling, clamped to a
+whole-GiB value strictly below the current host/inherited-cgroup ceiling. When
+that is lower than the configured policy it labels both values; it never
+presents the configured ceiling as currently accepted capacity.
+
+Duplicate and normal saved-conversation launches carry an explicitly selected
+cap. An in-place Claude resume or automatic CLI-maintenance relaunch preserves
+the exact observed pane cap only while the current owner policy still permits
+it. atmux deliberately does not mutate a live worker's cgroup: a changed limit
+applies only to a new process generation, avoiding a runtime reduction below
+current usage. The session header and API show the cap that is actually stored
+on the pane.
+
 The exact scope name and byte limit are retained in tmux pane metadata and
 reported in session API summaries. `systemctl --user show <scope> -p
 MemoryMax -p MemoryCurrent` can inspect a live worker. Scope arguments are
@@ -153,6 +184,13 @@ with `deploy/systemd/resume-tron-scoped-exec-block.bash` before Quick Resume is
 available; atmux rejects the old script shape. Max's checked-in boot recovery
 already uses the bridge for every roster entry. There is no unbounded recovery
 fallback.
+
+Boot/Quick Resume roster scripts use the current configured default. They do
+not retain a prior per-pane override across a host reboot because tmux metadata
+is gone and the pinned recovery formats contain no separate authenticated,
+durable per-pane override source. This is an intentional fail-closed fallback:
+recovery never trusts browser input, stale metadata, or a rewritten command to
+raise the cap. A normal saved-conversation launch can select an override again.
 
 Choose a limit below host capacity but above the largest legitimate native or
 GPU build, leaving memory for the OS, tmux, atmux, caches, and other workers.

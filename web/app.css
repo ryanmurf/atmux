@@ -223,6 +223,8 @@ dialog::backdrop { background: #000a; }
 .dialog-form h2, .dialog-form p { margin: 0; }
 .dialog-form p { color: var(--muted); }
 .dialog-form label { display: grid; gap: 7px; color: var(--muted); font-size: 13px; }
+.launch-memory-group { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(92px, .45fr); gap: 8px; align-items: end; }
+.launch-memory-group .dialog-note { grid-column: 1 / -1; font-size: 12px; }
 .launch-project-field { display: grid; gap: 7px; }
 .launch-project-field > label { display: block; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
@@ -472,6 +474,9 @@ dialog::backdrop { background: #000a; }
   .pulse-alert-actions > button, .pulse-reply-form input, .pulse-reply-form button { min-height: 44px; }
   #launch-dialog { width: calc(100vw - 16px); max-height: calc(var(--app-height, 100dvh) - 16px); overflow-y: auto; }
   #launch-dialog .dialog-form { gap: 10px; padding: 12px; }
+  .launch-memory-group { grid-template-columns: minmax(0, 1fr) minmax(82px, .42fr); gap: 6px; }
+  .launch-memory-group label { font-size: 12px; }
+  .launch-memory-group select, .launch-memory-group input { min-width: 0; min-height: 44px; height: 44px; font-size: 16px; }
   .launch-directory-control button, .launch-browser-actions button, .launch-browser-folder { min-height: 44px; }
   .launch-browser-list { max-height: min(260px, 32vh); }
 

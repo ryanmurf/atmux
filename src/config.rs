@@ -85,6 +85,7 @@ poll_seconds = 30
 # user scope with this MemoryMax. Leave unset on macOS and non-systemd hosts.
 [agent_resources]
 # memory_max_bytes = 34359738368 # 32 GiB
+# memory_override_max_bytes = 68719476736 # optional 64 GiB per-launch ceiling
 
 # Owner-local native CLI maintenance. Each owner runs one scheduler; federated
 # coordinators never update another machine. Disabled until explicitly enabled.
@@ -336,18 +337,47 @@ pub struct AutoCompactConfig {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct AgentResourcesConfig {
+    /// Default cap for launches and recovery paths which do not request an
+    /// explicit owner-approved override.
     pub memory_max_bytes: Option<u64>,
+    /// Explicit ceiling for per-launch overrides. Overrides remain disabled
+    /// when this is absent, even when a default cap is configured.
+    pub memory_override_max_bytes: Option<u64>,
 }
 
 impl AgentResourcesConfig {
     fn validate(self) -> Result<()> {
-        if self.memory_max_bytes == Some(0) {
-            bail!("[agent_resources].memory_max_bytes must be greater than zero");
+        #[cfg(not(target_os = "linux"))]
+        if self.memory_max_bytes.is_some() || self.memory_override_max_bytes.is_some() {
+            bail!("[agent_resources] memory limits require Linux with systemd and cgroup v2");
         }
-        if self.memory_max_bytes == Some(u64::MAX) {
-            bail!(
-                "[agent_resources].memory_max_bytes cannot be u64::MAX because systemd treats it as infinity"
-            );
+        for (key, value) in [
+            ("memory_max_bytes", self.memory_max_bytes),
+            ("memory_override_max_bytes", self.memory_override_max_bytes),
+        ] {
+            if value == Some(0) {
+                bail!("[agent_resources].{key} must be greater than zero");
+            }
+            if value == Some(u64::MAX) {
+                bail!(
+                    "[agent_resources].{key} cannot be u64::MAX because systemd treats it as infinity"
+                );
+            }
+        }
+        match (self.memory_max_bytes, self.memory_override_max_bytes) {
+            (None, Some(_)) => {
+                bail!("[agent_resources].memory_override_max_bytes requires memory_max_bytes")
+            }
+            (Some(default), Some(ceiling)) if default > ceiling => bail!(
+                "[agent_resources].memory_max_bytes must not exceed memory_override_max_bytes"
+            ),
+            _ => {}
+        }
+        if self
+            .memory_override_max_bytes
+            .is_some_and(|ceiling| ceiling % (1024 * 1024 * 1024) != 0)
+        {
+            bail!("[agent_resources].memory_override_max_bytes must be a whole number of GiB");
         }
         Ok(())
     }
@@ -587,6 +617,9 @@ impl Config {
         }
         if self.agent_resources.memory_max_bytes.is_some() {
             bail!("[node].coordinator_only forbids [agent_resources].memory_max_bytes");
+        }
+        if self.agent_resources.memory_override_max_bytes.is_some() {
+            bail!("[node].coordinator_only forbids [agent_resources].memory_override_max_bytes");
         }
         if self.maintenance.enabled {
             bail!("[node].coordinator_only requires [maintenance].enabled = false");
@@ -1718,6 +1751,7 @@ mod tests {
         assert_eq!(config.profiles.len(), 2);
         assert_eq!(config.general.refresh_ms, 750);
         assert_eq!(config.agent_resources.memory_max_bytes, None);
+        assert_eq!(config.agent_resources.memory_override_max_bytes, None);
     }
 
     #[test]
@@ -1733,21 +1767,67 @@ memory_max_bytes = 34359738368
             configured.agent_resources.memory_max_bytes,
             Some(34_359_738_368)
         );
-        configured.agent_resources.validate().unwrap();
+        if cfg!(target_os = "linux") {
+            configured.agent_resources.validate().unwrap();
+        } else {
+            assert!(configured.agent_resources.validate().is_err());
+        }
 
         let disabled = AgentResourcesConfig {
             memory_max_bytes: None,
+            memory_override_max_bytes: None,
         };
         disabled.validate().unwrap();
         let invalid = AgentResourcesConfig {
             memory_max_bytes: Some(0),
+            memory_override_max_bytes: None,
         };
         assert!(invalid.validate().is_err());
         let infinity = AgentResourcesConfig {
             memory_max_bytes: Some(u64::MAX),
+            memory_override_max_bytes: None,
         };
         let error = infinity.validate().unwrap_err().to_string();
         assert!(error.contains("infinity"));
+
+        let configurable: Config = toml::from_str(
+            r"
+[agent_resources]
+memory_max_bytes = 17179869184
+memory_override_max_bytes = 25769803776
+",
+        )
+        .unwrap();
+        if cfg!(target_os = "linux") {
+            configurable.agent_resources.validate().unwrap();
+        } else {
+            assert!(configurable.agent_resources.validate().is_err());
+        }
+        assert_eq!(
+            configurable.agent_resources.memory_override_max_bytes,
+            Some(25_769_803_776)
+        );
+
+        for invalid in [
+            AgentResourcesConfig {
+                memory_max_bytes: None,
+                memory_override_max_bytes: Some(16),
+            },
+            AgentResourcesConfig {
+                memory_max_bytes: Some(32),
+                memory_override_max_bytes: Some(16),
+            },
+            AgentResourcesConfig {
+                memory_max_bytes: Some(16),
+                memory_override_max_bytes: Some(u64::MAX),
+            },
+            AgentResourcesConfig {
+                memory_max_bytes: Some(16),
+                memory_override_max_bytes: Some(1024 * 1024 * 1024 + 1),
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
     }
 
     #[test]

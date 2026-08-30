@@ -273,6 +273,13 @@ function mockApi(url, response, request) {
               { id: "sol-fast", label: "Sol · xhigh · fast", model: "gpt-5.6-sol", effort: "xhigh", service_tier: "fast" },
             ],
           }],
+          memory: {
+            supported: true,
+            default_bytes: 17179869184,
+            override_max_bytes: 25769803776,
+            presets_bytes: [8589934592, 17179869184, 25769803776],
+            note: "Changes apply on the next launch or relaunch.",
+          },
           project_preferences: {}, note: null,
         },
       ],
@@ -855,6 +862,9 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       harness: document.getElementById('launch-harness').value,
       profile: document.getElementById('launch-profile').value,
       mode: document.getElementById('launch-mode').value,
+      memory: document.getElementById('launch-memory').value,
+      memoryOverflow: document.getElementById('launch-memory-group').scrollWidth
+        > document.getElementById('launch-memory-group').clientWidth,
       name: document.getElementById('launch-name').value,
       conversation: document.getElementById('launch-session').value,
       submit: document.querySelector('#launch-form button[type=submit]').textContent,
@@ -866,10 +876,121 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       harness: "codex",
       profile: "profile-codex-max",
       mode: "sol-fast",
+      memory: "",
+      memoryOverflow: false,
       name: "codex-main-copy",
       conversation: "",
       submit: "Launch duplicate",
     });
+
+    const originalMemoryViewport = await cdp.evaluate("({ width: innerWidth, height: innerHeight })");
+    const memorySelect = await cdp.evaluate(`(() => {
+      const select = document.getElementById('launch-memory');
+      select.focus({ preventScroll: true });
+      const box = select.getBoundingClientRect();
+      return {
+        fontSize: parseFloat(getComputedStyle(select).fontSize),
+        height: box.height,
+        focused: document.activeElement === select,
+        label: [...select.labels].map((node) => node.textContent).join(' '),
+        documentOverflow: document.documentElement.scrollWidth - innerWidth,
+      };
+    })()`);
+    assert.ok(memorySelect.fontSize >= 16, JSON.stringify(memorySelect));
+    assert.ok(memorySelect.height >= 44, JSON.stringify(memorySelect));
+    assert.equal(memorySelect.focused, true, JSON.stringify(memorySelect));
+    assert.match(memorySelect.label, /Memory limit/);
+    assert.ok(memorySelect.documentOverflow <= 1, JSON.stringify(memorySelect));
+
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: 390, height: 430, deviceScaleFactor: 1, mobile: false,
+    });
+    await waitFor(
+      () => cdp.evaluate("getComputedStyle(document.documentElement).getPropertyValue('--app-height').trim() === '430px'"),
+      "focused memory select did not follow the keyboard-sized viewport",
+    );
+    await waitFor(
+      () => cdp.evaluate(`(() => {
+        const box = document.getElementById('launch-memory').getBoundingClientRect();
+        return box.top >= 0 && box.bottom <= (window.visualViewport?.height || innerHeight) + 1;
+      })()`),
+      "focused memory select was not revealed inside the keyboard-sized viewport",
+    );
+    const keyboardSelect = await cdp.evaluate(`(() => {
+      const select = document.getElementById('launch-memory');
+      const box = select.getBoundingClientRect();
+      return {
+        viewport: window.visualViewport?.height || innerHeight,
+        top: box.top, bottom: box.bottom, right: box.right,
+        focused: document.activeElement === select,
+        documentOverflow: document.documentElement.scrollWidth - innerWidth,
+      };
+    })()`);
+    assert.equal(keyboardSelect.focused, true, JSON.stringify(keyboardSelect));
+    assert.ok(keyboardSelect.top >= 0, JSON.stringify(keyboardSelect));
+    assert.ok(keyboardSelect.bottom <= keyboardSelect.viewport + 1, JSON.stringify(keyboardSelect));
+    assert.ok(keyboardSelect.right <= 390, JSON.stringify(keyboardSelect));
+    assert.ok(keyboardSelect.documentOverflow <= 1, JSON.stringify(keyboardSelect));
+
+    await cdp.evaluate(`(() => {
+      const select = document.getElementById('launch-memory');
+      select.value = 'custom';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      const input = document.getElementById('launch-memory-custom');
+      input.value = '20';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.focus({ preventScroll: true });
+      return true;
+    })()`);
+    await waitFor(
+      () => cdp.evaluate(`(() => {
+        const input = document.getElementById('launch-memory-custom');
+        const box = input.getBoundingClientRect();
+        return document.activeElement === input && box.top >= 0
+          && box.bottom <= (window.visualViewport?.height || innerHeight) + 1;
+      })()`),
+      "focused custom memory input was not revealed inside the keyboard-sized viewport",
+    );
+    const customMemory = await cdp.evaluate(`(() => {
+      const input = document.getElementById('launch-memory-custom');
+      const box = input.getBoundingClientRect();
+      return {
+        visible: !document.getElementById('launch-memory-custom-row').hidden,
+        fontSize: parseFloat(getComputedStyle(input).fontSize),
+        height: box.height,
+        focused: document.activeElement === input,
+        label: [...input.labels].map((node) => node.textContent).join(' '),
+        viewport: window.visualViewport?.height || innerHeight,
+        top: box.top, bottom: box.bottom, right: box.right,
+        documentOverflow: document.documentElement.scrollWidth - innerWidth,
+        scrollHeight: document.documentElement.scrollHeight,
+        clientHeight: document.documentElement.clientHeight,
+      };
+    })()`);
+    assert.equal(customMemory.visible, true, JSON.stringify(customMemory));
+    assert.ok(customMemory.fontSize >= 16, JSON.stringify(customMemory));
+    assert.ok(customMemory.height >= 44, JSON.stringify(customMemory));
+    assert.equal(customMemory.focused, true, JSON.stringify(customMemory));
+    assert.match(customMemory.label, /Custom GiB/);
+    assert.ok(customMemory.top >= 0, JSON.stringify(customMemory));
+    assert.ok(customMemory.bottom <= customMemory.viewport + 1, JSON.stringify(customMemory));
+    assert.ok(customMemory.right <= 390, JSON.stringify(customMemory));
+    assert.ok(customMemory.documentOverflow <= 1, JSON.stringify(customMemory));
+    assert.ok(customMemory.scrollHeight <= customMemory.clientHeight, JSON.stringify(customMemory));
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: originalMemoryViewport.width, height: originalMemoryViewport.height,
+      deviceScaleFactor: 1, mobile: false,
+    });
+    await waitFor(
+      () => cdp.evaluate(`getComputedStyle(document.documentElement).getPropertyValue('--app-height').trim() === '${originalMemoryViewport.height}px'`),
+      "memory controls did not restore after the keyboard-sized viewport",
+    );
+    await cdp.evaluate(`(() => {
+      const select = document.getElementById('launch-memory');
+      select.value = '';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    })()`);
     assert.equal(launchRequests.length, 0, "opening Duplicate must not launch or resume a session");
     assert.equal(launchSessionRequests.length, 0, "Duplicate must skip saved-session discovery");
     await cdp.evaluate(`(() => {
@@ -888,6 +1009,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(launchRequests[0].body.resume_session_id, null, JSON.stringify(launchRequests[0]));
     assert.equal(launchRequests[0].body.profile_id, "profile-codex-max");
     assert.equal(launchRequests[0].body.mode_id, "sol-fast");
+    assert.equal(launchRequests[0].body.memory_max_bytes, null);
     await cdp.evaluate("document.querySelector('#launch-dialog .dialog-cancel').click(); true");
     launchRequests.length = 0;
 
