@@ -745,7 +745,8 @@ fn open_owner_executable(parent: &File, name: &std::ffi::OsStr, path: &Path) -> 
     )?
     .into();
     let metadata = file.metadata()?;
-    if before.st_dev as u64 != metadata.dev() || before.st_ino as u64 != metadata.ino() {
+    if checked_device_id(before.st_dev)? != metadata.dev() || before.st_ino as u64 != metadata.ino()
+    {
         bail!(
             "Codex package launcher {} changed while opening",
             path.display()
@@ -775,7 +776,7 @@ fn validated_symlink(parent: &File, name: &std::ffi::OsStr, euid: u32) -> Result
         bail!("Codex installer link changed while validating");
     }
     Ok(SymlinkIdentity {
-        device: before.st_dev as u64,
+        device: checked_device_id(before.st_dev)?,
         inode: before.st_ino as u64,
         target,
     })
@@ -834,6 +835,13 @@ where
 
 fn checked_raw_mode(mode: u32) -> Result<RawMode> {
     checked_mode(mode).context("Codex package mode cannot be represented on this platform")
+}
+
+fn checked_device_id<T>(device: T) -> Result<u64>
+where
+    u64: TryFrom<T>,
+{
+    u64::try_from(device).map_err(|_| anyhow::anyhow!("Codex package device id is invalid"))
 }
 
 fn validate_owner_executable(file: &File, path: &Path, euid: u32) -> Result<DirectoryIdentity> {
@@ -2251,6 +2259,10 @@ mod tests {
             ));
             fs::create_dir(&home).unwrap();
             fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+            // `/tmp` is a symlink to `/private/tmp` on macOS. Production HOME
+            // is canonicalized before recovery, so the fixture must use the
+            // same invariant for absolute launcher links and prefix checks.
+            let home = home.canonicalize().unwrap();
             for relative in [".local", ".local/bin", ".codex"] {
                 let path = home.join(relative);
                 fs::create_dir(&path).unwrap();
@@ -2473,10 +2485,15 @@ mod tests {
         let fixture = TestCodexInstall::new(0o775);
         let releases = fixture.home.join(".codex/packages/standalone/releases");
         fs::set_permissions(&releases, fs::Permissions::from_mode(0o3775)).unwrap();
+        // Darwin may clear setgid on a user-owned directory while retaining
+        // sticky. Preserve the special bits the filesystem actually accepted,
+        // while requiring group/world write to be removed on every platform.
+        let accepted = fs::metadata(&releases).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(accepted & 0o777, 0o775);
         reconcile_codex_package_permissions(&fixture.home).unwrap();
         assert_eq!(
             fs::metadata(releases).unwrap().permissions().mode() & 0o7777,
-            0o3755
+            accepted & !0o022
         );
     }
 
@@ -2487,6 +2504,8 @@ mod tests {
 
         let raw = checked_raw_mode(0o3755).unwrap();
         assert_eq!(raw, 0o3755);
+        assert_eq!(checked_device_id(7_i32).unwrap(), 7);
+        assert!(checked_device_id(-1_i32).is_err());
     }
 
     #[test]
