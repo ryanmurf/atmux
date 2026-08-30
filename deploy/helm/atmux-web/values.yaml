@@ -13,6 +13,65 @@ atmux:
   # host certificate and presents this identity to the host TLS listener.
   tlsSecret: atmux-gateway-tls
 
+# The safe default preserves the deployed gateway-only topology above. Enabling
+# this block runs the full atmux web/MCP/Pulse coordinator in the same Pod and
+# changes nginx's upstream to its loopback listener. Host tmux servers and agent
+# processes remain on their owner machines.
+server:
+  enabled: false
+  # Required, digest-pinned image when enabled, for example:
+  # localhost:32000/atmux@sha256:<64 lowercase hex characters>
+  image: ""
+  imagePullPolicy: IfNotPresent
+  node:
+    id: home
+    label: Home
+  # Existing Secret used by the public gateway. The atmux coordinator reads the
+  # same token through a file; the value is never rendered into a ConfigMap.
+  proxyTokenSecret: atmux-proxy-token
+  # Existing clientAuth certificate/key plus atmux-lan-ca CA. The coordinator
+  # uses this identity for native Rustls mutual-TLS connections to every host.
+  tlsSecret: atmux-gateway-tls
+  # One existing Secret with a separate key for each machine entry's tokenKey.
+  federationTokenSecret: atmux-node-tokens
+  # Production overrides use the reviewed private IPs whose IP SANs are in the
+  # host certificates. DNS aliases and mDNS are intentionally not used in K8s.
+  machines: []
+  # Example shape (keep disabled defaults environment-neutral):
+  # - id: tron
+  #   label: Tron
+  #   address: 192.168.0.109
+  #   port: 7345
+  #   tokenKey: tron
+  pulse:
+    serve: true
+    # Explicit account/profile metadata is safe configuration, not
+    # authentication. These names match the owner nodes so pull federation can
+    # attach their rows; owner-local config paths and collection settings are
+    # deliberately absent from Kubernetes.
+    accounts:
+      - id: 4
+        identity: ryanmurf@gmail.com
+        displayName: Ryan
+        profiles:
+          - {name: claude-hd, vendor: anthropic-oauth}
+          - {name: claude-max, vendor: anthropic-oauth}
+          - {name: codex, vendor: openai-codex}
+          - {name: grok, vendor: xai-grok}
+          - {name: gemini, vendor: gemini}
+          - {name: antigravity, vendor: antigravity}
+  persistence:
+    existingClaim: ""
+    storageClass: microk8s-hostpath
+    size: 2Gi
+    accessMode: ReadWriteOnce
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {cpu: "1", memory: 512Mi}
+  # External Secret contents are not visible to Helm. Bump this explicit,
+  # non-secret revision when rotating a mounted token or TLS identity.
+  secretRevision: v1
+
 oauth:
   image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.3@sha256:10a1165743a192e1940b4708fb9647027185ce11a681a1c5519b442ff7f1f561
   # Bump this value whenever all browser sessions must be invalidated. Keeping

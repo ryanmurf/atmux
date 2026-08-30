@@ -18,6 +18,8 @@ const {
   applyPanePatch,
   classifyOverviewUpdate,
   composerEnterAction,
+  composerSubmissionCanRestore,
+  composerSubmissionMatches,
   contentToLines,
   dictationDelivery,
   dictationEndAction,
@@ -842,8 +844,21 @@ test("push-to-talk keeps the pane selected when recording began", () => {
   assert.equal(dictationDelivery("midnight~%7", "draft", "  "), null);
   assert.equal(dictationPrefix("sending now", true, "sending now"), "");
   assert.equal(dictationPrefix("new draft", true, "sending now"), "new draft");
+  assert.equal(composerSubmissionMatches("midnight~%7", "midnight~%7", "review this", "review this"), true);
+  assert.equal(composerSubmissionMatches("midnight~%8", "midnight~%7", "review this", "review this"), false);
+  assert.equal(composerSubmissionMatches("midnight~%7", "midnight~%7", "new draft", "review this"), false);
+  const clearedSubmission = {
+    paneId: "midnight~%7",
+    message: "review this",
+    clearedRevision: 4,
+  };
+  assert.equal(composerSubmissionCanRestore("midnight~%7", "", 4, clearedSubmission), true);
+  assert.equal(composerSubmissionCanRestore("midnight~%7", "new draft", 4, clearedSubmission), false);
+  assert.equal(composerSubmissionCanRestore("midnight~%7", "", 5, clearedSubmission), false);
+  assert.equal(composerSubmissionCanRestore("midnight~%8", "", 4, clearedSubmission), false);
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
-  assert.match(source, /sendComposerMessage\(delivery\.paneId, delivery\.message\)/);
+  assert.match(source, /sendComposerMessage\(delivery\.paneId, delivery\.message, \{ clearOnAccept: true \}\)/);
+  assert.match(source, /restoreComposerSubmission\(composerSubmission\)/);
 });
 
 test("push-to-talk restarts recognition while held and stops cleanly on release", () => {
@@ -860,9 +875,9 @@ test("push-to-talk restarts recognition while held and stops cleanly on release"
   assert.match(source, /recognition\.continuous = true/);
   assert.match(source, /dictationEndAction\([\s\S]*=== "restart"\)[\s\S]*scheduleRestart\(generation\)/);
   assert.match(source, /window\.addEventListener\("blur", stopTalking\)/);
-  assert.match(source, /queuedComposerMessages\.push\(\{ paneId, message: String\(messageOverride\), resolve \}\)/);
+  assert.match(source, /queuedComposerMessages\.push\(\{[\s\S]*options: \{ clearOnAccept, composerSubmission, fromQueue:[^}]+\}[\s\S]*resolve,[\s\S]*\}\)/);
   assert.match(source, /state\.inFlightComposerText = message;/);
-  assert.match(source, /Message exceeds the 64 KiB UTF-8 limit"\);\s*if \(messageOverride !== null\) drainQueuedComposerMessage\(\);/s);
+  assert.match(source, /Message exceeds the 64 KiB UTF-8 limit"\);\s*if \(options\.fromQueue === true\) drainQueuedComposerMessage\(\);/s);
   assert.match(css, /#talk \{[^}]*touch-action: none;/s);
 });
 

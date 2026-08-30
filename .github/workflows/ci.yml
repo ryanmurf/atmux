@@ -26,10 +26,56 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
       - run: node --check web/app.js
       - run: node --test web/app.test.mjs
       - name: Run browser integration tests
         run: node --test tests/web_mobile_pulse_browser.mjs
+        timeout-minutes: 3
+      - name: Install Quick Talk browser prerequisites
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Build the production web fixture
+        run: cargo build --locked
+      - name: Run Quick Talk browser integration
+        env:
+          ATMUX_TMUX_SOCKET_NAME: atmux-ci-web-${{ github.run_id }}
+        run: |
+          quick_config="$RUNNER_TEMP/atmux-quick-talk.toml"
+          chrome_profile="$RUNNER_TEMP/atmux-quick-talk-chrome"
+          printf '%s\n' \
+            'session_name = "quick-talk-ci"' \
+            'harness = "codex"' \
+            'profile = "Default"' \
+            '' \
+            '[web]' \
+            'allow_unauthenticated_loopback = true' \
+            > "$quick_config"
+          mkdir -p "$chrome_profile"
+          tmux -L "$ATMUX_TMUX_SOCKET_NAME" new-session -d -s quick-talk-ci
+          ./target/debug/atmux --config "$quick_config" web --bind 127.0.0.1:7356 \
+            > "$RUNNER_TEMP/atmux-quick-talk-server.log" 2>&1 &
+          atmux_pid=$!
+          google-chrome --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
+            --remote-debugging-port=9224 --user-data-dir="$chrome_profile" about:blank \
+            > "$RUNNER_TEMP/atmux-quick-talk-chrome.log" 2>&1 &
+          chrome_pid=$!
+          cleanup() {
+            kill "$chrome_pid" "$atmux_pid" 2>/dev/null || true
+            wait "$chrome_pid" "$atmux_pid" 2>/dev/null || true
+            tmux -L "$ATMUX_TMUX_SOCKET_NAME" kill-server 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for attempt in {1..100}; do
+            if curl --fail --silent http://127.0.0.1:7356/api/v1/sessions >/dev/null \
+              && curl --fail --silent http://127.0.0.1:9224/json/version >/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          curl --fail --silent http://127.0.0.1:7356/api/v1/sessions >/dev/null
+          curl --fail --silent http://127.0.0.1:9224/json/version >/dev/null
+          node tests/quick_talk_browser.mjs http://127.0.0.1:7356 9224
         timeout-minutes: 3
 
   helm:
@@ -39,6 +85,21 @@ jobs:
       - uses: actions/checkout@v7
       - uses: azure/setup-helm@v4
       - run: bash deploy/helm/atmux-web/tests/render.sh
+
+  container:
+    name: Coordinator container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the full-featured runtime image
+        run: bash scripts/build-container.sh atmux-ci
+      - name: Smoke test bundled runtime dependencies
+        run: |
+          image="atmux-ci:${GITHUB_SHA:0:12}"
+          docker run --rm "$image" --version
+          docker run --rm --entrypoint tmux "$image" -V
+          docker run --rm --read-only --entrypoint /bin/sh "$image" \
+            -ec 'test "$(id -u)" = 10001; command -v curl; command -v grep; command -v nc; command -v tmux; test ! -w /'
 
   pulse-postgres:
     name: Pulse PostgreSQL conformance

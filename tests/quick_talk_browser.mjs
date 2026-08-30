@@ -104,7 +104,13 @@ const preload = String.raw`
         window.__holdNextMessage = false;
         window.__holdMessageText = null;
         return new Promise((resolve) => {
-          window.__releaseHeldMessage = () => resolve(new Response(null, { status: 204 }));
+          window.__releaseHeldMessage = (status = 204) => resolve(new Response(
+            status === 204 ? null : JSON.stringify({ error: "fixture message failure" }),
+            {
+              status,
+              headers: status === 204 ? undefined : { "content-type": "application/json" },
+            },
+          ));
         });
       }
       return Promise.resolve(new Response(null, { status: 204 }));
@@ -231,6 +237,58 @@ const observed = await evaluate(`(async () => {
   talk.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 11, pointerType: "touch" }));
   await sleep(50);
 
+  window.__holdMessageText = "clear on release";
+  talk.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 15, pointerType: "touch" }));
+  const optimisticRecognition = window.__speechInstances.at(-1);
+  optimisticRecognition.onresult(speechResult("clear on release"));
+  talk.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 15, pointerType: "touch" }));
+  await sleep(20);
+  const optimisticCleared = message.value === "";
+  message.value = "next typed draft";
+  message.dispatchEvent(new Event("input", { bubbles: true }));
+  window.__releaseHeldMessage();
+  await sleep(50);
+  const typedDraftSurvivedSuccess = message.value === "next typed draft";
+
+  message.value = "";
+  message.dispatchEvent(new Event("input", { bubbles: true }));
+  window.__holdMessageText = "restore failed speech";
+  talk.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 16, pointerType: "touch" }));
+  const failedRecognition = window.__speechInstances.at(-1);
+  failedRecognition.onresult(speechResult("restore failed speech"));
+  talk.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 16, pointerType: "touch" }));
+  await sleep(20);
+  const failedSubmissionCleared = message.value === "";
+  window.__releaseHeldMessage(503);
+  await sleep(50);
+  const failedSubmissionRestored = message.value === "restore failed speech";
+
+  message.value = "";
+  message.dispatchEvent(new Event("input", { bubbles: true }));
+  window.__holdMessageText = "failed before new draft";
+  talk.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 17, pointerType: "touch" }));
+  const failedBehindDraftRecognition = window.__speechInstances.at(-1);
+  failedBehindDraftRecognition.onresult(speechResult("failed before new draft"));
+  talk.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 17, pointerType: "touch" }));
+  await sleep(20);
+  message.value = "keep this newer draft";
+  message.dispatchEvent(new Event("input", { bubbles: true }));
+  window.__releaseHeldMessage(503);
+  await sleep(50);
+  const typedDraftSurvivedFailure = message.value === "keep this newer draft";
+
+  message.value = "";
+  message.dispatchEvent(new Event("input", { bubbles: true }));
+  window.__holdMessageText = "ios cancelled pointer";
+  talk.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 18, pointerType: "touch" }));
+  const cancelledTouchRecognition = window.__speechInstances.at(-1);
+  cancelledTouchRecognition.onresult(speechResult("ios cancelled pointer"));
+  talk.dispatchEvent(new PointerEvent("pointercancel", { bubbles: true, pointerId: 18, pointerType: "touch" }));
+  await sleep(20);
+  const cancelledTouchCleared = message.value === "";
+  window.__releaseHeldMessage();
+  await sleep(50);
+
   const recognitions = window.__speechInstances;
   return {
     allContinuous: recognitions.every((recognition) => recognition.continuous),
@@ -244,6 +302,12 @@ const observed = await evaluate(`(async () => {
     previewsDuringImageSend,
     previewsAfterImageSend,
     secondHoldSurvivedLateEvents,
+    optimisticCleared,
+    typedDraftSurvivedSuccess,
+    failedSubmissionCleared,
+    failedSubmissionRestored,
+    typedDraftSurvivedFailure,
+    cancelledTouchCleared,
     buttonText: talk.textContent,
     recording: talk.classList.contains("recording"),
     sent: window.__sentMessages,
@@ -254,14 +318,20 @@ const observed = await evaluate(`(async () => {
 assert.equal(observed.allContinuous, true);
 assert.equal(observed.firstRestarted, true, "recognition must restart while the mouse remains held");
 assert.equal(observed.secondRestarted, true, "a later touch hold must restart independently");
-assert.equal(observed.starts, 10);
-assert.equal(observed.stops, 8);
+assert.equal(observed.starts, 14);
+assert.equal(observed.stops, 12);
 assert.equal(observed.aborts, 1);
 assert.equal(observed.sentBeforeRelease, 3, "dictation must wait behind the in-flight message");
 assert.equal(observed.sentBeforeQueuedRelease, 4, "a later dictation must wait behind queued dictation");
 assert.equal(observed.previewsDuringImageSend, 1, "a second paste must not mutate an in-flight image snapshot");
 assert.equal(observed.previewsAfterImageSend, 0, "the delivered image snapshot must be removed exactly once");
 assert.equal(observed.secondHoldSurvivedLateEvents, true);
+assert.equal(observed.optimisticCleared, true, "touch release must clear accepted speech before the POST resolves");
+assert.equal(observed.typedDraftSurvivedSuccess, true, "a late success must not clear a newer typed draft");
+assert.equal(observed.failedSubmissionCleared, true, "an in-flight speech submission should initially clear");
+assert.equal(observed.failedSubmissionRestored, true, "a failed speech submission must restore an untouched composer");
+assert.equal(observed.typedDraftSurvivedFailure, true, "a late failure must not replace a newer typed draft");
+assert.equal(observed.cancelledTouchCleared, true, "an iOS-style cancelled touch must finish and clear its accepted speech");
 assert.equal(observed.buttonText, "Hold to talk");
 assert.equal(observed.recording, false);
 assert.deepEqual(observed.sent, [
@@ -300,6 +370,22 @@ assert.deepEqual(observed.sent, [
   {
     url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
     body: { text: "fresh second", submit: true },
+  },
+  {
+    url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
+    body: { text: "clear on release", submit: true },
+  },
+  {
+    url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
+    body: { text: "restore failed speech", submit: true },
+  },
+  {
+    url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
+    body: { text: "failed before new draft", submit: true },
+  },
+  {
+    url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
+    body: { text: "ios cancelled pointer", submit: true },
   },
 ]);
 assert.equal(observed.sentImages.length, 1);

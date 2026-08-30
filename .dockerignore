@@ -1,0 +1,10 @@
+.git
+.github
+.atmux*
+target
+deploy
+features
+ios
+tests
+**/*.swp
+**/*~

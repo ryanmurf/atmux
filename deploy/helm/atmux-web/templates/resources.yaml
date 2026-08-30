@@ -4,6 +4,57 @@
 {{- $keycloakEgressCidrs := .Values.oauth.keycloakEgressCidrs -}}
 {{- $trustedProxyCidrs := .Values.oauth.trustedProxyCidrs -}}
 {{- $sessionVersion := .Values.oauth.sessionVersion -}}
+{{- $server := .Values.server | default dict -}}
+{{- if not (kindIs "map" $server) -}}
+{{- fail "server must be a map when configured" -}}
+{{- end -}}
+{{- $serverEnabled := get $server "enabled" | default false -}}
+{{- if and (hasKey $server "enabled") (not (kindIs "bool" (get $server "enabled"))) -}}
+{{- fail "server.enabled must be a boolean" -}}
+{{- end -}}
+{{- $serverMachinesRaw := get $server "machines" -}}
+{{- $serverMachines := list -}}
+{{- if kindIs "slice" $serverMachinesRaw -}}
+{{- $serverMachines = $serverMachinesRaw -}}
+{{- end -}}
+{{- $serverNodeRaw := get $server "node" -}}
+{{- $serverNode := dict -}}
+{{- if kindIs "map" $serverNodeRaw -}}
+{{- $serverNode = $serverNodeRaw -}}
+{{- end -}}
+{{- $serverPulseRaw := get $server "pulse" -}}
+{{- $serverPulse := dict -}}
+{{- if kindIs "map" $serverPulseRaw -}}
+{{- $serverPulse = $serverPulseRaw -}}
+{{- end -}}
+{{- $serverPersistenceRaw := get $server "persistence" -}}
+{{- $serverPersistence := dict -}}
+{{- if kindIs "map" $serverPersistenceRaw -}}
+{{- $serverPersistence = $serverPersistenceRaw -}}
+{{- end -}}
+{{- $serverResourcesRaw := get $server "resources" -}}
+{{- $serverResources := dict -}}
+{{- if kindIs "map" $serverResourcesRaw -}}
+{{- $serverResources = $serverResourcesRaw -}}
+{{- end -}}
+{{- $serverImage := get $server "image" | default "" -}}
+{{- $serverImagePullPolicy := get $server "imagePullPolicy" | default "" -}}
+{{- $serverProxyTokenSecret := get $server "proxyTokenSecret" | default "" -}}
+{{- $serverTlsSecret := get $server "tlsSecret" | default "" -}}
+{{- $serverFederationTokenSecret := get $server "federationTokenSecret" | default "" -}}
+{{- $serverSecretRevision := get $server "secretRevision" | default "" -}}
+{{- $serverNodeId := get $serverNode "id" | default "" -}}
+{{- $serverNodeLabel := get $serverNode "label" | default "" -}}
+{{- $serverPulseServe := get $serverPulse "serve" | default false -}}
+{{- $serverPulseAccountsRaw := get $serverPulse "accounts" -}}
+{{- $serverPulseAccounts := list -}}
+{{- if kindIs "slice" $serverPulseAccountsRaw -}}
+{{- $serverPulseAccounts = $serverPulseAccountsRaw -}}
+{{- end -}}
+{{- $serverPersistenceExistingClaim := get $serverPersistence "existingClaim" | default "" -}}
+{{- $serverPersistenceStorageClass := get $serverPersistence "storageClass" | default "" -}}
+{{- $serverPersistenceSize := get $serverPersistence "size" | default "" -}}
+{{- $serverPersistenceAccessMode := get $serverPersistence "accessMode" | default "" -}}
 {{- if and .Values.ingress.enabled (eq (len $allowedEmails) 0) -}}
 {{- fail "oauth.allowedEmails must contain at least one approved Google identity" -}}
 {{- end -}}
@@ -40,6 +91,136 @@
 {{- if not (regexMatch "^[A-Za-z0-9.-]+$" .Values.atmux.tlsServerName) -}}
 {{- fail "atmux.tlsServerName must be the exact DNS name from the host certificate" -}}
 {{- end -}}
+{{- if $serverEnabled -}}
+{{- if not (kindIs "map" $serverNodeRaw) -}}
+{{- fail "server.node must be a map when server.enabled=true" -}}
+{{- end -}}
+{{- if not (kindIs "slice" $serverMachinesRaw) -}}
+{{- fail "server.machines must be a list when server.enabled=true" -}}
+{{- end -}}
+{{- if not (kindIs "map" $serverPulseRaw) -}}
+{{- fail "server.pulse must be a map when server.enabled=true" -}}
+{{- end -}}
+{{- if not (kindIs "map" $serverPersistenceRaw) -}}
+{{- fail "server.persistence must be a map when server.enabled=true" -}}
+{{- end -}}
+{{- if not (kindIs "map" $serverResourcesRaw) -}}
+{{- fail "server.resources must be a map when server.enabled=true" -}}
+{{- end -}}
+{{- if not (kindIs "bool" (get $serverPulse "serve")) -}}
+{{- fail "server.pulse.serve must be a boolean when server.enabled=true" -}}
+{{- end -}}
+{{- if not (kindIs "slice" $serverPulseAccountsRaw) -}}
+{{- fail "server.pulse.accounts must be a list when server.enabled=true" -}}
+{{- end -}}
+{{- if and $serverPulseServe (eq (len $serverPulseAccounts) 0) -}}
+{{- fail "server.pulse.accounts must contain at least one account when server.pulse.serve=true" -}}
+{{- end -}}
+{{- if not (regexMatch "^.+@sha256:[a-f0-9]{64}$" $serverImage) -}}
+{{- fail "server.image must be an immutable image reference ending in @sha256:<64 lowercase hex characters>" -}}
+{{- end -}}
+{{- if not (regexMatch "^[a-z0-9][a-z0-9_-]{0,31}$" $serverNodeId) -}}
+{{- fail "server.node.id must be a valid atmux machine id of at most 32 characters" -}}
+{{- end -}}
+{{- if or (eq (trim $serverNodeLabel) "") (gt (len $serverNodeLabel) 64) -}}
+{{- fail "server.node.label must contain 1 to 64 characters" -}}
+{{- end -}}
+{{- if eq (len $serverMachines) 0 -}}
+{{- fail "server.machines must contain at least one reviewed host when server.enabled=true" -}}
+{{- end -}}
+{{- if eq (trim $serverProxyTokenSecret) "" -}}
+{{- fail "server.proxyTokenSecret is required when server.enabled=true" -}}
+{{- end -}}
+{{- if eq (trim $serverTlsSecret) "" -}}
+{{- fail "server.tlsSecret is required when server.enabled=true" -}}
+{{- end -}}
+{{- if eq (trim $serverFederationTokenSecret) "" -}}
+{{- fail "server.federationTokenSecret is required when server.enabled=true" -}}
+{{- end -}}
+{{- if or (eq $serverFederationTokenSecret $serverProxyTokenSecret) (eq $serverFederationTokenSecret .Values.atmux.proxyTokenSecret) -}}
+{{- fail "server.federationTokenSecret must be distinct from the public gateway proxy token Secret" -}}
+{{- end -}}
+{{- if and (eq (trim $serverPersistenceExistingClaim) "") (eq (trim $serverPersistenceSize) "") -}}
+{{- fail "server.persistence.size is required when no existingClaim is configured" -}}
+{{- end -}}
+{{- if not (has $serverPersistenceAccessMode (list "ReadWriteOnce" "ReadOnlyMany" "ReadWriteMany" "ReadWriteOncePod")) -}}
+{{- fail "server.persistence.accessMode must be a supported Kubernetes access mode" -}}
+{{- end -}}
+{{- if not (has $serverImagePullPolicy (list "Always" "IfNotPresent" "Never")) -}}
+{{- fail "server.imagePullPolicy must be Always, IfNotPresent, or Never" -}}
+{{- end -}}
+{{- if eq (trim $serverSecretRevision) "" -}}
+{{- fail "server.secretRevision is required when server.enabled=true" -}}
+{{- end -}}
+{{- $machineIds := dict $serverNodeId true -}}
+{{- $tokenKeys := dict -}}
+{{- range $machine := $serverMachines -}}
+{{- if not (regexMatch "^[a-z0-9][a-z0-9_-]{0,31}$" $machine.id) -}}
+{{- fail (printf "server machine has an invalid atmux id: %q" $machine.id) -}}
+{{- end -}}
+{{- if hasKey $machineIds $machine.id -}}
+{{- fail (printf "server machine id is duplicate or collides with server.node.id: %q" $machine.id) -}}
+{{- end -}}
+{{- $_ := set $machineIds $machine.id true -}}
+{{- if or (eq (trim $machine.label) "") (gt (len $machine.label) 64) -}}
+{{- fail (printf "server machine %q label must contain 1 to 64 characters" $machine.id) -}}
+{{- end -}}
+{{- $addressParts := splitList "." $machine.address -}}
+{{- if ne (len $addressParts) 4 -}}
+{{- fail (printf "server machine %q address must be a reviewed IPv4 address" $machine.id) -}}
+{{- end -}}
+{{- range $part := $addressParts -}}
+{{- if or (not (regexMatch "^[0-9]{1,3}$" $part)) (gt (atoi $part) 255) -}}
+{{- fail (printf "server machine %q address must be a reviewed IPv4 address" $machine.id) -}}
+{{- end -}}
+{{- end -}}
+{{- if or (lt (int $machine.port) 1) (gt (int $machine.port) 65535) -}}
+{{- fail (printf "server machine %q port must be between 1 and 65535" $machine.id) -}}
+{{- end -}}
+{{- if not (regexMatch "^[A-Za-z0-9._-]+$" $machine.tokenKey) -}}
+{{- fail (printf "server machine %q tokenKey is invalid" $machine.id) -}}
+{{- end -}}
+{{- if hasKey $tokenKeys $machine.tokenKey -}}
+{{- fail (printf "server machine tokenKey must be unique: %q" $machine.tokenKey) -}}
+{{- end -}}
+{{- $_ := set $tokenKeys $machine.tokenKey true -}}
+{{- end -}}
+{{- $accountIds := dict -}}
+{{- range $account := $serverPulseAccounts -}}
+{{- if not (kindIs "map" $account) -}}
+{{- fail "server.pulse.accounts entries must be maps" -}}
+{{- end -}}
+{{- $accountId := get $account "id" | default 0 -}}
+{{- $accountIdentity := get $account "identity" | default "" -}}
+{{- $accountProfiles := get $account "profiles" | default list -}}
+{{- $accountKey := printf "%v" $accountId -}}
+{{- if or (lt (int64 $accountId) 1) (hasKey $accountIds $accountKey) -}}
+{{- fail (printf "server.pulse.accounts contains an invalid or duplicate id: %v" $accountId) -}}
+{{- end -}}
+{{- $_ := set $accountIds $accountKey true -}}
+{{- if eq (trim $accountIdentity) "" -}}
+{{- fail (printf "server.pulse account %v requires a nonempty identity" $accountId) -}}
+{{- end -}}
+{{- if not (kindIs "slice" $accountProfiles) -}}
+{{- fail (printf "server.pulse account %v profiles must be a list" $accountId) -}}
+{{- end -}}
+{{- $profileNames := dict -}}
+{{- range $profile := $accountProfiles -}}
+{{- if not (kindIs "map" $profile) -}}
+{{- fail (printf "server.pulse account %v profile entries must be maps" $accountId) -}}
+{{- end -}}
+{{- $profileName := get $profile "name" | default "" -}}
+{{- $profileVendor := get $profile "vendor" | default "" -}}
+{{- if or (not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" $profileName)) (hasKey $profileNames $profileName) -}}
+{{- fail (printf "server.pulse account %v contains an invalid or duplicate profile name: %q" $accountId $profileName) -}}
+{{- end -}}
+{{- $_ := set $profileNames $profileName true -}}
+{{- if not (has $profileVendor (list "anthropic-oauth" "openai-codex" "deepseek-balance" "xai-grok" "gemini" "antigravity")) -}}
+{{- fail (printf "server.pulse account %v profile %q has an unsupported vendor: %q" $accountId $profileName $profileVendor) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -64,6 +245,11 @@ data:
         proxy_read_timeout 3600s;
         proxy_set_header Host "{{ .Values.host }}";
         proxy_set_header Authorization "Bearer ${ATMUX_PROXY_TOKEN}";
+        {{- if $serverEnabled }}
+        # The coordinator is confined to this Pod's loopback interface. Host
+        # federation leaves the Pod through atmux's native mTLS client.
+        proxy_pass http://127.0.0.1:7345;
+        {{- else }}
         proxy_ssl_server_name on;
         proxy_ssl_name {{ .Values.atmux.tlsServerName | quote }};
         proxy_ssl_verify on;
@@ -72,9 +258,84 @@ data:
         proxy_ssl_certificate_key /etc/nginx/atmux-tls/tls.key;
         proxy_ssl_protocols TLSv1.2 TLSv1.3;
         proxy_pass https://{{ .Values.atmux.hostAddress }}:{{ .Values.atmux.hostPort }};
+        {{- end }}
       }
     }
 ---
+{{- if $serverEnabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-server-config
+data:
+  config.toml: |
+    [general]
+    project_roots = []
+    favorite_dirs = []
+    refresh_ms = 750
+    preview_lines = 160
+    switch_on_launch = false
+
+    [auto_compact]
+    enabled = false
+    inactivity_minutes = 15
+    input_tokens = 200000
+    poll_seconds = 30
+
+    [maintenance]
+    enabled = false
+    interval_minutes = 30
+    update_timeout_seconds = 180
+    relaunch_limit = 4
+
+    [node]
+    id = {{ $serverNodeId | quote }}
+    label = {{ $serverNodeLabel | quote }}
+
+    [node.tls]
+    cert_file = "/etc/atmux/tls/tls.crt"
+    key_file = "/etc/atmux/tls/tls.key"
+    ca_file = "/etc/atmux/tls/ca.crt"
+
+    [discovery]
+    enabled = false
+
+    [web]
+    allow_unauthenticated_loopback = false
+    proxy_token_file = "/etc/atmux/proxy-token/token"
+
+    [pulse]
+    collect = false
+    serve = {{ $serverPulseServe }}
+    receive = false
+
+    [pulse.database]
+    sqlite_path = "/var/lib/atmux/data/pulse.sqlite3"
+    {{- range $account := $serverPulseAccounts }}
+
+    [[pulse.accounts]]
+    id = {{ get $account "id" }}
+    identity = {{ get $account "identity" | quote }}
+    {{- with get $account "displayName" }}
+    display_name = {{ . | quote }}
+    {{- end }}
+    {{- range $profile := get $account "profiles" | default list }}
+
+    [[pulse.accounts.profiles]]
+    name = {{ get $profile "name" | quote }}
+    vendor = {{ get $profile "vendor" | quote }}
+    {{- end }}
+    {{- end }}
+    {{- range $machine := $serverMachines }}
+
+    [[machines]]
+    id = {{ $machine.id | quote }}
+    label = {{ $machine.label | quote }}
+    url = {{ printf "https://%s:%v" $machine.address $machine.port | quote }}
+    token_file = {{ printf "/etc/atmux/federation-tokens/%s.token" $machine.id | quote }}
+    {{- end }}
+---
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -85,12 +346,37 @@ data:
     {{ . }}
     {{- end }}
 ---
+{{- if and $serverEnabled (eq (trim $serverPersistenceExistingClaim) "") }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}-server-data
+  annotations:
+    # Gateway-only rollback must not turn a coordinator cutover into Pulse
+    # data deletion. An intentionally retired release must remove this claim
+    # through a separate, explicit data-lifecycle decision.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [{{ $serverPersistenceAccessMode | quote }}]
+  {{- with $serverPersistenceStorageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $serverPersistenceSize | quote }}
+---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ $name }}-web
 spec:
   replicas: 1
+  {{- if $serverEnabled }}
+  # SQLite and the coordinator's durable scheduler state must never be opened
+  # by overlapping old/new Pods on the single-node cluster.
+  strategy: {type: Recreate}
+  {{- end }}
   selector:
     matchLabels:
       app: {{ $name }}-web
@@ -100,12 +386,107 @@ spec:
         app: {{ $name }}-web
       annotations:
         checksum/allowed-emails: {{ join "\n" $allowedEmails | sha256sum | quote }}
+        {{- if $serverEnabled }}
+        checksum/server-config: {{ toJson $server | sha256sum | quote }}
+        atmux.dev/secret-revision: {{ $serverSecretRevision | quote }}
+        {{- end }}
     spec:
       automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
       securityContext:
         seccompProfile: {type: RuntimeDefault}
         fsGroup: 101
+        fsGroupChangePolicy: OnRootMismatch
+      {{- if $serverEnabled }}
+      initContainers:
+        - name: initialize-server-data
+          image: {{ $serverImage | quote }}
+          imagePullPolicy: {{ $serverImagePullPolicy }}
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              umask 077
+              mkdir -p /var/lib/atmux/home /var/lib/atmux/config /var/lib/atmux/data /var/lib/atmux/state /var/lib/atmux/cache
+              chmod 0700 /var/lib/atmux/home /var/lib/atmux/config /var/lib/atmux/data /var/lib/atmux/state /var/lib/atmux/cache
+          resources:
+            requests: {cpu: 5m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+          volumeMounts:
+            - {name: server-data, mountPath: /var/lib/atmux}
+      {{- end }}
       containers:
+        {{- if $serverEnabled }}
+        - name: atmux
+          image: {{ $serverImage | quote }}
+          imagePullPolicy: {{ $serverImagePullPolicy }}
+          args:
+            - --config
+            - /etc/atmux/config.toml
+            - web
+            - --bind
+            - 127.0.0.1:7345
+            - --allowed-host
+            - {{ .Values.host | quote }}
+            - --allowed-origin
+            - {{ printf "https://%s" .Values.host | quote }}
+          resources:
+            {{- toYaml $serverResources | nindent 12 }}
+          env:
+            - {name: HOME, value: /var/lib/atmux/home}
+            - {name: XDG_CONFIG_HOME, value: /var/lib/atmux/config}
+            - {name: XDG_DATA_HOME, value: /var/lib/atmux/data}
+            - {name: XDG_STATE_HOME, value: /var/lib/atmux/state}
+            - {name: XDG_CACHE_HOME, value: /var/lib/atmux/cache}
+            # Used only by the authenticated readiness probe. Runtime request
+            # authentication resolves the same Secret through token_file.
+            - name: ATMUX_READINESS_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ $serverProxyTokenSecret }}, key: token}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+          volumeMounts:
+            - {name: server-config, mountPath: /etc/atmux/config.toml, subPath: config.toml, readOnly: true}
+            - {name: server-proxy-token, mountPath: /etc/atmux/proxy-token, readOnly: true}
+            - {name: server-tls, mountPath: /etc/atmux/tls, readOnly: true}
+            - {name: federation-tokens, mountPath: /etc/atmux/federation-tokens, readOnly: true}
+            - {name: server-data, mountPath: /var/lib/atmux}
+            - {name: server-tmp, mountPath: /tmp}
+          startupProbe:
+            exec:
+              command: [nc, -z, 127.0.0.1, "7345"]
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  response="$(curl --fail --silent --show-error \
+                    --header "Authorization: Bearer ${ATMUX_READINESS_TOKEN}" \
+                    --header "Host: {{ .Values.host }}" \
+                    http://127.0.0.1:7345/api/v1/health)"
+                  printf '%s' "$response" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: [nc, -z, 127.0.0.1, "7345"]
+            periodSeconds: 10
+            timeoutSeconds: 2
+        {{- end }}
         - name: gateway
           image: {{ .Values.gateway.image | quote }}
           imagePullPolicy: IfNotPresent
@@ -130,7 +511,9 @@ spec:
           env:
             - name: ATMUX_PROXY_TOKEN
               valueFrom:
-                secretKeyRef: {name: {{ .Values.atmux.proxyTokenSecret }}, key: token}
+                secretKeyRef:
+                  name: {{ ternary $serverProxyTokenSecret .Values.atmux.proxyTokenSecret $serverEnabled }}
+                  key: token
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: {drop: ["ALL"]}
@@ -144,7 +527,9 @@ spec:
             # this writable runtime directory while the root filesystem stays
             # read-only.
             - {name: conf, mountPath: /etc/nginx/conf.d}
+            {{- if not $serverEnabled }}
             - {name: tls, mountPath: /etc/nginx/atmux-tls, readOnly: true}
+            {{- end }}
             - {name: tmp, mountPath: /tmp}
             - {name: cache, mountPath: /var/cache/nginx}
             - {name: run, mountPath: /var/run}
@@ -225,10 +610,38 @@ spec:
         - name: templates
           configMap: {name: {{ $name }}-gateway-config}
         - {name: conf, emptyDir: {}}
+        {{- if $serverEnabled }}
+        - name: server-config
+          configMap:
+            name: {{ $name }}-server-config
+            defaultMode: 0440
+        - name: server-proxy-token
+          secret:
+            secretName: {{ $serverProxyTokenSecret }}
+            defaultMode: 0440
+            items: [{key: token, path: token}]
+        - name: server-tls
+          secret:
+            secretName: {{ $serverTlsSecret }}
+            defaultMode: 0440
+        - name: federation-tokens
+          secret:
+            secretName: {{ $serverFederationTokenSecret }}
+            defaultMode: 0440
+            items:
+              {{- range $machine := $serverMachines }}
+              - {key: {{ $machine.tokenKey | quote }}, path: {{ printf "%s.token" $machine.id | quote }}}
+              {{- end }}
+        - name: server-data
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-server-data" $name) $serverPersistenceExistingClaim }}
+        - {name: server-tmp, emptyDir: {sizeLimit: 64Mi}}
+        {{- else }}
         - name: tls
           secret:
             secretName: {{ .Values.atmux.tlsSecret }}
             defaultMode: 0440
+        {{- end }}
         - {name: tmp, emptyDir: {}}
         - {name: cache, emptyDir: {}}
         - {name: run, emptyDir: {}}
@@ -289,9 +702,17 @@ spec:
             matchLabels: {name: nginx-ingress-microk8s}
       ports: [{protocol: TCP, port: 4180}]
   egress:
+    {{- if $serverEnabled }}
+    {{- range $machine := $serverMachines }}
+    - to:
+        - ipBlock: {cidr: {{ printf "%s/32" $machine.address | quote }} }
+      ports: [{protocol: TCP, port: {{ $machine.port }}}]
+    {{- end }}
+    {{- else }}
     - to:
         - ipBlock: {cidr: {{ printf "%s/32" .Values.atmux.hostAddress | quote }} }
       ports: [{protocol: TCP, port: {{ .Values.atmux.hostPort }}}]
+    {{- end }}
     {{- range $keycloakEgressCidrs }}
     - to:
         - ipBlock: {cidr: {{ . | quote }}}

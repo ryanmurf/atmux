@@ -1255,6 +1255,20 @@ function dictationPrefix(inputText, composerSending, inFlightText) {
   return composerSending && current === String(inFlightText || "").trim() ? "" : current;
 }
 
+function composerSubmissionMatches(selectedPaneId, targetPaneId, inputText, submittedText) {
+  return Boolean(targetPaneId)
+    && selectedPaneId === targetPaneId
+    && String(inputText) === String(submittedText);
+}
+
+function composerSubmissionCanRestore(selectedPaneId, inputText, revision, submission) {
+  return Boolean(submission)
+    && submission.clearedRevision !== null
+    && selectedPaneId === submission.paneId
+    && String(inputText) === ""
+    && revision === submission.clearedRevision;
+}
+
 function dictationEndAction(holding, releaseRequested, failed) {
   return holding && !releaseRequested && !failed ? "restart" : "finish";
 }
@@ -1487,6 +1501,8 @@ if (typeof module !== "undefined" && module.exports) {
     classifyOverviewUpdate,
     compareSessions,
     composerEnterAction,
+    composerSubmissionCanRestore,
+    composerSubmissionMatches,
     contentToLines,
     dictationDelivery,
     dictationEndAction,
@@ -1656,6 +1672,7 @@ function initialize() {
     messageHistoryNavigation: null,
     composerSending: false,
     inFlightComposerText: null,
+    composerRevision: 0,
     queuedComposerMessages: [],
     attachments: [],
     attachmentPaneId: null,
@@ -2257,7 +2274,7 @@ function initialize() {
     }
     const viewer = $("file-viewer");
     const position = { top: viewer.scrollTop, left: viewer.scrollLeft };
-    input.value = insertion.value;
+    replaceComposerValue(insertion.value);
     input.focus({ preventScroll: true });
     input.setSelectionRange(insertion.cursor, insertion.cursor);
     // Focusing the persistent composer must not knock the source reader away
@@ -4587,7 +4604,7 @@ function initialize() {
     const next = moveMessageHistory(history, index, direction);
     if (next === null) return false;
     state.messageHistoryNavigation = { paneId, index: next, draft };
-    input.value = next === history.length ? draft : history[next];
+    replaceComposerValue(next === history.length ? draft : history[next]);
     input.setSelectionRange(input.value.length, input.value.length);
     return true;
   }
@@ -4695,28 +4712,55 @@ function initialize() {
   $("mobile-back").addEventListener("click", backToAgentMenu);
   $("machine-mobile-back").addEventListener("click", backToAgentMenu);
 
+  function replaceComposerValue(value) {
+    const input = $("message");
+    const next = String(value);
+    if (input.value === next) return state.composerRevision;
+    input.value = next;
+    state.composerRevision += 1;
+    return state.composerRevision;
+  }
+
+  function acceptComposerSubmission(paneId, message) {
+    const submission = { paneId, message, clearedRevision: null };
+    const input = $("message");
+    if (composerSubmissionMatches(state.selected, paneId, input.value, message)) {
+      submission.clearedRevision = replaceComposerValue("");
+    }
+    return submission;
+  }
+
+  function restoreComposerSubmission(submission) {
+    if (!submission || submission.clearedRevision === null) return false;
+    const canRestore = composerSubmissionCanRestore(
+      state.selected,
+      $("message").value,
+      state.composerRevision,
+      submission,
+    );
+    // Consume the rollback token even if newer composer activity made it stale.
+    submission.clearedRevision = null;
+    if (!canRestore) return false;
+    const input = $("message");
+    replaceComposerValue(submission.message);
+    input.setSelectionRange(input.value.length, input.value.length);
+    return true;
+  }
+
   function drainQueuedComposerMessage() {
     const queued = state.queuedComposerMessages.shift();
     if (!queued) return;
-    void sendComposerMessage(queued.paneId, queued.message).then(queued.resolve);
+    void sendComposerMessage(queued.paneId, queued.message, {
+      ...queued.options,
+      fromQueue: true,
+    }).then(queued.resolve);
   }
 
-  async function sendComposerMessage(paneId = state.selected, messageOverride = null) {
+  async function sendComposerMessage(paneId = state.selected, messageOverride = null, options = {}) {
     const input = $("message");
     if (!paneId || (messageOverride === null && input.disabled)) {
-      if (messageOverride !== null) drainQueuedComposerMessage();
+      if (options.fromQueue === true) drainQueuedComposerMessage();
       return false;
-    }
-    if (state.composerSending) {
-      if (messageOverride === null || !String(messageOverride).trim()) return false;
-      if (state.queuedComposerMessages.length >= MAX_QUEUED_COMPOSER_MESSAGES) {
-        toast("Quick Talk queue is full; wait for the current send");
-        return false;
-      }
-      toast("Quick Talk queued behind the current send");
-      return new Promise((resolve) => {
-        state.queuedComposerMessages.push({ paneId, message: String(messageOverride), resolve });
-      });
     }
     const message = messageOverride === null ? input.value : String(messageOverride);
     const attachments = messageOverride === null ? [...state.attachments] : [];
@@ -4724,15 +4768,40 @@ function initialize() {
       ? attachmentDeliveryTarget(state.attachmentPaneId, paneId)
       : paneId;
     if (!message.trim() && !attachments.length) {
-      if (messageOverride !== null) drainQueuedComposerMessage();
+      if (options.fromQueue === true) drainQueuedComposerMessage();
       return false;
     }
     const messageLimit = attachments.length ? MAX_MESSAGE_BYTES - IMAGE_MESSAGE_TEXT_RESERVE : MAX_MESSAGE_BYTES;
     if (utf8ByteLength(message) > messageLimit) {
       toast("Message exceeds the 64 KiB UTF-8 limit");
-      if (messageOverride !== null) drainQueuedComposerMessage();
+      if (options.fromQueue === true) drainQueuedComposerMessage();
       return false;
     }
+    const clearOnAccept = options.clearOnAccept === true;
+    let composerSubmission = options.composerSubmission || null;
+    const markAccepted = () => {
+      if (clearOnAccept && !composerSubmission) {
+        composerSubmission = acceptComposerSubmission(targetPaneId, message);
+      }
+    };
+    if (state.composerSending) {
+      if (messageOverride === null) return false;
+      if (state.queuedComposerMessages.length >= MAX_QUEUED_COMPOSER_MESSAGES) {
+        toast("Quick Talk queue is full; wait for the current send");
+        return false;
+      }
+      markAccepted();
+      toast("Quick Talk queued behind the current send");
+      return new Promise((resolve) => {
+        state.queuedComposerMessages.push({
+          paneId,
+          message,
+          options: { clearOnAccept, composerSubmission, fromQueue: options.fromQueue === true },
+          resolve,
+        });
+      });
+    }
+    markAccepted();
     const button = $("send");
     state.composerSending = true;
     state.inFlightComposerText = message;
@@ -4752,11 +4821,16 @@ function initialize() {
         await request(`/api/v1/panes/${encodeURIComponent(targetPaneId)}/messages`, { method: "POST", body: JSON.stringify({ text: message, submit: true }) });
       }
       if (message.trim()) rememberMessage(targetPaneId, message);
-      if ((attachments.length || state.selected === targetPaneId) && input.value === message) input.value = "";
+      if (!clearOnAccept
+        && (attachments.length || state.selected === targetPaneId)
+        && input.value === message) replaceComposerValue("");
       if (attachments.length) removeDeliveredAttachments(attachments);
       toast(attachments.length === 1 ? "Image sent" : attachments.length > 1 ? "Images sent" : "Message sent");
       return true;
-    } catch (error) { toast(error.message); }
+    } catch (error) {
+      restoreComposerSubmission(composerSubmission);
+      toast(error.message);
+    }
     finally {
       state.composerSending = false;
       state.inFlightComposerText = null;
@@ -4905,7 +4979,10 @@ function initialize() {
     } catch (error) { toast(error.message); }
     finally { render(); }
   });
-  $("message").addEventListener("input", () => { state.messageHistoryNavigation = null; });
+  $("message").addEventListener("input", () => {
+    state.composerRevision += 1;
+    state.messageHistoryNavigation = null;
+  });
   $("message").addEventListener("keydown", (event) => {
     const action = composerEnterAction(event);
     if (action === "send") {
@@ -5029,7 +5106,7 @@ function initialize() {
     const delivery = dictationDelivery(dictation.paneId, dictation.prefix, dictation.finalText);
     dictation.paneId = null;
     if (!dictation.failed && delivery) {
-      void sendComposerMessage(delivery.paneId, delivery.message);
+      void sendComposerMessage(delivery.paneId, delivery.message, { clearOnAccept: true });
     }
   }
 
@@ -5074,7 +5151,7 @@ function initialize() {
           else interim = [interim, transcript].filter(Boolean).join(" ");
         }
         dictation.interimText = interim;
-        if (state.selected === dictation.paneId) $("message").value = dictationText();
+        if (state.selected === dictation.paneId) replaceComposerValue(dictationText());
       };
       recognition.onerror = (event) => {
         if (!isCurrent()) return;
@@ -5141,6 +5218,9 @@ function initialize() {
       if (!state.selected || dictation.holding || dictation.active || dictation.restartTimer !== null) return;
       event.preventDefault();
       talkButton.setPointerCapture?.(event.pointerId);
+      // Starting another hold is composer activity even before speech arrives;
+      // a late failure from the prior hold must not repopulate this new draft.
+      state.composerRevision += 1;
       dictation.generation += 1;
       dictation.holding = true;
       dictation.releaseRequested = false;
