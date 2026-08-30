@@ -115,10 +115,10 @@ textarea { resize: vertical; min-height: 74px; max-height: 220px; }
 .project-entry-icon { color: var(--cyan); }
 .project-entry-name, .git-change-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .project-entry-meta { color: var(--muted); font-size: 10px; }
-.code-viewer { --file-font-size: 12.5px; --file-line-height: 1.55; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; overflow-anchor: none; background: #060b0e; }
-.code-viewer.file-size-small { --file-font-size: 10.5px; --file-line-height: 1.5; }
-.code-viewer.file-size-medium { --file-font-size: 12.5px; --file-line-height: 1.55; }
-.code-viewer.file-size-large { --file-font-size: 15px; --file-line-height: 1.6; }
+.code-viewer { --file-font-size: 12.5px; --file-editor-font-size: 12.5px; --file-line-height: 1.55; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; overflow-anchor: none; background: #060b0e; }
+.code-viewer.file-size-small { --file-font-size: 10.5px; --file-editor-font-size: 10.5px; --file-line-height: 1.5; }
+.code-viewer.file-size-medium { --file-font-size: 12.5px; --file-editor-font-size: 12.5px; --file-line-height: 1.55; }
+.code-viewer.file-size-large { --file-font-size: 15px; --file-editor-font-size: 15px; --file-line-height: 1.6; }
 .code-viewer-head { position: sticky; z-index: 1; top: 0; min-width: 100%; width: max-content; display: flex; align-items: center; gap: 9px; padding: 7px 11px; border-bottom: 1px solid var(--line); background: #0e181dcc; color: #c6d7da; font: 11px/1.35 "SFMono-Regular", Consolas, monospace; backdrop-filter: blur(8px); }
 .code-viewer-path { min-width: 80px; max-width: min(42vw, 600px); overflow: hidden; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .code-viewer-head > span:not(.code-viewer-path) { color: var(--muted); }
@@ -142,7 +142,7 @@ button.code-line-number:hover, button.code-line-number:focus-visible, button.cod
 .code-viewer.file-wrap .code-source { min-width: 0; width: 100%; }
 .code-viewer.file-wrap .code-line { min-width: 0; width: 100%; }
 .code-viewer.file-wrap .code-line-content { flex: 1 1 auto; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
-.file-editor { width: 100%; height: calc(100% - 37px); min-height: 180px; max-height: none; padding: 12px 14px 28px; resize: none; border: 0; border-radius: 0; outline-offset: -2px; color: #dce8e8; background: #060b0e; font: var(--file-font-size)/var(--file-line-height) "SFMono-Regular", Consolas, "Liberation Mono", monospace; tab-size: 2; white-space: pre; overflow: auto; }
+.file-editor { width: 100%; height: calc(100% - 37px); min-height: 180px; max-height: none; padding: 12px 14px 28px; resize: none; border: 0; border-radius: 0; outline-offset: -2px; color: #dce8e8; background: #060b0e; font: var(--file-editor-font-size)/var(--file-line-height) "SFMono-Regular", Consolas, "Liberation Mono", monospace; tab-size: 2; white-space: pre; overflow: auto; }
 .code-viewer.file-wrap .file-editor { white-space: pre-wrap; overflow-x: hidden; overflow-wrap: anywhere; word-break: break-word; }
 .file-edit-status { min-height: 37px; margin: 0; padding: 9px 12px; border-bottom: 1px solid var(--line); color: var(--muted); background: #0b1418; font-size: 11px; }
 .file-edit-status.dirty { color: var(--amber); }
@@ -438,6 +438,9 @@ dialog::backdrop { background: #000a; }
   #file-viewer.file-wrap .code-viewer-head > span:not(.code-viewer-path) { display: none; }
   #file-viewer.file-wrap .code-viewer-path { max-width: 25vw; }
   .file-viewer-actions button { min-height: 36px; padding-inline: 7px; font-size: 10px; }
+  .code-viewer.file-size-small { --file-editor-font-size: 16px; }
+  .code-viewer.file-size-medium { --file-editor-font-size: 17px; }
+  .code-viewer.file-size-large { --file-editor-font-size: 19px; }
   .file-editor { min-height: 140px; padding: 10px; }
   .code-line { padding-inline: 8px; }
   .code-line-number { width: 3ch; min-width: 3ch; flex-basis: 3ch; margin-right: 9px; }

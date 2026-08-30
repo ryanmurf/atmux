@@ -68,6 +68,7 @@ const {
   fileEditHasUnsavedWork,
   fileReaderPreferences,
   fileReaderPreferenceJson,
+  loadFileReaderPreferences,
   fileReferenceBlock,
   insertComposerReference,
   nextFileLineSelection,
@@ -1008,6 +1009,14 @@ test("file reader preferences default by viewport and persist only bounded choic
     fileReaderPreferenceJson({ wrap: true, size: "small", ignored: "value" }),
     '{"wrap":true,"size":"small"}',
   );
+  assert.deepEqual(
+    loadFileReaderPreferences(() => { throw new DOMException("denied", "SecurityError"); }, true),
+    { wrap: true, size: "small" },
+  );
+  assert.deepEqual(
+    loadFileReaderPreferences(() => '{"wrap":true,"size":"large"}', false),
+    { wrap: true, size: "large" },
+  );
 });
 
 test("Files and Git are accessible lazy tabs with text-only source rendering", () => {
@@ -1057,6 +1066,8 @@ test("Files and Git are accessible lazy tabs with text-only source rendering", (
   assert.match(css, /\.code-viewer\.file-wrap \.code-line-content \{[^}]*white-space: pre-wrap;[^}]*overflow-wrap: anywhere;/s);
   assert.match(css, /\.code-viewer\.file-wrap \.file-editor \{[^}]*white-space: pre-wrap;[^}]*overflow-x: hidden;/s);
   assert.match(css, /\.code-viewer\.file-size-small \{[^}]*--file-font-size: 10\.5px;/s);
+  assert.match(css, /@media \(max-width: 720px\)[\s\S]*\.code-viewer\.file-size-small \{ --file-editor-font-size: 16px; \}[\s\S]*\.code-viewer\.file-size-medium \{ --file-editor-font-size: 17px; \}[\s\S]*\.code-viewer\.file-size-large \{ --file-editor-font-size: 19px; \}/s);
+  assert.doesNotMatch(css, /\.file-editor[^}]*\{[^}]*transform\s*:/s);
 });
 
 test("conversation rendering never assigns agent content through innerHTML", () => {

@@ -884,6 +884,14 @@ function fileReaderPreferenceJson(preferences) {
   return JSON.stringify({ wrap: normalized.wrap, size: normalized.size });
 }
 
+function loadFileReaderPreferences(readStoredValue, mobile = false) {
+  try {
+    return fileReaderPreferences(readStoredValue(), mobile);
+  } catch {
+    return fileReaderPreferences(null, mobile);
+  }
+}
+
 function paneFilesPath(paneId, path = "") {
   const relative = projectRelativePath(path);
   if (!paneId || relative === null) return null;
@@ -1611,6 +1619,7 @@ if (typeof module !== "undefined" && module.exports) {
     fileEditHasUnsavedWork,
     fileReaderPreferences,
     fileReaderPreferenceJson,
+    loadFileReaderPreferences,
     fileReferenceBlock,
     insertComposerReference,
     nextFileLineSelection,
@@ -1688,8 +1697,8 @@ function initialize() {
   const storedLaunchDirectories = rememberedLaunchDirectories(
     localStorage.getItem(LAUNCH_DIRECTORY_STORAGE_KEY),
   );
-  const storedFileReaderPreferences = fileReaderPreferences(
-    localStorage.getItem(FILE_READER_STORAGE_KEY),
+  const storedFileReaderPreferences = loadFileReaderPreferences(
+    () => localStorage.getItem(FILE_READER_STORAGE_KEY),
     mobileViewportActive(),
   );
   const requestedPulseAccount = pulseAccountId(pageUrl.searchParams.get("pulseAccount"));
