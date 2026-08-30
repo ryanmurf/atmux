@@ -1,0 +1,16 @@
+[package]
+name = "sqlite-handle-guard"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

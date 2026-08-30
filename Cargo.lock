@@ -157,6 +157,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "shell-words",
+ "sqlite-handle-guard",
  "sysinfo",
  "tokio",
  "tokio-postgres",
@@ -2321,6 +2322,13 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "sqlite-handle-guard"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
 ]
 
 [[package]]

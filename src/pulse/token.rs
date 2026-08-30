@@ -1325,6 +1325,9 @@ mod tests {
         connection
             .execute_batch("CREATE TABLE steps (step_payload BLOB NOT NULL) STRICT;")
             .expect("conversation schema");
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint schema only");
         let payload = vec![0x10, 100, 0x48, 10, 0x50, 20, 0x18, 30];
         connection
             .execute("INSERT INTO steps (step_payload) VALUES (?1)", [&payload])
@@ -1333,12 +1336,19 @@ mod tests {
         let profile = profile(&temp.0, Vendor::Antigravity);
         let machine = MachineName::new("max").expect("machine");
         let first = tally_profile_page(&profile, &machine, None, 2).expect("first WAL page");
+        assert_eq!(first.tally.grains.len(), 1);
+        assert_eq!(first.tally.grains[0].tokens_in, 100);
+        assert_eq!(first.tally.grains[0].tokens_out, 30);
         let main_before = fs::metadata(&path).expect("main DB metadata");
         let wal_path = PathBuf::from(format!("{}-wal", path.display()));
         let wal_before = fs::metadata(&wal_path).expect("WAL metadata").len();
 
+        let second_payload = vec![0x10, 101, 0x48, 10, 0x50, 21, 0x18, 31];
         connection
-            .execute("INSERT INTO steps (step_payload) VALUES (?1)", [&payload])
+            .execute(
+                "INSERT INTO steps (step_payload) VALUES (?1)",
+                [&second_payload],
+            )
             .expect("second WAL row");
         let main_after = fs::metadata(&path).expect("unchanged main DB metadata");
         assert_eq!(main_before.len(), main_after.len());
@@ -1349,6 +1359,9 @@ mod tests {
         assert!(fs::metadata(&wal_path).expect("changed WAL metadata").len() > wal_before);
 
         let changed = tally_profile_page(&profile, &machine, None, 2).expect("changed WAL page");
+        assert_eq!(changed.tally.grains.len(), 1);
+        assert_eq!(changed.tally.grains[0].tokens_in, 201);
+        assert_eq!(changed.tally.grains[0].tokens_out, 61);
         assert_ne!(first.source_generation, changed.source_generation);
     }
 

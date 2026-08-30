@@ -99,6 +99,7 @@ impl SqliteStore {
             let connection =
                 Connection::open_with_flags(&prepared.open_path, sqlite_open_flags(true))
                     .map_err(sql_error)?;
+            run_sqlite_after_open_test_hook(&path);
             #[cfg(unix)]
             prepared.guard.verify()?;
             verify_sqlite_opened(&connection, prepared.identity)?;
@@ -111,6 +112,9 @@ impl SqliteStore {
             connection
                 .pragma_update(None, "query_only", "ON")
                 .map_err(sql_error)?;
+            #[cfg(unix)]
+            prepared.guard.verify()?;
+            verify_sqlite_opened(&connection, prepared.identity)?;
             Ok(Self {
                 connection: Arc::new(Mutex::new(connection)),
                 #[cfg(unix)]
@@ -138,11 +142,14 @@ impl SqliteStore {
         let mut connection =
             Connection::open_with_flags(&prepared.open_path, sqlite_open_flags(false))
                 .map_err(sql_error)?;
+        run_sqlite_after_open_test_hook(path);
         #[cfg(unix)]
         prepared.guard.verify()?;
         verify_sqlite_opened(&connection, prepared.identity)?;
         configure(&connection)?;
         migrate::apply(&mut connection)?;
+        #[cfg(unix)]
+        prepared.guard.verify()?;
         verify_sqlite_opened(&connection, prepared.identity)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -198,14 +205,21 @@ impl SqliteStore {
         let path_guard = self.path_guard.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                #[cfg(unix)]
-                if let Some(path_guard) = path_guard {
-                    path_guard.verify()?;
-                }
                 let mut connection = connection.lock().map_err(|_| {
                     PulseError::new(PulseErrorKind::Storage, "Pulse SQLite lock was poisoned")
                 })?;
-                operation(&mut connection)
+                #[cfg(unix)]
+                if let Some(path_guard) = &path_guard {
+                    path_guard.verify()?;
+                    verify_live_sqlite_handle(&connection)?;
+                }
+                let result = operation(&mut connection)?;
+                #[cfg(unix)]
+                if let Some(path_guard) = &path_guard {
+                    path_guard.verify()?;
+                    verify_live_sqlite_handle(&connection)?;
+                }
+                Ok(result)
             })
             .await
             .map_err(join_error)?
@@ -614,6 +628,8 @@ fn validate_sqlite_parent(_parent: &Path) -> PulseResult<()> {
 }
 
 fn verify_sqlite_opened(connection: &Connection, identity: SqliteFileIdentity) -> PulseResult<()> {
+    #[cfg(unix)]
+    verify_live_sqlite_handle(connection)?;
     let opened = connection
         .query_row("PRAGMA database_list", [], |row| row.get::<_, String>(2))
         .map_err(sql_error)?;
@@ -624,11 +640,23 @@ fn verify_sqlite_opened(connection: &Connection, identity: SqliteFileIdentity) -
     Ok(())
 }
 
+#[cfg(unix)]
+fn verify_live_sqlite_handle(connection: &Connection) -> PulseResult<()> {
+    match sqlite_handle_guard::main_database_has_moved(connection) {
+        Ok(false) => Ok(()),
+        Ok(true) | Err(_) => Err(sqlite_path_changed()),
+    }
+}
+
 #[cfg(test)]
 type SqliteOpenTestHook = Box<dyn FnOnce() + Send + 'static>;
 
 #[cfg(test)]
 static SQLITE_OPEN_TEST_HOOKS: Mutex<Vec<(PathBuf, SqliteOpenTestHook)>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+static SQLITE_AFTER_OPEN_TEST_HOOKS: Mutex<Vec<(PathBuf, SqliteOpenTestHook)>> =
+    Mutex::new(Vec::new());
 
 #[cfg(test)]
 fn run_sqlite_open_test_hook(path: &Path) {
@@ -649,8 +677,33 @@ fn install_sqlite_open_test_hook(path: PathBuf, hook: SqliteOpenTestHook) {
         .push((path, hook));
 }
 
+#[cfg(test)]
+fn run_sqlite_after_open_test_hook(path: &Path) {
+    let hook = SQLITE_AFTER_OPEN_TEST_HOOKS
+        .lock()
+        .ok()
+        .and_then(|mut hooks| {
+            let index = hooks.iter().position(|(target, _)| target == path)?;
+            Some(hooks.remove(index).1)
+        });
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn install_sqlite_after_open_test_hook(path: PathBuf, hook: SqliteOpenTestHook) {
+    SQLITE_AFTER_OPEN_TEST_HOOKS
+        .lock()
+        .expect("SQLite after-open test hook lock")
+        .push((path, hook));
+}
+
 #[cfg(not(test))]
 fn run_sqlite_open_test_hook(_path: &Path) {}
+
+#[cfg(not(test))]
+fn run_sqlite_after_open_test_hook(_path: &Path) {}
 
 fn sqlite_open_flags(read_only: bool) -> rusqlite::OpenFlags {
     let access = if read_only {
@@ -694,6 +747,14 @@ fn join_error(error: tokio::task::JoinError) -> PulseError {
 #[allow(clippy::needless_pass_by_value)]
 fn sql_error(error: rusqlite::Error) -> PulseError {
     let kind = match &error {
+        // `SQLITE_OPEN_NOFOLLOW` reports a symlink in any path component
+        // through this extended code. Keep that path-policy failure distinct
+        // from an ordinary unavailable database (`SQLITE_CANTOPEN`).
+        rusqlite::Error::SqliteFailure(inner, _)
+            if inner.extended_code == rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK =>
+        {
+            PulseErrorKind::Configuration
+        }
         rusqlite::Error::SqliteFailure(inner, _)
             if matches!(
                 inner.code,
@@ -711,6 +772,31 @@ fn sql_error(error: rusqlite::Error) -> PulseError {
         _ => PulseErrorKind::Storage,
     };
     PulseError::new(kind, format!("Pulse SQLite operation failed: {error}"))
+}
+
+#[cfg(test)]
+mod sqlite_error_tests {
+    use super::{PulseErrorKind, sql_error};
+
+    #[test]
+    fn sqlite_symlink_open_failure_is_a_configuration_error() {
+        let error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK),
+            Some("symbolic link".to_owned()),
+        );
+
+        assert_eq!(sql_error(error).kind(), PulseErrorKind::Configuration);
+    }
+
+    #[test]
+    fn ordinary_sqlite_cannot_open_failure_remains_a_storage_error() {
+        let error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+            Some("cannot open".to_owned()),
+        );
+
+        assert_eq!(sql_error(error).kind(), PulseErrorKind::Storage);
+    }
 }
 
 fn encode<T: Serialize>(value: &T) -> PulseResult<String> {
@@ -5346,7 +5432,10 @@ mod path_security_tests {
 
     use sha2::{Digest as _, Sha256};
 
-    use super::{SqliteOpenTestHook, SqliteStore, Store, install_sqlite_open_test_hook};
+    use super::{
+        SqliteOpenTestHook, SqliteStore, Store, install_sqlite_after_open_test_hook,
+        install_sqlite_open_test_hook,
+    };
     use crate::pulse::{Account, AccountId, PulseErrorKind};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -5398,6 +5487,24 @@ mod path_security_tests {
         Sha256::digest(fs::read(path).expect("read SQLite target")).to_vec()
     }
 
+    fn assert_external_was_not_migrated(path: &Path) {
+        let connection = rusqlite::Connection::open(path).expect("inspect external database");
+        let sentinel = connection
+            .query_row("SELECT value FROM sentinel", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("external sentinel remains readable");
+        let accounts = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='accounts'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("inspect external schema");
+        assert_eq!(sentinel, "unchanged");
+        assert_eq!(accounts, 0, "wrong database must never be migrated");
+    }
+
     fn account() -> Account {
         Account {
             id: AccountId::new(1).expect("account id"),
@@ -5431,10 +5538,13 @@ mod path_security_tests {
             .await
             .err()
             .expect("ancestor swap must fail closed");
-        assert!(matches!(
-            error.kind(),
-            PulseErrorKind::Configuration | PulseErrorKind::Conflict
-        ));
+        assert!(
+            matches!(
+                error.kind(),
+                PulseErrorKind::Configuration | PulseErrorKind::Conflict
+            ),
+            "unexpected path-swap classification: {error:?}"
+        );
         assert_eq!(file_digest(&external_database), before);
     }
 
@@ -5461,11 +5571,86 @@ mod path_security_tests {
             .await
             .err()
             .expect("final swap must fail closed");
-        assert!(matches!(
-            error.kind(),
-            PulseErrorKind::Configuration | PulseErrorKind::Conflict
-        ));
+        assert!(
+            matches!(
+                error.kind(),
+                PulseErrorKind::Configuration | PulseErrorKind::Conflict
+            ),
+            "unexpected path-swap classification: {error:?}"
+        );
         assert_eq!(file_digest(&external_database), before);
+    }
+
+    #[tokio::test]
+    async fn pinned_open_rejects_held_regular_replacement_before_migration() {
+        let root = TestRoot::new("held-regular-swap");
+        let safe = root.directory("safe");
+        let requested = safe.join("pulse.sqlite3");
+        let anchored = safe.join("anchored.sqlite3");
+        let external = root.directory("external");
+        let external_database = external.join("pulse.sqlite3");
+        create_external_database(&external_database);
+        let before = file_digest(&external_database);
+        let hook_requested = requested.clone();
+        let hook_anchored = anchored.clone();
+        let hook_external = external_database.clone();
+        install_sqlite_open_test_hook(
+            requested.clone(),
+            Box::new(move || {
+                fs::rename(&hook_requested, hook_anchored).expect("retain pinned database");
+                fs::copy(hook_external, hook_requested).expect("install regular replacement");
+            }) as SqliteOpenTestHook,
+        );
+
+        let error = SqliteStore::open(&requested)
+            .await
+            .err()
+            .expect("held regular replacement must fail closed");
+        assert_eq!(error.kind(), PulseErrorKind::Conflict);
+        assert_eq!(file_digest(&external_database), before);
+        assert_external_was_not_migrated(&requested);
+    }
+
+    #[tokio::test]
+    async fn pinned_open_rejects_regular_swap_back_before_migration() {
+        let root = TestRoot::new("regular-swap-back");
+        let safe = root.directory("safe");
+        let requested = safe.join("pulse.sqlite3");
+        let anchored = safe.join("anchored.sqlite3");
+        let opened_replacement = safe.join("opened-replacement.sqlite3");
+        let external = root.directory("external");
+        let external_database = external.join("pulse.sqlite3");
+        create_external_database(&external_database);
+        let before = file_digest(&external_database);
+        let before_requested = requested.clone();
+        let before_anchored = anchored.clone();
+        let before_external = external_database.clone();
+        install_sqlite_open_test_hook(
+            requested.clone(),
+            Box::new(move || {
+                fs::rename(&before_requested, before_anchored).expect("retain pinned database");
+                fs::copy(before_external, before_requested).expect("install regular replacement");
+            }) as SqliteOpenTestHook,
+        );
+        let after_requested = requested.clone();
+        let after_anchored = anchored.clone();
+        let after_opened_replacement = opened_replacement.clone();
+        install_sqlite_after_open_test_hook(
+            requested.clone(),
+            Box::new(move || {
+                fs::rename(&after_requested, after_opened_replacement)
+                    .expect("move opened replacement aside");
+                fs::rename(after_anchored, after_requested).expect("restore pinned database");
+            }) as SqliteOpenTestHook,
+        );
+
+        let error = SqliteStore::open(&requested)
+            .await
+            .err()
+            .expect("regular swap-back must fail closed");
+        assert_eq!(error.kind(), PulseErrorKind::Conflict);
+        assert_eq!(file_digest(&external_database), before);
+        assert_external_was_not_migrated(&opened_replacement);
     }
 
     #[tokio::test]

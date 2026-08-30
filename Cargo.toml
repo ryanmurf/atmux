@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "development-tools"]
 
 [features]
 default = ["pulse"]
-pulse = ["dep:jiff", "dep:rand", "dep:rusqlite"]
+pulse = ["dep:jiff", "dep:rand", "dep:rusqlite", "dep:sqlite-handle-guard"]
 pulse-postgres = [
     "pulse",
     "dep:tokio-postgres",
@@ -40,6 +40,7 @@ rand = { version = "0.9.2", optional = true }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
 rmcp = { version = "3.1.0", features = ["transport-streamable-http-server"] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"], optional = true }
+sqlite-handle-guard = { path = "crates/sqlite-handle-guard", optional = true }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 rustls = "0.23.36"
 rustls-pemfile = "2.2.0"

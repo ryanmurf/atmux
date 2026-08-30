@@ -421,6 +421,8 @@ pub fn tally_conversation_db(
         started,
     )?;
     let Some(usage) = extract_usage_from_payloads(&payloads)? else {
+        #[cfg(target_os = "macos")]
+        verify_mac_pinned_connection(&connection, &file)?;
         return Ok(None);
     };
     let mut metadata_blobs = Vec::new();
@@ -464,6 +466,8 @@ pub fn tally_conversation_db(
         })
         .ok_or_else(|| PulseError::invalid_input("Antigravity session id was invalid"))?
         .to_owned();
+    #[cfg(target_os = "macos")]
+    verify_mac_pinned_connection(&connection, &file)?;
     Ok(Some(AntigravityConversation {
         session_id,
         model,
@@ -472,15 +476,11 @@ pub fn tally_conversation_db(
     }))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn open_read_only_connection(_path: &Path, file: &fs::File) -> PulseResult<Connection> {
     use std::os::fd::AsRawFd as _;
 
-    let descriptor_path = if cfg!(target_os = "linux") {
-        format!("/proc/self/fd/{}", file.as_raw_fd())
-    } else {
-        format!("/dev/fd/{}", file.as_raw_fd())
-    };
+    let descriptor_path = format!("/proc/self/fd/{}", file.as_raw_fd());
     Connection::open_with_flags(
         descriptor_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -488,7 +488,139 @@ fn open_read_only_connection(_path: &Path, file: &fs::File) -> PulseResult<Conne
     .map_err(|_| PulseError::invalid_input("Antigravity conversation database was invalid"))
 }
 
-#[cfg(not(unix))]
+// SQLite derives WAL/SHM paths from the database filename. Linux resolves a
+// `/proc/self/fd` filename back to the original database, but macOS keeps the
+// `/dev/fd` alias and consequently looks for sidecars beside that alias. Ask
+// the kernel for the pinned descriptor's real path so SQLite sees those
+// sidecars without trusting a second lookup of the caller-supplied path.
+#[cfg(target_os = "macos")]
+fn open_read_only_connection(_path: &Path, file: &fs::File) -> PulseResult<Connection> {
+    let pinned_path = mac_pinned_path(file)?;
+    open_pinned_path_connection(&pinned_path, file)
+}
+
+#[cfg(target_os = "macos")]
+fn mac_pinned_path(file: &fs::File) -> PulseResult<std::path::PathBuf> {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+    let pinned_path = rustix::fs::getpath(file)
+        .map_err(|_| PulseError::invalid_input("Antigravity conversation database was invalid"))?;
+    Ok(Path::new(OsStr::from_bytes(pinned_path.as_bytes())).to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_mac_pinned_connection(
+    connection: &Connection,
+    pinned_file: &fs::File,
+) -> PulseResult<()> {
+    let pinned_path = mac_pinned_path(pinned_file)?;
+    verify_pinned_path_connection(&pinned_path, pinned_file, connection)
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn open_pinned_path_connection(path: &Path, pinned_file: &fs::File) -> PulseResult<Connection> {
+    run_path_open_test_hook(path, PathOpenTestStage::BeforeSqliteOpen);
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|_| PulseError::invalid_input("Antigravity conversation database was invalid"))?;
+    run_path_open_test_hook(path, PathOpenTestStage::AfterSqliteOpen);
+    verify_pinned_path_connection(path, pinned_file, &connection)?;
+    Ok(connection)
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn verify_pinned_path_connection(
+    path: &Path,
+    pinned_file: &fs::File,
+    connection: &Connection,
+) -> PulseResult<()> {
+    let moved = sqlite_handle_guard::main_database_has_moved(connection).map_err(|_| {
+        PulseError::invalid_input("Antigravity conversation database identity was unavailable")
+    })?;
+    if moved {
+        return Err(PulseError::invalid_input(
+            "Antigravity conversation database identity changed",
+        ));
+    }
+    let reopened = open_regular_bounded(path, MAX_DB_BYTES).map_err(|_| {
+        PulseError::invalid_input("Antigravity conversation database identity changed")
+    })?;
+    if !same_file_identity(pinned_file, &reopened)? {
+        return Err(PulseError::invalid_input(
+            "Antigravity conversation database identity changed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn same_file_identity(left: &fs::File, right: &fs::File) -> PulseResult<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let left = left.metadata().map_err(|_| {
+        PulseError::invalid_input("Antigravity conversation database identity was unavailable")
+    })?;
+    let right = right.metadata().map_err(|_| {
+        PulseError::invalid_input("Antigravity conversation database identity was unavailable")
+    })?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathOpenTestStage {
+    BeforeSqliteOpen,
+    AfterSqliteOpen,
+}
+
+#[cfg(all(test, unix))]
+type PathOpenTestHook = Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(all(test, unix))]
+static PATH_OPEN_TEST_HOOKS: std::sync::Mutex<
+    Vec<(std::path::PathBuf, PathOpenTestStage, PathOpenTestHook)>,
+> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(all(test, unix))]
+fn run_path_open_test_hook(path: &Path, stage: PathOpenTestStage) {
+    let hook = PATH_OPEN_TEST_HOOKS.lock().ok().and_then(|mut hooks| {
+        let index = hooks
+            .iter()
+            .position(|(target, target_stage, _)| target == path && *target_stage == stage)?;
+        Some(hooks.remove(index).2)
+    });
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(all(test, unix))]
+fn install_path_open_test_hook(
+    path: std::path::PathBuf,
+    stage: PathOpenTestStage,
+    hook: PathOpenTestHook,
+) {
+    PATH_OPEN_TEST_HOOKS
+        .lock()
+        .expect("Antigravity path-open test hook lock")
+        .push((path, stage, hook));
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
+fn run_path_open_test_hook(_path: &Path, _stage: PathOpenTestStage) {}
+
+#[cfg(all(not(test), target_os = "macos"))]
+#[derive(Clone, Copy)]
+enum PathOpenTestStage {
+    BeforeSqliteOpen,
+    AfterSqliteOpen,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn open_read_only_connection(path: &Path, _file: &fs::File) -> PulseResult<Connection> {
     Connection::open_with_flags(
         path,
@@ -600,4 +732,146 @@ pub fn collect_conversations(
         }
     }
     Ok(conversations)
+}
+
+#[cfg(all(test, unix))]
+mod path_open_security_tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use rusqlite::Connection;
+
+    use super::{
+        MAX_DB_BYTES, PathOpenTestHook, PathOpenTestStage, install_path_open_test_hook,
+        open_pinned_path_connection, open_regular_bounded, verify_pinned_path_connection,
+    };
+
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "atmux-antigravity-{label}-{}-{}",
+                std::process::id(),
+                NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir(&path).expect("create Antigravity test root");
+            Self(path)
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn create_conversation(path: &Path, prompt: u8) {
+        let connection = Connection::open(path).expect("create conversation database");
+        connection
+            .execute_batch("CREATE TABLE steps (step_payload BLOB NOT NULL) STRICT;")
+            .expect("create conversation schema");
+        let payload = vec![0x10, prompt, 0x48, 10, 0x50, 20, 0x18, 30];
+        connection
+            .execute("INSERT INTO steps (step_payload) VALUES (?1)", [&payload])
+            .expect("insert conversation usage");
+    }
+
+    #[test]
+    fn path_open_rejects_held_regular_replacement_before_query() {
+        let root = TestRoot::new("held-regular-swap");
+        let requested = root.path("conversation.db");
+        let anchored = root.path("anchored.db");
+        let external = root.path("external.db");
+        create_conversation(&requested, 100);
+        create_conversation(&external, 200);
+        let pinned = open_regular_bounded(&requested, MAX_DB_BYTES).expect("pin original database");
+        let hook_requested = requested.clone();
+        let hook_anchored = anchored.clone();
+        let hook_external = external.clone();
+        install_path_open_test_hook(
+            requested.clone(),
+            PathOpenTestStage::BeforeSqliteOpen,
+            Box::new(move || {
+                fs::rename(&hook_requested, hook_anchored).expect("retain pinned database");
+                fs::copy(hook_external, hook_requested).expect("install regular replacement");
+            }) as PathOpenTestHook,
+        );
+
+        let error = open_pinned_path_connection(&requested, &pinned)
+            .expect_err("held regular replacement must fail before query");
+        assert!(error.message().contains("identity changed"));
+    }
+
+    #[test]
+    fn path_open_rejects_regular_swap_back_before_query() {
+        let root = TestRoot::new("regular-swap-back");
+        let requested = root.path("conversation.db");
+        let anchored = root.path("anchored.db");
+        let external = root.path("external.db");
+        let opened_replacement = root.path("opened-replacement.db");
+        create_conversation(&requested, 100);
+        create_conversation(&external, 200);
+        let pinned = open_regular_bounded(&requested, MAX_DB_BYTES).expect("pin original database");
+        let before_requested = requested.clone();
+        let before_anchored = anchored.clone();
+        let before_external = external.clone();
+        install_path_open_test_hook(
+            requested.clone(),
+            PathOpenTestStage::BeforeSqliteOpen,
+            Box::new(move || {
+                fs::rename(&before_requested, before_anchored).expect("retain pinned database");
+                fs::copy(before_external, before_requested).expect("install regular replacement");
+            }) as PathOpenTestHook,
+        );
+        let after_requested = requested.clone();
+        let after_anchored = anchored.clone();
+        let after_opened_replacement = opened_replacement.clone();
+        install_path_open_test_hook(
+            requested.clone(),
+            PathOpenTestStage::AfterSqliteOpen,
+            Box::new(move || {
+                fs::rename(&after_requested, after_opened_replacement)
+                    .expect("move opened replacement aside");
+                fs::rename(after_anchored, after_requested).expect("restore pinned database");
+            }) as PathOpenTestHook,
+        );
+
+        let error = open_pinned_path_connection(&requested, &pinned)
+            .expect_err("regular swap-back must fail before query");
+        assert!(error.message().contains("identity changed"));
+    }
+
+    #[test]
+    fn path_identity_is_rechecked_after_query_before_returning_data() {
+        let root = TestRoot::new("post-query-regular-swap");
+        let requested = root.path("conversation.db");
+        let anchored = root.path("anchored.db");
+        let external = root.path("external.db");
+        create_conversation(&requested, 100);
+        create_conversation(&external, 200);
+        let pinned = open_regular_bounded(&requested, MAX_DB_BYTES).expect("pin original database");
+        let connection =
+            open_pinned_path_connection(&requested, &pinned).expect("open pinned database");
+        let rows = connection
+            .query_row("SELECT count(*) FROM steps", [], |row| row.get::<_, i64>(0))
+            .expect("query pinned database");
+        assert_eq!(rows, 1);
+
+        fs::rename(&requested, anchored).expect("move queried database aside");
+        fs::copy(external, &requested).expect("install post-query replacement");
+        let error = verify_pinned_path_connection(&requested, &pinned, &connection)
+            .expect_err("post-query replacement must fail before returning data");
+        assert!(error.message().contains("identity changed"));
+    }
 }

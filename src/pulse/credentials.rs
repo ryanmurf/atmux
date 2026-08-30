@@ -6,10 +6,17 @@
 //! spends one only when `Persist` is configured for the Linux JSON store. The
 //! in-memory policy and macOS Keychain reads are adoption-only: neither can
 //! durably preserve a newly rotated refresh token across a process crash.
+//!
+//! On Unix, updated atmux processes lock both the anchored profile directory
+//! and the legacy lock file, then re-open and revalidate the lock pathname
+//! after `flock`. The directory lock prevents cooperative owners from splitting
+//! across lock-file inodes if that filename is replaced. These are advisory
+//! locks: a same-UID process that ignores them can still modify credentials or
+//! replace the whole profile directory and is outside the cooperative boundary.
 
 use std::{
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -618,7 +625,7 @@ enum StoreReadError {
 struct ValidatedDirectory {
     path: PathBuf,
     handle: File,
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(unix))]
     identity: FileIdentity,
 }
 
@@ -650,11 +657,12 @@ impl ValidatedDirectory {
         Ok(Self {
             path: path.to_path_buf(),
             handle,
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            #[cfg(not(unix))]
             identity: FileIdentity::from_metadata(&handle_metadata),
         })
     }
 
+    #[cfg(not(unix))]
     fn child(&self, name: &str) -> Result<PathBuf, StoreReadError> {
         if name.is_empty()
             || name.contains('/')
@@ -663,32 +671,11 @@ impl ValidatedDirectory {
         {
             return Err(StoreReadError::UnsafeStore);
         }
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd as _;
-            Ok(PathBuf::from(format!(
-                "/proc/self/fd/{}/{}",
-                self.handle.as_raw_fd(),
-                name
-            )))
-        }
-        #[cfg(target_os = "macos")]
-        {
-            use std::os::fd::AsRawFd as _;
-            Ok(PathBuf::from(format!(
-                "/dev/fd/{}/{}",
-                self.handle.as_raw_fd(),
-                name
-            )))
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            self.ensure_path_identity()?;
-            Ok(self.path.join(name))
-        }
+        self.ensure_path_identity()?;
+        Ok(self.path.join(name))
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(unix))]
     fn ensure_path_identity(&self) -> Result<(), StoreReadError> {
         let metadata = fs::symlink_metadata(&self.path).map_err(|_| StoreReadError::Unreadable)?;
         if metadata.file_type().is_symlink()
@@ -971,77 +958,312 @@ fn store_error(error: StoreReadError) -> PulseError {
 }
 
 struct CredentialLock {
-    _file: File,
+    file: File,
+    #[cfg(unix)]
+    directory: File,
 }
 
 impl CredentialLock {
     fn acquire(directory: &ValidatedDirectory, timeout: Duration) -> PulseResult<Self> {
-        use fs2::FileExt as _;
-
-        let path = directory
-            .child(".credentials.json.lock")
-            .map_err(store_error)?;
-        if let Ok(metadata) = fs::symlink_metadata(&path)
-            && (metadata.file_type().is_symlink() || !metadata.is_file())
-        {
-            return Err(PulseError::configuration(
-                "credential refresh lock failed safety checks",
-            ));
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|_| {
-                safe_error(
-                    PulseErrorKind::Authentication,
-                    "credential refresh lock is unavailable",
-                )
-            })?;
-        let file_metadata = file.metadata().map_err(|_| {
-            safe_error(
-                PulseErrorKind::Authentication,
-                "credential refresh lock is unavailable",
-            )
-        })?;
-        let path_metadata = fs::symlink_metadata(&path).map_err(|_| {
-            safe_error(
-                PulseErrorKind::Authentication,
-                "credential refresh lock is unavailable",
-            )
-        })?;
-        if !file_metadata.is_file()
-            || path_metadata.file_type().is_symlink()
-            || !same_file(&file_metadata, &path_metadata)
-        {
-            return Err(PulseError::configuration(
-                "credential refresh lock failed safety checks",
-            ));
-        }
         let started = MonotonicInstant::now();
-        loop {
-            match file.try_lock_exclusive() {
-                Ok(()) => return Ok(Self { _file: file }),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if started.elapsed() >= timeout {
-                        return Err(safe_error(
-                            PulseErrorKind::Conflict,
-                            "credential refresh is already in progress",
-                        ));
-                    }
-                    thread::sleep(Duration::from_millis(25));
-                }
-                Err(_) => {
+        #[cfg(unix)]
+        let directory_lock = open_credential_directory_lock(directory)?;
+        #[cfg(unix)]
+        lock_file_until(&directory_lock, started, timeout)?;
+        let file = open_credential_lock(directory)?;
+        lock_file_until(&file, started, timeout)?;
+        run_credential_lock_acquired_hook();
+        if !credential_lock_path_matches(directory, &file)? {
+            return Err(PulseError::configuration(
+                "credential refresh lock changed during acquisition",
+            ));
+        }
+        Ok(Self {
+            file,
+            #[cfg(unix)]
+            directory: directory_lock,
+        })
+    }
+}
+
+impl Drop for CredentialLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+        #[cfg(unix)]
+        let _ = fs2::FileExt::unlock(&self.directory);
+    }
+}
+
+fn lock_file_until(file: &File, started: MonotonicInstant, timeout: Duration) -> PulseResult<()> {
+    use fs2::FileExt as _;
+
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= timeout {
                     return Err(safe_error(
-                        PulseErrorKind::Authentication,
-                        "credential refresh lock is unavailable",
+                        PulseErrorKind::Conflict,
+                        "credential refresh is already in progress",
                     ));
                 }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                return Err(safe_error(
+                    PulseErrorKind::Authentication,
+                    "credential refresh lock is unavailable",
+                ));
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn open_credential_directory_lock(directory: &ValidatedDirectory) -> PulseResult<File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = rustix::fs::openat(
+        &directory.handle,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| {
+        safe_error(
+            PulseErrorKind::Authentication,
+            "credential refresh lock is unavailable",
+        )
+    })?;
+    let file = File::from(descriptor);
+    let metadata = file.metadata().map_err(|_| {
+        safe_error(
+            PulseErrorKind::Authentication,
+            "credential refresh lock is unavailable",
+        )
+    })?;
+    let anchored = directory.handle.metadata().map_err(|_| {
+        safe_error(
+            PulseErrorKind::Authentication,
+            "credential refresh lock is unavailable",
+        )
+    })?;
+    if !metadata.is_dir() || !same_file(&metadata, &anchored) {
+        return Err(PulseError::configuration(
+            "credential refresh lock failed safety checks",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(test)]
+thread_local! {
+    static CREDENTIAL_LOCK_ACQUIRED_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn install_credential_lock_acquired_hook(hook: impl FnOnce() + 'static) {
+    CREDENTIAL_LOCK_ACQUIRED_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "credential lock hook already installed"
+        );
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_credential_lock_acquired_hook() {
+    CREDENTIAL_LOCK_ACQUIRED_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+const fn run_credential_lock_acquired_hook() {}
+
+#[cfg(unix)]
+fn open_credential_lock(directory: &ValidatedDirectory) -> PulseResult<File> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+
+    const NAME: &str = ".credentials.json.lock";
+    let descriptor = rustix::fs::openat(
+        &directory.handle,
+        NAME,
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|error| {
+        let unsafe_entry = matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::ISDIR)
+            || rustix::fs::statat(&directory.handle, NAME, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(
+                |metadata| {
+                    rustix::fs::FileType::from_raw_mode(metadata.st_mode)
+                        != rustix::fs::FileType::RegularFile
+                },
+            );
+        if unsafe_entry {
+            PulseError::configuration("credential refresh lock failed safety checks")
+        } else {
+            safe_error(
+                PulseErrorKind::Authentication,
+                "credential refresh lock is unavailable",
+            )
+        }
+    })?;
+    let file = File::from(descriptor);
+    let file_metadata = file.metadata().map_err(|_| {
+        safe_error(
+            PulseErrorKind::Authentication,
+            "credential refresh lock is unavailable",
+        )
+    })?;
+    let path_metadata = rustix::fs::statat(&directory.handle, NAME, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| {
+            safe_error(
+                PulseErrorKind::Authentication,
+                "credential refresh lock is unavailable",
+            )
+        })?;
+    if !file_metadata.is_file()
+        || rustix::fs::FileType::from_raw_mode(path_metadata.st_mode)
+            != rustix::fs::FileType::RegularFile
+        || Some(FileIdentity::from_metadata(&file_metadata))
+            != FileIdentity::from_unix_stat(&path_metadata)
+    {
+        return Err(PulseError::configuration(
+            "credential refresh lock failed safety checks",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn credential_lock_path_matches(
+    directory: &ValidatedDirectory,
+    locked: &File,
+) -> PulseResult<bool> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+
+    const NAME: &str = ".credentials.json.lock";
+    let current = match rustix::fs::openat(
+        &directory.handle,
+        NAME,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => File::from(descriptor),
+        Err(_) => return Ok(false),
+    };
+    let locked_metadata = locked.metadata().map_err(|_| {
+        safe_error(
+            PulseErrorKind::Authentication,
+            "credential refresh lock is unavailable",
+        )
+    })?;
+    let current_metadata = current.metadata().map_err(|_| {
+        safe_error(
+            PulseErrorKind::Authentication,
+            "credential refresh lock is unavailable",
+        )
+    })?;
+    let Ok(path_metadata) = rustix::fs::statat(&directory.handle, NAME, AtFlags::SYMLINK_NOFOLLOW)
+    else {
+        return Ok(false);
+    };
+    let locked_identity = FileIdentity::from_metadata(&locked_metadata);
+    Ok(locked_metadata.is_file()
+        && current_metadata.is_file()
+        && rustix::fs::FileType::from_raw_mode(path_metadata.st_mode)
+            == rustix::fs::FileType::RegularFile
+        && FileIdentity::from_metadata(&current_metadata) == locked_identity
+        && FileIdentity::from_unix_stat(&path_metadata) == Some(locked_identity))
+}
+
+#[cfg(not(unix))]
+fn open_credential_lock(directory: &ValidatedDirectory) -> PulseResult<File> {
+    use std::fs::OpenOptions;
+
+    let path = directory
+        .child(".credentials.json.lock")
+        .map_err(store_error)?;
+    if let Ok(metadata) = fs::symlink_metadata(&path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(PulseError::configuration(
+            "credential refresh lock failed safety checks",
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|_| {
+            safe_error(
+                PulseErrorKind::Authentication,
+                "credential refresh lock is unavailable",
+            )
+        })?;
+    let file_metadata = file.metadata().map_err(|_| {
+        safe_error(
+            PulseErrorKind::Authentication,
+            "credential refresh lock is unavailable",
+        )
+    })?;
+    let path_metadata = fs::symlink_metadata(&path).map_err(|_| {
+        safe_error(
+            PulseErrorKind::Authentication,
+            "credential refresh lock is unavailable",
+        )
+    })?;
+    if !file_metadata.is_file()
+        || path_metadata.file_type().is_symlink()
+        || !same_file(&file_metadata, &path_metadata)
+    {
+        return Err(PulseError::configuration(
+            "credential refresh lock failed safety checks",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn credential_lock_path_matches(
+    directory: &ValidatedDirectory,
+    locked: &File,
+) -> PulseResult<bool> {
+    let path = directory
+        .child(".credentials.json.lock")
+        .map_err(store_error)?;
+    let Ok(path_metadata) = fs::symlink_metadata(&path) else {
+        return Ok(false);
+    };
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return Ok(false);
+    }
+    let Ok(current) = File::open(path) else {
+        return Ok(false);
+    };
+    let locked_metadata = locked.metadata().map_err(|_| {
+        safe_error(
+            PulseErrorKind::Authentication,
+            "credential refresh lock is unavailable",
+        )
+    })?;
+    let current_metadata = current.metadata().map_err(|_| {
+        safe_error(
+            PulseErrorKind::Authentication,
+            "credential refresh lock is unavailable",
+        )
+    })?;
+    Ok(locked_metadata.is_file()
+        && current_metadata.is_file()
+        && same_file(&locked_metadata, &current_metadata)
+        && same_file(&locked_metadata, &path_metadata))
 }
 
 #[cfg(unix)]
@@ -1060,6 +1282,21 @@ impl FileIdentity {
             inode: metadata.ino(),
         }
     }
+
+    fn from_unix_stat(metadata: &rustix::fs::Stat) -> Option<Self> {
+        Some(Self {
+            device: checked_u64(metadata.st_dev)?,
+            inode: checked_u64(metadata.st_ino)?,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn checked_u64<T>(value: T) -> Option<u64>
+where
+    u64: TryFrom<T>,
+{
+    u64::try_from(value).ok()
 }
 
 #[cfg(not(unix))]
@@ -1117,14 +1354,103 @@ fn persist_linux_document(directory: &ValidatedDirectory, document: &Value) -> P
             "credential update exceeded its size bound",
         ));
     }
-    let destination = directory.child(".credentials.json").map_err(store_error)?;
-    let temporary = directory
-        .child(&format!(".credentials.json.atmux-{}.tmp", unique_nonce()))
-        .map_err(store_error)?;
-    write_atomic_file(&temporary, &destination, &bytes)
+    let temporary = format!(".credentials.json.atmux-{}.tmp", unique_nonce());
+    #[cfg(unix)]
+    {
+        write_atomic_file_at(directory, &temporary, ".credentials.json", &bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        let destination = directory.child(".credentials.json").map_err(store_error)?;
+        let temporary = directory.child(&temporary).map_err(store_error)?;
+        write_atomic_file(&temporary, &destination, &bytes)
+    }
 }
 
+#[cfg(unix)]
+fn write_atomic_file_at(
+    directory: &ValidatedDirectory,
+    temporary: &str,
+    destination: &str,
+    bytes: &[u8],
+) -> PulseResult<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+
+    validate_child_name(temporary).map_err(store_error)?;
+    validate_child_name(destination).map_err(store_error)?;
+    let descriptor = rustix::fs::openat(
+        &directory.handle,
+        temporary,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|_| {
+        safe_error(
+            PulseErrorKind::Authentication,
+            "credential temporary file could not be created",
+        )
+    })?;
+    let mut file = File::from(descriptor);
+    let identity = FileIdentity::from_metadata(&file.metadata().map_err(|_| {
+        safe_error(
+            PulseErrorKind::Authentication,
+            "credential temporary file could not be inspected",
+        )
+    })?);
+    let mut owned = OwnedTemporaryAt {
+        directory: &directory.handle,
+        name: temporary,
+        identity,
+        committed: false,
+    };
+    file.write_all(bytes).map_err(|_| {
+        safe_error(
+            PulseErrorKind::Authentication,
+            "credential update could not be written",
+        )
+    })?;
+    file.sync_all().map_err(|_| {
+        safe_error(
+            PulseErrorKind::Authentication,
+            "credential update could not be synchronized",
+        )
+    })?;
+    let current = rustix::fs::statat(&directory.handle, temporary, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| {
+            safe_error(
+                PulseErrorKind::Authentication,
+                "credential temporary file could not be inspected",
+            )
+        })?;
+    if rustix::fs::FileType::from_raw_mode(current.st_mode) != rustix::fs::FileType::RegularFile
+        || FileIdentity::from_unix_stat(&current) != Some(identity)
+    {
+        return Err(PulseError::configuration(
+            "credential temporary file failed safety checks",
+        ));
+    }
+    rustix::fs::renameat(&directory.handle, temporary, &directory.handle, destination).map_err(
+        |_| {
+            safe_error(
+                PulseErrorKind::Authentication,
+                "credential update could not be committed",
+            )
+        },
+    )?;
+    owned.committed = true;
+    directory.handle.sync_all().map_err(|_| {
+        safe_error(
+            PulseErrorKind::Authentication,
+            "credential directory could not be synchronized",
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
 fn write_atomic_file(temporary: &Path, destination: &Path, bytes: &[u8]) -> PulseResult<()> {
+    use std::fs::OpenOptions;
+
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -1183,12 +1509,43 @@ fn write_atomic_file(temporary: &Path, destination: &Path, bytes: &[u8]) -> Puls
     Ok(())
 }
 
+#[cfg(unix)]
+struct OwnedTemporaryAt<'a> {
+    directory: &'a File,
+    name: &'a str,
+    identity: FileIdentity,
+    committed: bool,
+}
+
+#[cfg(unix)]
+impl Drop for OwnedTemporaryAt<'_> {
+    fn drop(&mut self) {
+        use rustix::fs::AtFlags;
+
+        if self.committed {
+            return;
+        }
+        let Ok(metadata) = rustix::fs::statat(self.directory, self.name, AtFlags::SYMLINK_NOFOLLOW)
+        else {
+            return;
+        };
+        if rustix::fs::FileType::from_raw_mode(metadata.st_mode)
+            == rustix::fs::FileType::RegularFile
+            && FileIdentity::from_unix_stat(&metadata) == Some(self.identity)
+        {
+            let _ = rustix::fs::unlinkat(self.directory, self.name, AtFlags::empty());
+        }
+    }
+}
+
+#[cfg(not(unix))]
 struct OwnedTemporary {
     path: PathBuf,
     identity: FileIdentity,
     committed: bool,
 }
 
+#[cfg(not(unix))]
 impl Drop for OwnedTemporary {
     fn drop(&mut self) {
         if self.committed {
@@ -1410,7 +1767,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_persist_is_atomic_and_preserves_siblings() {
+    fn json_persist_is_atomic_and_preserves_siblings() {
         let directory = TempDir::new();
         directory.write(&document("expired-token", "refresh-token", 500));
         let rejected = read_claude_credentials_for(&directory.0, CredentialPlatform::Linux)
@@ -1475,7 +1832,7 @@ mod tests {
         assert!(stale.exists());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn directory_handle_anchors_reads_and_persistence_after_ancestor_swap() {
         use std::os::unix::fs::symlink;
@@ -1500,6 +1857,9 @@ mod tests {
         fs::rename(&profile, &original).expect("move original");
         symlink(&attacker, &profile).expect("replace path with symlink");
 
+        let lock = CredentialLock::acquire(&anchored, Duration::ZERO).expect("anchored lock");
+        assert!(original.join(".credentials.json.lock").is_file());
+        assert!(!attacker.join(".credentials.json.lock").exists());
         let read = read_document(&anchored, CredentialPlatform::Linux).expect("anchored read");
         assert_eq!(
             read["claudeAiOauth"]["accessToken"],
@@ -1524,6 +1884,7 @@ mod tests {
             attacker_value["claudeAiOauth"]["accessToken"],
             "attacker-access"
         );
+        drop(lock);
     }
 
     #[test]
@@ -1641,6 +2002,132 @@ mod tests {
                 .expect("advisory lock file remains"),
             "crashed-owner\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_lock_rejects_symlinks_without_touching_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new();
+        let target = directory.0.join("lock-target");
+        fs::write(&target, "must remain unchanged\n").expect("write target");
+        symlink(&target, directory.0.join(".credentials.json.lock")).expect("create symlink");
+        let validated = ValidatedDirectory::open(&directory.0).expect("validate");
+
+        let error = CredentialLock::acquire(&validated, Duration::ZERO)
+            .err()
+            .expect("symlink lock must fail closed");
+
+        assert_eq!(error.kind(), PulseErrorKind::Configuration);
+        assert_eq!(
+            fs::read_to_string(target).expect("read target"),
+            "must remain unchanged\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_lock_rejects_fifo_socket_and_directory_entries() {
+        use std::os::unix::net::UnixListener;
+        use std::process::Command;
+
+        for kind in ["fifo", "socket", "directory"] {
+            let directory = TempDir::new();
+            let lock_path = directory.0.join(".credentials.json.lock");
+            let _socket = match kind {
+                "fifo" => {
+                    let status = Command::new("mkfifo")
+                        .arg(&lock_path)
+                        .status()
+                        .expect("run mkfifo");
+                    assert!(status.success(), "mkfifo failed");
+                    None
+                }
+                "socket" => Some(UnixListener::bind(&lock_path).expect("bind unix socket")),
+                "directory" => {
+                    fs::create_dir(&lock_path).expect("create lock directory");
+                    None
+                }
+                _ => unreachable!(),
+            };
+            let validated = ValidatedDirectory::open(&directory.0).expect("validate");
+
+            let error = CredentialLock::acquire(&validated, Duration::ZERO)
+                .err()
+                .expect("special lock entry must fail closed");
+
+            assert_eq!(error.kind(), PulseErrorKind::Configuration, "{kind}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_flock_replacement_cannot_split_owners_or_reach_the_refresh_grant() {
+        let directory = TempDir::new();
+        directory.write(&document("expired-token", "refresh-token", 500));
+        let rejected = read_claude_credentials_for(&directory.0, CredentialPlatform::Linux)
+            .expect("read rejected credentials");
+        let before = fs::read(directory.0.join(".credentials.json")).expect("read before");
+        let config_dir = directory.0.clone();
+        let hook_dir = config_dir.clone();
+        install_credential_lock_acquired_hook(move || {
+            let lock_path = hook_dir.join(".credentials.json.lock");
+            let displaced = hook_dir.join(".credentials.json.lock.displaced");
+            fs::rename(&lock_path, &displaced).expect("displace locked inode");
+            fs::write(&lock_path, "replacement-lock\n").expect("install replacement lock");
+
+            let contender_dir = hook_dir.clone();
+            let contender = thread::spawn(move || {
+                let validated =
+                    ValidatedDirectory::open(&contender_dir).expect("validate contender");
+                CredentialLock::acquire(&validated, Duration::ZERO)
+                    .err()
+                    .map(|error| error.kind())
+            })
+            .join()
+            .expect("join contender");
+            assert_eq!(contender, Some(PulseErrorKind::Conflict));
+        });
+        let mut grants = 0;
+
+        let error = cooperative_refresh_with(
+            &config_dir,
+            &rejected,
+            false,
+            RefreshPolicy::Persist,
+            1_000,
+            RefreshOptions {
+                platform: CredentialPlatform::Linux,
+                lock_timeout: Duration::ZERO,
+            },
+            |_| {
+                grants += 1;
+                RefreshGrant::new("must-not-write", "must-not-rotate", 100_000)
+            },
+        )
+        .expect_err("replaced lock path must fail before refresh");
+
+        assert_eq!(error.kind(), PulseErrorKind::Configuration);
+        assert_eq!(grants, 0);
+        assert_eq!(
+            fs::read(config_dir.join(".credentials.json")).expect("read after"),
+            before
+        );
+        assert_eq!(
+            fs::read_to_string(config_dir.join(".credentials.json.lock"))
+                .expect("read replacement"),
+            "replacement-lock\n"
+        );
+        assert!(
+            config_dir
+                .join(".credentials.json.lock.displaced")
+                .is_file()
+        );
+
+        let validated = ValidatedDirectory::open(&config_dir).expect("validate after mismatch");
+        CredentialLock::acquire(&validated, Duration::ZERO)
+            .expect("mismatched owner released both locks");
     }
 
     #[test]
