@@ -1795,6 +1795,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
             const node = conversation.querySelector('[data-transcript-id="' + id + '"]');
             return Boolean(node) && !node.closest('.tool-call-group');
           }),
+        fileReaderPreferences: localStorage.getItem('atmux.file-reader-preferences'),
         markupInjected: Boolean(conversation.querySelector('img, script')),
         escapedInputVisible: first.textContent.includes('<img src=x onerror=alert(1)>'),
         before,
@@ -1819,6 +1820,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       "exec · error", "exec · result", "exec_command · error", "exec_command · result", "exec · error",
     ], JSON.stringify(compactTools));
     assert.equal(compactTools.splitToolsSeparate, true, JSON.stringify(compactTools));
+    assert.equal(compactTools.fileReaderPreferences, '{"wrap":true,"size":"small"}');
     assert.equal(compactTools.markupInjected, false, JSON.stringify(compactTools));
     assert.equal(compactTools.escapedInputVisible, true, JSON.stringify(compactTools));
     assert.ok(Math.abs(compactTools.after - compactTools.before) <= 1, JSON.stringify(compactTools));
