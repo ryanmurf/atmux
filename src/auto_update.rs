@@ -25,7 +25,7 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use directories::ProjectDirs;
 use fs2::FileExt as _;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, RawMode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::process::Command;
@@ -804,7 +804,7 @@ fn validate_owner_directory(
                 path.display()
             );
         }
-        let repaired = metadata.permissions().mode() & 0o7777 & !0o022;
+        let repaired = checked_raw_mode(metadata.permissions().mode() & 0o7777 & !0o022)?;
         rustix::fs::fchmod(directory, Mode::from_raw_mode(repaired))?;
     }
     let verified = directory.metadata()?;
@@ -823,6 +823,17 @@ fn validate_owner_directory(
         device: verified.dev(),
         inode: verified.ino(),
     })
+}
+
+fn checked_mode<T>(mode: u32) -> Option<T>
+where
+    T: TryFrom<u32>,
+{
+    T::try_from(mode).ok()
+}
+
+fn checked_raw_mode(mode: u32) -> Result<RawMode> {
+    checked_mode(mode).context("Codex package mode cannot be represented on this platform")
 }
 
 fn validate_owner_executable(file: &File, path: &Path, euid: u32) -> Result<DirectoryIdentity> {
@@ -2467,6 +2478,15 @@ mod tests {
             fs::metadata(releases).unwrap().permissions().mode() & 0o7777,
             0o3755
         );
+    }
+
+    #[test]
+    fn package_mode_conversion_is_checked_before_platform_raw_mode() {
+        assert_eq!(checked_mode::<u16>(0o3755), Some(0o3755));
+        assert_eq!(checked_mode::<u16>(u32::from(u16::MAX) + 1), None);
+
+        let raw = checked_raw_mode(0o3755).unwrap();
+        assert_eq!(raw, 0o3755);
     }
 
     #[test]
