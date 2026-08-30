@@ -166,10 +166,9 @@ fn doctor(config_path: &std::path::Path) -> Result<()> {
         ),
         None => println!("- MemoryMax  disabled for agent scopes"),
     }
-    if let Some(ceiling) = config.agent_resources.memory_override_max_bytes {
-        println!(
-            "✓ override   whole-GiB launch caps up to {ceiling} bytes (owner revalidates each launch)"
-        );
+    if let Some(configured) = config.agent_resources.memory_override_max_bytes {
+        let effective = Tmux::check_agent_memory_override_ceiling(&config.agent_resources)?;
+        println!("{}", memory_override_doctor_line(configured, effective));
     }
     let folders = config.directories();
     println!("✓ folders    {} discovered", folders.len());
@@ -208,6 +207,20 @@ fn doctor(config_path: &std::path::Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn memory_override_doctor_line(configured: u64, effective: Option<u64>) -> String {
+    match effective {
+        Some(effective) if effective < configured => format!(
+            "✓ override   effective whole-GiB ceiling {effective} bytes (configured policy {configured}; host/cgroup clamped; revalidated each launch)"
+        ),
+        Some(effective) => format!(
+            "✓ override   effective whole-GiB ceiling {effective} bytes (configured policy; revalidated each launch)"
+        ),
+        None => format!(
+            "- override   unavailable: no whole-GiB cap fits below the effective host/cgroup ceiling (configured policy {configured})"
+        ),
+    }
 }
 
 #[cfg(feature = "pulse")]
@@ -568,6 +581,22 @@ impl Drop for TerminalSession {
 #[cfg(all(test, feature = "pulse"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_distinguishes_effective_and_configured_override_ceilings() {
+        let clamped = memory_override_doctor_line(24, Some(16));
+        assert!(clamped.contains("effective whole-GiB ceiling 16"));
+        assert!(clamped.contains("configured policy 24"));
+        assert!(clamped.contains("host/cgroup clamped"));
+
+        let exact = memory_override_doctor_line(24, Some(24));
+        assert!(exact.contains("effective whole-GiB ceiling 24"));
+        assert!(!exact.contains("host/cgroup clamped"));
+
+        let unavailable = memory_override_doctor_line(24, None);
+        assert!(unavailable.contains("unavailable"));
+        assert!(unavailable.contains("configured policy 24"));
+    }
 
     #[test]
     fn pulse_cli_requires_explicit_account_and_preserves_one_shot_flags() {

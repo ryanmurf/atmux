@@ -588,6 +588,7 @@ function formatMemoryLimit(bytes) {
 /// Returns only bounded owner-advertised choices. This is presentation
 /// validation; the owner repeats all checks against current configuration.
 function memoryLimitChoices(memory) {
+  const advertised = memory !== null && typeof memory === "object";
   const defaultBytes = safeMemoryBytes(memory?.default_bytes);
   const ceiling = safeMemoryBytes(memory?.override_max_bytes);
   const supported = memory?.supported === true && defaultBytes !== null;
@@ -595,7 +596,10 @@ function memoryLimitChoices(memory) {
     .map(safeMemoryBytes)
     .filter((value) => value !== null && ceiling !== null && value <= ceiling))]
     .sort((left, right) => left - right);
-  return { supported, defaultBytes, ceiling, presets, note: String(memory?.note || "") };
+  const note = advertised
+    ? String(memory?.note || "")
+    : "Memory limit is owner managed; this owner does not advertise override support.";
+  return { advertised, supported, defaultBytes, ceiling, presets, note };
 }
 
 function parseMemoryLimitSelection(memory, selected, customGiB) {
@@ -620,6 +624,14 @@ function parseMemoryLimitSelection(memory, selected, customGiB) {
     throw new Error("Choose an owner-approved memory limit");
   }
   return bytes;
+}
+
+function defaultMemoryLimitLabel(memory) {
+  const choices = memoryLimitChoices(memory);
+  if (!choices.advertised) return "Default (owner managed)";
+  return choices.defaultBytes === null
+    ? "Default (no configured cap)"
+    : `Default (${formatMemoryLimit(choices.defaultBytes)})`;
 }
 
 /// Resolves a running pane back to owner-issued launch IDs. The browser never
@@ -1748,6 +1760,7 @@ if (typeof module !== "undefined" && module.exports) {
     duplicateSourceSnapshot,
     duplicateSessionName,
     filterDirectories,
+    defaultMemoryLimitLabel,
     formatMemoryLimit,
     memoryLimitChoices,
     parseMemoryLimitSelection,
@@ -1980,6 +1993,17 @@ function initialize() {
     return window.matchMedia("(max-width: 720px)").matches;
   }
 
+  function revealFocusedLaunchMemoryControl() {
+    const focused = document.activeElement;
+    if (!$("launch-dialog").open
+        || !focused?.matches("#launch-memory, #launch-memory-custom")) return;
+    requestAnimationFrame(() => {
+      if (document.activeElement === focused) {
+        focused.scrollIntoView({ block: "nearest", inline: "nearest" });
+      }
+    });
+  }
+
   // Measure the layout viewport, never the visual viewport.
   //
   // On mobile `body` is `position: fixed`, so it is anchored to the layout
@@ -2009,6 +2033,7 @@ function initialize() {
     const height = window.innerHeight;
     if (Number.isFinite(height) && height > 0) {
       document.documentElement.style.setProperty("--app-height", `${Math.floor(height)}px`);
+      revealFocusedLaunchMemoryControl();
     }
   }
 
@@ -5777,9 +5802,7 @@ function initialize() {
   function renderLaunchMemory(selected = currentLaunchMachine()) {
     const choices = memoryLimitChoices(selected.memory);
     const select = $("launch-memory");
-    const defaultLabel = choices.defaultBytes === null
-      ? "Default (no per-worker cap)"
-      : `Default (${formatMemoryLimit(choices.defaultBytes)})`;
+    const defaultLabel = defaultMemoryLimitLabel(selected.memory);
     const options = [option("", defaultLabel)];
     if (choices.supported && choices.ceiling !== null) {
       options.push(...choices.presets.map((bytes) => option(String(bytes), formatMemoryLimit(bytes))));
@@ -5924,6 +5947,8 @@ function initialize() {
     updateLaunchAvailability();
     if ($("launch-memory").value === "custom") $("launch-memory-custom").focus();
   });
+  $("launch-memory").addEventListener("focus", revealFocusedLaunchMemoryControl);
+  $("launch-memory-custom").addEventListener("focus", revealFocusedLaunchMemoryControl);
   $("launch-memory-custom").addEventListener("input", () => updateLaunchAvailability());
   $("launch-name").addEventListener("input", () => { state.launchNamePristine = false; });
   function persistLaunchDirectory(machine, directory) {

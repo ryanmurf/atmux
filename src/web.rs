@@ -769,6 +769,7 @@ fn routes(state: WebState) -> Router {
             get(quick_resume_status).post(start_quick_resume),
         )
         .route("/api/v1/sessions", get(sessions).post(launch))
+        .route("/api/v1/memory-launches/v1", post(launch_with_memory))
         .route("/api/v1/events", get(overview_events))
         .route("/api/v1/launch-options", get(launch_options))
         .route("/api/v1/launch-directories", get(launch_directories))
@@ -1173,6 +1174,30 @@ async fn launch(
     Json(request): Json<LaunchRequest>,
 ) -> Result<(StatusCode, Json<OkResponse>), ApiError> {
     ensure_origin(&headers, &state.allowed_origins)?;
+    complete_launch(&state, request).await
+}
+
+/// Versioned owner boundary for explicit per-launch memory limits. A new
+/// coordinator must use this route instead of the legacy sessions endpoint so
+/// an old or downgraded owner rejects the request before launching anything.
+async fn launch_with_memory(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(request): Json<LaunchRequest>,
+) -> Result<(StatusCode, Json<OkResponse>), ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    if request.memory_max_bytes.is_none() {
+        return Err(ApiError::bad_request(
+            "the versioned memory launch endpoint requires memory_max_bytes",
+        ));
+    }
+    complete_launch(&state, request).await
+}
+
+async fn complete_launch(
+    state: &WebState,
+    request: LaunchRequest,
+) -> Result<(StatusCode, Json<OkResponse>), ApiError> {
     state
         .control
         .launch(request)
@@ -2045,6 +2070,7 @@ mod tests {
 
         for (method, path) in [
             ("GET", "/api/v1/sessions"),
+            ("POST", "/api/v1/memory-launches/v1"),
             ("GET", "/api/v1/panes/nope"),
             ("GET", "/api/v1/panes/nope/transcript"),
             ("GET", "/api/v1/panes/nope/events"),
@@ -2411,6 +2437,17 @@ mod tests {
             )
             .await,
             StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/memory-launches/v1",
+                Some(r#"{"name":"x","directory":"/srv","profile_id":"profile-0"}"#)
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "the versioned route must reject a request without an explicit memory cap"
         );
         assert_eq!(
             status_of(

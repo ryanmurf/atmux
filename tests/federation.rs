@@ -79,6 +79,9 @@ struct Recorder {
     hosts: Vec<Option<String>>,
     paths: Vec<String>,
     bodies: Vec<String>,
+    /// Whether this fixture represents a new owner which explicitly
+    /// advertises and validates per-launch memory overrides.
+    advertise_memory: bool,
     /// Latency injected into pane reads, so a test can hold several callers
     /// inside one fetch window at the same time.
     pane_latency: Duration,
@@ -459,14 +462,36 @@ async fn launch(State(state): State<Shared>, headers: HeaderMap, body: String) -
     (StatusCode::CREATED, Json(json!({ "ok": true }))).into_response()
 }
 
+async fn launch_with_memory(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if !state.lock().unwrap().advertise_memory {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    record(&state, &headers, "/api/v1/memory-launches/v1", &body);
+    (StatusCode::CREATED, Json(json!({ "ok": true }))).into_response()
+}
+
 async fn launch_options(State(state): State<Shared>, headers: HeaderMap) -> Response {
     record(&state, &headers, "/api/v1/launch-options", "");
-    Json(json!({
+    let advertise_memory = state.lock().unwrap().advertise_memory;
+    let mut payload = json!({
         "directories": ["/srv/models"],
         "profiles": [{ "id": "profile-0", "name": "Default", "harness": "claude" }],
         "machines": [],
-    }))
-    .into_response()
+    });
+    if advertise_memory {
+        payload["memory"] = json!({
+            "supported": true,
+            "default_bytes": 17_179_869_184_u64,
+            "override_max_bytes": 25_769_803_776_u64,
+            "presets_bytes": [8_589_934_592_u64, 17_179_869_184_u64, 25_769_803_776_u64],
+            "note": "fixture capability"
+        });
+    }
+    Json(payload).into_response()
 }
 
 async fn launch_directories(
@@ -488,7 +513,14 @@ async fn launch_directories(
 }
 
 async fn start_node() -> (SocketAddr, Shared) {
-    let recorder: Shared = Arc::new(Mutex::new(Recorder::default()));
+    start_node_with_memory(false).await
+}
+
+async fn start_node_with_memory(advertise_memory: bool) -> (SocketAddr, Shared) {
+    let recorder: Shared = Arc::new(Mutex::new(Recorder {
+        advertise_memory,
+        ..Recorder::default()
+    }));
     let app = Router::new()
         .route("/api/v1/events", get(events))
         .route("/api/v1/launch-options", get(launch_options))
@@ -507,6 +539,7 @@ async fn start_node() -> (SocketAddr, Shared) {
             get(recovery_status).post(start_recovery),
         )
         .route("/api/v1/sessions", post(launch))
+        .route("/api/v1/memory-launches/v1", post(launch_with_memory))
         .route("/api/v1/sessions/{id}", delete(kill))
         .with_state(Arc::clone(&recorder));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -795,6 +828,204 @@ async fn wait_for_online(control: &ControlPlane, machine: &str) -> bool {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     false
+}
+
+async fn wait_for_memory_capability(control: &ControlPlane, machine: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if control
+            .launch_options()
+            .machines
+            .iter()
+            .find(|candidate| candidate.id == machine)
+            .and_then(|candidate| candidate.memory.as_ref())
+            .is_some_and(|memory| memory.supported)
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_version_owner_never_receives_an_unadvertised_memory_override() {
+    if !tmux_available("mixed_version_owner_never_receives_an_unadvertised_memory_override") {
+        return;
+    }
+    let (address, recorder) = start_node().await;
+    let control = ControlPlane::start(federated_config(address))
+        .await
+        .unwrap();
+    assert!(wait_for_online(&control, "gpu-box").await);
+    let before = recorder
+        .lock()
+        .unwrap()
+        .paths
+        .iter()
+        .filter(|path| path.as_str() == "/api/v1/sessions")
+        .count();
+
+    for (index, requested) in [0, u64::MAX, 8 * 1024 * 1024 * 1024]
+        .into_iter()
+        .enumerate()
+    {
+        let error = control
+            .launch(LaunchRequest {
+                name: format!("old-owner-memory-{index}"),
+                directory: "/srv/models".to_owned(),
+                profile_id: "profile-0".to_owned(),
+                mode_id: None,
+                machine: Some("gpu-box".to_owned()),
+                resume_session_id: None,
+                memory_max_bytes: Some(requested),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error_kind(&error), ErrorKind::BadRequest);
+        assert!(error.to_string().contains("has not advertised"));
+    }
+    let seen = recorder.lock().unwrap();
+    assert_eq!(
+        seen.paths
+            .iter()
+            .filter(|path| path.as_str() == "/api/v1/sessions")
+            .count(),
+        before,
+        "an older owner must never receive or silently ignore an override"
+    );
+    assert!(
+        seen.bodies
+            .iter()
+            .all(|body| !body.contains("old-owner-memory"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn capable_owner_receives_valid_memory_but_coordinator_rejects_advertised_bounds() {
+    if !tmux_available(
+        "capable_owner_receives_valid_memory_but_coordinator_rejects_advertised_bounds",
+    ) {
+        return;
+    }
+    let (address, recorder) = start_node_with_memory(true).await;
+    let control = ControlPlane::start(federated_config(address))
+        .await
+        .unwrap();
+    assert!(wait_for_online(&control, "gpu-box").await);
+    assert!(wait_for_memory_capability(&control, "gpu-box").await);
+
+    let custom = 20 * 1024 * 1024 * 1024;
+    control
+        .launch(LaunchRequest {
+            name: "new-owner-memory".to_owned(),
+            directory: "/srv/models".to_owned(),
+            profile_id: "profile-0".to_owned(),
+            mode_id: None,
+            machine: Some("gpu-box".to_owned()),
+            resume_session_id: None,
+            memory_max_bytes: Some(custom),
+        })
+        .await
+        .unwrap();
+
+    let successful_posts = recorder
+        .lock()
+        .unwrap()
+        .paths
+        .iter()
+        .filter(|path| path.as_str() == "/api/v1/memory-launches/v1")
+        .count();
+    for (index, requested) in [0, u64::MAX, 25 * 1024 * 1024 * 1024]
+        .into_iter()
+        .enumerate()
+    {
+        let error = control
+            .launch(LaunchRequest {
+                name: format!("new-owner-invalid-{index}"),
+                directory: "/srv/models".to_owned(),
+                profile_id: "profile-0".to_owned(),
+                mode_id: None,
+                machine: Some("gpu-box".to_owned()),
+                resume_session_id: None,
+                memory_max_bytes: Some(requested),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error_kind(&error), ErrorKind::BadRequest);
+    }
+    let seen = recorder.lock().unwrap();
+    assert_eq!(
+        seen.paths
+            .iter()
+            .filter(|path| path.as_str() == "/api/v1/memory-launches/v1")
+            .count(),
+        successful_posts
+    );
+    assert!(
+        seen.paths
+            .iter()
+            .all(|path| path.as_str() != "/api/v1/sessions"),
+        "an explicit limit must never use the legacy launch route"
+    );
+    let forwarded = seen
+        .bodies
+        .iter()
+        .find(|body| body.contains("new-owner-memory"))
+        .map(|body| serde_json::from_str::<Value>(body).unwrap())
+        .unwrap();
+    assert_eq!(forwarded["memory_max_bytes"], custom);
+    assert_eq!(forwarded["machine"], Value::Null);
+    assert!(
+        seen.bodies
+            .iter()
+            .all(|body| !body.contains("new-owner-invalid"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_capability_cannot_launch_after_an_owner_downgrade() {
+    if !tmux_available("stale_capability_cannot_launch_after_an_owner_downgrade") {
+        return;
+    }
+    let (address, recorder) = start_node_with_memory(true).await;
+    let control = ControlPlane::start(federated_config(address))
+        .await
+        .unwrap();
+    assert!(wait_for_online(&control, "gpu-box").await);
+    assert!(wait_for_memory_capability(&control, "gpu-box").await);
+
+    // Simulate a rolling downgrade behind the same address while the
+    // coordinator still has the newer owner's launch options cached. The old
+    // owner retains only the legacy route and would ignore an additive field.
+    recorder.lock().unwrap().advertise_memory = false;
+    let error = control
+        .launch(LaunchRequest {
+            name: "downgraded-owner-memory".to_owned(),
+            directory: "/srv/models".to_owned(),
+            profile_id: "profile-0".to_owned(),
+            mode_id: None,
+            machine: Some("gpu-box".to_owned()),
+            resume_session_id: None,
+            memory_max_bytes: Some(20 * 1024 * 1024 * 1024),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error_kind(&error), ErrorKind::Upstream);
+
+    let seen = recorder.lock().unwrap();
+    assert!(
+        seen.paths
+            .iter()
+            .all(|path| path.as_str() != "/api/v1/sessions"),
+        "a stale capability must never fall back to the legacy launch route"
+    );
+    assert!(
+        seen.bodies
+            .iter()
+            .all(|body| !body.contains("downgraded-owner-memory")),
+        "the downgraded owner must not launch the request"
+    );
 }
 
 async fn assert_remote_directory_browsing(control: &ControlPlane, recorder: &Shared) {

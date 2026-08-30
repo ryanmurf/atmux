@@ -3017,14 +3017,18 @@ impl ControlPlane {
         if target != self.inner.local_id {
             let machine = self.remote_machine(target)?;
             self.ensure_online(&machine.id)?;
+            if let Some(requested) = request.memory_max_bytes {
+                self.ensure_remote_memory_request_advertised(&machine.id, requested)?;
+            }
             // The node validates its own directory and profile allowlists; this
             // coordinator never forwards a caller-supplied URL or machine hop.
             let forwarded = LaunchRequest {
                 machine: None,
                 ..request
             };
+            let launch_path = remote_launch_path(&forwarded);
             return machine
-                .post_json("/api/v1/sessions", &forwarded)
+                .post_json(launch_path, &forwarded)
                 .await
                 .map_err(|error| upstream(&error));
         }
@@ -3118,6 +3122,36 @@ impl ControlPlane {
             )));
         }
         Ok(())
+    }
+
+    /// Prevents a new coordinator from sending an override to an older owner
+    /// which would deserialize the additive field as unknown and silently
+    /// launch with its default (or no cap). This cached capability is only a
+    /// compatibility gate; the owner repeats current policy and host checks.
+    fn ensure_remote_memory_request_advertised(&self, machine: &str, requested: u64) -> Result<()> {
+        let state = self.read_state();
+        let advertised = state
+            .remotes
+            .get(machine)
+            .and_then(|remote| remote.launch.as_ref())
+            .and_then(|options| options.memory.as_ref())
+            .filter(|memory| memory.supported);
+        let Some(memory) = advertised else {
+            return Err(bad_request(format!(
+                "machine {machine} has not advertised per-agent memory override support; update that owner or use its Default limit"
+            )));
+        };
+        let resources = crate::config::AgentResourcesConfig {
+            memory_max_bytes: memory.default_bytes,
+            memory_override_max_bytes: memory.override_max_bytes,
+        };
+        systemd_scope::resolve_memory_max(&resources, Some(requested))
+            .map(|_| ())
+            .map_err(|error| {
+                bad_request(format!(
+                    "machine {machine} did not advertise that memory limit: {error}"
+                ))
+            })
     }
 
     async fn revalidate_resume_candidate(
@@ -4039,6 +4073,18 @@ fn validate_launch_memory(
     systemd_scope::resolve_memory_max(resources, requested_memory_max_bytes)
         .map(|_| ())
         .map_err(|error| bad_request(error.to_string()))
+}
+
+/// Never sends an additive memory field to the legacy launch route. An owner
+/// downgraded after capability discovery could otherwise ignore that field and
+/// still launch. Old owners do not implement the versioned route, so a stale
+/// capability fails before launch and there is deliberately no fallback.
+fn remote_launch_path(request: &LaunchRequest) -> &'static str {
+    if request.memory_max_bytes.is_some() {
+        "/api/v1/memory-launches/v1"
+    } else {
+        "/api/v1/sessions"
+    }
 }
 
 fn agent_memory_launch_options(
@@ -5304,20 +5350,24 @@ mod tests {
         config.agent_resources.memory_max_bytes = Some(16 * systemd_scope::GIBIBYTE);
         config.agent_resources.memory_override_max_bytes = Some(24 * systemd_scope::GIBIBYTE);
         let control = super::test_control_with_config(&[], config);
-        let error = control
-            .launch(LaunchRequest {
-                name: "malicious-memory".to_owned(),
-                directory: "/tmp".to_owned(),
-                profile_id: "profile-0".to_owned(),
-                mode_id: None,
-                machine: None,
-                resume_session_id: None,
-                memory_max_bytes: Some(25 * systemd_scope::GIBIBYTE),
-            })
-            .await
-            .unwrap_err();
-        assert_eq!(error_kind(&error), ErrorKind::BadRequest);
-        assert!(error.to_string().contains("override ceiling"));
+        for (index, requested) in [0, u64::MAX, 25 * systemd_scope::GIBIBYTE]
+            .into_iter()
+            .enumerate()
+        {
+            let error = control
+                .launch(LaunchRequest {
+                    name: format!("malicious-memory-{index}"),
+                    directory: "/tmp".to_owned(),
+                    profile_id: "profile-0".to_owned(),
+                    mode_id: None,
+                    machine: None,
+                    resume_session_id: None,
+                    memory_max_bytes: Some(requested),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error_kind(&error), ErrorKind::BadRequest);
+        }
     }
 
     #[tokio::test]

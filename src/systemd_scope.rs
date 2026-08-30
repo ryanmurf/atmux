@@ -221,18 +221,22 @@ pub(crate) fn advertised_override_ceiling(resources: &AgentResourcesConfig) -> R
     #[cfg(target_os = "linux")]
     {
         let effective = effective_host_ceiling()?;
-        let strict_whole_gib = effective
-            .saturating_sub(1)
-            .checked_div(GIBIBYTE)
-            .unwrap_or(0)
-            .saturating_mul(GIBIBYTE);
-        Ok((strict_whole_gib > 0).then_some(configured.min(strict_whole_gib)))
+        Ok(clamp_advertised_override_ceiling(configured, effective))
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = configured;
         bail!("per-agent memory overrides require Linux")
     }
+}
+
+fn clamp_advertised_override_ceiling(configured: u64, effective_host_ceiling: u64) -> Option<u64> {
+    let strict_whole_gib = effective_host_ceiling
+        .saturating_sub(1)
+        .checked_div(GIBIBYTE)
+        .unwrap_or(0)
+        .saturating_mul(GIBIBYTE);
+    (strict_whole_gib > 0).then_some(configured.min(strict_whole_gib))
 }
 
 fn validate_effective_ceiling(memory_max_bytes: u64, effective_ceiling: u64) -> Result<()> {
@@ -726,6 +730,26 @@ mod tests {
         assert!(validate_effective_ceiling(2048, 1024).is_err());
         assert!(validate_effective_ceiling(1, 0).is_err());
         assert!(validate_effective_ceiling(u64::MAX, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn advertised_override_ceiling_is_strict_whole_gib_and_host_clamped() {
+        assert_eq!(
+            clamp_advertised_override_ceiling(24 * GIBIBYTE, 10 * GIBIBYTE),
+            Some(9 * GIBIBYTE)
+        );
+        assert_eq!(
+            clamp_advertised_override_ceiling(8 * GIBIBYTE, 10 * GIBIBYTE),
+            Some(8 * GIBIBYTE)
+        );
+        assert_eq!(
+            clamp_advertised_override_ceiling(24 * GIBIBYTE, 10 * GIBIBYTE + 1),
+            Some(10 * GIBIBYTE)
+        );
+        assert_eq!(
+            clamp_advertised_override_ceiling(24 * GIBIBYTE, GIBIBYTE),
+            None
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -146,7 +146,17 @@ configuration and effective host/cgroup ceiling. A federation coordinator only
 forwards the requested number and cannot expand the owner's policy. The picker
 offers Default, bounded presets, and a bounded custom GiB value. Older clients
 omit the request and therefore continue to receive the default; older nodes
-omit the capability and the picker fails closed.
+omit the capability, so the picker stays owner-managed and a new coordinator
+rejects any explicit override before contacting that owner. This prevents an
+older serde decoder from silently ignoring the additive request field.
+Explicit caps are forwarded only through the versioned memory-launch route;
+there is no fallback to the legacy launch endpoint if an owner was downgraded
+after advertising support.
+
+`atmux doctor` reports the effective advertised override ceiling, clamped to a
+whole-GiB value strictly below the current host/inherited-cgroup ceiling. When
+that is lower than the configured policy it labels both values; it never
+presents the configured ceiling as currently accepted capacity.
 
 Duplicate and normal saved-conversation launches carry an explicitly selected
 cap. An in-place Claude resume or automatic CLI-maintenance relaunch preserves

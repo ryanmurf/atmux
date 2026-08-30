@@ -30,6 +30,7 @@ const {
   duplicateSourceMatches,
   duplicateSourceSnapshot,
   duplicateSessionName,
+  defaultMemoryLimitLabel,
   filterDirectories,
   formatMemoryLimit,
   memoryLimitChoices,
@@ -1351,6 +1352,7 @@ test("memory launch choices parse Default, presets, and bounded whole-GiB custom
     note: "next relaunch",
   };
   assert.deepEqual(memoryLimitChoices(memory), {
+    advertised: true,
     supported: true,
     defaultBytes: 16 * GiB,
     ceiling: 24 * GiB,
@@ -1364,6 +1366,16 @@ test("memory launch choices parse Default, presets, and bounded whole-GiB custom
   assert.throws(() => parseMemoryLimitSelection(memory, "custom", "25"), /at most 24 GiB/);
   assert.throws(() => parseMemoryLimitSelection(memory, String(20 * GiB), ""), /owner-approved/);
   assert.equal(formatMemoryLimit(16 * GiB), "16 GiB");
+  assert.deepEqual(memoryLimitChoices(null), {
+    advertised: false,
+    supported: false,
+    defaultBytes: null,
+    ceiling: null,
+    presets: [],
+    note: "Memory limit is owner managed; this owner does not advertise override support.",
+  });
+  assert.equal(defaultMemoryLimitLabel(null), "Default (owner managed)");
+  assert.equal(defaultMemoryLimitLabel(memory), "Default (16 GiB)");
 });
 
 test("duplicate preserves an exact owner-allowed cap and rejects stale capability", () => {
