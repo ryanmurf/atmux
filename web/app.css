@@ -115,19 +115,35 @@ textarea { resize: vertical; min-height: 74px; max-height: 220px; }
 .project-entry-icon { color: var(--cyan); }
 .project-entry-name, .git-change-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .project-entry-meta { color: var(--muted); font-size: 10px; }
-.code-viewer { min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; overflow-anchor: none; background: #060b0e; }
+.code-viewer { --file-font-size: 12.5px; --file-editor-font-size: 12.5px; --file-line-height: 1.55; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; overflow-anchor: none; background: #060b0e; }
+.code-viewer.file-size-small { --file-font-size: 10.5px; --file-editor-font-size: 10.5px; --file-line-height: 1.5; }
+.code-viewer.file-size-medium { --file-font-size: 12.5px; --file-editor-font-size: 12.5px; --file-line-height: 1.55; }
+.code-viewer.file-size-large { --file-font-size: 15px; --file-editor-font-size: 15px; --file-line-height: 1.6; }
 .code-viewer-head { position: sticky; z-index: 1; top: 0; min-width: 100%; width: max-content; display: flex; align-items: center; gap: 9px; padding: 7px 11px; border-bottom: 1px solid var(--line); background: #0e181dcc; color: #c6d7da; font: 11px/1.35 "SFMono-Regular", Consolas, monospace; backdrop-filter: blur(8px); }
 .code-viewer-path { min-width: 80px; max-width: min(42vw, 600px); overflow: hidden; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .code-viewer-head > span:not(.code-viewer-path) { color: var(--muted); }
 .file-viewer-actions { min-width: max-content; display: flex; align-items: center; gap: 5px; margin-left: auto; }
 .file-viewer-actions button { min-height: 30px; padding-inline: 8px; font: 11px/1.2 Inter, ui-sans-serif, system-ui, sans-serif; }
-.code-source { min-width: 100%; width: max-content; margin: 0; padding: 10px 0 24px; color: #dce8e8; font: 12.5px/1.55 "SFMono-Regular", Consolas, "Liberation Mono", monospace; tab-size: 2; }
-.code-line { min-width: 100%; display: block; padding: 0 12px; white-space: pre; }
+.file-display-controls { display: flex; align-items: center; overflow: hidden; border: 1px solid #31444c; border-radius: 7px; background: #091216; }
+.file-display-controls .file-wrap-toggle { min-height: 28px; padding-inline: 7px; border: 0; border-right: 1px solid #31444c; border-radius: 0; }
+.file-display-controls .file-wrap-toggle[aria-pressed="true"] { color: #071416; background: var(--cyan); }
+.file-display-controls .file-text-size { width: auto; min-height: 28px; padding: 3px 22px 3px 7px; border: 0; border-radius: 0; background-color: #091216; color: #cbdadd; font: 11px/1.2 Inter, ui-sans-serif, system-ui, sans-serif; }
+.code-source { min-width: 100%; width: max-content; margin: 0; padding: 10px 0 24px; color: #dce8e8; font: var(--file-font-size)/var(--file-line-height) "SFMono-Regular", Consolas, "Liberation Mono", monospace; tab-size: 2; }
+.code-line { min-width: 100%; display: flex; align-items: flex-start; padding: 0 12px; }
+.code-line-content { min-width: 0; flex: 0 0 auto; white-space: pre; }
 .code-line.selected { background: #17303a; box-shadow: inset 2px 0 #4bbbc5; }
-.code-line-number { width: 4ch; min-width: 4ch; min-height: 0; display: inline-block; margin-right: 14px; padding: 0; border: 0; border-radius: 2px; color: #4e626a; background: transparent; text-align: right; user-select: none; }
+.code-line-number { width: 4ch; min-width: 4ch; min-height: 0; flex: 0 0 4ch; margin-right: 14px; padding: 0; border: 0; border-radius: 2px; color: #4e626a; background: transparent; text-align: right; user-select: none; }
 button.code-line-number { cursor: pointer; }
 button.code-line-number:hover, button.code-line-number:focus-visible, button.code-line-number[aria-pressed="true"] { color: var(--cyan); background: #17303a; }
-.file-editor { width: 100%; height: calc(100% - 37px); min-height: 180px; max-height: none; padding: 12px 14px 28px; resize: none; border: 0; border-radius: 0; outline-offset: -2px; color: #dce8e8; background: #060b0e; font: 12.5px/1.55 "SFMono-Regular", Consolas, "Liberation Mono", monospace; tab-size: 2; white-space: pre; overflow: auto; }
+.code-viewer.file-wrap .code-viewer-head { width: 100%; max-width: 100%; overflow: hidden; }
+.code-viewer.file-wrap .file-viewer-actions { min-width: 0; flex: 1 1 auto; overflow-x: auto; scrollbar-width: none; }
+.code-viewer.file-wrap .file-viewer-actions::-webkit-scrollbar { display: none; }
+.code-viewer.file-wrap .file-viewer-actions > * { flex: 0 0 auto; }
+.code-viewer.file-wrap .code-source { min-width: 0; width: 100%; }
+.code-viewer.file-wrap .code-line { min-width: 0; width: 100%; }
+.code-viewer.file-wrap .code-line-content { flex: 1 1 auto; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+.file-editor { width: 100%; height: calc(100% - 37px); min-height: 180px; max-height: none; padding: 12px 14px 28px; resize: none; border: 0; border-radius: 0; outline-offset: -2px; color: #dce8e8; background: #060b0e; font: var(--file-editor-font-size)/var(--file-line-height) "SFMono-Regular", Consolas, "Liberation Mono", monospace; tab-size: 2; white-space: pre; overflow: auto; }
+.code-viewer.file-wrap .file-editor { white-space: pre-wrap; overflow-x: hidden; overflow-wrap: anywhere; word-break: break-word; }
 .file-edit-status { min-height: 37px; margin: 0; padding: 9px 12px; border-bottom: 1px solid var(--line); color: var(--muted); background: #0b1418; font-size: 11px; }
 .file-edit-status.dirty { color: var(--amber); }
 .file-edit-status.error { color: #ff9ba3; }
@@ -153,6 +169,7 @@ button.code-line-number:hover, button.code-line-number:focus-visible, button.cod
 .markdown-body { padding: 8px 12px 10px; color: #e2edef; font-size: 13.5px; line-height: 1.55; overflow-wrap: anywhere; }
 .tool-card { width: 100%; max-width: none; margin: 0 0 6px; border: 1px solid #263840; border-radius: 6px; background: #0c151a; overflow: hidden; }
 .tool-card > summary { padding: 6px 10px; cursor: pointer; color: #9eb2b9; font: 11.5px/1.4 "SFMono-Regular", Consolas, monospace; user-select: none; }
+.tool-card > summary:focus-visible { outline: 2px solid var(--cyan); outline-offset: -2px; }
 .tool-card[open] > summary { border-bottom: 1px solid #263840; color: #c7d8dc; }
 .tool-call-group { border-color: #34515b; background: #0b171c; }
 .tool-call-group > .tool-call-group-summary { min-height: 34px; display: list-item; padding: 8px 10px; color: #b8d2d8; font-weight: 650; touch-action: manipulation; }
@@ -419,11 +436,16 @@ dialog::backdrop { background: #000a; }
   .project-breadcrumbs button { min-height: 34px; }
   .code-viewer-head { padding-inline: 9px; }
   .code-viewer-path { max-width: 32vw; }
+  #file-viewer.file-wrap .code-viewer-head > span:not(.code-viewer-path) { display: none; }
+  #file-viewer.file-wrap .code-viewer-path { max-width: 25vw; }
   .file-viewer-actions button { min-height: 36px; padding-inline: 7px; font-size: 10px; }
-  .file-editor { min-height: 140px; padding: 10px; font-size: 16px; }
-  .code-source { font-size: 11.5px; }
+  .code-viewer.file-size-small { --file-editor-font-size: 16px; }
+  .code-viewer.file-size-medium { --file-editor-font-size: 17px; }
+  .code-viewer.file-size-large { --file-editor-font-size: 19px; }
+  .file-editor { min-height: 140px; padding: 10px; }
   .code-line { padding-inline: 8px; }
-  .code-line-number { width: 3ch; margin-right: 9px; }
+  .code-line-number { width: 3ch; min-width: 3ch; flex-basis: 3ch; margin-right: 9px; }
+  .file-display-controls .file-wrap-toggle, .file-display-controls .file-text-size { min-height: 36px; font-size: 11px; }
   .git-summary { min-height: 38px; padding-block: 4px; }
   .message-card { margin-bottom: 7px; border-radius: 7px; }
   .message-card.user { width: 100%; max-width: none; margin-inline: 0; }

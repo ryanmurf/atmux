@@ -1026,6 +1026,65 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       () => cdp.evaluate("document.querySelectorAll('#file-viewer .code-line').length === 320"),
       "source preview did not render",
     );
+    const mobileFileDefaults = await cdp.evaluate(`(() => {
+      const viewer = document.getElementById('file-viewer');
+      const source = viewer.querySelector('.code-source');
+      const line = viewer.querySelector('.code-line-content');
+      const head = viewer.querySelector('.code-viewer-head');
+      const controls = viewer.querySelector('.file-display-controls');
+      return {
+        wrap: viewer.querySelector('.file-wrap-toggle').getAttribute('aria-pressed'),
+        size: viewer.querySelector('.file-text-size').value,
+        fontSize: getComputedStyle(source).fontSize,
+        lineWhiteSpace: getComputedStyle(line).whiteSpace,
+        sourceOverflow: source.scrollWidth - viewer.clientWidth,
+        documentOverflow: document.documentElement.scrollWidth - innerWidth,
+        controlsInHeader: controls.closest('.code-viewer-head') === head,
+        wrapLabel: viewer.querySelector('.file-wrap-toggle').getAttribute('title'),
+        sizeLabel: viewer.querySelector('.file-text-size').getAttribute('aria-label'),
+      };
+    })()`);
+    assert.deepEqual(mobileFileDefaults, {
+      wrap: "true",
+      size: "small",
+      fontSize: "10.5px",
+      lineWhiteSpace: "pre-wrap",
+      sourceOverflow: 0,
+      documentOverflow: 0,
+      controlsInHeader: true,
+      wrapLabel: "Wrap long file lines",
+      sizeLabel: "File text size",
+    });
+    const noWrapFile = await cdp.evaluate(`(() => {
+      const viewer = document.getElementById('file-viewer');
+      viewer.querySelector('.file-wrap-toggle').click();
+      const size = viewer.querySelector('.file-text-size');
+      size.value = 'large';
+      size.dispatchEvent(new Event('change', { bubbles: true }));
+      const source = viewer.querySelector('.code-source');
+      return {
+        wrap: viewer.querySelector('.file-wrap-toggle').getAttribute('aria-pressed'),
+        size: size.value,
+        fontSize: getComputedStyle(source).fontSize,
+        sourceOverflow: source.scrollWidth - viewer.clientWidth,
+        documentOverflow: document.documentElement.scrollWidth - innerWidth,
+        stored: localStorage.getItem('atmux.file-reader-preferences'),
+      };
+    })()`);
+    assert.equal(noWrapFile.wrap, "false", JSON.stringify(noWrapFile));
+    assert.equal(noWrapFile.size, "large", JSON.stringify(noWrapFile));
+    assert.equal(noWrapFile.fontSize, "15px", JSON.stringify(noWrapFile));
+    assert.ok(noWrapFile.sourceOverflow > 0, JSON.stringify(noWrapFile));
+    assert.equal(noWrapFile.documentOverflow, 0, JSON.stringify(noWrapFile));
+    assert.equal(noWrapFile.stored, '{"wrap":false,"size":"large"}');
+    await cdp.evaluate(`(() => {
+      const viewer = document.getElementById('file-viewer');
+      viewer.querySelector('.file-wrap-toggle').click();
+      const size = viewer.querySelector('.file-text-size');
+      size.value = 'small';
+      size.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    })()`);
     const messagesBeforeReference = messageRequests.length;
     const referenceState = await cdp.evaluate(`(() => {
       const viewer = document.getElementById('file-viewer');
@@ -1060,10 +1119,81 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     await new Promise((resolveWait) => setTimeout(resolveWait, 100));
     assert.equal(messageRequests.length, messagesBeforeReference, "referencing source must not POST a message");
 
+    const mobileEditorEntry = await cdp.evaluate(`(() => {
+      document.querySelector('#file-viewer .file-edit').click();
+      const viewer = document.getElementById('file-viewer');
+      const editor = viewer.querySelector('.file-editor');
+      const size = viewer.querySelector('.file-text-size');
+      const fonts = {};
+      for (const value of ['small', 'medium', 'large']) {
+        size.value = value;
+        size.dispatchEvent(new Event('change', { bubbles: true }));
+        fonts[value] = getComputedStyle(editor).fontSize;
+      }
+      size.value = 'small';
+      size.dispatchEvent(new Event('change', { bubbles: true }));
+      editor.focus({ preventScroll: true });
+      return {
+        fonts,
+        focused: document.activeElement === editor,
+        transform: getComputedStyle(editor).transform,
+        wrap: editor.getAttribute('wrap'),
+        documentOverflow: document.documentElement.scrollWidth - innerWidth,
+        editorOverflow: editor.scrollWidth - editor.clientWidth,
+      };
+    })()`);
+    assert.deepEqual(mobileEditorEntry.fonts, {
+      small: "16px", medium: "17px", large: "19px",
+    });
+    assert.equal(mobileEditorEntry.focused, true, JSON.stringify(mobileEditorEntry));
+    assert.equal(mobileEditorEntry.transform, "none", JSON.stringify(mobileEditorEntry));
+    assert.equal(mobileEditorEntry.wrap, "soft", JSON.stringify(mobileEditorEntry));
+    assert.equal(mobileEditorEntry.documentOverflow, 0, JSON.stringify(mobileEditorEntry));
+    assert.equal(mobileEditorEntry.editorOverflow, 0, JSON.stringify(mobileEditorEntry));
+
+    const originalEditorViewport = await cdp.evaluate("({ width: innerWidth, height: innerHeight })");
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: 390, height: 430, deviceScaleFactor: 1, mobile: false,
+    });
+    await waitFor(
+      () => cdp.evaluate("getComputedStyle(document.documentElement).getPropertyValue('--app-height').trim() === '430px'"),
+      "focused file editor did not follow the keyboard-sized viewport",
+    );
+    const keyboardSizedEditor = await cdp.evaluate(`(() => {
+      const viewer = document.getElementById('file-viewer');
+      const editor = viewer.querySelector('.file-editor');
+      const box = viewer.getBoundingClientRect();
+      return {
+        viewport: window.visualViewport?.height || innerHeight,
+        viewerTop: box.top,
+        viewerBottom: box.bottom,
+        viewerRight: box.right,
+        fontSize: getComputedStyle(editor).fontSize,
+        focused: document.activeElement === editor,
+        documentOverflow: document.documentElement.scrollWidth - innerWidth,
+        scrollHeight: document.documentElement.scrollHeight,
+        clientHeight: document.documentElement.clientHeight,
+      };
+    })()`);
+    assert.equal(keyboardSizedEditor.fontSize, "16px", JSON.stringify(keyboardSizedEditor));
+    assert.equal(keyboardSizedEditor.focused, true, JSON.stringify(keyboardSizedEditor));
+    assert.ok(keyboardSizedEditor.viewerTop >= 0, JSON.stringify(keyboardSizedEditor));
+    assert.ok(keyboardSizedEditor.viewerBottom <= keyboardSizedEditor.viewport + 1, JSON.stringify(keyboardSizedEditor));
+    assert.ok(keyboardSizedEditor.viewerRight <= 390, JSON.stringify(keyboardSizedEditor));
+    assert.equal(keyboardSizedEditor.documentOverflow, 0, JSON.stringify(keyboardSizedEditor));
+    assert.ok(keyboardSizedEditor.scrollHeight <= keyboardSizedEditor.clientHeight, JSON.stringify(keyboardSizedEditor));
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: originalEditorViewport.width, height: originalEditorViewport.height,
+      deviceScaleFactor: 1, mobile: false,
+    });
+    await waitFor(
+      () => cdp.evaluate(`getComputedStyle(document.documentElement).getPropertyValue('--app-height').trim() === '${originalEditorViewport.height}px'`),
+      "file editor did not restore after the keyboard-sized viewport",
+    );
+
     // Every route that would drop a dirty editor asks first. Cancelling keeps
     // the exact file, tab, and agent selected; accepting once discards it.
     await cdp.evaluate(`(() => {
-      document.querySelector('#file-viewer .file-edit').click();
       const editor = document.querySelector('#file-viewer .file-editor');
       editor.value += '\\n// guarded draft';
       editor.dispatchEvent(new Event('input', { bubbles: true }));
@@ -1075,12 +1205,20 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       document.getElementById('mobile-back').click();
       return {
         editor: document.querySelector('#file-viewer .file-editor').value,
+        editorFontSize: getComputedStyle(document.querySelector('#file-viewer .file-editor')).fontSize,
+        editorWrap: document.querySelector('#file-viewer .file-editor').getAttribute('wrap'),
+        persistedSize: document.querySelector('#file-viewer .file-text-size').value,
+        persistedWrap: document.querySelector('#file-viewer .file-wrap-toggle').getAttribute('aria-pressed'),
         mode: document.getElementById('files-view').getAttribute('aria-selected'),
         agent: document.getElementById('agent-name').textContent,
         prompts: window.__discardPrompts,
       };
     })()`).then((guarded) => {
       assert.match(guarded.editor, /\/\/ guarded draft$/);
+      assert.equal(guarded.editorFontSize, "16px", JSON.stringify(guarded));
+      assert.equal(guarded.editorWrap, "soft", JSON.stringify(guarded));
+      assert.equal(guarded.persistedSize, "small", JSON.stringify(guarded));
+      assert.equal(guarded.persistedWrap, "true", JSON.stringify(guarded));
       assert.equal(guarded.mode, "true");
       assert.equal(guarded.agent, "codex-main");
       assert.equal(guarded.prompts.length, 4, JSON.stringify(guarded));
@@ -1234,7 +1372,8 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       };
     })()`);
     assert.equal(filesBeforeStatus.internalY, true);
-    assert.equal(filesBeforeStatus.internalX, true);
+    assert.equal(filesBeforeStatus.internalX, false);
+    assert.equal(filesBeforeStatus.left, 0);
     assert.ok(filesBeforeStatus.source.includes('<script>safe 1</script>'));
     assert.equal(await cdp.evaluate("Boolean(document.querySelector('#file-viewer script, #file-viewer img'))"), false);
     emitOverviewPatch([{
@@ -1583,6 +1722,25 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
         { id: "tool-wait-2", role: "tool", kind: "tool", tool_name: "collaboration.wait_agent", tool_output: "timed out" },
         { id: "tool-send-1", role: "tool", kind: "tool", tool_name: "send_message", tool_input: "<img src=x onerror=alert(1)>", tool_output: "delivered" },
         { id: "tool-agent-middle", role: "assistant", markdown: "This prose splits coordination runs" },
+        { id: "tool-exec-1", role: "tool", kind: "tool", tool_name: "functions.exec", tool_input: "<img src=x onerror=exec(1)>", tool_output: '{"exit_code":0,"output":"first command output"}' },
+        { id: "tool-exec-2", role: "tool", kind: "tool", tool_name: "exec_command", tool_input: "second command", tool_output: "Process exited with code 0" },
+        { id: "tool-exec-3", role: "tool", kind: "tool", tool_name: "tools/exec", tool_input: "third command", tool_output: '{"exit_code":0,"output":"third <script>safe</script> output"}' },
+        { id: "tool-exec-4", role: "tool", kind: "tool", tool_name: "functions.exec_command", tool_input: "fourth command", tool_output: "ok" },
+        { id: "tool-exec-timeout", role: "tool", kind: "tool", tool_name: "exec", tool_output: "timed out" },
+        { id: "tool-exec-ok-after-timeout", role: "tool", kind: "tool", tool_name: "exec", tool_output: "ok" },
+        { id: "tool-exec-json-error", role: "tool", kind: "tool", tool_name: "exec_command", tool_output: '{"exit_code":1}' },
+        { id: "tool-exec-json-ok", role: "tool", kind: "tool", tool_name: "exec_command", tool_output: '{"exit_code":0}' },
+        { id: "tool-exec-process-error", role: "tool", kind: "tool", tool_name: "exec", tool_output: "Process exited with code 1" },
+        { id: "tool-apply-1", role: "tool", kind: "tool", tool_name: "apply_patch", tool_output: "ok" },
+        { id: "tool-apply-2", role: "tool", kind: "tool", tool_name: "apply_patch", tool_output: "completed" },
+        { id: "tool-web-1", role: "tool", kind: "tool", tool_name: "web.run", tool_output: "ok" },
+        { id: "tool-web-2", role: "tool", kind: "tool", tool_name: "web.run", tool_output: "completed" },
+        { id: "tool-plan-1", role: "tool", kind: "tool", tool_name: "update_plan", tool_output: "ok" },
+        { id: "tool-plan-2", role: "tool", kind: "tool", tool_name: "update_plan", tool_output: "completed" },
+        { id: "tool-exec-error", role: "tool", kind: "tool", tool_name: "exec", tool_output: "Error: command failed with status 1" },
+        { id: "tool-exec-split-1", role: "tool", kind: "tool", tool_name: "exec", tool_output: "result before another tool" },
+        { id: "tool-patch-split", role: "tool", kind: "tool", tool_name: "apply_patch", tool_output: "updated a different resource" },
+        { id: "tool-exec-split-2", role: "tool", kind: "tool", tool_name: "exec", tool_output: "result after another tool" },
         { id: "tool-send-2", role: "tool", kind: "tool", tool_name: "send_message" },
         { id: "tool-follow-1", role: "tool", kind: "tool", tool_name: "followup_task", tool_output: '{"status":"completed"}' },
         { id: "tool-wait-error", role: "tool", kind: "tool", tool_name: "wait_agent", tool_output: "Error: failed to receive approval" },
@@ -1600,8 +1758,8 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       ],
     };
     await waitFor(
-      () => cdp.evaluate("document.querySelectorAll('#conversation .tool-call-group').length === 3"),
-      "coordination tool runs did not collapse on mobile",
+      () => cdp.evaluate("document.querySelectorAll('#conversation .tool-call-group').length === 4"),
+      "internal tool runs did not collapse on mobile",
       5_000,
     );
     const compactTools = await cdp.evaluate(`(() => {
@@ -1626,6 +1784,18 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
         malformedStatusSummaries: ['numeric', 'boolean', 'null'].map((suffix) =>
           conversation.querySelector('[data-transcript-id="tool-wait-' + suffix + '"] > summary')?.textContent),
         meaningfulSeparate: Boolean(conversation.querySelector('[data-transcript-id="tool-wait-meaningful"]')),
+        execErrorSummary: conversation.querySelector('[data-transcript-id="tool-exec-error"] > summary')?.textContent,
+        execBoundarySummaries: ['timeout', 'ok-after-timeout', 'json-error', 'json-ok', 'process-error']
+          .map((suffix) => conversation.querySelector('[data-transcript-id="tool-exec-' + suffix + '"] > summary')?.textContent),
+        splitToolsSeparate: [
+          'tool-exec-split-1', 'tool-patch-split', 'tool-exec-split-2',
+          'tool-apply-1', 'tool-apply-2', 'tool-web-1', 'tool-web-2', 'tool-plan-1', 'tool-plan-2',
+        ]
+          .every((id) => {
+            const node = conversation.querySelector('[data-transcript-id="' + id + '"]');
+            return Boolean(node) && !node.closest('.tool-call-group');
+          }),
+        fileReaderPreferences: localStorage.getItem('atmux.file-reader-preferences'),
         markupInjected: Boolean(conversation.querySelector('img, script')),
         escapedInputVisible: first.textContent.includes('<img src=x onerror=alert(1)>'),
         before,
@@ -1636,7 +1806,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.deepEqual(compactTools.order, ["tool-wait-1", "tool-wait-2", "tool-send-1"]);
     assert.ok(compactTools.groupSummaries[0].includes("wait_agent ×2"), JSON.stringify(compactTools));
     assert.ok(compactTools.groupSummaries[0].includes("send_message ×1"), JSON.stringify(compactTools));
-    assert.ok(compactTools.groupSummaries.every((summary) => summary.endsWith("no errors")), JSON.stringify(compactTools));
+    assert.ok(compactTools.groupSummaries.includes("exec ×4"), JSON.stringify(compactTools));
     assert.equal(compactTools.humanVisible, true, JSON.stringify(compactTools));
     assert.equal(compactTools.agentVisible, true, JSON.stringify(compactTools));
     assert.equal(compactTools.errorSummary, "wait_agent · error", JSON.stringify(compactTools));
@@ -1645,9 +1815,37 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       "wait_agent · error", "wait_agent · error", "wait_agent · error",
     ], JSON.stringify(compactTools));
     assert.equal(compactTools.meaningfulSeparate, true, JSON.stringify(compactTools));
+    assert.equal(compactTools.execErrorSummary, "exec · error", JSON.stringify(compactTools));
+    assert.deepEqual(compactTools.execBoundarySummaries, [
+      "exec · error", "exec · result", "exec_command · error", "exec_command · result", "exec · error",
+    ], JSON.stringify(compactTools));
+    assert.equal(compactTools.splitToolsSeparate, true, JSON.stringify(compactTools));
+    assert.equal(compactTools.fileReaderPreferences, '{"wrap":true,"size":"small"}');
     assert.equal(compactTools.markupInjected, false, JSON.stringify(compactTools));
     assert.equal(compactTools.escapedInputVisible, true, JSON.stringify(compactTools));
     assert.ok(Math.abs(compactTools.after - compactTools.before) <= 1, JSON.stringify(compactTools));
+
+    const expandedExec = await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      const group = [...conversation.querySelectorAll('.tool-call-group')]
+        .find((node) => node.querySelector(':scope > summary').textContent === 'exec ×4');
+      const summary = group.querySelector(':scope > summary');
+      summary.click();
+      return new Promise((resolve) => requestAnimationFrame(() => resolve({
+        open: group.open,
+        label: summary.getAttribute('aria-label'),
+        order: [...group.querySelectorAll('.tool-card-group-item')].map((node) => node.dataset.transcriptId),
+        inputVisible: group.textContent.includes('<img src=x onerror=exec(1)>'),
+        resultVisible: group.textContent.includes('third <script>safe</script> output'),
+        markupInjected: Boolean(group.querySelector('img, script')),
+      })));
+    })()`);
+    assert.equal(expandedExec.open, true, JSON.stringify(expandedExec));
+    assert.equal(expandedExec.label, "exec ×4; 4 calls and results");
+    assert.deepEqual(expandedExec.order, ["tool-exec-1", "tool-exec-2", "tool-exec-3", "tool-exec-4"]);
+    assert.equal(expandedExec.inputVisible, true, JSON.stringify(expandedExec));
+    assert.equal(expandedExec.resultVisible, true, JSON.stringify(expandedExec));
+    assert.equal(expandedExec.markupInjected, false, JSON.stringify(expandedExec));
 
     // A stale expansion callback must not mutate a freshly reconnected
     // transcript even when it is still the same pane. Hold the queued callback,
@@ -1675,7 +1873,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       base_revision: 999, revision: 1_000, start_line: 0, delete_lines: 0, lines: [],
     })}\n\n`);
     await waitFor(
-      () => cdp.evaluate("document.getElementById('stream-state').textContent === 'Live' && document.querySelectorAll('#conversation .tool-call-group:not([data-old-generation])').length === 3"),
+      () => cdp.evaluate("document.getElementById('stream-state').textContent === 'Live' && document.querySelectorAll('#conversation .tool-call-group:not([data-old-generation])').length === 4"),
       "same-pane reconnect did not replace the old tool group generation",
       5_000,
     );
@@ -1695,7 +1893,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       };
     })()`);
     assert.equal(staleExpansionResult.oldConnected, false, JSON.stringify(staleExpansionResult));
-    assert.equal(staleExpansionResult.groupCount, 3, JSON.stringify(staleExpansionResult));
+    assert.equal(staleExpansionResult.groupCount, 4, JSON.stringify(staleExpansionResult));
     assert.ok(Math.abs(staleExpansionResult.after - staleExpansionResult.before) <= 1, JSON.stringify({ staleExpansionSetup, staleExpansionResult }));
 
     // A pane change clears group expansion/content synchronously; an identical
