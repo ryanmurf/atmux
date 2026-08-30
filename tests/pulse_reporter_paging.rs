@@ -33,6 +33,9 @@ use std::os::unix::fs::DirBuilderExt as _;
 
 const LOCAL_ROWS: usize = 10_050;
 const REMOTE_ROWS: usize = 15_000;
+const TEMP_ROOT_ATTEMPTS: usize = 64;
+
+static NEXT_TEMP_ROOT: AtomicUsize = AtomicUsize::new(0);
 
 struct TempRoot(PathBuf);
 
@@ -42,15 +45,35 @@ impl TempRoot {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "atmux-pulse-reporter-{}-{nonce}",
-            std::process::id()
-        ));
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        builder.mode(0o700);
-        builder.create(&path).expect("private test root");
-        Self(path)
+        Self::new_in(&std::env::temp_dir(), "atmux-pulse-reporter", nonce)
+            .expect("private test root")
+    }
+
+    fn new_in(parent: &Path, prefix: &str, nonce: u128) -> std::io::Result<Self> {
+        Self::from_candidates((0..TEMP_ROOT_ATTEMPTS).map(|_| {
+            let sequence = NEXT_TEMP_ROOT.fetch_add(1, Ordering::Relaxed);
+            parent.join(format!(
+                "{prefix}-{}-{nonce}-{sequence}",
+                std::process::id()
+            ))
+        }))
+    }
+
+    fn from_candidates(candidates: impl IntoIterator<Item = PathBuf>) -> std::io::Result<Self> {
+        for path in candidates {
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            builder.mode(0o700);
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique private test root",
+        ))
     }
 
     fn path(&self) -> &Path {
@@ -62,6 +85,52 @@ impl Drop for TempRoot {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn private_test_roots_retry_collisions_without_reusing_or_removing_them() {
+    let outer = TempRoot::new();
+    let collision = outer.path().join("collision");
+    let fresh = outer.path().join("fresh");
+    fs::create_dir(&collision).expect("collision fixture");
+
+    let allocated =
+        TempRoot::from_candidates([collision.clone(), fresh.clone()]).expect("retry collision");
+    let allocated_path = allocated.path().to_owned();
+
+    assert_eq!(allocated.path(), fresh);
+    assert!(collision.is_dir(), "existing root must not be reused");
+    drop(allocated);
+    assert!(collision.is_dir(), "existing root must not be cleaned up");
+    assert!(!allocated_path.exists(), "owned root should be cleaned up");
+}
+
+#[test]
+fn private_test_roots_are_unique_under_concurrent_constant_nonce_allocation() {
+    const WORKERS: usize = 32;
+
+    let outer = TempRoot::new();
+    let roots = std::thread::scope(|scope| {
+        let handles = (0..WORKERS)
+            .map(|_| {
+                scope.spawn(|| {
+                    TempRoot::new_in(outer.path(), "concurrent", 11)
+                        .expect("concurrent private test root")
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("allocation worker"))
+            .collect::<Vec<_>>()
+    });
+    let unique = roots
+        .iter()
+        .map(|root| root.path().to_owned())
+        .collect::<HashSet<_>>();
+
+    assert_eq!(unique.len(), WORKERS);
+    assert!(roots.iter().all(|root| root.path().is_dir()));
 }
 
 #[derive(Default)]
