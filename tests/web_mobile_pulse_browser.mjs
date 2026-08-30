@@ -273,6 +273,13 @@ function mockApi(url, response, request) {
               { id: "sol-fast", label: "Sol · xhigh · fast", model: "gpt-5.6-sol", effort: "xhigh", service_tier: "fast" },
             ],
           }],
+          memory: {
+            supported: true,
+            default_bytes: 17179869184,
+            override_max_bytes: 25769803776,
+            presets_bytes: [8589934592, 17179869184, 25769803776],
+            note: "Changes apply on the next launch or relaunch.",
+          },
           project_preferences: {}, note: null,
         },
       ],
@@ -855,6 +862,9 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       harness: document.getElementById('launch-harness').value,
       profile: document.getElementById('launch-profile').value,
       mode: document.getElementById('launch-mode').value,
+      memory: document.getElementById('launch-memory').value,
+      memoryOverflow: document.getElementById('launch-memory-group').scrollWidth
+        > document.getElementById('launch-memory-group').clientWidth,
       name: document.getElementById('launch-name').value,
       conversation: document.getElementById('launch-session').value,
       submit: document.querySelector('#launch-form button[type=submit]').textContent,
@@ -866,6 +876,8 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       harness: "codex",
       profile: "profile-codex-max",
       mode: "sol-fast",
+      memory: "",
+      memoryOverflow: false,
       name: "codex-main-copy",
       conversation: "",
       submit: "Launch duplicate",
@@ -888,6 +900,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(launchRequests[0].body.resume_session_id, null, JSON.stringify(launchRequests[0]));
     assert.equal(launchRequests[0].body.profile_id, "profile-codex-max");
     assert.equal(launchRequests[0].body.mode_id, "sol-fast");
+    assert.equal(launchRequests[0].body.memory_max_bytes, null);
     await cdp.evaluate("document.querySelector('#launch-dialog .dialog-cancel').click(); true");
     launchRequests.length = 0;
 

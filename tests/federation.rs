@@ -1078,6 +1078,7 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
             mode_id: None,
             machine: Some("gpu-box".to_owned()),
             resume_session_id: None,
+            memory_max_bytes: None,
         })
         .await
         .unwrap();
@@ -1238,6 +1239,7 @@ async fn one_unreachable_machine_never_breaks_local_or_healthy_machines() {
                 mode_id: None,
                 machine: Some("dead".to_owned()),
                 resume_session_id: None,
+                memory_max_bytes: None,
             })
             .await
             .is_err()

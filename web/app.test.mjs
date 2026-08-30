@@ -31,6 +31,9 @@ const {
   duplicateSourceSnapshot,
   duplicateSessionName,
   filterDirectories,
+  formatMemoryLimit,
+  memoryLimitChoices,
+  parseMemoryLimitSelection,
   followsLiveTail,
   formatUptime,
   formatRelativeTime,
@@ -1331,10 +1334,64 @@ test("duplicate launch reuses exact owner profile and mode IDs with a fresh tmux
     harness: "codex",
     profileId: "profile-codex-max",
     modeId: "sol-fast",
+    memoryMaxBytes: null,
     name: "kernel-copy-2",
   });
   assert.equal(launchMachines({ directories: ["/one"], profiles: [] })[0].id, "local");
   assert.equal(duplicateSessionName({ ...running, name: "x".repeat(100) }, []), `${"x".repeat(95)}-copy`);
+});
+
+test("memory launch choices parse Default, presets, and bounded whole-GiB custom values", () => {
+  const GiB = 1024 ** 3;
+  const memory = {
+    supported: true,
+    default_bytes: 16 * GiB,
+    override_max_bytes: 24 * GiB,
+    presets_bytes: [8 * GiB, 16 * GiB, 24 * GiB, 32 * GiB, 0, "bad"],
+    note: "next relaunch",
+  };
+  assert.deepEqual(memoryLimitChoices(memory), {
+    supported: true,
+    defaultBytes: 16 * GiB,
+    ceiling: 24 * GiB,
+    presets: [8 * GiB, 16 * GiB, 24 * GiB],
+    note: "next relaunch",
+  });
+  assert.equal(parseMemoryLimitSelection(memory, "", ""), null);
+  assert.equal(parseMemoryLimitSelection(memory, String(8 * GiB), ""), 8 * GiB);
+  assert.equal(parseMemoryLimitSelection(memory, "custom", "12"), 12 * GiB);
+  assert.throws(() => parseMemoryLimitSelection(memory, "custom", "1.5"), /whole number/);
+  assert.throws(() => parseMemoryLimitSelection(memory, "custom", "25"), /at most 24 GiB/);
+  assert.throws(() => parseMemoryLimitSelection(memory, String(20 * GiB), ""), /owner-approved/);
+  assert.equal(formatMemoryLimit(16 * GiB), "16 GiB");
+});
+
+test("duplicate preserves an exact owner-allowed cap and rejects stale capability", () => {
+  const GiB = 1024 ** 3;
+  const session = {
+    id: "max~%4", machine: "max", name: "worker", agent: "codex",
+    profile: "Default", path: "/workspace", memory_max_bytes: 20 * GiB,
+  };
+  const machine = {
+    id: "max", label: "Max", online: true, directories: [session.path],
+    profiles: [{ id: "profile-0", name: "Default", harness: "codex", modes: [] }],
+    memory: {
+      supported: true, default_bytes: 16 * GiB, override_max_bytes: 24 * GiB,
+      presets_bytes: [16 * GiB, 24 * GiB],
+    },
+  };
+  assert.equal(
+    duplicateLaunchSelection({ machines: [machine] }, session, null).memoryMaxBytes,
+    20 * GiB,
+  );
+  assert.throws(
+    () => duplicateLaunchSelection({ machines: [{ ...machine, memory: null }] }, session, null),
+    /no longer allowed/,
+  );
+  assert.throws(
+    () => duplicateLaunchSelection({ machines: [{ ...machine, memory: { ...machine.memory, override_max_bytes: 18 * GiB } }] }, session, null),
+    /no longer allowed/,
+  );
 });
 
 test("duplicate launch refuses stale profile or ambiguous model settings", () => {

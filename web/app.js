@@ -567,8 +567,59 @@ function launchMachines(options) {
       directories: options?.directories || [],
       profiles: options?.profiles || [],
       project_preferences: options?.project_preferences || {},
+      memory: options?.memory || null,
       note: null,
     }];
+}
+
+const GIBIBYTE_BYTES = 1024 * 1024 * 1024;
+
+function safeMemoryBytes(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function formatMemoryLimit(bytes) {
+  const safe = safeMemoryBytes(bytes);
+  if (!safe) return "No cap";
+  const gib = safe / GIBIBYTE_BYTES;
+  return `${Number.isInteger(gib) ? gib : gib.toFixed(1)} GiB`;
+}
+
+/// Returns only bounded owner-advertised choices. This is presentation
+/// validation; the owner repeats all checks against current configuration.
+function memoryLimitChoices(memory) {
+  const defaultBytes = safeMemoryBytes(memory?.default_bytes);
+  const ceiling = safeMemoryBytes(memory?.override_max_bytes);
+  const supported = memory?.supported === true && defaultBytes !== null;
+  const presets = [...new Set((Array.isArray(memory?.presets_bytes) ? memory.presets_bytes : [])
+    .map(safeMemoryBytes)
+    .filter((value) => value !== null && ceiling !== null && value <= ceiling))]
+    .sort((left, right) => left - right);
+  return { supported, defaultBytes, ceiling, presets, note: String(memory?.note || "") };
+}
+
+function parseMemoryLimitSelection(memory, selected, customGiB) {
+  const choices = memoryLimitChoices(memory);
+  if (selected === "") return null;
+  if (!choices.supported || choices.ceiling === null) {
+    throw new Error("This machine does not allow per-agent memory overrides");
+  }
+  if (selected === "custom") {
+    const gib = Number(customGiB);
+    if (!Number.isSafeInteger(gib) || gib < 1) {
+      throw new Error("Custom memory must be a whole number of GiB");
+    }
+    const bytes = gib * GIBIBYTE_BYTES;
+    if (!Number.isSafeInteger(bytes) || bytes > choices.ceiling) {
+      throw new Error(`Custom memory must be at most ${formatMemoryLimit(choices.ceiling)}`);
+    }
+    return bytes;
+  }
+  const bytes = Number(selected);
+  if (!Number.isSafeInteger(bytes) || !choices.presets.includes(bytes)) {
+    throw new Error("Choose an owner-approved memory limit");
+  }
+  return bytes;
 }
 
 /// Resolves a running pane back to owner-issued launch IDs. The browser never
@@ -606,12 +657,29 @@ function duplicateLaunchSelection(options, session, capabilities, sessions = [])
   if (!validRememberedLaunchDirectory(directory)) {
     throw new Error(`The project folder for ${session.name} cannot be reused`);
   }
+  const observedMemory = session.memory_max_bytes == null
+    ? null
+    : safeMemoryBytes(session.memory_max_bytes);
+  if (session.memory_max_bytes != null && observedMemory === null) {
+    throw new Error(`The memory cap for ${session.name} is invalid`);
+  }
+  if (observedMemory !== null) {
+    const memory = memoryLimitChoices(machine.memory);
+    const allowed = memory.supported && (observedMemory === memory.defaultBytes
+      || (memory.ceiling !== null
+        && observedMemory <= memory.ceiling
+        && observedMemory % GIBIBYTE_BYTES === 0));
+    if (!allowed) {
+      throw new Error(`The ${formatMemoryLimit(observedMemory)} cap for ${session.name} is no longer allowed on ${machine.label || machineId}`);
+    }
+  }
   return {
     machineId,
     directory,
     harness: profile.harness,
     profileId: profile.id,
     modeId,
+    memoryMaxBytes: observedMemory,
     name: duplicateSessionName(session, sessions),
   };
 }
@@ -1680,6 +1748,9 @@ if (typeof module !== "undefined" && module.exports) {
     duplicateSourceSnapshot,
     duplicateSessionName,
     filterDirectories,
+    formatMemoryLimit,
+    memoryLimitChoices,
+    parseMemoryLimitSelection,
     formatRelativeTime,
     groupSessionsByMachine,
     harnessesForProfiles,
@@ -3428,6 +3499,9 @@ function initialize() {
       machine?.label || sessionMachineId(selected),
       state.statusPresentations.get(selected.id)?.shown || selected.status,
       selected.agent,
+      safeMemoryBytes(selected.memory_max_bytes) === null
+        ? "Memory cap unavailable"
+        : `Memory ${formatMemoryLimit(selected.memory_max_bytes)}`,
     ].filter(Boolean).join(" · ");
     $("agent-meta").title = selected.path || "";
     const launch = $("agent-launch");
@@ -5636,6 +5710,7 @@ function initialize() {
       directories: [],
       profiles: [],
       project_preferences: {},
+      memory: null,
       note: "No online machine currently has both runnable agent profiles and configured project folders.",
     };
   }
@@ -5653,6 +5728,7 @@ function initialize() {
     state.launchNamePristine = true;
     clearLaunchSessions();
     closeLaunchBrowser();
+    renderLaunchMemory(selected);
     renderLaunchDirectories(selected);
   }
 
@@ -5691,10 +5767,53 @@ function initialize() {
     $("launch-profile").value = selection.profileId;
     renderLaunchModes(machine);
     if (selection.modeId) $("launch-mode").value = selection.modeId;
+    selectLaunchMemory(selection.memoryMaxBytes);
     $("launch-session").value = "";
     $("launch-name").value = selection.name;
     state.launchNamePristine = false;
     updateLaunchAvailability(machine);
+  }
+
+  function renderLaunchMemory(selected = currentLaunchMachine()) {
+    const choices = memoryLimitChoices(selected.memory);
+    const select = $("launch-memory");
+    const defaultLabel = choices.defaultBytes === null
+      ? "Default (no per-worker cap)"
+      : `Default (${formatMemoryLimit(choices.defaultBytes)})`;
+    const options = [option("", defaultLabel)];
+    if (choices.supported && choices.ceiling !== null) {
+      options.push(...choices.presets.map((bytes) => option(String(bytes), formatMemoryLimit(bytes))));
+      options.push(option("custom", "Custom…"));
+    }
+    select.replaceChildren(...options);
+    select.value = "";
+    select.disabled = !isLaunchCapableMachine(selected) || choices.ceiling === null;
+    $("launch-memory-custom").value = "";
+    $("launch-memory-custom").max = choices.ceiling === null
+      ? ""
+      : String(Math.floor(choices.ceiling / GIBIBYTE_BYTES));
+    $("launch-memory-custom").disabled = select.disabled;
+    $("launch-memory-custom-row").hidden = true;
+    $("launch-memory-note").textContent = choices.note;
+    $("launch-memory-group").hidden = selected === null;
+  }
+
+  function selectLaunchMemory(memoryMaxBytes) {
+    const select = $("launch-memory");
+    if (memoryMaxBytes == null) {
+      select.value = "";
+      $("launch-memory-custom-row").hidden = true;
+      return;
+    }
+    const preset = [...select.options].find((candidate) => candidate.value === String(memoryMaxBytes));
+    if (preset) {
+      select.value = preset.value;
+      $("launch-memory-custom-row").hidden = true;
+      return;
+    }
+    select.value = "custom";
+    $("launch-memory-custom").value = String(memoryMaxBytes / GIBIBYTE_BYTES);
+    $("launch-memory-custom-row").hidden = false;
   }
 
   function applyProjectPreferences(selected, directory, forceName) {
@@ -5764,11 +5883,21 @@ function initialize() {
   ) {
     const profiles = profilesForHarness(selected.profiles, $("launch-harness").value);
     const button = $("launch-form").querySelector("button[type=submit]");
-    button.disabled = !isLaunchCapableMachine(selected) || !directory || !profiles.length;
+    let memoryError = "";
+    try {
+      parseMemoryLimitSelection(
+        selected.memory,
+        $("launch-memory").value,
+        $("launch-memory-custom").value,
+      );
+    } catch (error) {
+      memoryError = error.message;
+    }
+    button.disabled = !isLaunchCapableMachine(selected) || !directory || !profiles.length || Boolean(memoryError);
     const note = $("launch-note");
     const listed = availableLaunchDirectories(selected, state.rememberedLaunchDirectories)
       .includes(directory);
-    const message = selected.note || (!directory
+    const message = selected.note || memoryError || (!directory
       ? (!directories.length
         ? "No project matches. Type an absolute folder within a configured project root."
         : "Choose a project or type an absolute folder within a configured project root.")
@@ -5790,6 +5919,12 @@ function initialize() {
     renderLaunchModes();
     updateLaunchAvailability();
   });
+  $("launch-memory").addEventListener("change", () => {
+    $("launch-memory-custom-row").hidden = $("launch-memory").value !== "custom";
+    updateLaunchAvailability();
+    if ($("launch-memory").value === "custom") $("launch-memory-custom").focus();
+  });
+  $("launch-memory-custom").addEventListener("input", () => updateLaunchAvailability());
   $("launch-name").addEventListener("input", () => { state.launchNamePristine = false; });
   function persistLaunchDirectory(machine, directory) {
     state.rememberedLaunchDirectories = rememberLaunchDirectory(
@@ -5980,6 +6115,18 @@ function initialize() {
     event.preventDefault();
     const button = event.currentTarget.querySelector("button[type=submit]");
     const duplicateFlow = state.launchFlow === "duplicate";
+    const launchMachine = currentLaunchMachine();
+    let memoryMaxBytes;
+    try {
+      memoryMaxBytes = parseMemoryLimitSelection(
+        launchMachine.memory,
+        $("launch-memory").value,
+        $("launch-memory-custom").value,
+      );
+    } catch (error) {
+      toast(error.message);
+      return;
+    }
     const body = {
       name: $("launch-name").value,
       directory: $("launch-directory").value,
@@ -5987,6 +6134,7 @@ function initialize() {
       mode_id: $("launch-mode").value || null,
       machine: $("launch-machine").value || null,
       resume_session_id: duplicateFlow ? null : ($("launch-session").value || null),
+      memory_max_bytes: memoryMaxBytes,
     };
     if (body.resume_session_id) {
       const machine = currentLaunchMachine();

@@ -156,6 +156,11 @@
       <label id="launch-harness-row">Agent<select id="launch-harness" required></select></label>
       <label id="launch-profile-row">Profile<select id="launch-profile" required></select></label>
       <label id="launch-mode-row">Mode<select id="launch-mode"></select></label>
+      <div id="launch-memory-group" class="launch-memory-group">
+        <label id="launch-memory-row">Memory limit<select id="launch-memory"></select></label>
+        <label id="launch-memory-custom-row" hidden>Custom GiB<input id="launch-memory-custom" type="number" inputmode="decimal" min="1" step="1"></label>
+        <p id="launch-memory-note" class="dialog-note"></p>
+      </div>
       <div class="launch-project-field"><label for="launch-directory">Project</label>
         <span class="launch-directory-control"><input id="launch-directory" type="search" list="launch-directory-options" placeholder="Filter projects or type an absolute folder" autocomplete="off" required><button id="launch-browse" type="button">Browse</button></span>
         <datalist id="launch-directory-options"></datalist>

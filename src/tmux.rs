@@ -2821,6 +2821,7 @@ mod tests {
         };
         let resources = AgentResourcesConfig {
             memory_max_bytes: Some(64 * 1024 * 1024),
+            memory_override_max_bytes: Some(systemd_scope::GIBIBYTE),
         };
 
         let initial_server = Command::new("tmux")
@@ -2849,7 +2850,11 @@ mod tests {
                 assert!(!output.status.success(), "tmux retained {variable}");
             }
 
-            let scope = systemd_scope::prepare(&resources, "isolated-real-tmux")?;
+            let scope = systemd_scope::prepare_override(
+                &resources,
+                Some(systemd_scope::GIBIBYTE),
+                "isolated-real-tmux",
+            )?;
             let unit = scope
                 .metadata()
                 .map(|(unit, _)| unit.to_owned())
@@ -2863,7 +2868,7 @@ mod tests {
                 .find(|session| session.name == "bounded")
                 .context("bounded session was not discovered")?;
             assert_eq!(session.systemd_scope.as_deref(), Some(unit.as_str()));
-            assert_eq!(session.memory_max_bytes, Some(64 * 1024 * 1024));
+            assert_eq!(session.memory_max_bytes, Some(systemd_scope::GIBIBYTE));
 
             let capture = wait_for_capture(&session.pane_id, |content| {
                 content.contains("agent-pid=").then(|| content.to_owned())
@@ -2887,7 +2892,7 @@ mod tests {
             let memory =
                 fixed_user_systemctl(&["--user", "show", &unit, "--property=MemoryMax", "--value"]);
             assert!(memory.status.success(), "{:?}", memory.stderr);
-            assert_eq!(String::from_utf8(memory.stdout)?.trim(), "67108864");
+            assert_eq!(String::from_utf8(memory.stdout)?.trim(), "1073741824");
             let control_group = fixed_user_systemctl(&[
                 "--user",
                 "show",

@@ -4,6 +4,11 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 block=$repo_root/deploy/systemd/resume-tron-scoped-exec-block.bash
 
+if grep -Fq memory-max-bytes "$block"; then
+  printf 'Tron recovery must use the owner-configured default MemoryMax\n' >&2
+  exit 1
+fi
+
 grep -Fxq '# ATMUX_QUICK_RESUME_SCOPED_EXEC_V1' "$block"
 # The pattern is intentionally a literal shell fragment from the unsafe legacy
 # helper, not an expression for this test shell to expand.

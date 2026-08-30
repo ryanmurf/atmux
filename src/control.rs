@@ -332,6 +332,24 @@ pub struct ProfileModeOption {
     pub service_tier: Option<String>,
 }
 
+/// Owner-advertised, server-enforced memory choices for one machine.
+///
+/// The browser treats this as display data only. Every requested byte value is
+/// resolved again by the owning node against its current configuration and
+/// host/cgroup ceiling immediately before launch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentMemoryLaunchOptions {
+    pub supported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_max_bytes: Option<u64>,
+    #[serde(default)]
+    pub presets_bytes: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 /// Launch inputs accepted by one machine.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MachineLaunchOptions {
@@ -343,6 +361,9 @@ pub struct MachineLaunchOptions {
     /// Saved project-local defaults keyed by their absolute launch directory.
     #[serde(default)]
     pub project_preferences: BTreeMap<String, ProjectPreferences>,
+    /// Per-launch cgroup limit capability reported by this exact owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<AgentMemoryLaunchOptions>,
     /// Why a machine currently offers no launch inputs.
     pub note: Option<String>,
 }
@@ -356,6 +377,10 @@ pub struct LaunchOptions {
     /// Saved project-local defaults keyed by their absolute launch directory.
     #[serde(default)]
     pub project_preferences: BTreeMap<String, ProjectPreferences>,
+    /// This machine's memory capability. Retained beside `machines` for old
+    /// single-owner clients and omitted by older nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<AgentMemoryLaunchOptions>,
     /// Per-machine launch inputs, this machine first.
     #[serde(default)]
     pub machines: Vec<MachineLaunchOptions>,
@@ -378,6 +403,10 @@ pub struct LaunchRequest {
     /// provider session id and configuration path never cross the API.
     #[serde(default)]
     pub resume_session_id: Option<String>,
+    /// Optional exact byte cap. Absence selects the owner's configured
+    /// default; presence is never trusted without owner-side revalidation.
+    #[serde(default)]
+    pub memory_max_bytes: Option<u64>,
 }
 
 /// One saved native conversation safe to display in Quick Launch.
@@ -1549,8 +1578,9 @@ impl ControlPlane {
                         // is temporarily unavailable, retain the plan so a
                         // later maintenance pass can retry without ever
                         // launching an unbounded replacement.
-                        let scope = match systemd_scope::prepare(
+                        let scope = match systemd_scope::prepare_override(
                             &self.inner.config.agent_resources,
+                            fresh.as_ref().and_then(|session| session.memory_max_bytes),
                             &pane_id,
                         ) {
                             Ok(scope) => scope,
@@ -2364,6 +2394,13 @@ impl ControlPlane {
             .map(|path| path.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         let project_preferences = project_preferences(&directory_paths);
+        let memory = if self.inner.config.node.coordinator_only {
+            None
+        } else {
+            Some(agent_memory_launch_options(
+                &self.inner.config.agent_resources,
+            ))
+        };
         let profiles = if self.inner.config.node.coordinator_only {
             Vec::new()
         } else {
@@ -2389,6 +2426,7 @@ impl ControlPlane {
                 directories: directories.clone(),
                 profiles: profiles.clone(),
                 project_preferences: project_preferences.clone(),
+                memory: memory.clone(),
                 note: None,
             });
         }
@@ -2412,6 +2450,7 @@ impl ControlPlane {
                     .as_ref()
                     .map(|options| options.project_preferences.clone())
                     .unwrap_or_default(),
+                memory: options.as_ref().and_then(|options| options.memory.clone()),
                 note: remote.and_then(|remote| {
                     remote
                         .launch_note
@@ -2424,6 +2463,7 @@ impl ControlPlane {
             directories,
             profiles,
             project_preferences,
+            memory,
             machines,
         }
     }
@@ -2735,10 +2775,14 @@ impl ControlPlane {
                             )
                             .into());
                         }
-                        let scope = systemd_scope::prepare(&resources, &pane_id)?;
-                        begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
                         let (session, resume, claude_program) =
                             fresh_claude_resume_target(&pane_id, &status, capture_lines)?;
+                        let scope = systemd_scope::prepare_override(
+                            &resources,
+                            session.memory_max_bytes,
+                            &pane_id,
+                        )?;
+                        begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
                         Tmux::resume_claude(
                             &pane_id,
                             &session.path,
@@ -2985,17 +3029,7 @@ impl ControlPlane {
                 .map_err(|error| upstream(&error));
         }
         self.ensure_local_owner_enabled()?;
-        if self
-            .read_state()
-            .sessions
-            .iter()
-            .any(|session| session.name == request.name)
-        {
-            return Err(conflict(format!(
-                "a tmux session named {} already exists",
-                request.name
-            )));
-        }
+        self.ensure_launch_name_available(&request.name)?;
         let directory = self
             .inner
             .config
@@ -3008,6 +3042,11 @@ impl ControlPlane {
             })?;
         let profile = profile_by_id(&self.inner.config, &request.profile_id)?;
         let mode = select_launch_mode(&profile, request.mode_id.as_deref())?;
+        let requested_memory_max_bytes = request.memory_max_bytes;
+        validate_launch_memory(
+            &self.inner.config.agent_resources,
+            requested_memory_max_bytes,
+        )?;
         let resume = self
             .revalidate_resume_candidate(
                 request.resume_session_id.as_deref(),
@@ -3029,7 +3068,11 @@ impl ControlPlane {
         let launched = local_tmux(
             tokio::task::spawn_blocking(move || {
                 let launched = (|| {
-                    let scope = systemd_scope::prepare(&resources, &name)?;
+                    let scope = systemd_scope::prepare_override(
+                        &resources,
+                        requested_memory_max_bytes,
+                        &name,
+                    )?;
                     project::remember_launch(&directory, &name, &profile)?;
                     match (resume.as_ref(), launch_lease.as_deref()) {
                         (Some(candidate), Some(lease)) => Tmux::launch_resumed(
@@ -3060,6 +3103,20 @@ impl ControlPlane {
         );
         launched?;
         self.inner.refresh_now.notify_one();
+        Ok(())
+    }
+
+    fn ensure_launch_name_available(&self, name: &str) -> Result<()> {
+        if self
+            .read_state()
+            .sessions
+            .iter()
+            .any(|session| session.name == name)
+        {
+            return Err(conflict(format!(
+                "a tmux session named {name} already exists"
+            )));
+        }
         Ok(())
     }
 
@@ -3973,6 +4030,65 @@ fn profile_by_id(config: &Config, id: &str) -> Result<AgentProfile> {
         .get(index)
         .cloned()
         .ok_or_else(|| bad_request("profile no longer exists"))
+}
+
+fn validate_launch_memory(
+    resources: &crate::config::AgentResourcesConfig,
+    requested_memory_max_bytes: Option<u64>,
+) -> Result<()> {
+    systemd_scope::resolve_memory_max(resources, requested_memory_max_bytes)
+        .map(|_| ())
+        .map_err(|error| bad_request(error.to_string()))
+}
+
+fn agent_memory_launch_options(
+    resources: &crate::config::AgentResourcesConfig,
+) -> AgentMemoryLaunchOptions {
+    let default_bytes = resources.memory_max_bytes;
+    let (override_max_bytes, override_check_failed) =
+        match systemd_scope::advertised_override_ceiling(resources) {
+            Ok(ceiling) => (ceiling, false),
+            Err(_) => (None, resources.memory_override_max_bytes.is_some()),
+        };
+    let supported = cfg!(target_os = "linux") && default_bytes.is_some();
+    let mut presets = BTreeSet::new();
+    if let Some(ceiling) = override_max_bytes {
+        for gib in [2_u64, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128] {
+            let bytes = gib.saturating_mul(systemd_scope::GIBIBYTE);
+            if bytes <= ceiling {
+                presets.insert(bytes);
+            }
+        }
+        if let Some(default) = default_bytes
+            && default <= ceiling
+        {
+            presets.insert(default);
+        }
+    }
+    let note = if !cfg!(target_os = "linux") {
+        Some(
+            "Per-agent memory limits require Linux and apply on the next launch or relaunch."
+                .to_owned(),
+        )
+    } else if override_check_failed {
+        Some("Per-launch memory overrides are unavailable because the effective host/cgroup ceiling could not be verified.".to_owned())
+    } else if default_bytes.is_none() {
+        Some("Per-agent memory limits are not enabled on this machine.".to_owned())
+    } else if override_max_bytes.is_none() {
+        Some(
+            "This machine enforces its default cap; per-launch overrides are not enabled."
+                .to_owned(),
+        )
+    } else {
+        Some("Changes apply on the next launch or relaunch; running cgroups are never mutated in place.".to_owned())
+    };
+    AgentMemoryLaunchOptions {
+        supported,
+        default_bytes,
+        override_max_bytes,
+        presets_bytes: presets.into_iter().collect(),
+        note,
+    }
 }
 
 fn opaque_resume_id(
@@ -5130,6 +5246,7 @@ mod tests {
                     modes: Vec::new(),
                 }],
                 project_preferences: BTreeMap::new(),
+                memory: None,
                 machines: Vec::new(),
             },
         );
@@ -5138,6 +5255,69 @@ mod tests {
         assert_eq!(options.machines[1].directories, ["/srv/models"]);
         assert_eq!(options.machines[1].profiles[0].harness, "claude");
         assert!(options.machines[1].note.is_none());
+    }
+
+    #[test]
+    fn launch_memory_options_are_owner_scoped_and_legacy_payloads_stay_valid() {
+        let mut config = Config::default();
+        config.agent_resources.memory_max_bytes = Some(16 * systemd_scope::GIBIBYTE);
+        config.agent_resources.memory_override_max_bytes = Some(24 * systemd_scope::GIBIBYTE);
+        let control = super::test_control_with_config(&[], config);
+        let options = control.launch_options();
+        let memory = options.memory.as_ref().unwrap();
+        assert_eq!(memory.default_bytes, Some(16 * systemd_scope::GIBIBYTE));
+        if let Some(ceiling) = memory.override_max_bytes {
+            assert!(ceiling <= 24 * systemd_scope::GIBIBYTE);
+            assert!(memory.presets_bytes.iter().all(|preset| *preset <= ceiling));
+        } else {
+            assert!(memory.presets_bytes.is_empty());
+            assert!(memory.note.as_deref().is_some_and(|note| !note.is_empty()));
+        }
+
+        let legacy: LaunchRequest = serde_json::from_value(serde_json::json!({
+            "name": "legacy",
+            "directory": "/tmp",
+            "profile_id": "profile-0"
+        }))
+        .unwrap();
+        assert_eq!(legacy.memory_max_bytes, None);
+
+        let mut legacy_options = serde_json::to_value(&options).unwrap();
+        legacy_options.as_object_mut().unwrap().remove("memory");
+        for machine in legacy_options["machines"].as_array_mut().unwrap() {
+            machine.as_object_mut().unwrap().remove("memory");
+        }
+        let decoded: LaunchOptions = serde_json::from_value(legacy_options).unwrap();
+        assert!(decoded.memory.is_none());
+        assert!(
+            decoded
+                .machines
+                .iter()
+                .all(|machine| machine.memory.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_rejects_a_spoofed_memory_override_before_tmux_or_systemd() {
+        let mut config = Config::default();
+        config.general.project_roots = vec![PathBuf::from("/tmp")];
+        config.agent_resources.memory_max_bytes = Some(16 * systemd_scope::GIBIBYTE);
+        config.agent_resources.memory_override_max_bytes = Some(24 * systemd_scope::GIBIBYTE);
+        let control = super::test_control_with_config(&[], config);
+        let error = control
+            .launch(LaunchRequest {
+                name: "malicious-memory".to_owned(),
+                directory: "/tmp".to_owned(),
+                profile_id: "profile-0".to_owned(),
+                mode_id: None,
+                machine: None,
+                resume_session_id: None,
+                memory_max_bytes: Some(25 * systemd_scope::GIBIBYTE),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error_kind(&error), ErrorKind::BadRequest);
+        assert!(error.to_string().contains("override ceiling"));
     }
 
     #[tokio::test]
@@ -5174,6 +5354,7 @@ mod tests {
                 mode_id: None,
                 machine: None,
                 resume_session_id: None,
+                memory_max_bytes: None,
             })
             .await
             .unwrap_err()
@@ -5239,6 +5420,7 @@ mod tests {
                     mode_id: None,
                     machine: Some("gpu-box".to_owned()),
                     resume_session_id: None,
+                    memory_max_bytes: None,
                 })
                 .await
                 .is_err()
@@ -5252,6 +5434,7 @@ mod tests {
                 mode_id: None,
                 machine: Some("ghost".to_owned()),
                 resume_session_id: None,
+                memory_max_bytes: None,
             })
             .await
             .unwrap_err()
@@ -5416,6 +5599,7 @@ mod tests {
                         mode_id: None,
                         machine: None,
                         resume_session_id: None,
+                        memory_max_bytes: None,
                     })
                     .await
                     .unwrap_err()
@@ -5432,6 +5616,7 @@ mod tests {
                         mode_id: None,
                         machine: None,
                         resume_session_id: None,
+                        memory_max_bytes: None,
                     })
                     .await
                     .unwrap_err()

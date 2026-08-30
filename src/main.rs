@@ -166,6 +166,11 @@ fn doctor(config_path: &std::path::Path) -> Result<()> {
         ),
         None => println!("- MemoryMax  disabled for agent scopes"),
     }
+    if let Some(ceiling) = config.agent_resources.memory_override_max_bytes {
+        println!(
+            "✓ override   whole-GiB launch caps up to {ceiling} bytes (owner revalidates each launch)"
+        );
+    }
     let folders = config.directories();
     println!("✓ folders    {} discovered", folders.len());
     let harnesses = config.harnesses();
