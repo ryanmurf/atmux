@@ -20,6 +20,13 @@ const MAX_COLLAPSED_TOOL_RUN = 24;
 const COLLAPSIBLE_COORDINATION_TOOLS = new Set([
   "followup_task", "list_agents", "send_message", "wait_agent",
 ]);
+const INTERNAL_TOOL_ALIASES = new Map([
+  ["exec_command", "exec"],
+  ["exec", "exec"],
+]);
+const ALWAYS_VISIBLE_INTERNAL_TOOLS = new Set([
+  "create_goal", "interrupt_agent", "request_user_input", "spawn_agent", "update_goal",
+]);
 const BENIGN_COORDINATION_STATUSES = new Set([
   "ok", "sent", "queued", "delivered", "acknowledged", "waiting", "idle", "running",
   "complete", "completed", "success", "succeeded", "timed out", "timeout", "no update",
@@ -1146,9 +1153,15 @@ function transcriptItemKind(item) {
 function normalizedToolName(item) {
   const raw = String(item?.tool_name || "Tool").trim() || "Tool";
   const lower = raw.toLowerCase();
-  for (const name of COLLAPSIBLE_COORDINATION_TOOLS) {
+  for (const name of [
+    ...COLLAPSIBLE_COORDINATION_TOOLS,
+    ...INTERNAL_TOOL_ALIASES.keys(),
+    ...ALWAYS_VISIBLE_INTERNAL_TOOLS,
+  ]) {
     if (lower === name || lower.endsWith(`.${name}`) || lower.endsWith(`/${name}`)
-      || lower.endsWith(`:${name}`) || lower.endsWith(`__${name}`)) return name;
+      || lower.endsWith(`:${name}`) || lower.endsWith(`__${name}`)) {
+      return INTERNAL_TOOL_ALIASES.get(name) || name;
+    }
   }
   return lower;
 }
@@ -1205,9 +1218,23 @@ function coordinationStatusJsonHasInvalidPrimitive(value, depth = 0) {
 }
 
 function collapsibleCoordinationTool(item) {
-  return transcriptItemKind(item) === "tool"
-    && COLLAPSIBLE_COORDINATION_TOOLS.has(normalizedToolName(item))
-    && ["sent", "status"].includes(coordinationResultSignal(item));
+  return internalToolGroupKey(item) === "coordination";
+}
+
+function internalToolGroupKey(item) {
+  if (transcriptItemKind(item) !== "tool") return null;
+  if (typeof item?.tool_name !== "string" || !item.tool_name.trim()) return null;
+  const name = normalizedToolName(item);
+  if (ALWAYS_VISIBLE_INTERNAL_TOOLS.has(name)) return null;
+  const signal = coordinationResultSignal(item);
+  if (["error", "approval"].includes(signal)) return null;
+  if (COLLAPSIBLE_COORDINATION_TOOLS.has(name)) {
+    return ["sent", "status"].includes(signal) ? "coordination" : null;
+  }
+  // Non-coordination tools collapse only with adjacent calls of the same
+  // normalized tool and result class. This keeps commands/results in order
+  // without merging across a different meaningful action.
+  return `repeat:${name}:${signal}`;
 }
 
 function coordinationToolCounts(messages) {
@@ -1224,11 +1251,12 @@ function compactTranscriptItems(messages, maxRun = MAX_COLLAPSED_TOOL_RUN) {
   const source = Array.isArray(messages) ? messages : [];
   const boundedMax = Math.max(2, Math.min(Number.isInteger(maxRun) ? maxRun : MAX_COLLAPSED_TOOL_RUN, MAX_COLLAPSED_TOOL_RUN));
   for (let index = 0; index < source.length;) {
-    if (!collapsibleCoordinationTool(source[index])) {
+    const groupKey = internalToolGroupKey(source[index]);
+    if (!groupKey) {
       items.push({ kind: "item", message: source[index] }); index += 1; continue;
     }
     let end = index;
-    while (end < source.length && collapsibleCoordinationTool(source[end])) end += 1;
+    while (end < source.length && internalToolGroupKey(source[end]) === groupKey) end += 1;
     let cursor = index;
     while (cursor < end) {
       const remaining = end - cursor;
@@ -1251,10 +1279,12 @@ function compactTranscriptItems(messages, maxRun = MAX_COLLAPSED_TOOL_RUN) {
   return items;
 }
 
-function coordinationGroupSummary(group) {
+function toolGroupSummary(group) {
   const calls = group?.messages?.length || 0;
-  const counts = (group?.counts || []).map(({ name, count }) => `${name} ×${count}`).join(" · ");
-  return `${calls} coordination calls · ${counts} · no errors`;
+  const counts = group?.counts || [];
+  if (counts.length === 1) return `${counts[0].name} ×${calls}`;
+  const labels = counts.map(({ name, count }) => `${name} ×${count}`).join(" · ");
+  return `${calls} internal calls · ${labels}`;
 }
 
 function dictationDelivery(paneId, prefix, finalText) {
@@ -1634,8 +1664,9 @@ if (typeof module !== "undefined" && module.exports) {
     normalizedToolName,
     coordinationResultSignal,
     collapsibleCoordinationTool,
+    internalToolGroupKey,
     compactTranscriptItems,
-    coordinationGroupSummary,
+    toolGroupSummary,
     diffLineKind,
     safeLinkUrl,
     sortSessions,
@@ -2058,14 +2089,18 @@ function initialize() {
     return details;
   }
 
-  function renderCoordinationGroup(group, expandedTools) {
+  function renderToolGroup(group, expandedTools) {
     const details = document.createElement("details");
     details.className = "tool-card tool-call-group";
     details.dataset.transcriptId = group.id;
     details.open = expandedTools.has(group.id);
     const summary = document.createElement("summary");
     summary.className = "tool-call-group-summary";
-    summary.textContent = coordinationGroupSummary(group);
+    summary.textContent = toolGroupSummary(group);
+    summary.setAttribute(
+      "aria-label",
+      `${summary.textContent}; ${group.messages.length} calls and results`,
+    );
     // Mobile browsers may scroll an expanding <details> to keep its newly
     // exposed body visible. The reader chose this visible summary, so retain
     // their exact Conversation offset while revealing the original calls.
@@ -2118,7 +2153,7 @@ function initialize() {
     );
     for (const item of transcriptItems) {
       if (item.kind === "tool-group") {
-        nodes.push(renderCoordinationGroup(item, expandedTools));
+        nodes.push(renderToolGroup(item, expandedTools));
         continue;
       }
       const message = item.message;

@@ -116,8 +116,9 @@ const {
   normalizedToolName,
   coordinationResultSignal,
   collapsibleCoordinationTool,
+  internalToolGroupKey,
   compactTranscriptItems,
-  coordinationGroupSummary,
+  toolGroupSummary,
   diffLineKind,
   utf8ByteLength,
   validateImageSelection,
@@ -273,6 +274,65 @@ test("adjacent low-signal coordination calls collapse without crossing prose or 
   assert.equal(compacted[6].message.id, "wait-single");
 });
 
+test("adjacent exec variants collapse as exec ×4 without crossing narrative or failures", () => {
+  const exec = (id, name, output) => ({
+    id, kind: "tool", role: "tool", tool_name: name,
+    tool_input: `{ "cmd": "printf ${id}" }`, tool_output: output,
+  });
+  const messages = [
+    { id: "human", role: "user", markdown: "Human plan stays visible" },
+    exec("exec-1", "functions.exec", "command one output"),
+    exec("exec-2", "exec_command", "command two output"),
+    exec("exec-3", "tools/exec", "command three output"),
+    exec("exec-4", "functions.exec_command", "command four output"),
+    { id: "agent", role: "assistant", markdown: "Agent interpretation stays visible" },
+    exec("exec-error", "exec", "Error: command exited with status 1"),
+  ];
+  const compacted = compactTranscriptItems(messages);
+  assert.deepEqual(compacted.map((item) => item.kind), ["item", "tool-group", "item", "item"]);
+  assert.deepEqual(compacted[1].messages.map((item) => item.id), ["exec-1", "exec-2", "exec-3", "exec-4"]);
+  assert.deepEqual(compacted[1].counts, [{ name: "exec", count: 4 }]);
+  assert.equal(toolGroupSummary(compacted[1]), "exec ×4");
+  assert.equal(compacted[0].message.markdown, "Human plan stays visible");
+  assert.equal(compacted[2].message.markdown, "Agent interpretation stays visible");
+  assert.equal(compacted[3].message.id, "exec-error");
+});
+
+test("general tool grouping respects tool, result-class, lifecycle, and error boundaries", () => {
+  const tool = (id, name, output) => ({
+    id, kind: "tool", role: "tool", tool_name: name, tool_output: output,
+  });
+  const messages = [
+    tool("patch-result", "apply_patch", "updated one file"),
+    tool("patch-status-1", "apply_patch", "ok"),
+    tool("patch-status-2", "apply_patch", "complete"),
+    tool("web-1", "web.run", "first useful result"),
+    tool("web-2", "web.run", "second useful result"),
+    tool("spawn-1", "spawn_agent", "queued"),
+    tool("spawn-2", "spawn_agent", "queued"),
+    tool("web-error", "web.run", "failed: upstream unavailable"),
+  ];
+  assert.deepEqual(messages.map(internalToolGroupKey), [
+    "repeat:apply_patch:meaningful",
+    "repeat:apply_patch:status",
+    "repeat:apply_patch:status",
+    "repeat:web.run:meaningful",
+    "repeat:web.run:meaningful",
+    null,
+    null,
+    null,
+  ]);
+  const compacted = compactTranscriptItems(messages);
+  assert.deepEqual(compacted.map((item) => item.kind), [
+    "item", "tool-group", "tool-group", "item", "item", "item",
+  ]);
+  assert.equal(toolGroupSummary(compacted[1]), "apply_patch ×2");
+  assert.equal(toolGroupSummary(compacted[2]), "web.run ×2");
+  assert.deepEqual(compacted.slice(3).map((item) => item.message.id), [
+    "spawn-1", "spawn-2", "web-error",
+  ]);
+});
+
 test("meaningful results, approvals, and lifecycle tools always remain visible", () => {
   const tool = (id, name, output) => ({ id, kind: "tool", role: "tool", tool_name: name, tool_output: output });
   const protectedItems = [
@@ -326,7 +386,7 @@ test("coordination groups are bounded at 24 and preserve every call in exact ord
   assert.ok(groups.every((group) => group.messages.length >= 2 && group.messages.length <= 24));
 });
 
-test("coordination summaries normalize namespaces and expose per-tool counts and status", () => {
+test("tool summaries normalize namespaces and expose per-tool counts", () => {
   const messages = [
     { id: "a", kind: "tool", tool_name: "functions.collaboration.wait_agent" },
     { id: "b", kind: "tool", tool_name: "mcp__send_message", tool_output: "sent" },
@@ -335,14 +395,15 @@ test("coordination summaries normalize namespaces and expose per-tool counts and
   const [group] = compactTranscriptItems(messages);
   assert.equal(normalizedToolName(messages[0]), "wait_agent");
   assert.equal(normalizedToolName(messages[1]), "send_message");
-  assert.equal(coordinationGroupSummary(group), "3 coordination calls · wait_agent ×2 · send_message ×1 · no errors");
+  assert.equal(toolGroupSummary(group), "3 internal calls · wait_agent ×2 · send_message ×1");
 });
 
 test("coordination compaction stays inside Conversation and uses text-only DOM rendering", () => {
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
   const renderer = source.slice(source.indexOf("function renderToolCard"), source.indexOf("function flushPendingTranscriptRender"));
   assert.match(renderer, /compactTranscriptItems\(/);
-  assert.match(renderer, /summary\.textContent = coordinationGroupSummary\(group\)/);
+  assert.match(renderer, /summary\.textContent = toolGroupSummary\(group\)/);
+  assert.match(renderer, /\$\{summary\.textContent\}; \$\{group\.messages\.length\} calls and results/);
   assert.match(renderer, /pre\.textContent = value/);
   assert.match(renderer, /state\.transcriptRequest === transcriptGeneration/);
   assert.match(renderer, /details\.isConnected/);
