@@ -297,6 +297,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: Vec::new(),
         };
         remember_launch(&project, "petclinic", &profile).unwrap();
@@ -334,6 +335,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: Vec::new(),
         };
         assert!(remember_launch(&project, "should-not-copy", &profile).is_err());

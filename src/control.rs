@@ -5795,6 +5795,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: vec![
                 ProfileMode {
                     id: "sonnet".to_owned(),
@@ -5849,6 +5850,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: vec![ProfileMode {
                 id: "pinned".to_owned(),
                 label: None,
@@ -5981,6 +5983,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: Vec::new(),
         };
         let launcher = Path::new("/owner/.local/share/claude/versions/2.1.0");
@@ -6023,6 +6026,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: vec![
                 ProfileMode {
                     id: "terra".to_owned(),
@@ -6114,6 +6118,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: Vec::new(),
         };
 

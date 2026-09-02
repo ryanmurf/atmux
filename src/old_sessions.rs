@@ -749,6 +749,7 @@ mod tests {
                 args: Vec::new(),
                 env: BTreeMap::from([(key.to_owned(), config.display().to_string())]),
                 inherit_discovered: false,
+                claude_relaunch_permissions: None,
                 modes: Vec::new(),
             }
         }

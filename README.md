@@ -183,7 +183,10 @@ Tron's live `/home/ryan/resume-tron.sh` must replace its raw `send()` function
 with `deploy/systemd/resume-tron-scoped-exec-block.bash` before Quick Resume is
 available; atmux rejects the old script shape. Max's checked-in boot recovery
 already uses the bridge for every roster entry. There is no unbounded recovery
-fallback.
+fallback. `scoped-exec` deliberately preserves opaque launcher argv instead of
+guessing what a credential wrapper does internally; the pinned Claude recovery
+commands remain responsible for supplying their already-configured permission
+policy exactly once.
 
 Boot/Quick Resume roster scripts use the current configured default. They do
 not retain a prior per-pane override across a host reboot because tmux metadata
@@ -233,6 +236,18 @@ explicit resume, auto-compact, and maintenance relaunch uses the same
 owner-local per-pane OS lock plus a durable tmux mutation sequence, so briefly
 overlapping old/new web processes cannot race. Working, approval, unknown,
 wrapper, Grok, and unmapped panes fail closed.
+
+Every native Claude command that atmux reconstructs for a saved-conversation
+launch, explicit in-place resume, or CLI-maintenance relaunch includes Claude's
+`--dangerously-skip-permissions` global option. For the default
+`atmux_injects` profile policy, atmux keeps one configured active copy or
+inserts one immediately before the native resume selector; a same-looking value
+after `--` remains literal data. Discovery does not inspect opaque executable
+wrappers, so they retain the safe `atmux_injects` default. A manually configured
+wrapper that provides the option and owns any `--` forwarding boundary must set
+`claude_relaunch_permissions = "launcher_provides"`; a forwarding wrapper that
+wants atmux to provide it may explicitly select `"atmux_injects"`. Fresh
+Claude launches and every non-Claude harness keep their existing argv.
 
 A persisted pending plan repairs partial marker writes after a crash. A Ready
 marker remains deferred through transient working, approval, and unrecognized
@@ -687,6 +702,8 @@ name = "Work account"
 harness = "claude"
 command = "claude-hd"
 args = []
+# This opaque wrapper already adds Claude's permission flag itself.
+claude_relaunch_permissions = "launcher_provides"
 
 [status]
 working_markers = []

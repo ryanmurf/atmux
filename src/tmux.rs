@@ -19,7 +19,9 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    config::{AgentProfile, AgentResourcesConfig, ProfileMode, StatusConfig},
+    config::{
+        AgentProfile, AgentResourcesConfig, ClaudeRelaunchPermissions, ProfileMode, StatusConfig,
+    },
     old_sessions::{self, ResumeCandidate},
     status::{self, AgentKind, AgentStatus},
     systemd_scope::{self, PreparedScope},
@@ -44,6 +46,7 @@ impl Drop for SocketOverrideRestore {
 
 const MODEL_MENU_TIMEOUT: Duration = Duration::from_secs(4);
 const MODEL_MENU_POLL: Duration = Duration::from_millis(25);
+const CLAUDE_SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
 /// Give interactive TUIs one input turn to finish decoding bracketed paste
 /// before Enter arrives. Without this boundary Claude and Codex can consume
 /// both terminal writes in one read and leave the pasted text unsubmitted.
@@ -698,39 +701,46 @@ impl Tmux {
         mode: Option<&ProfileMode>,
         resume: Option<&ResumeCandidate>,
     ) -> Result<Vec<String>> {
-        let mut invocation = vec!["env".to_owned()];
-        invocation.extend(
-            profile
-                .env
-                .iter()
-                .map(|(key, value)| format!("{key}={value}")),
-        );
-        invocation.push(profile.command.clone());
-        invocation.extend(profile.args.clone());
+        Self::build_invocation(profile, mode, resume, resume.is_some())
+    }
+
+    fn build_invocation(
+        profile: &AgentProfile,
+        mode: Option<&ProfileMode>,
+        resume: Option<&ResumeCandidate>,
+        reconstructing: bool,
+    ) -> Result<Vec<String>> {
+        let mut arguments = profile.args.clone();
+        let claude_relaunch_permissions = (reconstructing
+            && profile.harness.eq_ignore_ascii_case("claude"))
+        .then(|| profile.effective_claude_relaunch_permissions());
+        let atmux_manages_claude_permissions =
+            claude_relaunch_permissions == Some(ClaudeRelaunchPermissions::AtmuxInjects);
         if let Some(mode) = mode {
             if !valid_model_id(&mode.model) {
                 bail!("profile mode has an invalid model id");
             }
-            match profile.harness.to_ascii_lowercase().as_str() {
+            let mode_arguments = match profile.harness.to_ascii_lowercase().as_str() {
                 "claude" => {
                     if mode.service_tier.is_some() {
                         bail!("Claude profile modes cannot set a service tier");
                     }
-                    invocation.extend(["--model".to_owned(), mode.model.clone()]);
+                    let mut mode_arguments = vec!["--model".to_owned(), mode.model.clone()];
                     if let Some(effort) = &mode.effort {
                         if !valid_claude_effort(effort) {
                             bail!("Claude profile mode has unsupported effort");
                         }
-                        invocation.extend(["--effort".to_owned(), effort.clone()]);
+                        mode_arguments.extend(["--effort".to_owned(), effort.clone()]);
                     }
+                    mode_arguments
                 }
                 "codex" => {
-                    invocation.extend(["--model".to_owned(), mode.model.clone()]);
+                    let mut mode_arguments = vec!["--model".to_owned(), mode.model.clone()];
                     if let Some(effort) = &mode.effort {
                         if !valid_codex_effort(effort) {
                             bail!("profile mode has unsupported Codex effort");
                         }
-                        invocation.extend([
+                        mode_arguments.extend([
                             "-c".to_owned(),
                             format!("model_reasoning_effort=\"{effort}\""),
                         ]);
@@ -739,10 +749,21 @@ impl Tmux {
                         if tier != "fast" {
                             bail!("profile mode has unsupported Codex service tier");
                         }
-                        invocation.extend(["-c".to_owned(), format!("service_tier=\"{tier}\"")]);
+                        mode_arguments
+                            .extend(["-c".to_owned(), format!("service_tier=\"{tier}\"")]);
                     }
+                    mode_arguments
                 }
                 _ => bail!("profile harness does not support configured modes"),
+            };
+            if atmux_manages_claude_permissions {
+                insert_before_option_terminator(&mut arguments, mode_arguments);
+            } else {
+                // Preserve the established fresh-launch argv byte-for-byte.
+                // Only atmux-managed Claude reconstruction moves generated
+                // options ahead of its native option terminator. Opaque
+                // launchers and non-Claude harnesses retain legacy ordering.
+                arguments.extend(mode_arguments);
             }
         }
         if let Some(resume) = resume {
@@ -751,18 +772,38 @@ impl Tmux {
                 bail!("saved conversation does not match the selected profile harness");
             }
             let has_selector = match harness.as_str() {
-                "claude" => profile
-                    .args
-                    .iter()
-                    .any(|arg| matches!(arg.as_str(), "--resume" | "-r" | "--continue" | "-c")),
-                "codex" => profile.args.iter().any(|arg| arg == "resume"),
+                "claude"
+                    if claude_relaunch_permissions
+                        == Some(ClaudeRelaunchPermissions::AtmuxInjects) =>
+                {
+                    active_arguments(&arguments)
+                        .iter()
+                        .any(|arg| is_claude_resume_selector(arg))
+                }
+                "claude" => arguments.iter().any(|arg| is_claude_resume_selector(arg)),
+                "codex" => arguments.iter().any(|arg| arg == "resume"),
                 _ => true,
             };
             if has_selector {
                 bail!("selected profile already defines a resume selector");
             }
-            invocation.extend(old_sessions::resume_arguments(resume)?);
+            let resume_arguments = old_sessions::resume_arguments(resume)?;
+            if atmux_manages_claude_permissions {
+                insert_before_option_terminator(&mut arguments, resume_arguments);
+                normalize_claude_relaunch_arguments(&mut arguments);
+            } else {
+                arguments.extend(resume_arguments);
+            }
         }
+        let mut invocation = vec!["env".to_owned()];
+        invocation.extend(
+            profile
+                .env
+                .iter()
+                .map(|(key, value)| format!("{key}={value}")),
+        );
+        invocation.push(profile.command.clone());
+        invocation.extend(arguments);
         Ok(invocation)
     }
 
@@ -846,10 +887,9 @@ impl Tmux {
             bail!("pane profile no longer selects its exact native session store");
         }
         let has_selector = match harness {
-            crate::auto_update::Harness::Claude => profile
-                .args
+            crate::auto_update::Harness::Claude => active_arguments(&profile.args)
                 .iter()
-                .any(|arg| matches!(arg.as_str(), "--resume" | "-r" | "--continue" | "-c")),
+                .any(|arg| is_claude_resume_selector(arg)),
             crate::auto_update::Harness::Codex => profile.args.iter().any(|arg| arg == "resume"),
         };
         if has_selector {
@@ -857,8 +897,8 @@ impl Tmux {
         }
         let mut exact_profile = profile.clone();
         exact_profile.command = launcher.to_string_lossy().into_owned();
-        let mut invocation = Self::build_launch_invocation(&exact_profile, Some(mode), None)?;
-        invocation.extend(resume_args);
+        let invocation =
+            build_native_relaunch_invocation(&exact_profile, mode, harness, resume_args)?;
         let invocation = scope.wrap(invocation)?;
         let command = shell_words::join(invocation);
         let directory = directory
@@ -1446,6 +1486,101 @@ pub(crate) fn valid_claude_effort(effort: &str) -> bool {
     matches!(effort, "low" | "medium" | "high" | "xhigh" | "max")
 }
 
+fn active_arguments(arguments: &[String]) -> &[String] {
+    &arguments[..arguments
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(arguments.len())]
+}
+
+fn insert_before_option_terminator(
+    arguments: &mut Vec<String>,
+    inserted: impl IntoIterator<Item = String>,
+) {
+    let index = arguments
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(arguments.len());
+    arguments.splice(index..index, inserted);
+}
+
+fn is_claude_resume_selector(argument: &str) -> bool {
+    matches!(argument, "--resume" | "-r" | "--continue" | "-c") || argument.starts_with("--resume=")
+}
+
+/// Applies the permission policy only to an argv which atmux has already
+/// classified as a reconstructed Claude conversation. The first configured
+/// active copy keeps its position and later active duplicates are removed; an
+/// absent copy is inserted immediately ahead of the native resume selector. A
+/// same-looking value after `--` remains literal data.
+fn normalize_claude_relaunch_arguments(arguments: &mut Vec<String>) {
+    if !active_arguments(arguments)
+        .iter()
+        .any(|argument| is_claude_resume_selector(argument))
+    {
+        return;
+    }
+    let first_flag = active_arguments(arguments)
+        .iter()
+        .position(|argument| argument == CLAUDE_SKIP_PERMISSIONS_FLAG);
+    if let Some(first_flag) = first_flag {
+        let mut index = first_flag + 1;
+        while index < arguments.len() && arguments[index] != "--" {
+            if arguments[index] == CLAUDE_SKIP_PERMISSIONS_FLAG {
+                arguments.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    } else {
+        let selector = active_arguments(arguments)
+            .iter()
+            .position(|argument| is_claude_resume_selector(argument))
+            .expect("the validated Claude resume selector disappeared");
+        arguments.insert(selector, CLAUDE_SKIP_PERMISSIONS_FLAG.to_owned());
+    }
+}
+
+fn append_native_resume_arguments(
+    invocation: &mut Vec<String>,
+    argument_start: usize,
+    is_claude: bool,
+    resume_arguments: Vec<String>,
+) {
+    if !is_claude {
+        invocation.extend(resume_arguments);
+        return;
+    }
+    let mut arguments = invocation.split_off(argument_start);
+    insert_before_option_terminator(&mut arguments, resume_arguments);
+    normalize_claude_relaunch_arguments(&mut arguments);
+    invocation.extend(arguments);
+}
+
+fn build_native_relaunch_invocation(
+    exact_profile: &AgentProfile,
+    mode: &ProfileMode,
+    harness: crate::auto_update::Harness,
+    resume_arguments: Vec<String>,
+) -> Result<Vec<String>> {
+    let mut exact_profile = exact_profile.clone();
+    if harness == crate::auto_update::Harness::Claude {
+        // Maintenance always replaces a pane with the validated native
+        // executable, even when the original saved-launch profile delegated
+        // permission handling to an opaque wrapper.
+        exact_profile.claude_relaunch_permissions = Some(ClaudeRelaunchPermissions::AtmuxInjects);
+    }
+    let mut invocation = Tmux::build_invocation(&exact_profile, Some(mode), None, true)?;
+    let argument_start = 2 + exact_profile.env.len();
+    append_native_resume_arguments(
+        &mut invocation,
+        argument_start,
+        harness == crate::auto_update::Harness::Claude,
+        resume_arguments,
+    );
+    Ok(invocation)
+}
+
 fn claude_resume_invocation(
     claude_program: &Path,
     config_dir: &Path,
@@ -1476,6 +1611,7 @@ fn claude_resume_invocation(
         "env".to_owned(),
         format!("CLAUDE_CONFIG_DIR={config_dir}"),
         claude_program.to_owned(),
+        CLAUDE_SKIP_PERMISSIONS_FLAG.to_owned(),
         "--resume".to_owned(),
         session_id.to_owned(),
     ])
@@ -2718,6 +2854,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: Vec::new(),
         };
 
@@ -2777,6 +2914,7 @@ mod tests {
             args: vec!["-lc".to_owned(), "exit 7".to_owned()],
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: Vec::new(),
         };
         let error = Tmux::with_socket_for_test(&probe.socket, || {
@@ -2831,6 +2969,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: Vec::new(),
         };
         let resources = AgentResourcesConfig {
@@ -2998,6 +3137,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: Vec::new(),
         };
         let candidate = ResumeCandidate::fixture(
@@ -3034,6 +3174,95 @@ mod tests {
             assert_eq!(resumed.resume_lease.as_deref(), Some(lease.as_str()));
             assert!(Tmux::resume_lease_active(&lease)?);
             Tmux.kill("lease-fixture")?;
+            assert!(!Tmux::resume_lease_active(&lease)?);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn disposable_launcher_managed_claude_launch_receives_one_native_flag() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket = format!("atmux-test-claude-resume-{}-{nonce}", std::process::id());
+        let socket_base = env::var_os("TMUX_TMPDIR").map_or_else(env::temp_dir, PathBuf::from);
+        let probe = DisposableTmux {
+            socket_path: socket_base
+                .join(format!("tmux-{}", rustix::process::geteuid().as_raw()))
+                .join(&socket),
+            socket,
+            directory: env::temp_dir().join(format!(
+                "atmux-test-claude-resume-agent-{}-{nonce}",
+                std::process::id()
+            )),
+        };
+        fs::create_dir(&probe.directory).unwrap();
+        let command = probe.directory.join("claude-wrapper");
+        let argv_file = probe.directory.join("argv");
+        let interpolation_marker = probe.directory.join("interpolated");
+        fs::write(
+            &command,
+            concat!(
+                "#!/bin/sh\n",
+                "while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n",
+                "[ \"$#\" -eq 0 ] || shift\n",
+                "tmp_file=\"${ATMUX_TEST_ARGV}.tmp.$$\"\n",
+                "printf '%s\\n' --dangerously-skip-permissions \"$@\" >\"$tmp_file\"\n",
+                "/bin/mv \"$tmp_file\" \"$ATMUX_TEST_ARGV\"\n",
+                "sleep 30\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o700)).unwrap();
+        let literal = format!("$(touch {})", interpolation_marker.display());
+        let profile = AgentProfile {
+            name: "Claude canary".to_owned(),
+            harness: "claude".to_owned(),
+            command: command.to_string_lossy().into_owned(),
+            args: vec![literal.clone(), "--".to_owned()],
+            env: BTreeMap::from([(
+                "ATMUX_TEST_ARGV".to_owned(),
+                argv_file.to_string_lossy().into_owned(),
+            )]),
+            inherit_discovered: false,
+            claude_relaunch_permissions: Some(ClaudeRelaunchPermissions::LauncherProvides),
+            modes: Vec::new(),
+        };
+        let session_id = "55555555-5555-4555-8555-555555555555";
+        let candidate =
+            ResumeCandidate::fixture(crate::old_sessions::ResumeHarness::Claude, session_id);
+        let lease = format!("lease-v1-{}", "d".repeat(64));
+
+        Tmux::with_socket_for_test(&probe.socket, || {
+            Tmux::check()?;
+            Tmux::launch_resumed(
+                "claude-resume-canary",
+                &probe.directory,
+                &profile,
+                None,
+                &candidate,
+                &lease,
+                systemd_scope::prepare(&AgentResourcesConfig::default(), "claude-resume-canary")?,
+            )?;
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !argv_file.exists() {
+                if Instant::now() >= deadline {
+                    bail!("disposable Claude wrapper did not record argv");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let argv = fs::read_to_string(&argv_file)?;
+            assert_eq!(
+                argv.lines().collect::<Vec<_>>(),
+                [CLAUDE_SKIP_PERMISSIONS_FLAG, "--resume", session_id,]
+            );
+            assert!(
+                !interpolation_marker.exists(),
+                "shell interpolation escaped argv quoting"
+            );
+            Tmux.kill("claude-resume-canary")?;
             assert!(!Tmux::resume_lease_active(&lease)?);
             Ok(())
         })
@@ -3111,6 +3340,7 @@ mod tests {
             args: vec!["--profile".to_owned(), "work".to_owned()],
             env: BTreeMap::from([("CODEX_HOME".to_owned(), "/owner/.codex-work".to_owned())]),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: Vec::new(),
         };
         let mode = ProfileMode {
@@ -3120,14 +3350,18 @@ mod tests {
             effort: Some("xhigh".to_owned()),
             service_tier: Some("fast".to_owned()),
         };
-        let mut invocation = Tmux::build_launch_invocation(&profile, Some(&mode), None).unwrap();
-        invocation.extend(
-            crate::auto_update::resume_arguments(
-                crate::auto_update::Harness::Codex,
-                "11111111-1111-1111-1111-111111111111",
-            )
-            .unwrap(),
-        );
+        let resume_arguments = crate::auto_update::resume_arguments(
+            crate::auto_update::Harness::Codex,
+            "11111111-1111-1111-1111-111111111111",
+        )
+        .unwrap();
+        let invocation = build_native_relaunch_invocation(
+            &profile,
+            &mode,
+            crate::auto_update::Harness::Codex,
+            resume_arguments,
+        )
+        .unwrap();
         assert_eq!(
             invocation,
             [
@@ -3160,6 +3394,7 @@ mod tests {
                 "/Users/ryan/.claude-max".to_owned(),
             )]),
             inherit_discovered: false,
+            claude_relaunch_permissions: Some(ClaudeRelaunchPermissions::LauncherProvides),
             modes: Vec::new(),
         };
         let mode = ProfileMode {
@@ -3171,15 +3406,18 @@ mod tests {
         };
         let mut exact_profile = profile;
         exact_profile.command = "/Users/ryan/.local/share/claude/versions/2.2.0".to_owned();
-        let mut invocation =
-            Tmux::build_launch_invocation(&exact_profile, Some(&mode), None).unwrap();
-        invocation.extend(
-            crate::auto_update::resume_arguments(
-                crate::auto_update::Harness::Claude,
-                "22222222-2222-2222-2222-222222222222",
-            )
-            .unwrap(),
-        );
+        let resume_arguments = crate::auto_update::resume_arguments(
+            crate::auto_update::Harness::Claude,
+            "22222222-2222-2222-2222-222222222222",
+        )
+        .unwrap();
+        let invocation = build_native_relaunch_invocation(
+            &exact_profile,
+            &mode,
+            crate::auto_update::Harness::Claude,
+            resume_arguments,
+        )
+        .unwrap();
         let command = shell_words::join(invocation);
         assert_eq!(
             respawn_pane_args("%9", "/Users/ryan/IdeaProjects/atmux", &command),
@@ -3196,9 +3434,231 @@ mod tests {
         assert!(command.contains("CLAUDE_CONFIG_DIR=/Users/ryan/.claude-max"));
         assert!(command.contains("/Users/ryan/.local/share/claude/versions/2.2.0"));
         assert!(command.contains("--model opus --effort high"));
-        assert!(command.ends_with("--resume 22222222-2222-2222-2222-222222222222"));
+        assert!(command.ends_with(
+            "--dangerously-skip-permissions --resume 22222222-2222-2222-2222-222222222222"
+        ));
         assert!(!command.contains("/Users/ryan/.claude "));
         assert!(!command.contains("claude-max-wrapper"));
+    }
+
+    #[test]
+    fn saved_claude_relaunch_normalizes_permission_flag_before_resume_and_double_dash() {
+        let session_id = "33333333-3333-3333-3333-333333333333";
+        let profile = AgentProfile {
+            name: "Wrapped max".to_owned(),
+            harness: "ClAuDe".to_owned(),
+            command: "/owner/bin/claude-max-wrapper".to_owned(),
+            args: vec![
+                "--settings".to_owned(),
+                "literal $(touch /tmp/never) ' quote".to_owned(),
+                CLAUDE_SKIP_PERMISSIONS_FLAG.to_owned(),
+                CLAUDE_SKIP_PERMISSIONS_FLAG.to_owned(),
+                "--".to_owned(),
+                CLAUDE_SKIP_PERMISSIONS_FLAG.to_owned(),
+                "--resume".to_owned(),
+                "literal-after-terminator".to_owned(),
+            ],
+            env: BTreeMap::from([(
+                "CLAUDE_CONFIG_DIR".to_owned(),
+                "/owner/.claude max".to_owned(),
+            )]),
+            inherit_discovered: false,
+            claude_relaunch_permissions: Some(ClaudeRelaunchPermissions::AtmuxInjects),
+            modes: Vec::new(),
+        };
+        let mode = ProfileMode {
+            id: "opus-high".to_owned(),
+            label: None,
+            model: "opus".to_owned(),
+            effort: Some("high".to_owned()),
+            service_tier: None,
+        };
+        let candidate =
+            ResumeCandidate::fixture(crate::old_sessions::ResumeHarness::Claude, session_id);
+
+        let invocation =
+            Tmux::build_launch_invocation(&profile, Some(&mode), Some(&candidate)).unwrap();
+
+        assert_eq!(
+            invocation,
+            [
+                "env",
+                "CLAUDE_CONFIG_DIR=/owner/.claude max",
+                "/owner/bin/claude-max-wrapper",
+                "--settings",
+                "literal $(touch /tmp/never) ' quote",
+                CLAUDE_SKIP_PERMISSIONS_FLAG,
+                "--model",
+                "opus",
+                "--effort",
+                "high",
+                "--resume",
+                session_id,
+                "--",
+                CLAUDE_SKIP_PERMISSIONS_FLAG,
+                "--resume",
+                "literal-after-terminator",
+            ]
+        );
+        assert_eq!(
+            active_arguments(&invocation[3..])
+                .iter()
+                .filter(|argument| argument.as_str() == CLAUDE_SKIP_PERMISSIONS_FLAG)
+                .count(),
+            1
+        );
+        assert_eq!(
+            shell_words::split(&shell_words::join(invocation.clone())).unwrap(),
+            invocation
+        );
+    }
+
+    #[test]
+    fn launcher_provided_policy_preserves_opaque_order_and_adds_no_outer_flag() {
+        let session_id = "66666666-6666-4666-8666-666666666666";
+        let profile = AgentProfile {
+            name: "Opaque wrapper".to_owned(),
+            harness: "claude".to_owned(),
+            command: "/owner/bin/claude-opaque".to_owned(),
+            args: vec![
+                "--wrapper-setting".to_owned(),
+                "value".to_owned(),
+                "--".to_owned(),
+                "forwarded-literal".to_owned(),
+            ],
+            env: BTreeMap::new(),
+            inherit_discovered: false,
+            claude_relaunch_permissions: Some(ClaudeRelaunchPermissions::LauncherProvides),
+            modes: Vec::new(),
+        };
+        let mode = ProfileMode {
+            id: "opus-high".to_owned(),
+            label: None,
+            model: "opus".to_owned(),
+            effort: Some("high".to_owned()),
+            service_tier: None,
+        };
+        let candidate =
+            ResumeCandidate::fixture(crate::old_sessions::ResumeHarness::Claude, session_id);
+
+        let invocation =
+            Tmux::build_launch_invocation(&profile, Some(&mode), Some(&candidate)).unwrap();
+
+        assert_eq!(
+            invocation,
+            [
+                "env",
+                "/owner/bin/claude-opaque",
+                "--wrapper-setting",
+                "value",
+                "--",
+                "forwarded-literal",
+                "--model",
+                "opus",
+                "--effort",
+                "high",
+                "--resume",
+                session_id,
+            ]
+        );
+        assert!(
+            !invocation
+                .iter()
+                .any(|argument| argument == CLAUDE_SKIP_PERMISSIONS_FLAG)
+        );
+
+        let mut ambiguous = profile;
+        ambiguous.args.push("--continue".to_owned());
+        assert!(
+            Tmux::build_launch_invocation(&ambiguous, None, Some(&candidate)).is_err(),
+            "a forwarded launcher resume selector must fail before adding another"
+        );
+    }
+
+    #[test]
+    fn fresh_claude_and_saved_codex_do_not_inherit_claude_relaunch_policy() {
+        let fresh_claude = AgentProfile {
+            name: "Fresh Claude".to_owned(),
+            harness: "claude".to_owned(),
+            command: "claude".to_owned(),
+            args: vec![
+                "--settings".to_owned(),
+                "fresh.json".to_owned(),
+                "--".to_owned(),
+                "literal".to_owned(),
+            ],
+            env: BTreeMap::new(),
+            inherit_discovered: false,
+            claude_relaunch_permissions: None,
+            modes: Vec::new(),
+        };
+        let mode = ProfileMode {
+            id: "opus-high".to_owned(),
+            label: None,
+            model: "opus".to_owned(),
+            effort: Some("high".to_owned()),
+            service_tier: None,
+        };
+        let fresh = Tmux::build_launch_invocation(&fresh_claude, Some(&mode), None).unwrap();
+        assert!(
+            !fresh
+                .iter()
+                .any(|argument| argument == CLAUDE_SKIP_PERMISSIONS_FLAG)
+        );
+        assert_eq!(
+            fresh,
+            [
+                "env",
+                "claude",
+                "--settings",
+                "fresh.json",
+                "--",
+                "literal",
+                "--model",
+                "opus",
+                "--effort",
+                "high",
+            ]
+        );
+
+        let codex = AgentProfile {
+            name: "Codex".to_owned(),
+            harness: "codex".to_owned(),
+            command: "codex".to_owned(),
+            args: vec![
+                "--profile".to_owned(),
+                "work".to_owned(),
+                "--".to_owned(),
+                "--resume".to_owned(),
+            ],
+            env: BTreeMap::new(),
+            inherit_discovered: false,
+            claude_relaunch_permissions: None,
+            modes: Vec::new(),
+        };
+        let candidate = ResumeCandidate::fixture(
+            crate::old_sessions::ResumeHarness::Codex,
+            "44444444-4444-4444-4444-444444444444",
+        );
+        let resumed = Tmux::build_launch_invocation(&codex, None, Some(&candidate)).unwrap();
+        assert!(
+            !resumed
+                .iter()
+                .any(|argument| argument == CLAUDE_SKIP_PERMISSIONS_FLAG)
+        );
+        assert_eq!(
+            resumed,
+            [
+                "env",
+                "codex",
+                "--profile",
+                "work",
+                "--",
+                "--resume",
+                "resume",
+                "44444444-4444-4444-4444-444444444444",
+            ]
+        );
     }
 
     #[test]
@@ -3300,6 +3760,7 @@ mod tests {
                 "env",
                 "CLAUDE_CONFIG_DIR=/tmp/.claude max",
                 "/tmp/Claude Code/claude",
+                CLAUDE_SKIP_PERMISSIONS_FLAG,
                 "--resume",
                 session_id,
             ]

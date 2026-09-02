@@ -410,10 +410,31 @@ pub struct AgentProfile {
     /// existing local wrapper/alias while this config supplies its modes.
     #[serde(default)]
     pub inherit_discovered: bool,
+    /// Declares which typed boundary supplies Claude's permission flag when
+    /// atmux reconstructs a saved conversation. `None` keeps old configs
+    /// compatible by keeping atmux-managed injection. An opaque wrapper that
+    /// supplies the option itself must opt into launcher ownership explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_relaunch_permissions: Option<ClaudeRelaunchPermissions>,
     /// Explicit model/effort/tier combinations available to this profile.
     /// An empty list deliberately exposes no selectable mode for a profile.
     #[serde(default)]
     pub modes: Vec<ProfileMode>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeRelaunchPermissions {
+    AtmuxInjects,
+    LauncherProvides,
+}
+
+impl AgentProfile {
+    #[must_use]
+    pub(crate) fn effective_claude_relaunch_permissions(&self) -> ClaudeRelaunchPermissions {
+        self.claude_relaunch_permissions
+            .unwrap_or(ClaudeRelaunchPermissions::AtmuxInjects)
+    }
 }
 
 /// One explicit, profile-scoped agent mode.
@@ -683,6 +704,12 @@ impl Config {
                 bail!("profile name {:?} must be readable text", profile.name);
             }
             let harness = profile.harness.to_ascii_lowercase();
+            if profile.claude_relaunch_permissions.is_some() && harness != "claude" {
+                bail!(
+                    "profile {} sets claude_relaunch_permissions but is not a Claude profile",
+                    profile.name
+                );
+            }
             if !profile.modes.is_empty() && !matches!(harness.as_str(), "claude" | "codex") {
                 bail!(
                     "profile {} uses modes but has unsupported harness {:?}",
@@ -905,6 +932,7 @@ impl Config {
             "Default",
             codex.clone(),
             Vec::new(),
+            None,
         );
         add_discovered_profile(
             &mut self.profiles,
@@ -913,6 +941,7 @@ impl Config {
             "Default",
             claude.clone(),
             Vec::new(),
+            None,
         );
 
         if let Some(home) = home {
@@ -932,6 +961,7 @@ impl Config {
                         name,
                         codex.clone(),
                         vec!["--profile".to_owned(), name.to_owned()],
+                        None,
                     );
                 }
             }
@@ -1065,6 +1095,7 @@ fn add_discovered_profile(
     name: &str,
     command: Option<PathBuf>,
     args: Vec<String>,
+    claude_relaunch_permissions: Option<ClaudeRelaunchPermissions>,
 ) {
     let Some(command) = command else {
         return;
@@ -1076,6 +1107,7 @@ fn add_discovered_profile(
         args,
         env: BTreeMap::new(),
         inherit_discovered: false,
+        claude_relaunch_permissions,
         modes: Vec::new(),
     };
     merge_or_add_discovered_profile(profiles, seen, discovered);
@@ -1104,6 +1136,9 @@ fn merge_or_add_discovered_profile(
         configured.args = discovered.args;
         configured.env = discovered.env;
         configured.env.extend(configured_env);
+        if configured.claude_relaunch_permissions.is_none() {
+            configured.claude_relaunch_permissions = discovered.claude_relaunch_permissions;
+        }
         return;
     }
     if seen.insert(key) {
@@ -1115,6 +1150,10 @@ fn merge_or_add_discovered_profile(
 ///
 /// Wrapper files take precedence over shell aliases of the same name because
 /// they can be run directly without evaluating a user's shell configuration.
+/// Discovery cannot inspect an opaque executable's internal permission or `--`
+/// forwarding policy. It therefore keeps the backward-compatible
+/// `atmux_injects` default; a configured profile must explicitly declare
+/// `launcher_provides` when its wrapper supplies the option itself.
 fn discover_executable_profiles(
     home: &Path,
     harness: &str,
@@ -1148,7 +1187,7 @@ fn discover_executable_profiles(
             {
                 continue;
             }
-            add_discovered_profile(profiles, seen, harness, name, Some(path), Vec::new());
+            add_discovered_profile(profiles, seen, harness, name, Some(path), Vec::new(), None);
         }
     }
 }
@@ -1261,6 +1300,7 @@ fn profile_from_shell_alias(
         args,
         env,
         inherit_discovered: false,
+        claude_relaunch_permissions: None,
         modes: Vec::new(),
     })
 }
@@ -1755,6 +1795,12 @@ mod tests {
         assert_eq!(config.general.refresh_ms, 750);
         assert_eq!(config.agent_resources.memory_max_bytes, None);
         assert_eq!(config.agent_resources.memory_override_max_bytes, None);
+        let claude = config.profiles_for("claude").remove(0);
+        assert_eq!(claude.claude_relaunch_permissions, None);
+        assert_eq!(
+            claude.effective_claude_relaunch_permissions(),
+            ClaudeRelaunchPermissions::AtmuxInjects
+        );
     }
 
     #[test]
@@ -1852,6 +1898,10 @@ memory_override_max_bytes = 25769803776
         assert_eq!(profile.harness, "claude");
         assert_eq!(profile.command, "/opt/homebrew/bin/claude");
         assert_eq!(profile.args, vec!["--model", "fast"]);
+        assert_eq!(
+            profile.effective_claude_relaunch_permissions(),
+            ClaudeRelaunchPermissions::AtmuxInjects
+        );
         assert_eq!(profile.env.get("PROVIDER"), Some(&"local".to_owned()));
         assert_eq!(profile.env.get("TOKEN"), Some(&"value".to_owned()));
     }
@@ -1878,6 +1928,7 @@ memory_override_max_bytes = 25769803776
             args: vec!["--profile".to_owned(), "work".to_owned()],
             env: BTreeMap::from([("CODEX_HOME".to_owned(), "/tmp/codex".to_owned())]),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: Vec::new(),
         };
         let mut custom = AgentProfile {
@@ -1887,6 +1938,7 @@ memory_override_max_bytes = 25769803776
             args: Vec::new(),
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: Vec::new(),
         };
         let discovered = Path::new("/home/ryan/.local/bin/codex");
@@ -1914,6 +1966,7 @@ memory_override_max_bytes = 25769803776
                 ("LOCAL_MARKER".to_owned(), "configured".to_owned()),
             ]),
             inherit_discovered: true,
+            claude_relaunch_permissions: None,
             modes: Vec::new(),
         }];
         let discovered = AgentProfile {
@@ -1929,8 +1982,22 @@ memory_override_max_bytes = 25769803776
                 ("DISCOVERED_MARKER".to_owned(), "present".to_owned()),
             ]),
             inherit_discovered: false,
+            claude_relaunch_permissions: Some(ClaudeRelaunchPermissions::LauncherProvides),
             modes: Vec::new(),
         };
+
+        let mut explicitly_managed = profiles.clone();
+        explicitly_managed[0].claude_relaunch_permissions =
+            Some(ClaudeRelaunchPermissions::AtmuxInjects);
+        merge_or_add_discovered_profile(
+            &mut explicitly_managed,
+            &mut BTreeSet::new(),
+            discovered.clone(),
+        );
+        assert_eq!(
+            explicitly_managed[0].claude_relaunch_permissions,
+            Some(ClaudeRelaunchPermissions::AtmuxInjects)
+        );
 
         merge_or_add_discovered_profile(&mut profiles, &mut BTreeSet::new(), discovered);
 
@@ -1940,6 +2007,10 @@ memory_override_max_bytes = 25769803776
         assert_eq!(merged.env["CLAUDE_CONFIG_DIR"], configured_store);
         assert_eq!(merged.env["LOCAL_MARKER"], "configured");
         assert_eq!(merged.env["DISCOVERED_MARKER"], "present");
+        assert_eq!(
+            merged.claude_relaunch_permissions,
+            Some(ClaudeRelaunchPermissions::LauncherProvides)
+        );
     }
 
     #[test]
@@ -1951,6 +2022,7 @@ memory_override_max_bytes = 25769803776
             args: Vec::new(),
             env: BTreeMap::from([("CODEX_HOME".to_owned(), "/srv/codex-work".to_owned())]),
             inherit_discovered: true,
+            claude_relaunch_permissions: None,
             modes: Vec::new(),
         }];
         let discovered = AgentProfile {
@@ -1960,12 +2032,67 @@ memory_override_max_bytes = 25769803776
             args: Vec::new(),
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: Vec::new(),
         };
 
         merge_or_add_discovered_profile(&mut profiles, &mut BTreeSet::new(), discovered);
 
         assert_eq!(profiles[0].env["CODEX_HOME"], "/srv/codex-work");
+    }
+
+    #[test]
+    fn executable_claude_wrapper_discovery_does_not_guess_launcher_permissions() {
+        let fixture = ResumeHome::new("wrapper policy");
+        let bin = fixture.owner_dir(".local/bin");
+        let wrapper = bin.join("claude-policy-canary");
+        fs::write(&wrapper, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut profiles = Vec::new();
+        let mut seen = BTreeSet::new();
+
+        discover_executable_profiles(&fixture.home, "claude", &mut profiles, &mut seen);
+
+        let profile = profiles
+            .iter()
+            .find(|profile| profile.name == "policy-canary")
+            .unwrap();
+        assert_eq!(profile.claude_relaunch_permissions, None);
+        assert_eq!(
+            profile.effective_claude_relaunch_permissions(),
+            ClaudeRelaunchPermissions::AtmuxInjects
+        );
+    }
+
+    #[test]
+    fn explicit_launcher_permission_policy_is_claude_only() {
+        let configured: Config = toml::from_str(
+            r#"
+[[profiles]]
+name = "wrapped"
+harness = "claude"
+command = "/owner/bin/claude-wrapper"
+claude_relaunch_permissions = "launcher_provides"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            configured.profiles[0].claude_relaunch_permissions,
+            Some(ClaudeRelaunchPermissions::LauncherProvides)
+        );
+        configured.validate_profiles().unwrap();
+
+        let invalid: Config = toml::from_str(
+            r#"
+[[profiles]]
+name = "codex"
+harness = "codex"
+command = "codex"
+claude_relaunch_permissions = "atmux_injects"
+"#,
+        )
+        .unwrap();
+        assert!(invalid.validate_profiles().is_err());
     }
 
     #[test]

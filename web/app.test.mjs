@@ -1929,6 +1929,7 @@ test("Claude resume uses a confirmation and never sends browser-supplied session
   assert.match(handler, /encodeURIComponent\(target\)\}\/resume/);
   assert.match(handler, /body: JSON\.stringify\(\{\}\)/);
   assert.doesNotMatch(handler, /session_id:\s*[^,}]+/);
+  assert.doesNotMatch(handler, /dangerously-skip-permissions/);
   assert.doesNotMatch(source, /CLAUDE_CONFIG_DIR/);
 });
 
