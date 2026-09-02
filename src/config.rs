@@ -909,80 +909,87 @@ impl Config {
     }
 
     fn discover_profiles(&mut self) {
-        let configured_profiles = self.profiles.len();
-        let mut seen: BTreeSet<(String, String)> = self
-            .profiles
-            .iter()
-            .map(|profile| (profile.harness.to_lowercase(), profile.name.to_lowercase()))
-            .collect();
-
         let home = env::var_os("HOME").map(PathBuf::from);
         let codex = find_program(
             "codex",
             &home.as_deref().map_or_else(Vec::new, codex_candidates),
         );
         let claude = current_claude_program();
+        self.discover_profiles_from(home.as_deref(), codex.as_deref(), claude.as_deref());
+    }
+
+    fn discover_profiles_from(
+        &mut self,
+        home: Option<&Path>,
+        codex: Option<&Path>,
+        claude: Option<&Path>,
+    ) {
+        let configured_profiles = self.profiles.len();
+        let mut seen: BTreeSet<(String, String)> = self
+            .profiles
+            .iter()
+            .map(|profile| (profile.harness.to_lowercase(), profile.name.to_lowercase()))
+            .collect();
+        // Keep the first source merged into configured profiles because
+        // discovery is ordered from precise executables to shell aliases.
+        let mut inherited = BTreeSet::new();
+
         for profile in &mut self.profiles {
-            resolve_configured_default_command(profile, codex.as_deref(), claude.as_deref());
+            resolve_configured_default_command(profile, codex, claude);
         }
-        add_discovered_profile(
-            &mut self.profiles,
-            &mut seen,
-            "codex",
-            "Default",
-            codex.clone(),
-            Vec::new(),
-            None,
-        );
-        add_discovered_profile(
-            &mut self.profiles,
-            &mut seen,
-            "claude",
-            "Default",
-            claude.clone(),
-            Vec::new(),
-            None,
-        );
 
         if let Some(home) = home {
-            let codex_dir = home.join(".codex");
-            if let Ok(entries) = fs::read_dir(codex_dir) {
-                for entry in entries.flatten() {
-                    let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
-                        continue;
-                    };
-                    let Some(name) = file_name.strip_suffix(".config.toml") else {
-                        continue;
-                    };
-                    add_discovered_profile(
-                        &mut self.profiles,
-                        &mut seen,
-                        "codex",
-                        name,
-                        codex.clone(),
-                        vec!["--profile".to_owned(), name.to_owned()],
-                        None,
-                    );
-                }
-            }
-
-            discover_executable_profiles(&home, "codex", &mut self.profiles, &mut seen);
-            discover_executable_profiles(&home, "claude", &mut self.profiles, &mut seen);
-            discover_shell_alias_profiles(
-                &home,
+            discover_executable_profiles(
+                home,
                 "codex",
-                codex.as_deref(),
                 &mut self.profiles,
                 &mut seen,
+                &mut inherited,
+            );
+            discover_executable_profiles(
+                home,
+                "claude",
+                &mut self.profiles,
+                &mut seen,
+                &mut inherited,
             );
             discover_shell_alias_profiles(
-                &home,
-                "claude",
-                claude.as_deref(),
+                home,
+                "codex",
+                codex,
                 &mut self.profiles,
                 &mut seen,
+                &mut inherited,
+            );
+            discover_shell_alias_profiles(
+                home,
+                "claude",
+                claude,
+                &mut self.profiles,
+                &mut seen,
+                &mut inherited,
+            );
+            discover_codex_config_profiles(
+                home,
+                codex,
+                &mut self.profiles,
+                &mut seen,
+                &mut inherited,
             );
         }
+
+        add_discovered_profile(
+            &mut self.profiles,
+            &mut seen,
+            &mut inherited,
+            discovered_profile("codex", "Default", codex, Vec::new(), None),
+        );
+        add_discovered_profile(
+            &mut self.profiles,
+            &mut seen,
+            &mut inherited,
+            discovered_profile("claude", "Default", claude, Vec::new(), None),
+        );
 
         self.profiles[configured_profiles..].sort_by_key(|profile| {
             (
@@ -1091,26 +1098,31 @@ fn resolve_configured_default_command(
 fn add_discovered_profile(
     profiles: &mut Vec<AgentProfile>,
     seen: &mut BTreeSet<(String, String)>,
+    inherited: &mut BTreeSet<(String, String)>,
+    discovered: Option<AgentProfile>,
+) {
+    if let Some(discovered) = discovered {
+        merge_or_add_discovered_profile(profiles, seen, inherited, discovered);
+    }
+}
+
+fn discovered_profile(
     harness: &str,
     name: &str,
-    command: Option<PathBuf>,
+    command: Option<&Path>,
     args: Vec<String>,
     claude_relaunch_permissions: Option<ClaudeRelaunchPermissions>,
-) {
-    let Some(command) = command else {
-        return;
-    };
-    let discovered = AgentProfile {
+) -> Option<AgentProfile> {
+    Some(AgentProfile {
         name: name.to_owned(),
         harness: harness.to_owned(),
-        command: command.to_string_lossy().into_owned(),
+        command: command?.to_string_lossy().into_owned(),
         args,
         env: BTreeMap::new(),
         inherit_discovered: false,
         claude_relaunch_permissions,
         modes: Vec::new(),
-    };
-    merge_or_add_discovered_profile(profiles, seen, discovered);
+    })
 }
 
 /// A profile that explicitly opts into discovery keeps its configured model
@@ -1120,6 +1132,7 @@ fn add_discovered_profile(
 fn merge_or_add_discovered_profile(
     profiles: &mut Vec<AgentProfile>,
     seen: &mut BTreeSet<(String, String)>,
+    inherited: &mut BTreeSet<(String, String)>,
     discovered: AgentProfile,
 ) {
     let key = (
@@ -1131,6 +1144,9 @@ fn merge_or_add_discovered_profile(
             && profile.harness.eq_ignore_ascii_case(&discovered.harness)
             && profile.name.eq_ignore_ascii_case(&discovered.name)
     }) {
+        if !inherited.insert(key) {
+            return;
+        }
         let configured_env = std::mem::take(&mut configured.env);
         configured.command = discovered.command;
         configured.args = discovered.args;
@@ -1143,6 +1159,43 @@ fn merge_or_add_discovered_profile(
     }
     if seen.insert(key) {
         profiles.push(discovered);
+    }
+}
+
+fn discover_codex_config_profiles(
+    home: &Path,
+    command: Option<&Path>,
+    profiles: &mut Vec<AgentProfile>,
+    seen: &mut BTreeSet<(String, String)>,
+    inherited: &mut BTreeSet<(String, String)>,
+) {
+    let Ok(entries) = fs::read_dir(home.join(".codex")) else {
+        return;
+    };
+    let mut paths = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(name) = file_name.strip_suffix(".config.toml") else {
+            continue;
+        };
+        add_discovered_profile(
+            profiles,
+            seen,
+            inherited,
+            discovered_profile(
+                "codex",
+                name,
+                command,
+                vec!["--profile".to_owned(), name.to_owned()],
+                None,
+            ),
+        );
     }
 }
 
@@ -1159,6 +1212,7 @@ fn discover_executable_profiles(
     harness: &str,
     profiles: &mut Vec<AgentProfile>,
     seen: &mut BTreeSet<(String, String)>,
+    inherited: &mut BTreeSet<(String, String)>,
 ) {
     let prefix = format!("{harness}-");
     for bin_dir in profile_bin_directories(home) {
@@ -1187,7 +1241,12 @@ fn discover_executable_profiles(
             {
                 continue;
             }
-            add_discovered_profile(profiles, seen, harness, name, Some(path), Vec::new(), None);
+            add_discovered_profile(
+                profiles,
+                seen,
+                inherited,
+                discovered_profile(harness, name, Some(&path), Vec::new(), None),
+            );
         }
     }
 }
@@ -1225,6 +1284,7 @@ fn discover_shell_alias_profiles(
     command: Option<&Path>,
     profiles: &mut Vec<AgentProfile>,
     seen: &mut BTreeSet<(String, String)>,
+    inherited: &mut BTreeSet<(String, String)>,
 ) {
     let Some(command) = command else {
         return;
@@ -1235,7 +1295,7 @@ fn discover_shell_alias_profiles(
         };
         for line in source.lines() {
             if let Some(profile) = profile_from_shell_alias(line, harness, command) {
-                merge_or_add_discovered_profile(profiles, seen, profile);
+                merge_or_add_discovered_profile(profiles, seen, inherited, profile);
             }
         }
     }
@@ -1992,6 +2052,7 @@ memory_override_max_bytes = 25769803776
         merge_or_add_discovered_profile(
             &mut explicitly_managed,
             &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
             discovered.clone(),
         );
         assert_eq!(
@@ -1999,7 +2060,12 @@ memory_override_max_bytes = 25769803776
             Some(ClaudeRelaunchPermissions::AtmuxInjects)
         );
 
-        merge_or_add_discovered_profile(&mut profiles, &mut BTreeSet::new(), discovered);
+        merge_or_add_discovered_profile(
+            &mut profiles,
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            discovered,
+        );
 
         let merged = &profiles[0];
         assert_eq!(merged.command, "/usr/local/bin/claude-max");
@@ -2036,7 +2102,12 @@ memory_override_max_bytes = 25769803776
             modes: Vec::new(),
         };
 
-        merge_or_add_discovered_profile(&mut profiles, &mut BTreeSet::new(), discovered);
+        merge_or_add_discovered_profile(
+            &mut profiles,
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            discovered,
+        );
 
         assert_eq!(profiles[0].env["CODEX_HOME"], "/srv/codex-work");
     }
@@ -2050,8 +2121,15 @@ memory_override_max_bytes = 25769803776
         fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
         let mut profiles = Vec::new();
         let mut seen = BTreeSet::new();
+        let mut inherited = BTreeSet::new();
 
-        discover_executable_profiles(&fixture.home, "claude", &mut profiles, &mut seen);
+        discover_executable_profiles(
+            &fixture.home,
+            "claude",
+            &mut profiles,
+            &mut seen,
+            &mut inherited,
+        );
 
         let profile = profiles
             .iter()
@@ -2062,6 +2140,166 @@ memory_override_max_bytes = 25769803776
             profile.effective_claude_relaunch_permissions(),
             ClaudeRelaunchPermissions::AtmuxInjects
         );
+    }
+
+    #[test]
+    fn configured_discovery_keeps_executable_precedence_and_still_merges_alias_only_profiles() {
+        let fixture = ResumeHome::new("configured discovery precedence");
+        let wrapper = fixture.owner_dir(".local/bin").join("claude-max");
+        fs::write(&wrapper, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            fixture.home.join(".zshrc"),
+            concat!(
+                "alias claude-max='claude --dangerously-skip-permissions'\n",
+                "alias claude-work='CLAUDE_CONFIG_DIR=~/.claude-work claude --dangerously-skip-permissions'\n",
+            ),
+        )
+        .unwrap();
+        let mut profiles = ["max", "work"]
+            .into_iter()
+            .map(|name| AgentProfile {
+                name: name.to_owned(),
+                harness: "claude".to_owned(),
+                command: "claude".to_owned(),
+                args: Vec::new(),
+                env: BTreeMap::from([("LOCAL_MARKER".to_owned(), name.to_owned())]),
+                inherit_discovered: true,
+                claude_relaunch_permissions: None,
+                modes: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut seen = BTreeSet::from([
+            ("claude".to_owned(), "max".to_owned()),
+            ("claude".to_owned(), "work".to_owned()),
+        ]);
+        let mut inherited = BTreeSet::new();
+        let native = Path::new("/usr/local/bin/claude");
+
+        discover_executable_profiles(
+            &fixture.home,
+            "claude",
+            &mut profiles,
+            &mut seen,
+            &mut inherited,
+        );
+        discover_shell_alias_profiles(
+            &fixture.home,
+            "claude",
+            Some(native),
+            &mut profiles,
+            &mut seen,
+            &mut inherited,
+        );
+
+        let max = profiles
+            .iter()
+            .find(|profile| profile.name == "max")
+            .unwrap();
+        assert_eq!(max.command, wrapper.to_string_lossy());
+        assert!(max.args.is_empty());
+        assert_eq!(max.env["LOCAL_MARKER"], "max");
+
+        let work = profiles
+            .iter()
+            .find(|profile| profile.name == "work")
+            .unwrap();
+        assert_eq!(work.command, native.to_string_lossy());
+        assert_eq!(work.args, ["--dangerously-skip-permissions"]);
+        assert_eq!(work.env["LOCAL_MARKER"], "work");
+        assert!(work.env["CLAUDE_CONFIG_DIR"].ends_with(".claude-work"));
+    }
+
+    #[test]
+    fn full_discovery_keeps_claude_default_wrapper_ahead_of_generic_default() {
+        let fixture = ResumeHome::new("claude default wrapper precedence");
+        let wrapper = fixture.owner_dir(".local/bin").join("claude-Default");
+        fs::write(&wrapper, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        let native = fixture.home.join("native-claude");
+        let mut config: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        let profile = config
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.harness == "claude" && profile.name == "Default")
+            .unwrap();
+        profile.inherit_discovered = true;
+        profile
+            .env
+            .insert("LOCAL_MARKER".into(), "configured".into());
+
+        config.discover_profiles_from(Some(&fixture.home), None, Some(&native));
+
+        let profile = config
+            .profiles
+            .iter()
+            .find(|profile| profile.harness == "claude" && profile.name == "Default")
+            .unwrap();
+        assert_eq!(profile.command, wrapper.to_string_lossy());
+        assert!(profile.args.is_empty());
+        assert_eq!(profile.env["LOCAL_MARKER"], "configured");
+    }
+
+    #[test]
+    fn full_discovery_keeps_codex_wrapper_ahead_of_named_config_fallback() {
+        let fixture = ResumeHome::new("codex named wrapper precedence");
+        let wrapper = fixture.owner_dir(".local/bin").join("codex-work");
+        fs::write(&wrapper, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(fixture.owner_dir(".codex").join("work.config.toml"), "").unwrap();
+        let native = fixture.home.join("native-codex");
+        let mut config: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        config.profiles.push(AgentProfile {
+            name: "work".to_owned(),
+            harness: "codex".to_owned(),
+            command: "codex".to_owned(),
+            args: Vec::new(),
+            env: BTreeMap::from([("LOCAL_MARKER".to_owned(), "configured".to_owned())]),
+            inherit_discovered: true,
+            claude_relaunch_permissions: None,
+            modes: Vec::new(),
+        });
+
+        config.discover_profiles_from(Some(&fixture.home), Some(&native), None);
+
+        let profile = config
+            .profiles
+            .iter()
+            .find(|profile| profile.harness == "codex" && profile.name == "work")
+            .unwrap();
+        assert_eq!(profile.command, wrapper.to_string_lossy());
+        assert!(profile.args.is_empty());
+        assert_eq!(profile.env["LOCAL_MARKER"], "configured");
+    }
+
+    #[test]
+    fn full_discovery_sorts_case_colliding_codex_config_fallbacks() {
+        let fixture = ResumeHome::new("codex config collision order");
+        let codex_dir = fixture.owner_dir(".codex");
+        fs::write(codex_dir.join("zz-atmux-case.config.toml"), "").unwrap();
+        fs::write(codex_dir.join("Zz-Atmux-Case.config.toml"), "").unwrap();
+        let native = fixture.home.join("native-codex");
+        let mut config: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        config.profiles.push(AgentProfile {
+            name: "zZ-aTmUx-CaSe".to_owned(),
+            harness: "codex".to_owned(),
+            command: "codex".to_owned(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            inherit_discovered: true,
+            claude_relaunch_permissions: None,
+            modes: Vec::new(),
+        });
+
+        config.discover_profiles_from(Some(&fixture.home), Some(&native), None);
+
+        let profile = config
+            .profiles
+            .iter()
+            .find(|profile| profile.harness == "codex" && profile.name == "zZ-aTmUx-CaSe")
+            .unwrap();
+        assert_eq!(profile.command, native.to_string_lossy());
+        assert_eq!(profile.args, ["--profile", "Zz-Atmux-Case"]);
     }
 
     #[test]
