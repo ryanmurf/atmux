@@ -179,6 +179,13 @@ The hidden `atmux scoped-exec -- <command>...` bridge is reserved for the
 owner-validated Quick Resume/boot scripts. It reloads the active configuration,
 requires memory isolation to be enabled, preflights once, records scope
 metadata on `TMUX_PANE`, and then replaces itself with the exact scope argv.
+Ordinary recovery entries use the configured worker default. A recovery script
+may request a distinct cap only for its `atmux-web` service entry; atmux accepts
+that cap only when it is a finite whole-GiB value strictly above the configured
+worker ceiling and strictly below the current host/inherited-cgroup limit. The
+canonical Tron bridge therefore keeps workers at their 12 GiB default with a
+48 GiB override ceiling while reserving a bounded 56 GiB scope for the web
+service. This does not raise any worker cap.
 Tron's live `/home/ryan/resume-tron.sh` must replace its raw `send()` function
 with `deploy/systemd/resume-tron-scoped-exec-block.bash` before Quick Resume is
 available; atmux rejects the old script shape. Max's checked-in boot recovery
@@ -725,9 +732,18 @@ profile = "Default"
 
 On startup, atmux also discovers:
 
-- A default Codex or Claude profile when its CLI is installed. On macOS this includes standard Homebrew and Claude desktop-app CLI locations.
-- `~/.codex/<name>.config.toml` as Codex profile `<name>`.
-- Executable `claude-*` wrappers in `~/.local/bin` and `~/bin` as Claude profiles.
+- Executable `codex-*` and `claude-*` wrappers in owner-local bin directories.
+- Simple `codex-*` and `claude-*` aliases from the owner's standard shell profiles.
+- Sorted `~/.codex/<name>.config.toml` files as Codex profile `<name>` fallbacks.
+- A generic default Codex or Claude profile when its CLI is installed. On macOS this includes
+  standard Homebrew and Claude desktop-app CLI locations.
+
+Discovery applies that order consistently: an executable wrapper wins over a same-named alias, a
+shell alias wins over a same-named Codex config, and every named source wins over the generic
+default. A configured profile remains authoritative unless it sets `inherit_discovered = true`;
+an opted-in profile inherits only the first matching discovered command, arguments, and
+credential-bound environment while keeping its configured environment, modes, and explicit Claude
+relaunch permission policy.
 
 ## Agent-state detection
 
