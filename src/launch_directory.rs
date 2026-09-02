@@ -114,13 +114,20 @@ struct StagingDirectory {
     name: OsString,
     handle: File,
     identity: DirectoryIdentity,
+    payload_identity: Option<DirectoryIdentity>,
     cleanup_armed: bool,
 }
 
 impl StagingDirectory {
     fn cleanup(mut self) -> Result<(), ActionError> {
         self.cleanup_armed = false;
-        cleanup_staging_parts(&self.parent, &self.name, &self.handle, self.identity)
+        cleanup_staging_parts(
+            &self.parent,
+            &self.name,
+            &self.handle,
+            self.identity,
+            self.payload_identity,
+        )
     }
 
     fn disarm_cleanup(&mut self) {
@@ -131,7 +138,13 @@ impl StagingDirectory {
 impl Drop for StagingDirectory {
     fn drop(&mut self) {
         if self.cleanup_armed {
-            let _ = cleanup_staging_parts(&self.parent, &self.name, &self.handle, self.identity);
+            let _ = cleanup_staging_parts(
+                &self.parent,
+                &self.name,
+                &self.handle,
+                self.identity,
+                self.payload_identity,
+            );
         }
     }
 }
@@ -158,6 +171,7 @@ struct PayloadDirectory {
     identity: DirectoryIdentity,
 }
 
+#[derive(Debug)]
 struct CloneRunError {
     error: ActionError,
     cleanup_safe: bool,
@@ -198,11 +212,8 @@ fn create_folder_with_hook(
     let parent = resolve_parent(config, parent)?;
     let destination = validate_child_name(name)?;
     ensure_target_absent_at(&parent.handle, OsStr::new(destination))?;
-    let staging = create_staging_directory(&parent)?;
-    rustix::fs::mkdirat(&staging.handle, PAYLOAD_NAME, Mode::from_raw_mode(0o777))
-        .map_err(|_| ActionError::internal("new folder payload could not be created"))?;
-    let (handle, identity) = open_child_directory(&staging.handle, OsStr::new(PAYLOAD_NAME), None)?;
-    let payload = PayloadDirectory { handle, identity };
+    let mut staging = create_staging_directory(&parent)?;
+    let payload = create_payload_directory(&mut staging)?;
     if let Some(hook) = before_publish {
         hook();
     }
@@ -267,6 +278,7 @@ fn clone_repository_with_program_and_hook(
         };
     ensure_target_absent_at(&parent.handle, OsStr::new(&destination))?;
     let mut staging = create_staging_directory(&parent)?;
+    let payload = create_payload_directory(&mut staging)?;
     if let Err(failure) = run_git_clone(git, repository, &staging.handle, timeout) {
         if !failure.cleanup_safe {
             staging.disarm_cleanup();
@@ -279,8 +291,6 @@ fn clone_repository_with_program_and_hook(
             ))),
         };
     }
-    let (handle, identity) = open_child_directory(&staging.handle, OsStr::new(PAYLOAD_NAME), None)?;
-    let payload = PayloadDirectory { handle, identity };
     if let Some(hook) = before_publish {
         hook();
     }
@@ -557,6 +567,7 @@ fn create_staging_directory_with_fault(
                     name: std::mem::take(&mut pending.name),
                     handle,
                     identity,
+                    payload_identity: None,
                     cleanup_armed: true,
                 });
             }
@@ -571,6 +582,16 @@ fn create_staging_directory_with_fault(
     Err(ActionError::internal(
         "private staging directory name could not be allocated",
     ))
+}
+
+fn create_payload_directory(
+    staging: &mut StagingDirectory,
+) -> Result<PayloadDirectory, ActionError> {
+    rustix::fs::mkdirat(&staging.handle, PAYLOAD_NAME, Mode::from_raw_mode(0o777))
+        .map_err(|_| ActionError::internal("private payload directory could not be created"))?;
+    let (handle, identity) = open_child_directory(&staging.handle, OsStr::new(PAYLOAD_NAME), None)?;
+    staging.payload_identity = Some(identity);
+    Ok(PayloadDirectory { handle, identity })
 }
 
 fn parent_is_still_authorized(config: &Config, parent: &HeldDirectory) -> bool {
@@ -685,6 +706,7 @@ fn cleanup_staging_parts(
     name: &OsStr,
     staging: &File,
     identity: DirectoryIdentity,
+    expected_payload: Option<DirectoryIdentity>,
 ) -> Result<(), ActionError> {
     let entries = fs::read_dir(descriptor_path(staging))
         .map_err(|_| ActionError::internal("private staging directory could not be inspected"))?
@@ -704,6 +726,11 @@ fn cleanup_staging_parts(
     if !entries.is_empty() {
         let (payload, payload_identity) =
             open_child_directory(staging, OsStr::new(PAYLOAD_NAME), None)?;
+        if Some(payload_identity) != expected_payload {
+            return Err(ActionError::internal(
+                "private payload name no longer identifies the retained directory",
+            ));
+        }
         clear_directory(&payload)?;
         if !named_directory_identity(staging, OsStr::new(PAYLOAD_NAME))
             .is_ok_and(|current| current == payload_identity)
@@ -993,10 +1020,10 @@ mod tests {
             let arguments = shell_words::quote(&arguments_path);
             let body = if success {
                 format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$@\" >{arguments}\nmkdir \"$4\"\ntouch \"$4/cloned-marker\"\n"
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" >{arguments}\ntouch \"$4/cloned-marker\"\n"
                 )
             } else {
-                "#!/bin/sh\nprintf 'fatal: could not clone %s\\n' \"$3\" >&2\nmkdir \"$4\"\ntouch \"$4/partial\"\nexit 19\n".to_owned()
+                "#!/bin/sh\nprintf 'fatal: could not clone %s\\n' \"$3\" >&2\ntouch \"$4/partial\"\nexit 19\n".to_owned()
             };
             fs::write(&script, body).unwrap();
             fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1083,6 +1110,73 @@ mod tests {
         assert_eq!(failed.kind(), ErrorKind::Invalid);
         assert!(!failed.to_string().contains("ssh://git@example.test"));
         assert!(!fixture.root.join("failed clone").exists());
+    }
+
+    #[test]
+    fn real_git_clones_into_the_retained_precreated_payload() {
+        let fixture = Fixture::new();
+        let source = fixture.base.join("source.git");
+        let status = Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg("--quiet")
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let parent = resolve_parent(&fixture.config, fixture.root.to_str().unwrap()).unwrap();
+        let mut staging = create_staging_directory(&parent).unwrap();
+        let payload = create_payload_directory(&mut staging).unwrap();
+        run_git_clone(
+            OsStr::new("git"),
+            source.to_str().unwrap(),
+            &staging.handle,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(descriptor_path(&payload.handle).join(".git").is_dir());
+        staging.cleanup().unwrap();
+        assert!(staging_names(&fixture.root).is_empty());
+    }
+
+    #[test]
+    fn failed_clone_never_adopts_a_swapped_payload_for_cleanup() {
+        let fixture = Fixture::new();
+        let script = fixture.base.join("git-swaps-payload");
+        fs::write(
+            &script,
+            "#!/bin/sh\nmv \"$4\" ../moved-owned-payload\nmkdir \"$4\"\nprintf unrelated > \"$4/replacement-marker\"\nexit 19\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = clone_repository_with_program(
+            &fixture.config,
+            fixture.root.to_str().unwrap(),
+            "https://example.test/team/swapped.git",
+            Some("must not publish"),
+            script.as_os_str(),
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Internal);
+        assert!(error.to_string().contains("could not be removed"));
+        assert!(!fixture.root.join("must not publish").exists());
+        assert!(fixture.root.join("moved-owned-payload").is_dir());
+        let stages = staging_names(&fixture.root);
+        assert_eq!(stages.len(), 1, "swapped staging must fail closed");
+        assert_eq!(
+            fs::read_to_string(
+                fixture
+                    .root
+                    .join(&stages[0])
+                    .join(PAYLOAD_NAME)
+                    .join("replacement-marker")
+            )
+            .unwrap(),
+            "unrelated"
+        );
     }
 
     #[test]
@@ -1275,7 +1369,7 @@ mod tests {
         fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf '%s' \"$$\" >{quoted_pid_file}\nmkdir \"$4\"\nwhile :; do sleep 30; done\n"
+                "#!/bin/sh\nprintf '%s' \"$$\" >{quoted_pid_file}\nwhile :; do sleep 30; done\n"
             ),
         )
         .unwrap();

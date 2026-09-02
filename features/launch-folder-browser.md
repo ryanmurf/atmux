@@ -22,8 +22,9 @@ allowed tree, create a folder in the displayed directory, or clone a repository 
 - Owner mutations retain a validated parent directory handle, build in a private staging directory,
   revalidate the parent's identity, and publish with atomic no-replace semantics. Cleanup stays
   anchored to the retained staging object, so pathname swaps cannot delete unrelated content.
-- Staging remains mode `0700`, while New Folder and Git create a distinct published payload under
-  the owner's normal process umask; restrictive host permission policy is therefore preserved.
+- Staging remains mode `0700`, while a distinct payload is created with `mkdirat(0777)` under the
+  owner's normal process umask before New Folder or Git work begins. Its retained identity governs
+  cleanup and publication, so a swapped payload is never adopted or recursively removed.
 - Repository clones accept credential-free HTTPS, SSH URLs, or `git@host:path`, execute fixed argv
   as `git clone -- ...` without a shell, disable terminal prompting, redact bounded failures, time
   out by terminating the whole clone process group, and remove only the incomplete staging object.
@@ -45,8 +46,9 @@ allowed tree, create a folder in the displayed directory, or clone a repository 
 - Rust tests cover root listings, overlapping-root parent navigation, actual-root disabling,
   outside-root rejection, symlink escapes, safe component names, spaces, literal Git argv,
   credential/option/transport rejection, existing targets, failure redaction, parent/target swap
-  resistance, `0077`/`0022` payload modes, injected staging open/stat rollback, process-group
-  timeouts and drain failures with inherited stderr, and staging cleanup.
+  resistance, failed-clone payload replacement, real Git with a precreated empty payload,
+  `0077`/`0022` payload modes, injected staging open/stat rollback, process-group timeouts and drain
+  failures with inherited stderr, and staging cleanup.
 - API tests cover existing authentication and mutation-Origin policy plus exact federated machine
   routing for create and clone requests.
 - Web units cover untrusted stored-data normalization, per-machine memory, deduplication, and query
