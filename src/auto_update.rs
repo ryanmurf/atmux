@@ -3320,11 +3320,22 @@ mod tests {
                 .is_some()
         );
         drop(first);
-        assert!(
-            PaneProcessLock::try_acquire_in(&root, "%7")
-                .unwrap()
-                .is_some()
-        );
+        // A concurrently forked test child may briefly retain the CLOEXEC
+        // descriptor until it reaches exec. The lock must become available
+        // promptly, but flock release need not be observable in the same
+        // scheduling turn as the original descriptor's close.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let reacquired = loop {
+            if let Some(lock) = PaneProcessLock::try_acquire_in(&root, "%7").unwrap() {
+                break lock;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pane mutation lock remained busy after its owner was dropped"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        drop(reacquired);
         let _ = fs::remove_dir_all(root);
     }
 
