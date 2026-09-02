@@ -3181,23 +3181,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a real isolated tmux server; run explicitly outside the parallel unit suite"]
     fn disposable_launcher_managed_claude_launch_receives_one_native_flag() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let socket = format!("atmux-test-claude-resume-{}-{nonce}", std::process::id());
-        let socket_base = env::var_os("TMUX_TMPDIR").map_or_else(env::temp_dir, PathBuf::from);
-        let probe = DisposableTmux {
-            socket_path: socket_base
-                .join(format!("tmux-{}", rustix::process::geteuid().as_raw()))
-                .join(&socket),
-            socket,
-            directory: env::temp_dir().join(format!(
-                "atmux-test-claude-resume-agent-{}-{nonce}",
-                std::process::id()
-            )),
-        };
+        let probe = disposable_tmux("claude-resume");
         fs::create_dir(&probe.directory).unwrap();
         let command = probe.directory.join("claude-wrapper");
         let argv_file = probe.directory.join("argv");
