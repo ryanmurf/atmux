@@ -31,6 +31,7 @@ const BENIGN_COORDINATION_STATUSES = new Set([
 ]);
 const LAUNCH_DIRECTORY_STORAGE_KEY = "atmux.launch-directories";
 const FILE_READER_STORAGE_KEY = "atmux.file-reader-preferences";
+const CONVERSATION_VISIBILITY_STORAGE_KEY = "atmux.conversation-visibility";
 const FILE_READER_SIZES = new Set(["small", "medium", "large"]);
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg"]);
 const COMPOSITE_SEPARATOR = "~";
@@ -968,6 +969,41 @@ function fileReaderPreferenceJson(preferences) {
   return JSON.stringify({ wrap: normalized.wrap, size: normalized.size });
 }
 
+function conversationVisibilityPreferences(value) {
+  const defaults = { human: true, internal: true };
+  let stored = value;
+  if (typeof value === "string") {
+    try { stored = JSON.parse(value); } catch { return defaults; }
+  }
+  if (!stored || typeof stored !== "object" || Array.isArray(stored)) return defaults;
+  return {
+    human: typeof stored.human === "boolean" ? stored.human : defaults.human,
+    internal: typeof stored.internal === "boolean" ? stored.internal : defaults.internal,
+  };
+}
+
+function conversationVisibilityPreferenceJson(preferences) {
+  const normalized = conversationVisibilityPreferences(preferences);
+  return JSON.stringify({ human: normalized.human, internal: normalized.internal });
+}
+
+function loadConversationVisibilityPreferences(readStoredValue) {
+  try {
+    return conversationVisibilityPreferences(readStoredValue());
+  } catch {
+    return conversationVisibilityPreferences(null);
+  }
+}
+
+function saveConversationVisibilityPreferences(writeStoredValue, preferences) {
+  try {
+    writeStoredValue(conversationVisibilityPreferenceJson(preferences));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function loadFileReaderPreferences(readStoredValue, mobile = false) {
   try {
     return fileReaderPreferences(readStoredValue(), mobile);
@@ -1255,6 +1291,30 @@ function reduceTranscript(current, data) {
 
 function transcriptItemKind(item) {
   return item?.kind === "tool" || item?.role === "tool" ? "tool" : "message";
+}
+
+/// Conversation visibility is deliberately role-based and fail-closed. Only
+/// ordinary assistant prose is Agent text, and only ordinary user prose is
+/// Human text. Tool calls plus future system/status/coordination records are
+/// Internal, so a new transcript shape cannot leak into the wrong filter.
+function transcriptVisibilityKind(item) {
+  if (transcriptItemKind(item) === "tool") return "internal";
+  const kind = typeof item?.kind === "string" && item.kind ? item.kind : "message";
+  if (kind === "message" && item?.role === "assistant") return "agent";
+  if (kind === "message" && item?.role === "user") return "human";
+  return "internal";
+}
+
+function transcriptItemIsVisible(item, preferences) {
+  const visibility = transcriptVisibilityKind(item);
+  if (visibility === "agent") return true;
+  const normalized = conversationVisibilityPreferences(preferences);
+  return visibility === "human" ? normalized.human : normalized.internal;
+}
+
+function filterTranscriptMessages(messages, preferences) {
+  return (Array.isArray(messages) ? messages : [])
+    .filter((message) => transcriptItemIsVisible(message, preferences));
 }
 
 function normalizedToolName(item) {
@@ -1557,12 +1617,12 @@ function followsLiveTail(element, tolerance = 16) {
 
 /// Captures the first visible semantic transcript item, not just a pixel
 /// offset. Bounded logs can discard cards above a reader while an agent emits.
-function transcriptReadingAnchor(container) {
+function transcriptReadingAnchor(container, retain = null) {
   const bounds = container.getBoundingClientRect();
   for (const item of container.querySelectorAll("[data-transcript-id]")) {
     const id = item.dataset.transcriptId;
     const box = item.getBoundingClientRect();
-    if (id && box.bottom > bounds.top) {
+    if (id && box.bottom > bounds.top && (!retain || retain(item))) {
       return { id, offset: box.top - bounds.top };
     }
   }
@@ -1799,6 +1859,10 @@ if (typeof module !== "undefined" && module.exports) {
     fileReaderPreferences,
     fileReaderPreferenceJson,
     loadFileReaderPreferences,
+    conversationVisibilityPreferences,
+    conversationVisibilityPreferenceJson,
+    loadConversationVisibilityPreferences,
+    saveConversationVisibilityPreferences,
     fileReferenceBlock,
     insertComposerReference,
     nextFileLineSelection,
@@ -1843,6 +1907,9 @@ if (typeof module !== "undefined" && module.exports) {
     savedSessionPreview,
     selectionTouchesPane,
     transcriptItemKind,
+    transcriptVisibilityKind,
+    transcriptItemIsVisible,
+    filterTranscriptMessages,
     normalizedToolName,
     coordinationResultSignal,
     execResultClass,
@@ -1875,13 +1942,19 @@ function initialize() {
   } else {
     history.replaceState(appHistoryState(initialRoute), "", pageUrl);
   }
-  const storedPulseAccount = pulseAccountId(localStorage.getItem("atmux.pulse-account"));
+  const readLocalStorage = (key) => {
+    try { return localStorage.getItem(key); } catch { return null; }
+  };
+  const storedPulseAccount = pulseAccountId(readLocalStorage("atmux.pulse-account"));
   const storedLaunchDirectories = rememberedLaunchDirectories(
-    localStorage.getItem(LAUNCH_DIRECTORY_STORAGE_KEY),
+    readLocalStorage(LAUNCH_DIRECTORY_STORAGE_KEY),
   );
   const storedFileReaderPreferences = loadFileReaderPreferences(
-    () => localStorage.getItem(FILE_READER_STORAGE_KEY),
+    () => readLocalStorage(FILE_READER_STORAGE_KEY),
     mobileViewportActive(),
+  );
+  const storedConversationVisibility = loadConversationVisibilityPreferences(
+    () => readLocalStorage(CONVERSATION_VISIBILITY_STORAGE_KEY),
   );
   const requestedPulseAccount = pulseAccountId(pageUrl.searchParams.get("pulseAccount"));
   const state = {
@@ -1921,8 +1994,10 @@ function initialize() {
     transcriptRequest: 0,
     transcriptPointerDown: false,
     pendingTranscriptRender: false,
+    pendingTranscriptFilterChange: false,
     transcriptFollowing: true,
     transcriptExpectedScrollTop: null,
+    conversationVisibility: storedConversationVisibility,
     viewMode: "conversation",
     projectView: null,
     filesRequest: 0,
@@ -1950,7 +2025,7 @@ function initialize() {
     recoveryStatus: null,
     recoveryLoading: false,
     recoveryPoll: null,
-    railCollapsed: localStorage.getItem("atmux.rail-collapsed") === "true",
+    railCollapsed: readLocalStorage("atmux.rail-collapsed") === "true",
     pulseOpen: initialRoute.view === "usage",
     pulseAccount: requestedPulseAccount || storedPulseAccount,
     pulseAccounts: [],
@@ -2152,6 +2227,7 @@ function initialize() {
     state.transcriptRequest += 1;
     state.transcriptPointerDown = false;
     state.pendingTranscriptRender = false;
+    state.pendingTranscriptFilterChange = false;
     state.transcriptFollowing = true;
     state.transcriptExpectedScrollTop = null;
     clearTimeout(state.transcriptTimer);
@@ -2268,6 +2344,7 @@ function initialize() {
     details.className = "tool-card";
     if (grouped) details.classList.add("tool-card-group-item");
     details.dataset.transcriptId = String(message.id || "");
+    details.dataset.transcriptVisibility = "internal";
     details.open = expandedTools.has(details.dataset.transcriptId);
     const summary = document.createElement("summary");
     const name = String(message.tool_name || "Tool");
@@ -2294,6 +2371,7 @@ function initialize() {
     const details = document.createElement("details");
     details.className = "tool-card tool-call-group";
     details.dataset.transcriptId = group.id;
+    details.dataset.transcriptVisibility = "internal";
     details.open = expandedTools.has(group.id);
     const summary = document.createElement("summary");
     summary.className = "tool-call-group-summary";
@@ -2328,57 +2406,77 @@ function initialize() {
     return details;
   }
 
-  function drawConversation() {
+  function drawConversation(filterChanged = false) {
     if (state.transcriptPointerDown || selectionTouchesPane(conversation, window.getSelection())) {
       state.pendingTranscriptRender = true;
+      state.pendingTranscriptFilterChange ||= filterChanged;
       return;
     }
     const shouldFollow = state.transcriptFollowing
       && followsLiveTail(conversation, LIVE_TAIL_TOLERANCE);
     const readingOffset = conversation.scrollTop;
-    const readingAnchor = shouldFollow ? null : transcriptReadingAnchor(conversation);
+    const retainAfterFilter = filterChanged
+      ? (node) => node.dataset.transcriptVisibility === "agent"
+        || (node.dataset.transcriptVisibility === "human" && state.conversationVisibility.human)
+        || (node.dataset.transcriptVisibility === "internal" && state.conversationVisibility.internal)
+      : null;
+    const readingAnchor = shouldFollow
+      ? null
+      : transcriptReadingAnchor(conversation, retainAfterFilter);
     const expandedTools = new Set(
       [...conversation.querySelectorAll("details.tool-card[open]")]
         .map((node) => node.dataset.transcriptId)
         .filter(Boolean),
     );
     const nodes = [];
-    if (state.transcript.truncated) {
+    if (state.transcript.truncated && state.conversationVisibility.internal) {
       const notice = document.createElement("p");
       notice.className = "transcript-notice";
       notice.textContent = "Showing the newest bounded part of this session log.";
       nodes.push(notice);
     }
-    const transcriptItems = compactTranscriptItems(
-      state.transcript.available ? state.transcript.messages : [],
-    );
+    const sourceMessages = state.transcript.available && Array.isArray(state.transcript.messages)
+      ? state.transcript.messages : [];
+    const visibleMessages = filterTranscriptMessages(sourceMessages, state.conversationVisibility);
+    const transcriptItems = compactTranscriptItems(visibleMessages);
+    let renderedMessages = 0;
     for (const item of transcriptItems) {
       if (item.kind === "tool-group") {
         nodes.push(renderToolGroup(item, expandedTools));
+        renderedMessages += item.messages.length;
         continue;
       }
       const message = item.message;
       if (!message) continue;
       if (transcriptItemKind(message) === "tool") {
         nodes.push(renderToolCard(message, expandedTools));
+        renderedMessages += 1;
         continue;
       }
-      if (message.role !== "user" && message.role !== "assistant") continue;
+      const visibility = transcriptVisibilityKind(message);
+      if (visibility === "internal" && typeof message.markdown !== "string") continue;
       const article = document.createElement("article");
-      article.className = `message-card ${message.role}`;
+      article.className = `message-card ${String(message.role || "internal")} ${visibility}`;
       article.dataset.transcriptId = String(message.id || "");
+      article.dataset.transcriptVisibility = visibility;
       const label = document.createElement("header");
-      label.textContent = message.role === "user" ? "You" : "Agent";
+      label.textContent = visibility === "human" ? "You"
+        : visibility === "agent" ? "Agent" : "Internal";
       const body = document.createElement("div");
       body.className = "markdown-body";
       body.append(markdownFragment(message.markdown));
       article.append(label, body); nodes.push(article);
+      renderedMessages += 1;
     }
-    if (!nodes.length) {
+    const hasOnlyNotice = nodes.length === 1 && nodes[0].classList.contains("transcript-notice");
+    if (!renderedMessages && (!nodes.length || hasOnlyNotice)) {
       const empty = document.createElement("div");
       empty.className = "conversation-empty";
-      empty.textContent = state.transcript.error
-        ? `Conversation log unavailable: ${state.transcript.error}. Raw pane remains available.`
+      const hiddenMessages = Math.max(0, sourceMessages.length - visibleMessages.length);
+      empty.textContent = hiddenMessages > 0
+        ? "No agent messages to show. Change Conversation visibility or choose Show all."
+        : (state.transcript.error && state.conversationVisibility.internal)
+          ? `Conversation log unavailable: ${state.transcript.error}. Raw pane remains available.`
         : (state.transcript.available
           ? `Waiting for ${state.transcript.source} conversation messages…`
           : "No agent session log is mapped yet. Raw pane remains available.");
@@ -2386,6 +2484,7 @@ function initialize() {
     }
     conversation.replaceChildren(...nodes);
     state.pendingTranscriptRender = false;
+    state.pendingTranscriptFilterChange = false;
     // Stream updates replace transcript cards wholesale. Following is an
     // explicit reader choice, not merely a position that happens to be near
     // the tail. When reading, anchor the same transcript item in the viewport.
@@ -2399,7 +2498,7 @@ function initialize() {
     if (!state.pendingTranscriptRender
       || state.transcriptPointerDown
       || selectionTouchesPane(conversation, window.getSelection())) return;
-    drawConversation();
+    drawConversation(state.pendingTranscriptFilterChange);
   }
 
   function emptyProjectView(paneId) {
@@ -3200,6 +3299,31 @@ function initialize() {
     return true;
   }
 
+  function renderConversationFilters() {
+    const preferences = conversationVisibilityPreferences(state.conversationVisibility);
+    const hiddenCount = Number(!preferences.human) + Number(!preferences.internal);
+    const open = $("conversation-filters-open");
+    const indicator = $("conversation-filters-indicator");
+    $("conversation-show-human").checked = preferences.human;
+    $("conversation-show-internal").checked = preferences.internal;
+    $("conversation-filters-reset").disabled = hiddenCount === 0;
+    open.classList.toggle("active", hiddenCount > 0);
+    open.setAttribute("aria-label", hiddenCount
+      ? `Conversation visibility: ${hiddenCount} message ${hiddenCount === 1 ? "type" : "types"} hidden`
+      : "Conversation visibility: showing all message types");
+    indicator.textContent = hiddenCount ? `${hiddenCount} off` : "All";
+  }
+
+  function setConversationVisibility(next) {
+    state.conversationVisibility = conversationVisibilityPreferences(next);
+    saveConversationVisibilityPreferences(
+      (value) => localStorage.setItem(CONVERSATION_VISIBILITY_STORAGE_KEY, value),
+      state.conversationVisibility,
+    );
+    renderConversationFilters();
+    drawConversation(true);
+  }
+
   function renderViewMode() {
     const raw = state.viewMode === "raw";
     const files = state.viewMode === "files";
@@ -3213,6 +3337,7 @@ function initialize() {
     const revealGit = git && gitPanel.hidden;
     pane.hidden = !raw;
     conversation.hidden = state.viewMode !== "conversation";
+    $("conversation-filters-open").hidden = state.viewMode !== "conversation";
     filesPanel.hidden = !files;
     gitPanel.hidden = !git;
     // Snapshots normally arrive while Conversation is visible, when the
@@ -3236,6 +3361,7 @@ function initialize() {
       button.setAttribute("aria-pressed", String(selected));
       button.tabIndex = selected ? 0 : -1;
     }
+    renderConversationFilters();
     if (revealFiles) {
       const view = selectedProjectView();
       if (view?.files.listing) renderFiles();
@@ -5048,6 +5174,27 @@ function initialize() {
   $("raw-view").addEventListener("click", () => setViewMode("raw"));
   $("files-view").addEventListener("click", () => setViewMode("files"));
   $("git-view").addEventListener("click", () => setViewMode("git"));
+  $("conversation-filters-open").addEventListener("click", () => {
+    const dialog = $("conversation-filters-dialog");
+    if (!dialog.open) {
+      dialog.showModal();
+      $("conversation-filters-open").setAttribute("aria-expanded", "true");
+    }
+  });
+  $("conversation-filters-dialog").addEventListener("close", () => {
+    $("conversation-filters-open").setAttribute("aria-expanded", "false");
+  });
+  for (const [id, key] of [["conversation-show-human", "human"], ["conversation-show-internal", "internal"]]) {
+    $(id).addEventListener("change", (event) => {
+      setConversationVisibility({
+        ...state.conversationVisibility,
+        [key]: event.currentTarget.checked,
+      });
+    });
+  }
+  $("conversation-filters-reset").addEventListener("click", () => {
+    setConversationVisibility({ human: true, internal: true });
+  });
   document.querySelector(".view-switch").addEventListener("keydown", (event) => {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     const modes = ["conversation", "raw", "files", "git"];

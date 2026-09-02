@@ -101,6 +101,10 @@ textarea { resize: vertical; min-height: 74px; max-height: 220px; }
 .view-switch::-webkit-scrollbar { display: none; }
 .view-button { min-height: 30px; padding: 0 9px; border: 0; border-radius: 5px; color: var(--muted); background: transparent; font-size: 11px; }
 .view-button.selected { color: var(--text); background: var(--panel-2); }
+.conversation-filters-open { min-width: max-content; min-height: 32px; display: inline-flex; align-items: center; gap: 5px; padding-inline: 8px; color: var(--muted); background: #091115; font-size: 11px; }
+.conversation-filters-open.active { border-color: #4a8790; color: #d8f4f1; background: #11262b; }
+.conversation-filters-indicator { min-width: 20px; padding: 2px 5px; border-radius: 999px; color: #b9c9cd; background: #223038; font-size: 9px; font-weight: 800; line-height: 1.2; text-align: center; text-transform: uppercase; }
+.conversation-filters-open.active .conversation-filters-indicator { color: #071416; background: var(--cyan); }
 #pane { width: 100%; height: 100%; min-width: 0; min-height: 0; max-width: 100%; max-height: 100%; margin: 0; padding: 14px; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; overflow-anchor: none; color: #dce8e8; font: 13px/1.45 "SFMono-Regular", Consolas, "Liberation Mono", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .conversation { min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: clamp(8px, 1.3vw, 14px); scroll-padding-bottom: 18px; scrollbar-gutter: stable; overflow-anchor: none; background: #0a1115; }
 .project-panel { min-width: 0; min-height: 0; height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; overscroll-behavior: contain; background: #081014; }
@@ -164,8 +168,10 @@ button.code-line-number:hover, button.code-line-number:focus-visible, button.cod
 .transcript-notice { margin-top: 0; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; font-size: 12px; }
 .message-card { width: 100%; max-width: none; margin: 0 0 8px; overflow: hidden; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); }
 .message-card.user { width: 100%; max-width: none; margin-inline: 0; border-color: #32565e; background: #12242a; }
+.message-card.internal { border-color: #293940; background: #0c151a; }
 .message-card > header { padding: 5px 11px; border-bottom: 1px solid var(--line); color: var(--cyan); font-size: 10px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
 .message-card.user > header { color: #9ae8df; }
+.message-card.internal > header { color: var(--muted); }
 .markdown-body { padding: 8px 12px 10px; color: #e2edef; font-size: 13.5px; line-height: 1.55; overflow-wrap: anywhere; }
 .tool-card { width: 100%; max-width: none; margin: 0 0 6px; border: 1px solid #263840; border-radius: 6px; background: #0c151a; overflow: hidden; }
 .tool-card > summary { padding: 6px 10px; cursor: pointer; color: #9eb2b9; font: 11.5px/1.4 "SFMono-Regular", Consolas, monospace; user-select: none; }
@@ -223,6 +229,13 @@ dialog::backdrop { background: #000a; }
 .dialog-form h2, .dialog-form p { margin: 0; }
 .dialog-form p { color: var(--muted); }
 .dialog-form label { display: grid; gap: 7px; color: var(--muted); font-size: 13px; }
+.conversation-filters-form { width: min(100%, 390px); }
+.conversation-filter-options { display: grid; gap: 7px; }
+.conversation-filter-options label { min-height: 48px; grid-template-columns: 24px minmax(0, 1fr); grid-template-rows: auto auto; align-items: center; column-gap: 9px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: #0d171c; cursor: pointer; }
+.conversation-filter-options input { width: 20px; height: 20px; grid-column: 1; grid-row: 1 / 3; margin: 0; accent-color: var(--cyan); }
+.conversation-filter-options span { grid-column: 2; grid-row: 1; font-size: 13px; font-weight: 700; }
+.conversation-filter-options small { grid-column: 2; grid-row: 2; color: var(--muted); font-size: 11px; }
+.conversation-filter-options label:has(input:disabled) { cursor: default; opacity: .7; }
 .launch-memory-group { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(92px, .45fr); gap: 8px; align-items: end; }
 .launch-memory-group .dialog-note { grid-column: 1 / -1; font-size: 12px; }
 .launch-project-field { display: grid; gap: 7px; }
@@ -419,11 +432,17 @@ dialog::backdrop { background: #000a; }
      row underneath the textarea too. Advisory: ignored engines just keep the
      pre-existing behaviour. */
   .composer textarea { width: 100%; min-width: 0; min-height: 48px; max-height: 112px; padding: 7px 9px; font-size: 16px; resize: none; scroll-margin-bottom: 52px; }
-  .terminal-title { min-height: 30px; flex-wrap: nowrap; padding-block: 2px; }
+  .terminal-title { min-height: 30px; flex-wrap: nowrap; padding-block: 0; }
   .terminal-title h2 { display: none; }
   .terminal-title > span { display: none; }
-  .view-switch { width: 100%; margin-left: 0; }
+  .view-switch { width: auto; flex: 1 1 auto; margin-left: 0; }
   .view-button { min-width: max-content; min-height: 30px; flex: 1 0 auto; padding-inline: 8px; font-size: 10px; }
+  .conversation-filters-open { min-width: 52px; min-height: 44px; flex: 0 0 auto; justify-content: center; padding-inline: 5px; }
+  .conversation-filters-open > span:first-child { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .conversation-filters-indicator { min-width: 34px; padding-block: 4px; font-size: 9px; }
+  .conversation-filter-options label { min-height: 52px; }
+  .conversation-filter-options input { width: 22px; height: 22px; }
+  .conversation-filters-form button { min-height: 44px; }
   .conversation { padding: 10px; }
   .files-workspace, .git-workspace { display: block; }
   .files-list, .git-changes { width: 100%; height: 100%; border-right: 0; }

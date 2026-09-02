@@ -561,7 +561,10 @@ rather than merging into a gap.
   or unsafe path prefixes.
 - Credentials are referenced by `token_env` or `token_file`, never inlined in configuration. They
   are redacted from every `Debug` rendering and never appear in an API response or log line.
-- Conversation views show bounded agent messages and collapsed tool calls/results. Tool fields are
+- Conversation views show bounded agent messages and collapsed tool calls/results. The compact
+  **Show** control can independently hide Human messages or Internal tool/status activity; Agent
+  prose always remains enabled, and the preference follows the browser across panes and reloads.
+  Tool fields are
   rendered as text and atmux redacts common secret-bearing JSON keys, headers, assignments, bearer
   values, and private-key blocks. That redaction is defense in depth, not a guarantee: arbitrary
   command output can encode a secret in an unrecognizable form. Anyone allowed to view a session

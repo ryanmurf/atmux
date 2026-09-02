@@ -2018,11 +2018,205 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(staleExpansionResult.groupCount, 4, JSON.stringify(staleExpansionResult));
     assert.ok(Math.abs(staleExpansionResult.after - staleExpansionResult.before) <= 1, JSON.stringify({ staleExpansionSetup, staleExpansionResult }));
 
+    // Conversation visibility is a same-row mobile control. Agent prose can
+    // never be hidden; Human and Internal are independent, persistent filters.
+    const filterDefaults = await cdp.evaluate(`(() => {
+      const open = document.getElementById('conversation-filters-open');
+      open.click();
+      const dialog = document.getElementById('conversation-filters-dialog');
+      const title = document.querySelector('.terminal-title').getBoundingClientRect();
+      const openBounds = open.getBoundingClientRect();
+      const labels = [...dialog.querySelectorAll('.conversation-filter-options label')];
+      const inputs = [...dialog.querySelectorAll('.conversation-filter-options input')];
+      return {
+        open: dialog.open,
+        expanded: open.getAttribute('aria-expanded'),
+        indicator: document.getElementById('conversation-filters-indicator').textContent,
+        active: open.classList.contains('active'),
+        openHeight: openBounds.height,
+        titleHeight: title.height,
+        sameRow: openBounds.top >= title.top - 1 && openBounds.bottom <= title.bottom + 1,
+        checked: inputs.map((input) => input.checked),
+        disabled: inputs.map((input) => input.disabled),
+        inputSizes: inputs.map((input) => {
+          const box = input.getBoundingClientRect();
+          return [box.width, box.height];
+        }),
+        targetHeights: labels.map((label) => label.getBoundingClientRect().height),
+        buttonHeights: [...dialog.querySelectorAll('button')].map((button) => button.getBoundingClientRect().height),
+        label: open.getAttribute('aria-label'),
+        describedBy: dialog.getAttribute('aria-describedby'),
+        overflowX: document.documentElement.scrollWidth - innerWidth,
+      };
+    })()`);
+    assert.equal(filterDefaults.open, true, JSON.stringify(filterDefaults));
+    assert.equal(filterDefaults.expanded, "true", JSON.stringify(filterDefaults));
+    assert.equal(filterDefaults.indicator, "All", JSON.stringify(filterDefaults));
+    assert.equal(filterDefaults.active, false, JSON.stringify(filterDefaults));
+    assert.ok(filterDefaults.openHeight >= 44, JSON.stringify(filterDefaults));
+    assert.ok(filterDefaults.titleHeight <= 48, JSON.stringify(filterDefaults));
+    assert.equal(filterDefaults.sameRow, true, JSON.stringify(filterDefaults));
+    assert.deepEqual(filterDefaults.checked, [true, true, true]);
+    assert.deepEqual(filterDefaults.disabled, [true, false, false]);
+    assert.ok(filterDefaults.inputSizes.every(([width, height]) => width >= 16 && height >= 16), JSON.stringify(filterDefaults));
+    assert.ok(filterDefaults.targetHeights.every((height) => height >= 44), JSON.stringify(filterDefaults));
+    assert.ok(filterDefaults.buttonHeights.every((height) => height >= 44), JSON.stringify(filterDefaults));
+    assert.equal(filterDefaults.label, "Conversation visibility: showing all message types");
+    assert.equal(filterDefaults.describedBy, "conversation-filters-note");
+    assert.ok(filterDefaults.overflowX <= 1, JSON.stringify(filterDefaults));
+
+    const filterReadingAnchor = await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      const target = conversation.querySelector('[data-transcript-id="tool-agent-middle"]');
+      const bounds = conversation.getBoundingClientRect();
+      conversation.scrollTop += target.getBoundingClientRect().top - bounds.top - 12;
+      conversation.dispatchEvent(new Event('scroll'));
+      return {
+        id: target.dataset.transcriptId,
+        offset: target.getBoundingClientRect().top - bounds.top,
+        scrollTop: conversation.scrollTop,
+      };
+    })()`);
+    const humanHidden = await cdp.evaluate(`(() => {
+      document.getElementById('conversation-show-human').click();
+      const conversation = document.getElementById('conversation');
+      const bounds = conversation.getBoundingClientRect();
+      const target = conversation.querySelector('[data-transcript-id="tool-agent-middle"]');
+      return {
+        humans: conversation.querySelectorAll('[data-transcript-visibility="human"]').length,
+        agents: conversation.querySelectorAll('[data-transcript-visibility="agent"]').length,
+        groups: conversation.querySelectorAll('.tool-call-group').length,
+        targetOffset: target.getBoundingClientRect().top - bounds.top,
+        indicator: document.getElementById('conversation-filters-indicator').textContent,
+        active: document.getElementById('conversation-filters-open').classList.contains('active'),
+        stored: localStorage.getItem('atmux.conversation-visibility'),
+      };
+    })()`);
+    assert.equal(humanHidden.humans, 0, JSON.stringify(humanHidden));
+    assert.ok(humanHidden.agents > 0, JSON.stringify(humanHidden));
+    assert.equal(humanHidden.groups, 4, JSON.stringify(humanHidden));
+    assert.ok(Math.abs(humanHidden.targetOffset - filterReadingAnchor.offset) <= 1, JSON.stringify({ filterReadingAnchor, humanHidden }));
+    assert.equal(humanHidden.indicator, "1 off", JSON.stringify(humanHidden));
+    assert.equal(humanHidden.active, true, JSON.stringify(humanHidden));
+    assert.equal(humanHidden.stored, '{"human":false,"internal":true}');
+
+    const internalHidden = await cdp.evaluate(`(() => {
+      document.getElementById('conversation-show-human').click();
+      document.getElementById('conversation-show-internal').click();
+      const conversation = document.getElementById('conversation');
+      return {
+        humans: conversation.querySelectorAll('[data-transcript-visibility="human"]').length,
+        agents: conversation.querySelectorAll('[data-transcript-visibility="agent"]').length,
+        internals: conversation.querySelectorAll('[data-transcript-visibility="internal"]').length,
+        errors: [...conversation.querySelectorAll('summary')].filter((node) => node.textContent.includes('error')).length,
+        indicator: document.getElementById('conversation-filters-indicator').textContent,
+        stored: localStorage.getItem('atmux.conversation-visibility'),
+      };
+    })()`);
+    assert.ok(internalHidden.humans > 0, JSON.stringify(internalHidden));
+    assert.ok(internalHidden.agents > 0, JSON.stringify(internalHidden));
+    assert.equal(internalHidden.internals, 0, JSON.stringify(internalHidden));
+    assert.equal(internalHidden.errors, 0, JSON.stringify(internalHidden));
+    assert.equal(internalHidden.indicator, "1 off", JSON.stringify(internalHidden));
+    assert.equal(internalHidden.stored, '{"human":true,"internal":false}');
+
+    const agentOnly = await cdp.evaluate(`(() => {
+      document.getElementById('conversation-show-human').click();
+      const conversation = document.getElementById('conversation');
+      return {
+        humans: conversation.querySelectorAll('[data-transcript-visibility="human"]').length,
+        agents: conversation.querySelectorAll('[data-transcript-visibility="agent"]').length,
+        internals: conversation.querySelectorAll('[data-transcript-visibility="internal"]').length,
+        indicator: document.getElementById('conversation-filters-indicator').textContent,
+        label: document.getElementById('conversation-filters-open').getAttribute('aria-label'),
+        resetDisabled: document.getElementById('conversation-filters-reset').disabled,
+        stored: localStorage.getItem('atmux.conversation-visibility'),
+      };
+    })()`);
+    assert.equal(agentOnly.humans, 0, JSON.stringify(agentOnly));
+    assert.ok(agentOnly.agents > 0, JSON.stringify(agentOnly));
+    assert.equal(agentOnly.internals, 0, JSON.stringify(agentOnly));
+    assert.equal(agentOnly.indicator, "2 off", JSON.stringify(agentOnly));
+    assert.equal(agentOnly.label, "Conversation visibility: 2 message types hidden");
+    assert.equal(agentOnly.resetDisabled, false, JSON.stringify(agentOnly));
+    assert.equal(agentOnly.stored, '{"human":false,"internal":false}');
+    await cdp.evaluate("document.querySelector('#conversation-filters-dialog .primary').click(); true");
+
+    const filteredBeforeIncoming = await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      const target = conversation.querySelector('[data-transcript-id="tool-agent-middle"]');
+      const bounds = conversation.getBoundingClientRect();
+      conversation.scrollTop += target.getBoundingClientRect().top - bounds.top - 10;
+      conversation.dispatchEvent(new Event('scroll'));
+      return { id: target.dataset.transcriptId, offset: target.getBoundingClientRect().top - bounds.top };
+    })()`);
+    transcriptFixture = {
+      ...transcriptFixture,
+      content_hash: "conversation-filter-incoming",
+      messages: [
+        ...transcriptFixture.messages,
+        { id: "hidden-incoming-human", role: "user", markdown: "HIDDEN HUMAN <img src=x onerror=human()>" },
+        { id: "hidden-incoming-tool", role: "tool", kind: "tool", tool_name: "exec", tool_output: "Error: HIDDEN TOOL" },
+        { id: "visible-incoming-agent", role: "assistant", markdown: "VISIBLE AGENT <img src=x onerror=agent()>" },
+      ],
+    };
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('conversation').textContent.includes('VISIBLE AGENT')"),
+      "a visible incoming agent message did not render through agent-only mode",
+      5_000,
+    );
+    const filteredIncoming = await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      const bounds = conversation.getBoundingClientRect();
+      const target = conversation.querySelector('[data-transcript-id="tool-agent-middle"]');
+      return {
+        humanHidden: !conversation.textContent.includes('HIDDEN HUMAN'),
+        toolHidden: !conversation.textContent.includes('HIDDEN TOOL'),
+        agentVisible: conversation.textContent.includes('VISIBLE AGENT'),
+        targetOffset: target.getBoundingClientRect().top - bounds.top,
+        markupInjected: Boolean(conversation.querySelector('img, script')),
+      };
+    })()`);
+    assert.equal(filteredIncoming.humanHidden, true, JSON.stringify(filteredIncoming));
+    assert.equal(filteredIncoming.toolHidden, true, JSON.stringify(filteredIncoming));
+    assert.equal(filteredIncoming.agentVisible, true, JSON.stringify(filteredIncoming));
+    assert.equal(filteredIncoming.markupInjected, false, JSON.stringify(filteredIncoming));
+    assert.ok(Math.abs(filteredIncoming.targetOffset - filteredBeforeIncoming.offset) <= 1, JSON.stringify({ filteredBeforeIncoming, filteredIncoming }));
+
+    // Reconnect and a full document reload retain the same filters. Neither
+    // operation can flash hidden transcript records from the selected pane.
+    const filteredPaneStream = [...paneStreams].at(-1);
+    assert.ok(filteredPaneStream, "conversation filter reconnect needs a pane stream");
+    filteredPaneStream.write(`event: pane.patch\ndata: ${JSON.stringify({
+      base_revision: 9_999, revision: 10_000, start_line: 0, delete_lines: 0, lines: [],
+    })}\n\n`);
+    await waitFor(
+      () => cdp.evaluate(`document.getElementById('stream-state').textContent === 'Live'
+        && document.getElementById('conversation').textContent.includes('VISIBLE AGENT')
+        && !document.getElementById('conversation').textContent.includes('HIDDEN HUMAN')
+        && document.getElementById('conversation-filters-indicator').textContent === '2 off'`),
+      "agent-only visibility did not survive a pane reconnect",
+      5_000,
+    );
+    await cdp.send("Page.reload");
+    await waitFor(
+      () => cdp.evaluate(`document.readyState === 'complete'
+        && document.getElementById('conversation').textContent.includes('VISIBLE AGENT')
+        && !document.getElementById('conversation').textContent.includes('HIDDEN HUMAN')
+        && document.getElementById('conversation-filters-indicator').textContent === '2 off'`),
+      "agent-only visibility did not restore from local storage",
+      5_000,
+    );
+
     // A pane change clears group expansion/content synchronously; an identical
     // transcript id from another owner cannot inherit the previous pane DOM.
     transcriptFixture = {
       available: true, source: "codex", changed: true, content_hash: "pane-b-prose", truncated: false,
-      messages: [{ id: "pane-b-agent", role: "assistant", markdown: "Different pane conversation" }],
+      messages: [
+        { id: "pane-b-human", role: "user", markdown: "Different pane human" },
+        { id: "pane-b-tool", role: "tool", kind: "tool", tool_name: "exec", tool_output: "ok" },
+        { id: "pane-b-agent", role: "assistant", markdown: "Different pane conversation" },
+      ],
     };
     await cdp.evaluate("document.getElementById('mobile-back').click(); true");
     await waitFor(() => cdp.evaluate("!document.body.classList.contains('has-selection')"), "tool grouping test did not return to agent list");
@@ -2036,6 +2230,47 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       "pane B conversation did not replace pane A tool groups",
       5_000,
     );
+    const paneFilterPersistence = await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      return {
+        agent: conversation.textContent.includes('Different pane conversation'),
+        human: conversation.textContent.includes('Different pane human'),
+        tool: conversation.querySelector('[data-transcript-id="pane-b-tool"]') !== null,
+        indicator: document.getElementById('conversation-filters-indicator').textContent,
+      };
+    })()`);
+    assert.deepEqual(paneFilterPersistence, {
+      agent: true, human: false, tool: false, indicator: "2 off",
+    });
+    transcriptFixture = {
+      available: true, source: "codex", changed: true, content_hash: "pane-b-hidden-only", truncated: false,
+      messages: [
+        { id: "pane-b-human", role: "user", markdown: "Different pane human" },
+        { id: "pane-b-tool", role: "tool", kind: "tool", tool_name: "exec", tool_output: "ok" },
+      ],
+    };
+    await waitFor(
+      () => cdp.evaluate("document.querySelector('#conversation .conversation-empty')?.textContent.includes('No agent messages to show')"),
+      "agent-only mode did not expose a recoverable filtered empty state",
+      5_000,
+    );
+    await cdp.evaluate(`(() => {
+      document.getElementById('conversation-filters-open').click();
+      document.getElementById('conversation-filters-reset').click();
+      document.querySelector('#conversation-filters-dialog .primary').click();
+      return true;
+    })()`);
+    const filtersReset = await cdp.evaluate(`(() => ({
+      human: document.getElementById('conversation').textContent.includes('Different pane human'),
+      tool: document.getElementById('conversation').querySelector('[data-transcript-id="pane-b-tool"]') !== null,
+      indicator: document.getElementById('conversation-filters-indicator').textContent,
+      active: document.getElementById('conversation-filters-open').classList.contains('active'),
+      stored: localStorage.getItem('atmux.conversation-visibility'),
+    }))()`);
+    assert.deepEqual(filtersReset, {
+      human: true, tool: true, indicator: "All", active: false,
+      stored: '{"human":true,"internal":true}',
+    });
 
     const composerBeforeFocus = await cdp.evaluate(`(() => {
       const box = document.getElementById('composer').getBoundingClientRect();

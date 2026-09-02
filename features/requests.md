@@ -71,6 +71,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Support old/unlabeled Claude CLI storage and profile directories such as `~/.claude-max` | `completed/claude-codex-transcripts.md` | Completed |
 | Render agent output as safe native Markdown with links and highlighted, expandable code blocks | `completed/claude-codex-transcripts.md` | Completed |
 | Show compact, expandable Claude and Codex tool calls and results | `completed/claude-codex-transcripts.md` | Completed |
+| Hide Human messages or Internal activity independently while Agent prose stays visible | `completed/conversation-visibility-filters.md` | Completed |
 | Make agent boxes and the overall web view denser and more streamlined | `completed/claude-codex-transcripts.md` | Completed |
 | Put a nearby trash-can action beside each session in the left navigation | `completed/left-rail-session-controls.md` | Completed |
 | Collapse and restore the left navigation | `completed/left-rail-session-controls.md` | Completed |

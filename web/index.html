@@ -108,6 +108,9 @@
               <button id="files-view" class="view-button" type="button" role="tab" aria-selected="false" aria-controls="files-panel" tabindex="-1">Files</button>
               <button id="git-view" class="view-button" type="button" role="tab" aria-selected="false" aria-controls="git-panel" tabindex="-1">Git</button>
             </div>
+            <button id="conversation-filters-open" class="subtle conversation-filters-open" type="button" aria-haspopup="dialog" aria-controls="conversation-filters-dialog" aria-expanded="false">
+              <span>Show</span><span id="conversation-filters-indicator" class="conversation-filters-indicator">All</span>
+            </button>
             <span id="stream-state">Connecting…</span>
           </div>
           <div id="conversation" class="conversation" role="tabpanel" aria-live="polite" aria-labelledby="conversation-view" tabindex="0" title="Start typing to message this agent"></div>
@@ -224,6 +227,19 @@
         <button id="quick-kill-open" class="danger" type="button">Kill agent</button>
       </div>
       <p id="quick-resume-note" class="dialog-note" role="status" hidden></p>
+    </form>
+  </dialog>
+
+  <dialog id="conversation-filters-dialog" aria-labelledby="conversation-filters-title" aria-describedby="conversation-filters-note">
+    <form method="dialog" class="dialog-form conversation-filters-form">
+      <div class="dialog-head"><h2 id="conversation-filters-title">Conversation visibility</h2><button class="icon-button" type="submit" aria-label="Close">×</button></div>
+      <p id="conversation-filters-note">Agent messages always stay visible.</p>
+      <div class="conversation-filter-options" role="group" aria-label="Message types to show">
+        <label><input type="checkbox" checked disabled> <span>Agent messages</span><small>Always shown</small></label>
+        <label for="conversation-show-human"><input id="conversation-show-human" type="checkbox" checked> <span>Human messages</span><small>Your prompts and follow-ups</small></label>
+        <label for="conversation-show-internal"><input id="conversation-show-internal" type="checkbox" checked> <span>Internal activity</span><small>Tools, status, and coordination</small></label>
+      </div>
+      <div class="dialog-actions"><button id="conversation-filters-reset" class="subtle" type="button">Show all</button><button class="primary" type="submit">Done</button></div>
     </form>
   </dialog>
 

@@ -73,6 +73,10 @@ const {
   fileReaderPreferences,
   fileReaderPreferenceJson,
   loadFileReaderPreferences,
+  conversationVisibilityPreferences,
+  conversationVisibilityPreferenceJson,
+  loadConversationVisibilityPreferences,
+  saveConversationVisibilityPreferences,
   fileReferenceBlock,
   insertComposerReference,
   nextFileLineSelection,
@@ -120,6 +124,9 @@ const {
   WORKING_TO_WAITING_HOLD_MS,
   suggestedSessionName,
   transcriptItemKind,
+  transcriptVisibilityKind,
+  transcriptItemIsVisible,
+  filterTranscriptMessages,
   normalizedToolName,
   coordinationResultSignal,
   execResultClass,
@@ -253,6 +260,112 @@ test("streaming redraws use semantic transcript anchors and explicit reader inte
   assert.match(source, /if \(pane\.hidden\) return;\s*state\.paneReadingScrollTop = pane\.scrollTop;/s);
   assert.match(css, /#pane \{[^}]*height: 100%;[^}]*min-height: 0;[^}]*max-height: 100%;[^}]*overflow: auto;[^}]*overscroll-behavior: contain;[^}]*overflow-anchor: none;/s);
   assert.match(css, /\.conversation \{[^}]*overscroll-behavior: contain;/s);
+});
+
+test("conversation visibility defaults to all and independently filters human and internal records", () => {
+  const messages = [
+    { id: "agent", role: "assistant", markdown: "Agent prose" },
+    { id: "human", role: "user", markdown: "Human prompt" },
+    { id: "tool", role: "tool", kind: "tool", tool_name: "exec" },
+    { id: "system", role: "system", kind: "system", markdown: "System status" },
+    { id: "status", role: "assistant", kind: "status", markdown: "Coordination status" },
+  ];
+  assert.deepEqual(messages.map(transcriptVisibilityKind), [
+    "agent", "human", "internal", "internal", "internal",
+  ]);
+  assert.deepEqual(filterTranscriptMessages(messages, {}).map(({ id }) => id), [
+    "agent", "human", "tool", "system", "status",
+  ]);
+  assert.deepEqual(
+    filterTranscriptMessages(messages, { human: false, internal: true }).map(({ id }) => id),
+    ["agent", "tool", "system", "status"],
+  );
+  assert.deepEqual(
+    filterTranscriptMessages(messages, { human: true, internal: false }).map(({ id }) => id),
+    ["agent", "human"],
+  );
+  assert.deepEqual(
+    filterTranscriptMessages(messages, { human: false, internal: false }).map(({ id }) => id),
+    ["agent"],
+  );
+  assert.equal(transcriptItemIsVisible(messages[0], { human: false, internal: false }), true);
+});
+
+test("conversation visibility preferences persist safely and reject malformed storage", () => {
+  assert.deepEqual(conversationVisibilityPreferences(null), { human: true, internal: true });
+  assert.deepEqual(conversationVisibilityPreferences("not-json"), { human: true, internal: true });
+  assert.deepEqual(conversationVisibilityPreferences("[]"), { human: true, internal: true });
+  assert.deepEqual(conversationVisibilityPreferences('{"human":false,"internal":true,"agent":false}'), {
+    human: false,
+    internal: true,
+  });
+  assert.deepEqual(conversationVisibilityPreferences({ human: "false", internal: false }), {
+    human: true,
+    internal: false,
+  });
+  assert.equal(
+    conversationVisibilityPreferenceJson({ human: false, internal: false, agent: false }),
+    '{"human":false,"internal":false}',
+  );
+  assert.deepEqual(loadConversationVisibilityPreferences(() => {
+    throw new Error("storage denied");
+  }), { human: true, internal: true });
+  let stored = null;
+  assert.equal(saveConversationVisibilityPreferences((value) => { stored = value; }, {
+    human: false, internal: true,
+  }), true);
+  assert.equal(stored, '{"human":false,"internal":true}');
+  assert.equal(saveConversationVisibilityPreferences(() => {
+    throw new Error("quota exceeded");
+  }, { human: false, internal: false }), false);
+});
+
+test("conversation filtering happens before exec grouping and never counts hidden calls", () => {
+  const exec = (id) => ({
+    id, role: "tool", kind: "tool", tool_name: "exec", tool_output: "ok",
+  });
+  const messages = [
+    exec("exec-1"),
+    { id: "human", role: "user", markdown: "a human boundary" },
+    exec("exec-2"),
+    exec("exec-3"),
+    { id: "agent", role: "assistant", markdown: "agent boundary" },
+    exec("exec-4"),
+  ];
+  const withoutHuman = compactTranscriptItems(filterTranscriptMessages(messages, {
+    human: false, internal: true,
+  }));
+  assert.deepEqual(withoutHuman.map((item) => item.kind), ["tool-group", "item", "item"]);
+  assert.equal(toolGroupSummary(withoutHuman[0]), "exec ×3");
+  assert.deepEqual(withoutHuman[0].messages.map(({ id }) => id), ["exec-1", "exec-2", "exec-3"]);
+  const agentOnly = compactTranscriptItems(filterTranscriptMessages(messages, {
+    human: false, internal: false,
+  }));
+  assert.deepEqual(agentOnly.map((item) => item.message.id), ["agent"]);
+});
+
+test("conversation filter controls are recoverable, accessible, and text-only", () => {
+  const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+  const css = readFileSync(new URL("./app.css", import.meta.url), "utf8");
+  assert.match(html, /id="conversation-filters-open"[^>]*aria-haspopup="dialog"[^>]*aria-controls="conversation-filters-dialog"/);
+  assert.match(html, /id="conversation-filters-dialog"[^>]*aria-labelledby="conversation-filters-title"[^>]*aria-describedby="conversation-filters-note"/);
+  assert.match(html, /<input type="checkbox" checked disabled>\s*<span>Agent messages<\/span>/);
+  assert.match(html, /id="conversation-show-human" type="checkbox" checked/);
+  assert.match(html, /id="conversation-show-internal" type="checkbox" checked/);
+  assert.match(html, /id="conversation-filters-reset"[^>]*>Show all<\/button>/);
+  assert.match(source, /indicator\.textContent = hiddenCount \? `\$\{hiddenCount\} off` : "All"/);
+  assert.match(source, /drawConversation\(true\)/);
+  assert.match(source, /state\.pendingTranscriptFilterChange \|\|= filterChanged/);
+  assert.match(source, /drawConversation\(state\.pendingTranscriptFilterChange\)/);
+  assert.match(source, /filterTranscriptMessages\(sourceMessages, state\.conversationVisibility\)/);
+  assert.match(source, /No agent messages to show\. Change Conversation visibility or choose Show all\./);
+  assert.doesNotMatch(source.slice(
+    source.indexOf("function renderConversationFilters"),
+    source.indexOf("function renderViewMode"),
+  ), /innerHTML/);
+  assert.match(css, /@media \(max-width: 720px\)[\s\S]*\.conversation-filters-open \{[^}]*min-height: 44px;/s);
+  assert.match(css, /@media \(max-width: 720px\)[\s\S]*\.conversation-filter-options input \{[^}]*width: 22px;[^}]*height: 22px;/s);
 });
 
 test("adjacent low-signal coordination calls collapse without crossing prose or error boundaries", () => {
