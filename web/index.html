@@ -170,7 +170,15 @@
       </div>
       <section id="launch-browser" class="launch-browser" aria-label="Project folder browser" hidden>
         <div class="launch-browser-head"><strong id="launch-browser-path">Project roots</strong><button id="launch-browser-close" class="icon-button" type="button" aria-label="Close folder browser">×</button></div>
-        <div class="launch-browser-actions"><button id="launch-browser-up" class="subtle" type="button">Up</button><button id="launch-browser-use" class="primary" type="button">Use this folder</button></div>
+        <div class="launch-browser-actions"><button id="launch-browser-up" class="subtle" type="button">Up</button><button id="launch-browser-use" class="primary" type="button">Use folder</button><button id="launch-browser-new" class="subtle" type="button" aria-expanded="false">New folder</button><button id="launch-browser-clone" class="subtle" type="button" aria-expanded="false">Clone repo</button></div>
+        <div id="launch-browser-operation" class="launch-browser-operation" role="group" aria-labelledby="launch-browser-operation-title" hidden>
+          <strong id="launch-browser-operation-title"></strong>
+          <label id="launch-browser-new-row" for="launch-browser-new-name">Folder name<input id="launch-browser-new-name" maxlength="240" autocomplete="off"></label>
+          <label id="launch-browser-repository-row" for="launch-browser-repository">Repository URL<input id="launch-browser-repository" maxlength="4096" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+          <label id="launch-browser-destination-row" for="launch-browser-destination">Destination folder <span>(optional)</span><input id="launch-browser-destination" maxlength="240" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+          <div class="launch-browser-operation-actions"><button id="launch-browser-operation-cancel" class="subtle" type="button">Cancel</button><button id="launch-browser-operation-confirm" class="primary" type="button"></button></div>
+          <p id="launch-browser-operation-note" class="dialog-note" role="status" aria-live="polite"></p>
+        </div>
         <div id="launch-browser-list" class="launch-browser-list" role="list"></div>
         <p id="launch-browser-note" class="dialog-note" hidden></p>
       </section>

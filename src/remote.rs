@@ -220,6 +220,27 @@ impl RemoteMachine {
             .with_context(|| format!("machine {} returned an unreadable {path} payload", self.id))
     }
 
+    /// Sends a JSON command whose bounded owner-side work may legitimately
+    /// take longer than the normal interactive request timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for request serialization, transport failure, a
+    /// non-success response, an oversized response, or malformed JSON.
+    pub async fn post_json_response_with_timeout<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Duration,
+    ) -> Result<T> {
+        let encoded = serde_json::to_vec(body).context("failed to encode a federated command")?;
+        let response = self
+            .request_with_timeout(Method::POST, path, Some(encoded), timeout)
+            .await?;
+        serde_json::from_slice(&response)
+            .with_context(|| format!("machine {} returned an unreadable {path} payload", self.id))
+    }
+
     /// Sends an optimistic JSON replacement and decodes its bounded response.
     /// The rejected HTTP status remains downcastable so a coordinator can
     /// preserve an owner's 400/404/409 classification.
@@ -279,6 +300,17 @@ impl RemoteMachine {
     }
 
     async fn request(&self, method: Method, path: &str, body: Option<Vec<u8>>) -> Result<Bytes> {
+        self.request_with_timeout(method, path, body, self.request_timeout)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+        timeout: Duration,
+    ) -> Result<Bytes> {
         let (mut sender, _guard) = self.connect().await?;
         let mut builder = self
             .build(method, path)
@@ -289,13 +321,13 @@ impl RemoteMachine {
         let request = builder
             .body(Full::new(Bytes::from(body.unwrap_or_default())))
             .context("failed to build a federated request")?;
-        let response = tokio::time::timeout(self.request_timeout, sender.send_request(request))
+        let response = tokio::time::timeout(timeout, sender.send_request(request))
             .await
             .with_context(|| format!("machine {} timed out on {path}", self.id))?
             .with_context(|| format!("machine {} refused {path}", self.id))?;
         let status = response.status();
         let collected = tokio::time::timeout(
-            self.request_timeout,
+            timeout,
             collect_bounded(response.into_body(), MAX_RESPONSE_BYTES),
         )
         .await

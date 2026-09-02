@@ -26,7 +26,8 @@ use crate::{
     attachment::{ImageMessageRequest, MAX_ATTACHMENT_REQUEST_BODY_BYTES},
     config::Config,
     control::{
-        ControlPlane, ErrorKind, LaunchDirectoryListing, LaunchRequest, ModelSwitchRequest,
+        CloneLaunchRepositoryRequest, ControlPlane, CreateLaunchDirectoryRequest, ErrorKind,
+        LaunchDirectoryActionResult, LaunchDirectoryListing, LaunchRequest, ModelSwitchRequest,
         Overview, PaneModels, PaneOutput, ResumableLaunchSessions, error_kind, overview_patch,
         pane_patch,
     },
@@ -773,6 +774,14 @@ fn routes(state: WebState) -> Router {
         .route("/api/v1/events", get(overview_events))
         .route("/api/v1/launch-options", get(launch_options))
         .route("/api/v1/launch-directories", get(launch_directories))
+        .route(
+            "/api/v1/launch-directories/folders",
+            post(create_launch_directory),
+        )
+        .route(
+            "/api/v1/launch-directories/clone",
+            post(clone_launch_repository),
+        )
         .route("/api/v1/launch-sessions", get(launch_sessions))
         .route("/api/v1/panes/{id}", get(pane_output))
         .route("/api/v1/panes/{id}/transcript", get(pane_transcript))
@@ -925,6 +934,34 @@ async fn launch_directories(
     state
         .control
         .browse_launch_directories(query.machine.as_deref(), query.path.as_deref())
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::from_control(&error))
+}
+
+async fn create_launch_directory(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateLaunchDirectoryRequest>,
+) -> Result<Json<LaunchDirectoryActionResult>, ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    state
+        .control
+        .create_launch_directory(request)
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::from_control(&error))
+}
+
+async fn clone_launch_repository(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(request): Json<CloneLaunchRepositoryRequest>,
+) -> Result<Json<LaunchDirectoryActionResult>, ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    state
+        .control
+        .clone_launch_repository(request)
         .await
         .map(Json)
         .map_err(|error| ApiError::from_control(&error))
@@ -1636,6 +1673,10 @@ mod tests {
         Router::new()
             .route("/api/probe", get(|| async { "ok" }))
             .route("/api/v1/pulse/probe", get(|| async { "ok" }))
+            .route(
+                "/api/v1/launch-directories/folders",
+                post(|| async { "mutated" }),
+            )
             .route("/public", get(|| async { "ok" }))
             .layer(middleware::from_fn_with_state(
                 policy,
@@ -1724,6 +1765,89 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn folder_mutations_use_the_existing_api_authentication_boundary() {
+        let app = probe_app(Some(Secret::new("folder-node-token")));
+        let request = |token: Option<&str>| {
+            let mut builder = HttpRequest::builder()
+                .method("POST")
+                .uri("/api/v1/launch-directories/folders")
+                .header(header::HOST, "localhost:7345")
+                .extension(ConnectInfo(
+                    "100.64.0.9:41000".parse::<SocketAddr>().unwrap(),
+                ));
+            if let Some(token) = token {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(request(None)).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.oneshot(request(Some("folder-node-token")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn folder_mutation_handlers_reject_cross_origin_before_owner_work() {
+        let mut config = Config::default();
+        config.profiles.clear();
+        config.general.project_roots.clear();
+        config.general.favorite_dirs.clear();
+        config.general.switch_on_launch = false;
+        config.node.id = "home".to_owned();
+        config.node.coordinator_only = true;
+        config.discovery.enabled = false;
+        config.auto_compact.enabled = false;
+        config.maintenance.enabled = false;
+        #[cfg(feature = "pulse")]
+        {
+            config.pulse.collect = false;
+            config.pulse.receive = false;
+            config.pulse.report_to = None;
+        }
+        let control = ControlPlane::start(config).await.unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let app = api_router(
+            control,
+            vec!["https://atmux.example.test".to_owned()],
+            shutdown_rx,
+        );
+        let request = |origin: &'static str| {
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/api/v1/launch-directories/folders")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, origin)
+                .body(Body::from(
+                    r#"{"directory":"/tmp","name":"project","machine":null}"#,
+                ))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request("https://attacker.example"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            app.oneshot(request("https://atmux.example.test"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST,
+            "an allowed origin must reach the owner capability check"
+        );
     }
 
     #[cfg(feature = "pulse")]

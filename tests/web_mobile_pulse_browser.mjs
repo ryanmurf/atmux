@@ -17,9 +17,12 @@ const paneStreams = new Set();
 const overviewStreams = new Set();
 const launchRequests = [];
 const launchSessionRequests = [];
+const launchDirectoryMutationRequests = [];
+const launchBrowserChildren = new Set();
 let failLiveModels = false;
 let launchOptionsDelayMs = 0;
 let launchResponseDelayMs = 0;
+let launchDirectoryMutationDelayMs = 0;
 let launchMachinesUnavailable = false;
 let overviewRevision = 1;
 let delayProjectFilePane = null;
@@ -298,15 +301,56 @@ function mockApi(url, response, request) {
   }
   if (pathname === "/api/v1/launch-directories") {
     const path = url.searchParams.get("path");
-    json(response, path === "/workspace/custom"
-      ? {
-        machine: "tron", current: "/workspace/custom", parent: null,
-        directories: [], truncated: false,
-      }
-      : {
-        machine: "tron", current: null, parent: null,
-        directories: [{ path: "/workspace/custom", name: "custom" }], truncated: false,
-      });
+    const current = path === "/workspace" || path === "/workspace/custom" ? path : null;
+    const directories = current === "/workspace/custom"
+      ? [...launchBrowserChildren].map((name) => ({ path: `/workspace/custom/${name}`, name }))
+      : [{ path: "/workspace/custom", name: "custom" }];
+    json(response, {
+      machine: "tron", current,
+      parent: current === "/workspace/custom" ? "/workspace" : null,
+      directories, truncated: false,
+    });
+    return true;
+  }
+  if (["/api/v1/launch-directories/folders", "/api/v1/launch-directories/clone"].includes(pathname)
+      && request.method === "POST") {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      let parsed = null;
+      try { parsed = JSON.parse(body); } catch { /* asserted below */ }
+      launchDirectoryMutationRequests.push({ pathname, body: parsed });
+      const reply = () => {
+        if (parsed?.name === "existing") {
+          errorJson(response, 409, "destination already exists");
+          return;
+        }
+        if (/^https:\/\/[^/]*@/.test(String(parsed?.repository || ""))) {
+          errorJson(response, 400, "credential-bearing HTTPS repository URLs are not allowed");
+          return;
+        }
+        const derived = String(parsed?.repository || "").split(/[?#]/, 1)[0]
+          .replace(/\/+$/, "").split(/[/:]/).pop()?.replace(/\.git$/, "");
+        const name = parsed?.name || parsed?.destination || derived;
+        launchBrowserChildren.add(name);
+        json(response, {
+          directory: { path: `/workspace/custom/${name}`, name },
+          listing: {
+            machine: "tron", current: "/workspace/custom", parent: "/workspace",
+            directories: [...launchBrowserChildren].map((child) => ({
+              path: `/workspace/custom/${child}`, name: child,
+            })),
+            truncated: false,
+          },
+        });
+      };
+      if (launchDirectoryMutationDelayMs > 0) {
+        const delayMs = launchDirectoryMutationDelayMs;
+        launchDirectoryMutationDelayMs = 0;
+        setTimeout(reply, delayMs);
+      } else reply();
+    });
     return true;
   }
   if (pathname === "/api/v1/launch-sessions") {
@@ -643,6 +687,8 @@ async function openCdp(browserSocket, pageUrl) {
 test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dashboard", { timeout: 120_000 }, async () => {
   launchRequests.length = 0;
   launchSessionRequests.length = 0;
+  launchDirectoryMutationRequests.length = 0;
+  launchBrowserChildren.clear();
   fileSaveRequests.length = 0;
   messageRequests.length = 0;
   projectFileContents.clear();
@@ -652,6 +698,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
   failLiveModels = false;
   launchOptionsDelayMs = 0;
   launchResponseDelayMs = 0;
+  launchDirectoryMutationDelayMs = 0;
   overviewRevision = 1;
   const transcript = (start, count, hash) => ({
     available: true,
@@ -2484,6 +2531,140 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       () => cdp.evaluate("!document.getElementById('launch-browser-use').disabled"),
       "folder browser did not navigate into the selected folder",
     );
+    assert.equal(await cdp.evaluate("document.getElementById('launch-browser-up').disabled"), false);
+    await cdp.evaluate("document.getElementById('launch-browser-up').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('launch-browser-path').textContent === '/workspace'"),
+      "folder browser did not navigate to its allowed parent",
+    );
+    assert.equal(
+      await cdp.evaluate("document.getElementById('launch-browser-up').disabled"),
+      true,
+      "Up must be disabled only at the actual allowed root",
+    );
+    await cdp.evaluate("document.querySelector('.launch-browser-folder').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('launch-browser-path').textContent === '/workspace/custom'"),
+      "folder browser did not return to the selected child",
+    );
+
+    const browserActionGeometry = await cdp.evaluate(`(() => ({
+      documentWidth: document.documentElement.scrollWidth,
+      viewportWidth: window.innerWidth,
+      buttons: [...document.querySelectorAll('.launch-browser-actions button')].map((button) => ({
+        height: button.getBoundingClientRect().height,
+        right: button.getBoundingClientRect().right,
+      })),
+    }))()`);
+    assert.ok(browserActionGeometry.documentWidth <= browserActionGeometry.viewportWidth, JSON.stringify(browserActionGeometry));
+    assert.ok(browserActionGeometry.buttons.every((button) => button.height >= 44 && button.right <= browserActionGeometry.viewportWidth + 1), JSON.stringify(browserActionGeometry));
+
+    await cdp.evaluate("document.getElementById('launch-browser-new').click(); true");
+    await cdp.evaluate(`(() => {
+      document.getElementById('launch-browser-new-name').value = 'new project';
+      document.getElementById('launch-browser-operation-confirm').click();
+      return true;
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("[...document.querySelectorAll('.launch-browser-folder')].some((button) => button.dataset.path === '/workspace/custom/new project')"),
+      "new folder action did not refresh the current listing",
+    );
+    assert.deepEqual(launchDirectoryMutationRequests.at(-1), {
+      pathname: "/api/v1/launch-directories/folders",
+      body: { machine: "tron", directory: "/workspace/custom", name: "new project" },
+    });
+
+    await cdp.evaluate("document.getElementById('launch-browser-clone').click(); true");
+    const clonePanel = await cdp.evaluate(`(() => {
+      const repository = document.getElementById('launch-browser-repository');
+      repository.value = 'https://example.test/team/cloned project.git';
+      repository.dispatchEvent(new Event('input', { bubbles: true }));
+      const destination = document.getElementById('launch-browser-destination');
+      return {
+        destination: destination.value,
+        fontSize: getComputedStyle(repository).fontSize,
+        inputHeight: repository.getBoundingClientRect().height,
+        expanded: document.getElementById('launch-browser-clone').getAttribute('aria-expanded'),
+      };
+    })()`);
+    assert.equal(clonePanel.destination, "cloned project", JSON.stringify(clonePanel));
+    assert.equal(clonePanel.fontSize, "16px", JSON.stringify(clonePanel));
+    assert.ok(clonePanel.inputHeight >= 44, JSON.stringify(clonePanel));
+    assert.equal(clonePanel.expanded, "true", JSON.stringify(clonePanel));
+    await cdp.evaluate("document.getElementById('launch-browser-operation-confirm').click(); true");
+    await waitFor(
+      () => cdp.evaluate("[...document.querySelectorAll('.launch-browser-folder')].some((button) => button.dataset.path === '/workspace/custom/cloned project')"),
+      "clone action did not refresh the current listing",
+    );
+    assert.deepEqual(launchDirectoryMutationRequests.at(-1), {
+      pathname: "/api/v1/launch-directories/clone",
+      body: {
+        machine: "tron", directory: "/workspace/custom",
+        repository: "https://example.test/team/cloned project.git",
+        destination: "cloned project",
+      },
+    });
+    assert.equal(await cdp.evaluate("document.getElementById('launch-browser-operation').hidden"), true);
+
+    await cdp.evaluate(`(() => {
+      document.getElementById('launch-browser-clone').click();
+      const repository = document.getElementById('launch-browser-repository');
+      repository.value = 'https://oauth2:super-secret@example.test/team/private.git';
+      repository.dispatchEvent(new Event('input', { bubbles: true }));
+      document.getElementById('launch-browser-operation-confirm').click();
+      return true;
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('launch-browser-operation-note').textContent.includes('credential-bearing')"),
+      "credential-bearing repository rejection was not shown inline",
+    );
+    const credentialError = await cdp.evaluate("document.getElementById('launch-browser-operation-note').textContent");
+    assert.doesNotMatch(credentialError, /super-secret|oauth2|private\.git/);
+    await cdp.evaluate("document.getElementById('launch-browser-operation-cancel').click(); true");
+
+    launchDirectoryMutationDelayMs = 600;
+    await cdp.evaluate(`(() => {
+      document.getElementById('launch-browser-clone').click();
+      const repository = document.getElementById('launch-browser-repository');
+      repository.value = 'https://example.test/team/stale-clone.git';
+      repository.dispatchEvent(new Event('input', { bubbles: true }));
+      document.getElementById('launch-browser-operation-confirm').click();
+      return true;
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('launch-browser-operation-confirm').disabled"),
+      "delayed clone did not enter its disabled mutation state",
+    );
+    await cdp.evaluate("document.getElementById('launch-browser-close').click(); true");
+    await cdp.evaluate("document.getElementById('launch-browse').click(); true");
+    await waitFor(
+      () => cdp.evaluate("!document.getElementById('launch-browser').hidden && document.querySelector('.launch-browser-folder')?.dataset.path === '/workspace/custom'"),
+      "folder browser did not reopen while an old clone response was pending",
+    );
+    await cdp.evaluate("document.querySelector('.launch-browser-folder').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('launch-browser-path').textContent === '/workspace/custom'"),
+      "folder browser did not navigate after reopening during an old clone request",
+    );
+    await cdp.evaluate("document.getElementById('launch-browser-clone').click(); true");
+    const reopenedControls = await cdp.evaluate(`(() => ({
+      repository: document.getElementById('launch-browser-repository').disabled,
+      destination: document.getElementById('launch-browser-destination').disabled,
+      cancel: document.getElementById('launch-browser-operation-cancel').disabled,
+      confirm: document.getElementById('launch-browser-operation-confirm').disabled,
+    }))()`);
+    assert.deepEqual(reopenedControls, {
+      repository: false, destination: false, cancel: false, confirm: false,
+    });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 700));
+    assert.equal(
+      await cdp.evaluate("[...document.querySelectorAll('.launch-browser-folder')].some((button) => button.dataset.path.endsWith('/stale-clone'))"),
+      false,
+      "a stale clone response mutated the reopened browser",
+    );
+    assert.equal(await cdp.evaluate("document.getElementById('launch-browser-operation').hidden"), false);
+    await cdp.evaluate("document.getElementById('launch-browser-operation-cancel').click(); true");
+
     await cdp.evaluate("document.getElementById('launch-browser-use').click(); true");
     assert.equal(await cdp.evaluate("document.getElementById('launch-directory').value"), "/workspace/custom");
     await waitFor(

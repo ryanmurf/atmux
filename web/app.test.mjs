@@ -53,6 +53,8 @@ const {
   rememberLaunchDirectory,
   availableLaunchDirectories,
   launchDirectoryBrowsePath,
+  validLaunchChildName,
+  repositoryDestinationName,
   launchMachines,
   imageFilesFromTransfer,
   machineStatusLabel,
@@ -913,12 +915,26 @@ test("launch dialog uses the Project typeahead itself instead of a separate find
   assert.match(source, /type an absolute folder within a configured project root/i);
   assert.match(markup, /id="launch-browse"[^>]*>Browse<\/button>/);
   assert.match(markup, /id="launch-browser"/);
+  assert.match(markup, /id="launch-browser-new"[^>]*>New folder<\/button>/);
+  assert.match(markup, /id="launch-browser-clone"[^>]*>Clone repo<\/button>/);
+  assert.match(markup, /id="launch-browser-operation"[^>]*aria-labelledby=/);
   assert.match(source, /request\(endpoint\)/);
   assert.match(markup, /id="launch-sessions"/);
   assert.match(markup, /id="launch-session"/);
   assert.match(source, /\/api\/v1\/launch-sessions/);
   assert.match(source, /resume_session_id: duplicateFlow \? null : \(\$\("launch-session"\)\.value \|\| null\)/);
   assert.match(source, /\^saved-\[0-9a-f\]\{32\}\$/);
+});
+
+test("folder actions keep names component-safe and derive repository destinations", () => {
+  assert.equal(validLaunchChildName("new project"), true);
+  for (const invalid of ["", ".", "..", "../escape", "child/name", "child\\name", "-option", "line\nbreak"]) {
+    assert.equal(validLaunchChildName(invalid), false, invalid);
+  }
+  assert.equal(repositoryDestinationName("https://example.test/team/atmux.git"), "atmux");
+  assert.equal(repositoryDestinationName("ssh://git@example.test/team/project with spaces.git"), "project with spaces");
+  assert.equal(repositoryDestinationName("git@example.test:team/repo.git"), "repo");
+  assert.equal(repositoryDestinationName("https://example.test/team/-option.git"), "");
 });
 
 test("saved conversation launch requires an explicit, sanitized confirmation", () => {

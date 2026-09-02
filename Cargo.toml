@@ -30,6 +30,7 @@ crossterm = "0.29.0"
 directories = "6.0.0"
 futures-core = "0.3.32"
 fs2 = "0.4.3"
+getrandom = "0.3.4"
 http-body-util = "0.1.4"
 hyper = { version = "1.11.0", features = ["client", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
