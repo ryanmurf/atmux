@@ -9,7 +9,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs::{self, File, Metadata},
     io::{self, Read},
-    os::unix::{fs::MetadataExt as _, io::AsRawFd as _, process::CommandExt as _},
+    os::unix::{ffi::OsStrExt as _, fs::MetadataExt as _, process::CommandExt as _},
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     thread,
@@ -17,7 +17,7 @@ use std::{
 };
 
 use rustix::{
-    fs::{AtFlags, Mode, OFlags, RenameFlags},
+    fs::{AtFlags, Dir, Mode, OFlags, RenameFlags},
     process::{Pid, Signal, kill_process_group, test_kill_process_group},
 };
 
@@ -665,21 +665,26 @@ fn publish_payload(
     ))
 }
 
-fn descriptor_path(directory: &File) -> PathBuf {
-    #[cfg(target_os = "linux")]
-    let base = "/proc/self/fd";
-    #[cfg(target_vendor = "apple")]
-    let base = "/dev/fd";
-    Path::new(base).join(directory.as_raw_fd().to_string())
+fn directory_entry_names(
+    directory: &File,
+    error_message: &'static str,
+) -> Result<Vec<OsString>, ActionError> {
+    let mut entries =
+        Dir::read_from(directory).map_err(|_| ActionError::internal(error_message))?;
+    let mut names = Vec::new();
+    while let Some(entry) = entries.read() {
+        let entry = entry.map_err(|_| ActionError::internal(error_message))?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            names.push(OsStr::from_bytes(name).to_owned());
+        }
+    }
+    Ok(names)
 }
 
 fn clear_directory(directory: &File) -> Result<(), ActionError> {
-    let entries = fs::read_dir(descriptor_path(directory))
-        .map_err(|_| ActionError::internal("private directory could not be inspected"))?;
-    for entry in entries {
-        let entry =
-            entry.map_err(|_| ActionError::internal("private directory could not be inspected"))?;
-        let name = entry.file_name();
+    let entries = directory_entry_names(directory, "private directory could not be inspected")?;
+    for name in entries {
         let stat = rustix::fs::statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|_| ActionError::internal("private entry could not be inspected"))?;
         if rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir() {
@@ -708,13 +713,11 @@ fn cleanup_staging_parts(
     identity: DirectoryIdentity,
     expected_payload: Option<DirectoryIdentity>,
 ) -> Result<(), ActionError> {
-    let entries = fs::read_dir(descriptor_path(staging))
-        .map_err(|_| ActionError::internal("private staging directory could not be inspected"))?
-        .collect::<io::Result<Vec<_>>>()
-        .map_err(|_| ActionError::internal("private staging directory could not be inspected"))?;
+    let entries =
+        directory_entry_names(staging, "private staging directory could not be inspected")?;
     if entries
         .iter()
-        .any(|entry| entry.file_name() != OsStr::new(PAYLOAD_NAME))
+        .any(|entry| entry != OsStr::new(PAYLOAD_NAME))
     {
         // The random mode-0700 stage is a same-UID boundary, not protection
         // from another process running as the owner. Unexpected top-level
@@ -854,22 +857,27 @@ fn start_git_clone(
     repository: &str,
     staging: &File,
 ) -> Result<RunningClone, CloneRunError> {
-    let mut child = Command::new(git)
+    let mut command = Command::new(git);
+    fd_command_cwd::set_current_dir(&mut command, staging).map_err(|error| CloneRunError {
+        error: ActionError::internal(format!(
+            "private staging directory could not be retained for git clone: {error}"
+        )),
+        cleanup_safe: true,
+    })?;
+    command
         .arg("clone")
         .arg("--")
         .arg(repository)
         .arg(PAYLOAD_NAME)
-        .current_dir(descriptor_path(staging))
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|error| CloneRunError {
-            error: ActionError::internal(format!("could not start git clone: {error}")),
-            cleanup_safe: true,
-        })?;
+        .process_group(0);
+    let mut child = command.spawn().map_err(|error| CloneRunError {
+        error: ActionError::internal(format!("could not start git clone: {error}")),
+        cleanup_safe: true,
+    })?;
     let Some(group) = i32::try_from(child.id()).ok().and_then(Pid::from_raw) else {
         let _ = child.kill();
         let _ = child.wait();
@@ -1142,9 +1150,44 @@ mod tests {
             Duration::from_secs(5),
         )
         .unwrap();
-        assert!(descriptor_path(&payload.handle).join(".git").is_dir());
+        let git_directory =
+            rustix::fs::statat(&payload.handle, ".git", AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        assert!(rustix::fs::FileType::from_raw_mode(git_directory.st_mode).is_dir());
         staging.cleanup().unwrap();
         assert!(staging_names(&fixture.root).is_empty());
+    }
+
+    #[test]
+    fn clone_and_cleanup_follow_the_retained_directory_after_a_path_move() {
+        let fixture = Fixture::new();
+        let original = fixture.root.join("original stage");
+        let moved = fixture.root.join("moved stage");
+        fs::create_dir(&original).unwrap();
+        let staging = open_absolute_directory(&original).unwrap();
+        rustix::fs::mkdirat(&staging, PAYLOAD_NAME, Mode::from_raw_mode(0o777)).unwrap();
+        fs::rename(&original, &moved).unwrap();
+        fs::create_dir(&original).unwrap();
+
+        run_git_clone(
+            fixture.fake_git(true).as_os_str(),
+            "https://example.test/team/fd-native.git",
+            &staging,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        assert!(moved.join(PAYLOAD_NAME).join("cloned-marker").is_file());
+        assert!(!original.join(PAYLOAD_NAME).exists());
+        clear_directory(&staging).unwrap();
+        assert!(
+            directory_entry_names(&staging, "stage read failed")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            original.is_dir(),
+            "the replacement path must remain untouched"
+        );
     }
 
     #[test]

@@ -2276,8 +2276,16 @@ memory_override_max_bytes = 25769803776
     fn full_discovery_sorts_case_colliding_codex_config_fallbacks() {
         let fixture = ResumeHome::new("codex config collision order");
         let codex_dir = fixture.owner_dir(".codex");
-        fs::write(codex_dir.join("zz-atmux-case.config.toml"), "").unwrap();
-        fs::write(codex_dir.join("Zz-Atmux-Case.config.toml"), "").unwrap();
+        let lowercase = codex_dir.join("zz-atmux-case.config.toml");
+        let uppercase = codex_dir.join("Zz-Atmux-Case.config.toml");
+        fs::write(&lowercase, "").unwrap();
+        fs::write(&uppercase, "").unwrap();
+        fs::write(codex_dir.join("alpha-atmux-order.config.toml"), "").unwrap();
+        fs::write(codex_dir.join("omega-atmux-order.config.toml"), "").unwrap();
+        let lowercase_metadata = fs::metadata(&lowercase).unwrap();
+        let uppercase_metadata = fs::metadata(&uppercase).unwrap();
+        let case_variants_are_distinct = lowercase_metadata.dev() != uppercase_metadata.dev()
+            || lowercase_metadata.ino() != uppercase_metadata.ino();
         let native = fixture.home.join("native-codex");
         let mut config: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
         config.profiles.push(AgentProfile {
@@ -2299,7 +2307,22 @@ memory_override_max_bytes = 25769803776
             .find(|profile| profile.harness == "codex" && profile.name == "zZ-aTmUx-CaSe")
             .unwrap();
         assert_eq!(profile.command, native.to_string_lossy());
-        assert_eq!(profile.args, ["--profile", "Zz-Atmux-Case"]);
+        // Case-insensitive filesystems cannot represent this collision: the
+        // second write addresses the same inode and preserves one spelling.
+        if case_variants_are_distinct {
+            assert_eq!(profile.args, ["--profile", "Zz-Atmux-Case"]);
+        }
+        let alpha = config
+            .profiles
+            .iter()
+            .position(|profile| profile.name == "alpha-atmux-order")
+            .unwrap();
+        let omega = config
+            .profiles
+            .iter()
+            .position(|profile| profile.name == "omega-atmux-order")
+            .unwrap();
+        assert!(alpha < omega, "non-colliding fallbacks must remain sorted");
     }
 
     #[test]

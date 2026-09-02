@@ -28,6 +28,7 @@ base64 = "0.22.1"
 clap = { version = "4.6.5", features = ["derive"] }
 crossterm = "0.29.0"
 directories = "6.0.0"
+fd-command-cwd = { path = "crates/fd-command-cwd" }
 futures-core = "0.3.32"
 fs2 = "0.4.3"
 getrandom = "0.3.4"
