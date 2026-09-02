@@ -2245,12 +2245,19 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       "agent-only visibility did not survive a pane reconnect",
       5_000,
     );
+    // Page.reload acknowledges the command before the replacement document is
+    // necessarily installed. The transcript predicate below also matches the
+    // old document, so waiting on content alone can let a Back click race (and
+    // be discarded by) the pending navigation on a slow CI worker.
+    await cdp.evaluate("window.__atmuxFilterReloadGeneration = 'before-reload'; true");
     await cdp.send("Page.reload");
     await waitFor(
-      () => cdp.evaluate(`document.readyState === 'complete'
+      () => cdp.evaluate(`window.__atmuxFilterReloadGeneration !== 'before-reload'
+        && document.readyState === 'complete'
         && document.getElementById('conversation').textContent.includes('VISIBLE AGENT')
         && !document.getElementById('conversation').textContent.includes('HIDDEN HUMAN')
-        && document.getElementById('conversation-filters-indicator').textContent === '2 off'`),
+        && document.getElementById('conversation-filters-indicator').textContent === '2 off'
+        && document.querySelector('.session-button[data-session-id="midnight~%5"]') !== null`),
       "agent-only visibility did not restore from local storage",
       5_000,
     );

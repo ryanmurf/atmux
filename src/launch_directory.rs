@@ -993,6 +993,13 @@ mod tests {
 
     static NONCE: AtomicU64 = AtomicU64::new(1);
 
+    fn checked_test_mode<T>(mode: u32) -> Option<T>
+    where
+        T: TryFrom<u32>,
+    {
+        T::try_from(mode).ok()
+    }
+
     struct Fixture {
         base: PathBuf,
         root: PathBuf,
@@ -1417,7 +1424,17 @@ mod tests {
             return;
         };
         let mask = u32::from_str_radix(&raw_mask, 8).unwrap();
-        rustix::process::umask(Mode::from_raw_mode(mask));
+        assert!(
+            mask <= 0o777,
+            "test umask must fit the portable permission bits"
+        );
+        assert_eq!(
+            u32::from(checked_test_mode::<u16>(mask).expect("permission mask fits u16")),
+            mask
+        );
+        let platform_mask: rustix::fs::RawMode =
+            checked_test_mode(mask).expect("a bounded permission mask fits the platform RawMode");
+        rustix::process::umask(Mode::from_raw_mode(platform_mask));
         let expected = 0o777 & !mask;
         let fixture = Fixture::new();
 
