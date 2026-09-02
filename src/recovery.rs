@@ -27,9 +27,14 @@ const TRON_MACHINE_ID: &str = "tron";
 const TRON_RESUME_SCRIPT: &str = "/home/ryan/resume-tron.sh";
 const SCRIPT_MARKER: &str = "ATMUX_QUICK_RESUME_IDEMPOTENT_V1";
 const SCOPED_EXEC_MARKER: &str = "ATMUX_QUICK_RESUME_SCOPED_EXEC_V1";
-const SCOPED_EXEC_PREFIX: &str =
-    "/home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec --";
-const SCOPED_EXEC_SEND_FRAGMENT: &str = "\"exec /home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec -- $2\" Enter";
+#[cfg(test)]
+const SCOPED_EXEC_WEB_OVERRIDE_FRAGMENT: &str = "if [ \"$unit_session\" = atmux-web ]; then\n    scoped_exec_command+=' --recovery-service-memory-max-bytes 60129542144'\n  fi";
+#[cfg(test)]
+const SCOPED_EXEC_SEND_FRAGMENT: &str = "\"exec $scoped_exec_command -- $2\" Enter";
+const TRANSACTION_BEGIN: &[u8] = b"\n# ATMUX_QUICK_RESUME_TRANSACTION_BEGIN\n";
+const TRANSACTION_END: &[u8] = b"# ATMUX_QUICK_RESUME_TRANSACTION_END\n";
+const EXPECTED_TRANSACTION_HELPERS: &str =
+    include_str!("../tests/fixtures/resume_tron_transactional_helpers.sh");
 const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
 const RUN_TIMEOUT: Duration = Duration::from_secs(180);
 #[cfg(not(test))]
@@ -422,28 +427,29 @@ fn validate_script(path: &Path) -> Result<ValidatedScript, ()> {
     let mut contents = Vec::with_capacity(usize::try_from(metadata.len()).map_err(|_| ())?);
     file.read_to_end(&mut contents).map_err(|_| ())?;
     let lines = contents.split(|byte| *byte == b'\n').collect::<Vec<_>>();
-    let scoped_send_lines = lines
-        .iter()
-        .filter(|line| {
-            line.windows(b"\"exec ".len())
-                .any(|window| window == b"\"exec ")
-        })
-        .copied()
-        .collect::<Vec<_>>();
     if ![SCRIPT_MARKER, SCOPED_EXEC_MARKER].iter().all(|marker| {
         let expected = format!("# {marker}");
         lines.contains(&expected.as_bytes())
-    }) || !contents
-        .windows(SCOPED_EXEC_PREFIX.len())
-        .any(|window| window == SCOPED_EXEC_PREFIX.as_bytes())
-        || scoped_send_lines.len() != 1
-        || !scoped_send_lines[0]
-            .windows(SCOPED_EXEC_SEND_FRAGMENT.len())
-            .any(|window| window == SCOPED_EXEC_SEND_FRAGMENT.as_bytes())
+    }) || transaction_helpers(&contents) != Some(EXPECTED_TRANSACTION_HELPERS.as_bytes())
     {
         return Err(());
     }
     Ok(ValidatedScript { contents })
+}
+
+fn transaction_helpers(contents: &[u8]) -> Option<&[u8]> {
+    let begin = single_fragment_offset(contents, TRANSACTION_BEGIN)? + TRANSACTION_BEGIN.len();
+    let end = single_fragment_offset(contents, TRANSACTION_END)?;
+    (begin <= end).then_some(&contents[begin..end])
+}
+
+fn single_fragment_offset(contents: &[u8], fragment: &[u8]) -> Option<usize> {
+    let mut matches = contents
+        .windows(fragment.len())
+        .enumerate()
+        .filter_map(|(offset, candidate)| (candidate == fragment).then_some(offset));
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 fn validate_secure_ancestry(path: &Path, euid: u32) -> Result<(), ()> {
@@ -574,7 +580,7 @@ mod tests {
         let mut file = File::create(&path).unwrap();
         writeln!(
             file,
-            "#!/usr/bin/env bash\n# {SCRIPT_MARKER}\n# {SCOPED_EXEC_MARKER}\n# {SCOPED_EXEC_PREFIX}\n# {SCOPED_EXEC_SEND_FRAGMENT}\n{body}"
+            "#!/usr/bin/env bash\n# {SCRIPT_MARKER}\n# ATMUX_QUICK_RESUME_TRANSACTION_BEGIN\n{EXPECTED_TRANSACTION_HELPERS}# ATMUX_QUICK_RESUME_TRANSACTION_END\n{body}"
         )
         .unwrap();
         let mut permissions = file.metadata().unwrap().permissions();
@@ -708,7 +714,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "#!/usr/bin/env bash\n# {SCRIPT_MARKER}\n# {SCOPED_EXEC_MARKER}\n# {SCOPED_EXEC_PREFIX}\n# {SCOPED_EXEC_SEND_FRAGMENT}\n(trap '' TERM; while :; do sleep 30; done) &\nprintf '%s' \"$!\" > {}\nwait\n",
+                "#!/usr/bin/env bash\n# {SCRIPT_MARKER}\n# ATMUX_QUICK_RESUME_TRANSACTION_BEGIN\n{EXPECTED_TRANSACTION_HELPERS}# ATMUX_QUICK_RESUME_TRANSACTION_END\n(trap '' TERM; while :; do sleep 30; done) &\nprintf '%s' \"$!\" > {}\nwait\n",
                 shell_words::quote(&pid_file.display().to_string()),
             ),
         )
@@ -757,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_tron_bridge_passes_validation_and_raw_variants_fail() {
+    fn checked_in_tron_bridge_requires_exact_active_transaction_helpers() {
         let path = fixture_script(":");
         let block = fs::read_to_string(
             std::env::current_dir()
@@ -765,30 +771,37 @@ mod tests {
                 .join("deploy/systemd/resume-tron-scoped-exec-block.bash"),
         )
         .unwrap();
-        fs::write(
-            &path,
-            format!("#!/usr/bin/env bash\n# {SCRIPT_MARKER}\n{block}\n"),
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(EXPECTED_TRANSACTION_HELPERS.contains(&block));
         assert!(validate_script(&path).is_ok());
+        let valid = fs::read_to_string(&path).unwrap();
+        let assert_invalid = |source: String| {
+            fs::write(&path, source).unwrap();
+            assert!(validate_script(&path).is_err());
+        };
 
-        let raw = block.replace(SCOPED_EXEC_SEND_FRAGMENT, "\"exec $2\" Enter");
-        fs::write(
-            &path,
-            format!("#!/usr/bin/env bash\n# {SCRIPT_MARKER}\n{raw}\n"),
-        )
-        .unwrap();
-        assert!(validate_script(&path).is_err());
+        assert_invalid(valid.replace(SCOPED_EXEC_WEB_OVERRIDE_FRAGMENT, ""));
+        assert_invalid(valid.replace("60129542144", "51539607552"));
 
-        let duplicate =
-            format!("{block}\ntmux send-keys -t \"$created_session_id\" \"exec $2\" Enter\n");
-        fs::write(
-            &path,
-            format!("#!/usr/bin/env bash\n# {SCRIPT_MARKER}\n{duplicate}\n"),
-        )
-        .unwrap();
-        assert!(validate_script(&path).is_err());
+        let commented = block.lines().fold(String::new(), |mut output, line| {
+            output.push_str("# ");
+            output.push_str(line);
+            output.push('\n');
+            output
+        });
+        assert_invalid(valid.replace(&block, &commented));
+        assert_invalid(valid.replace(&block, &format!("if false; then\n{block}fi\n")));
+        assert_invalid(valid.replace(SCOPED_EXEC_SEND_FRAGMENT, "\"exec $2\" Enter"));
+
+        assert_invalid(valid.replace(
+            "# ATMUX_QUICK_RESUME_TRANSACTION_END\n",
+            &format!("{block}# ATMUX_QUICK_RESUME_TRANSACTION_END\n"),
+        ));
+        assert_invalid(valid.replace(
+            &block,
+            &format!(
+                "{block}scoped_exec_command+=' --recovery-service-memory-max-bytes 60129542144'\n"
+            ),
+        ));
         remove_fixture(&path);
     }
 

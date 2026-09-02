@@ -251,9 +251,17 @@ impl Tmux {
     ///
     /// Returns an error for absent isolation, an unsafe/missing pane identity,
     /// failed scope preflight/metadata, or an empty/unexecutable command.
-    pub fn scoped_exec(config_path: &Path, command: Vec<String>) -> Result<()> {
+    pub fn scoped_exec(
+        config_path: &Path,
+        requested_memory_max_bytes: Option<u64>,
+        recovery_service_memory_max_bytes: Option<u64>,
+        command: Vec<String>,
+    ) -> Result<()> {
         if command.is_empty() {
             bail!("scoped-exec requires a command after --");
+        }
+        if requested_memory_max_bytes.is_some() && recovery_service_memory_max_bytes.is_some() {
+            bail!("scoped-exec worker and recovery service caps are mutually exclusive");
         }
         let (config, _) = crate::config::Config::load(Some(config_path))?;
         if config.agent_resources.memory_max_bytes.is_none() {
@@ -265,7 +273,19 @@ impl Tmux {
             .ok()
             .filter(|pane_id| valid_tmux_pane_id(pane_id))
             .context("scoped-exec requires a valid TMUX_PANE")?;
-        let scope = systemd_scope::prepare(&config.agent_resources, &pane_id)?;
+        let scope = if let Some(service_memory_max_bytes) = recovery_service_memory_max_bytes {
+            systemd_scope::prepare_recovery_service(
+                &config.agent_resources,
+                service_memory_max_bytes,
+                &pane_id,
+            )?
+        } else {
+            systemd_scope::prepare_override(
+                &config.agent_resources,
+                requested_memory_max_bytes,
+                &pane_id,
+            )?
+        };
         let invocation = scope.wrap(command)?;
         publish_scope_metadata(&pane_id, &scope)?;
         let (program, arguments) = invocation
