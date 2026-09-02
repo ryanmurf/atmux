@@ -119,6 +119,7 @@ const {
   savedSessionConfirmation,
   savedSessionPreview,
   selectionTouchesPane,
+  transcriptAnchorMembers,
   sortSessions,
   presentSessionStatuses,
   WORKING_TO_WAITING_HOLD_MS,
@@ -246,7 +247,8 @@ test("streaming redraws use semantic transcript anchors and explicit reader inte
   assert.match(source, /article\.dataset\.transcriptId = String\(message\.id \|\| ""\)/);
   assert.match(source, /restoreTranscriptReadingAnchor\(conversation, readingAnchor, readingOffset\)/);
   assert.match(source, /details\.dataset\.transcriptMembers = JSON\.stringify/);
-  assert.match(source, /members\.includes\(anchor\.memberId\)/);
+  assert.match(source, /node\.dataset\.transcriptId === anchor\.memberId/);
+  assert.match(source, /transcriptAnchorMembers\(node\.dataset\.transcriptMembers\)\s*\.includes\(anchor\.memberId\)/s);
   assert.match(source, /state\.paneFollowing = false;/);
   assert.match(source, /state\.transcriptFollowing = false;/);
   assert.match(source, /paneReadingScrollTop: 0/);
@@ -262,6 +264,22 @@ test("streaming redraws use semantic transcript anchors and explicit reader inte
   assert.match(source, /if \(pane\.hidden\) return;\s*state\.paneReadingScrollTop = pane\.scrollTop;/s);
   assert.match(css, /#pane \{[^}]*height: 100%;[^}]*min-height: 0;[^}]*max-height: 100%;[^}]*overflow: auto;[^}]*overscroll-behavior: contain;[^}]*overflow-anchor: none;/s);
   assert.match(css, /\.conversation \{[^}]*overscroll-behavior: contain;/s);
+});
+
+test("tool-group anchor membership is bounded and malformed hints fail closed", () => {
+  assert.deepEqual(transcriptAnchorMembers('["exec-1","exec-2"]'), ["exec-1", "exec-2"]);
+  for (const invalid of [
+    null,
+    "",
+    "not-json",
+    '{}',
+    '[]',
+    '[1]',
+    '[""]',
+    JSON.stringify(Array.from({ length: 25 }, (_, index) => `exec-${index}`)),
+    JSON.stringify(["x".repeat(513)]),
+    "[" + " ".repeat(128 * 1024) + "]",
+  ]) assert.deepEqual(transcriptAnchorMembers(invalid), []);
 });
 
 test("conversation visibility defaults to all and independently filters human and internal records", () => {

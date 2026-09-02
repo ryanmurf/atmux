@@ -17,6 +17,8 @@ const MAX_FILE_REFERENCE_LINES = 200;
 const CONTENT_HASH_PATTERN = /^[a-f0-9]{64}$/;
 const LIVE_TAIL_TOLERANCE = 2;
 const MAX_COLLAPSED_TOOL_RUN = 24;
+const MAX_TRANSCRIPT_ANCHOR_MEMBER_CHARS = 512;
+const MAX_TRANSCRIPT_ANCHOR_JSON_CHARS = 128 * 1024;
 const COLLAPSIBLE_COORDINATION_TOOLS = new Set([
   "followup_task", "list_agents", "send_message", "wait_agent",
 ]);
@@ -1614,21 +1616,36 @@ function followsLiveTail(element, tolerance = 16) {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= tolerance;
 }
 
+function transcriptAnchorMembers(value) {
+  if (typeof value !== "string" || !value
+    || value.length > MAX_TRANSCRIPT_ANCHOR_JSON_CHARS) return [];
+  try {
+    const members = JSON.parse(value);
+    if (!Array.isArray(members) || !members.length
+      || members.length > MAX_COLLAPSED_TOOL_RUN
+      || members.some((member) => typeof member !== "string" || !member
+        || member.length > MAX_TRANSCRIPT_ANCHOR_MEMBER_CHARS)) return [];
+    return members;
+  } catch {
+    return [];
+  }
+}
+
+function transcriptAnchorItems(container) {
+  return [...(container?.children || [])]
+    .filter((node) => Boolean(node?.dataset?.transcriptId));
+}
+
 /// Captures the first visible semantic transcript item, not just a pixel
 /// offset. Bounded logs can discard cards above a reader while an agent emits.
 function transcriptReadingAnchor(container, retain = null) {
   const bounds = container.getBoundingClientRect();
-  for (const item of container.querySelectorAll("[data-transcript-id]")) {
+  for (const item of transcriptAnchorItems(container)) {
     const id = item.dataset.transcriptId;
     const box = item.getBoundingClientRect();
     if (id && box.bottom > bounds.top && (!retain || retain(item))) {
-      let memberId = id;
-      try {
-        const members = JSON.parse(item.dataset.transcriptMembers || "[]");
-        if (Array.isArray(members) && typeof members[0] === "string" && members[0]) {
-          memberId = members[0];
-        }
-      } catch { /* A malformed hint falls back to the exact outer id. */ }
+      const members = transcriptAnchorMembers(item.dataset.transcriptMembers);
+      const memberId = members[0] || id;
       return { id, memberId, offset: box.top - bounds.top };
     }
   }
@@ -1643,15 +1660,14 @@ function restoreTranscriptReadingAnchor(container, anchor, fallbackOffset) {
     container.scrollTop = fallbackOffset;
     return;
   }
-  const items = [...container.querySelectorAll("[data-transcript-id]")];
+  // Only outer Conversation rows participate. Expanded/collapsed tool-group
+  // descendants carry their own ids but are not independent scroll anchors.
+  const items = transcriptAnchorItems(container);
   let item = items.find((node) => node.dataset.transcriptId === anchor.id);
   if (!item && anchor.memberId) {
-    item = items.find((node) => {
-      try {
-        const members = JSON.parse(node.dataset.transcriptMembers || "[]");
-        return Array.isArray(members) && members.includes(anchor.memberId);
-      } catch { return false; }
-    });
+    item = items.find((node) => node.dataset.transcriptId === anchor.memberId)
+      || items.find((node) => transcriptAnchorMembers(node.dataset.transcriptMembers)
+        .includes(anchor.memberId));
   }
   if (!item) {
     container.scrollTop = fallbackOffset;
@@ -1920,6 +1936,7 @@ if (typeof module !== "undefined" && module.exports) {
     savedSessionConfirmation,
     savedSessionPreview,
     selectionTouchesPane,
+    transcriptAnchorMembers,
     transcriptItemKind,
     transcriptVisibilityKind,
     transcriptItemIsVisible,

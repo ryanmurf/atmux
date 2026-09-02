@@ -2219,7 +2219,11 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       ],
     };
     await cdp.evaluate("document.getElementById('mobile-back').click(); true");
-    await waitFor(() => cdp.evaluate("!document.body.classList.contains('has-selection')"), "tool grouping test did not return to agent list");
+    await waitFor(
+      () => cdp.evaluate(`!document.body.classList.contains('has-selection')
+        && document.querySelector('.session-button[data-session-id="midnight~%5"]') !== null`),
+      "tool grouping test did not return to the populated agent list",
+    );
     const groupClearedOnPaneChange = await cdp.evaluate(`(() => {
       document.querySelector('.session-button[data-session-id="midnight~%5"]').click();
       return !document.querySelector('#conversation .tool-call-group');
@@ -2327,8 +2331,28 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.ok(Math.abs(mergedGroupAnchorAfter.offset - mergedGroupAnchorBefore.offset) <= 1, JSON.stringify({
       mergedGroupAnchorBefore, mergedGroupAnchorAfter,
     }));
-    await cdp.evaluate(`(() => {
+    const splitGroupAnchorAfterReset = await cdp.evaluate(`(() => {
       document.getElementById('conversation-filters-reset').click();
+      const conversation = document.getElementById('conversation');
+      const singleton = conversation.querySelector('[data-transcript-id="anchor-exec-1"]');
+      const bounds = conversation.getBoundingClientRect();
+      return {
+        offset: singleton.getBoundingClientRect().top - bounds.top,
+        singletonOutsideGroup: !singleton.closest('.tool-call-group'),
+        humanRestored: conversation.textContent.includes('Human boundary between exec calls'),
+        splitGroupMembers: JSON.parse(
+          conversation.querySelector('[data-transcript-id="tool-group:anchor-exec-2"]')
+            .dataset.transcriptMembers,
+        ),
+      };
+    })()`);
+    assert.equal(splitGroupAnchorAfterReset.singletonOutsideGroup, true, JSON.stringify(splitGroupAnchorAfterReset));
+    assert.equal(splitGroupAnchorAfterReset.humanRestored, true, JSON.stringify(splitGroupAnchorAfterReset));
+    assert.deepEqual(splitGroupAnchorAfterReset.splitGroupMembers, ["anchor-exec-2", "anchor-exec-3"]);
+    assert.ok(Math.abs(splitGroupAnchorAfterReset.offset - mergedGroupAnchorAfter.offset) <= 1, JSON.stringify({
+      mergedGroupAnchorAfter, splitGroupAnchorAfterReset,
+    }));
+    await cdp.evaluate(`(() => {
       document.querySelector('#conversation-filters-dialog .primary').click();
       return true;
     })()`);
