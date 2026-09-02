@@ -4,8 +4,12 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 block=$repo_root/deploy/systemd/resume-tron-scoped-exec-block.bash
 
-if grep -Fq memory-max-bytes "$block"; then
-  printf 'Tron recovery must use the owner-configured default MemoryMax\n' >&2
+if [ "$(grep -Fc -- '--recovery-service-memory-max-bytes 60129542144' "$block")" -ne 1 ]; then
+  printf 'Tron recovery must set exactly one 56 GiB atmux-web service cap\n' >&2
+  exit 1
+fi
+if grep -Fq 'scoped-exec --memory-max-bytes' "$block"; then
+  printf 'Tron recovery must not apply a worker override to the web service\n' >&2
   exit 1
 fi
 
@@ -41,6 +45,19 @@ mapfile -d '' -t actual <"$capture"
 # shellcheck disable=SC2016
 [[ ${actual[2]} == '$42' ]]
 [[ ${actual[3]} == 'exec /home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec -- /usr/bin/env CODEX_HOME=/home/ryan/.codex /home/ryan/.local/bin/codex resume -C /home/ryan/IdeaProjects/qwen-kernel -m gpt-5.6-sol -c model_reasoning_effort="max" 01a03c8d-0826-7561-8a84-c16d95ac7a49' ]]
+[[ ${actual[4]} == Enter ]]
+
+: >"$capture"
+# shellcheck disable=SC2034
+unit_session=atmux-web
+send atmux-web './target/release/atmux --config /home/ryan/.config/atmux/config.toml web'
+mapfile -d '' -t actual <"$capture"
+[[ ${actual[0]} == send-keys ]]
+[[ ${actual[1]} == -t ]]
+# This is a literal tmux pane id.
+# shellcheck disable=SC2016
+[[ ${actual[2]} == '$42' ]]
+[[ ${actual[3]} == 'exec /home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec --recovery-service-memory-max-bytes 60129542144 -- ./target/release/atmux --config /home/ryan/.config/atmux/config.toml web' ]]
 [[ ${actual[4]} == Enter ]]
 
 printf 'Tron scoped recovery template tests passed\n'

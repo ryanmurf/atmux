@@ -121,6 +121,32 @@ pub(crate) fn prepare_override(
     }
 }
 
+/// Prepares the control-plane scope used by a fixed owner recovery script.
+/// Its cap must leave headroom above every configured worker cap while still
+/// remaining strictly below the effective host/inherited cgroup ceiling.
+pub(crate) fn prepare_recovery_service(
+    resources: &AgentResourcesConfig,
+    requested_memory_max_bytes: u64,
+    launch_hint: &str,
+) -> Result<PreparedScope> {
+    #[cfg(target_os = "linux")]
+    {
+        let effective_ceiling = effective_host_ceiling()?;
+        let memory_max_bytes = resolve_recovery_service_memory_max(
+            resources,
+            requested_memory_max_bytes,
+            effective_ceiling,
+        )?;
+        let user_bus = user_bus_environment()?;
+        prepare_linux(memory_max_bytes, launch_hint, user_bus, run_probe)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (resources, requested_memory_max_bytes, launch_hint);
+        bail!("recovery service MemoryMax requires Linux with a working systemd user manager")
+    }
+}
+
 /// Applies the owner policy without consulting systemd. Host and inherited
 /// cgroup bounds are checked immediately afterwards by `prepare_override`.
 pub(crate) fn resolve_memory_max(
@@ -148,7 +174,7 @@ pub(crate) fn resolve_memory_max(
     let Some(ceiling) = resources.memory_override_max_bytes else {
         bail!("this machine does not allow per-agent memory overrides");
     };
-    if requested % GIBIBYTE != 0 {
+    if !requested.is_multiple_of(GIBIBYTE) {
         bail!("agent memory overrides must be a whole number of GiB");
     }
     if requested > ceiling {
@@ -157,6 +183,36 @@ pub(crate) fn resolve_memory_max(
         );
     }
     Ok(Some(requested))
+}
+
+fn resolve_recovery_service_memory_max(
+    resources: &AgentResourcesConfig,
+    requested: u64,
+    effective_host_ceiling: u64,
+) -> Result<u64> {
+    if requested == 0 {
+        bail!("recovery service MemoryMax must be greater than zero");
+    }
+    if requested == u64::MAX {
+        bail!("recovery service MemoryMax cannot be infinity");
+    }
+    if !requested.is_multiple_of(GIBIBYTE) {
+        bail!("recovery service MemoryMax must be a whole number of GiB");
+    }
+    let default = resources
+        .memory_max_bytes
+        .context("recovery service MemoryMax requires per-agent memory isolation")?;
+    let worker_ceiling = resources
+        .memory_override_max_bytes
+        .unwrap_or(default)
+        .max(default);
+    if requested <= worker_ceiling {
+        bail!(
+            "recovery service MemoryMax={requested} must exceed the configured worker ceiling of {worker_ceiling} bytes"
+        );
+    }
+    validate_effective_ceiling(requested, effective_host_ceiling)?;
+    Ok(requested)
 }
 
 #[cfg(target_os = "linux")]
@@ -592,6 +648,48 @@ mod tests {
             resolve_memory_max(&tightened, Some(20 * GIBIBYTE)).is_err(),
             "a previously observed cap must be revalidated after policy changes"
         );
+    }
+
+    #[test]
+    fn recovery_web_scope_preserves_worker_override_headroom_and_fails_closed() {
+        let resources = AgentResourcesConfig {
+            memory_max_bytes: Some(12 * GIBIBYTE),
+            memory_override_max_bytes: Some(48 * GIBIBYTE),
+        };
+        let web_scope = 56 * GIBIBYTE;
+        assert_eq!(
+            resolve_memory_max(&resources, None).unwrap(),
+            Some(12 * GIBIBYTE)
+        );
+        assert_eq!(
+            clamp_advertised_override_ceiling(48 * GIBIBYTE, web_scope),
+            Some(48 * GIBIBYTE)
+        );
+        assert_eq!(
+            resolve_memory_max(&resources, Some(48 * GIBIBYTE)).unwrap(),
+            Some(48 * GIBIBYTE)
+        );
+        assert_eq!(
+            resolve_recovery_service_memory_max(&resources, web_scope, 60 * GIBIBYTE).unwrap(),
+            web_scope
+        );
+        assert!(validate_effective_ceiling(48 * GIBIBYTE, web_scope).is_ok());
+
+        for too_small in [40 * GIBIBYTE, 48 * GIBIBYTE] {
+            assert!(
+                resolve_recovery_service_memory_max(&resources, too_small, 60 * GIBIBYTE).is_err()
+            );
+        }
+        for host_bound in [56 * GIBIBYTE, 55 * GIBIBYTE] {
+            assert!(
+                resolve_recovery_service_memory_max(&resources, web_scope, host_bound).is_err()
+            );
+        }
+        for invalid in [0, 56 * GIBIBYTE + 1, u64::MAX] {
+            assert!(
+                resolve_recovery_service_memory_max(&resources, invalid, 60 * GIBIBYTE).is_err()
+            );
+        }
     }
 
     #[test]
