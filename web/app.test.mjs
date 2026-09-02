@@ -245,6 +245,8 @@ test("streaming redraws use semantic transcript anchors and explicit reader inte
   assert.match(source, /const shouldFollow = state\.transcriptFollowing\s*&& followsLiveTail\(conversation, LIVE_TAIL_TOLERANCE\)/s);
   assert.match(source, /article\.dataset\.transcriptId = String\(message\.id \|\| ""\)/);
   assert.match(source, /restoreTranscriptReadingAnchor\(conversation, readingAnchor, readingOffset\)/);
+  assert.match(source, /details\.dataset\.transcriptMembers = JSON\.stringify/);
+  assert.match(source, /members\.includes\(anchor\.memberId\)/);
   assert.match(source, /state\.paneFollowing = false;/);
   assert.match(source, /state\.transcriptFollowing = false;/);
   assert.match(source, /paneReadingScrollTop: 0/);
@@ -318,6 +320,20 @@ test("conversation visibility preferences persist safely and reject malformed st
   assert.equal(saveConversationVisibilityPreferences(() => {
     throw new Error("quota exceeded");
   }, { human: false, internal: false }), false);
+  assert.equal(saveConversationVisibilityPreferences(() => false, {
+    human: false, internal: false,
+  }), false);
+});
+
+test("browser storage access is centralized behind fail-open initialization helpers", () => {
+  const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  const calls = [...source.matchAll(/localStorage\.(getItem|setItem|removeItem|clear)\(/g)]
+    .map((match) => match[1]);
+  assert.deepEqual(calls, ["getItem", "setItem"]);
+  assert.match(source, /const readLocalStorage = \(key\) => \{\s*try \{ return localStorage\.getItem\(key\); \} catch \{ return null; \}\s*\};/s);
+  assert.match(source, /const writeLocalStorage = \(key, value\) => \{\s*try \{\s*localStorage\.setItem\(key, value\);\s*return true;\s*\} catch \{\s*return false;\s*\}\s*\};/s);
+  assert.match(source, /setRailCollapsed\(state\.railCollapsed\)/);
+  assert.match(source, /writeLocalStorage\("atmux\.rail-collapsed"/);
 });
 
 test("conversation filtering happens before exec grouping and never counts hidden calls", () => {
@@ -1032,7 +1048,7 @@ test("left rail controls expose encoded per-session deletion and persistent coll
   const css = readFileSync(new URL("./app.css", import.meta.url), "utf8");
   assert.match(app, /deleteButton\.addEventListener\("click", \(\) => openKillDialog\(id\)\)/);
   assert.match(app, /state\.pendingKillId = id/);
-  assert.match(app, /localStorage\.setItem\("atmux\.rail-collapsed"/);
+  assert.match(app, /writeLocalStorage\("atmux\.rail-collapsed"/);
   assert.match(html, /id="rail-toggle"[^>]+aria-controls="session-rail"/);
   assert.match(css, /body\.rail-collapsed \.workspace/);
   assert.match(css, /\.session-delete/);
@@ -1254,7 +1270,7 @@ test("Files and Git are accessible lazy tabs with text-only source rendering", (
   assert.match(source, /function renderAgentBranch/);
   assert.match(source, /state\.projectView !== view \|\| view\.paneId !== paneId/);
   assert.match(source, /token\.textContent = segment\.text/);
-  assert.match(source, /localStorage\.setItem\([\s\S]*FILE_READER_STORAGE_KEY/);
+  assert.match(source, /writeLocalStorage\([\s\S]*FILE_READER_STORAGE_KEY/);
   assert.match(source, /editor\.wrap = state\.fileReaderPreferences\.wrap \? "soft" : "off"/);
   assert.doesNotMatch(source, /\.innerHTML\s*=/);
   assert.match(css, /\.project-panel \{[^}]*min-height: 0;[^}]*overflow: hidden;[^}]*overscroll-behavior: contain;/s);

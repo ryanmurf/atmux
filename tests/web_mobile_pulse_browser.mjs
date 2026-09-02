@@ -2272,6 +2272,67 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       stored: '{"human":true,"internal":true}',
     });
 
+    // Hiding Human can merge two tool runs. Anchor restoration follows the
+    // first underlying tool member when the group's generated outer id changes.
+    transcriptFixture = {
+      available: true, source: "codex", changed: true, content_hash: "filter-merged-tool-anchor", truncated: false,
+      messages: [
+        ...Array.from({ length: 10 }, (_, index) => ({
+          id: `anchor-prefix-${index}`, role: "assistant",
+          markdown: `Anchor prefix ${index} ${"stable reading context ".repeat(8)}`,
+        })),
+        { id: "anchor-exec-1", role: "tool", kind: "tool", tool_name: "exec", tool_output: "ok" },
+        { id: "anchor-human", role: "user", markdown: "Human boundary between exec calls" },
+        { id: "anchor-exec-2", role: "tool", kind: "tool", tool_name: "exec", tool_output: "ok" },
+        { id: "anchor-exec-3", role: "tool", kind: "tool", tool_name: "exec", tool_output: "ok" },
+        ...Array.from({ length: 12 }, (_, index) => ({
+          id: `anchor-suffix-${index}`, role: "assistant",
+          markdown: `Anchor suffix ${index} ${"more stable reading context ".repeat(8)}`,
+        })),
+      ],
+    };
+    await waitFor(
+      () => cdp.evaluate("document.querySelector('[data-transcript-id=\"tool-group:anchor-exec-2\"]') !== null"),
+      "pre-filter exec-2 group did not render",
+      5_000,
+    );
+    const mergedGroupAnchorBefore = await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      const group = conversation.querySelector('[data-transcript-id="tool-group:anchor-exec-2"]');
+      const bounds = conversation.getBoundingClientRect();
+      conversation.scrollTop += group.getBoundingClientRect().top - bounds.top - 14;
+      conversation.dispatchEvent(new Event('scroll'));
+      return {
+        offset: group.getBoundingClientRect().top - bounds.top,
+        members: JSON.parse(group.dataset.transcriptMembers),
+      };
+    })()`);
+    assert.deepEqual(mergedGroupAnchorBefore.members, ["anchor-exec-2", "anchor-exec-3"]);
+    const mergedGroupAnchorAfter = await cdp.evaluate(`(() => {
+      document.getElementById('conversation-filters-open').click();
+      document.getElementById('conversation-show-human').click();
+      const conversation = document.getElementById('conversation');
+      const group = conversation.querySelector('[data-transcript-id="tool-group:anchor-exec-1"]');
+      const bounds = conversation.getBoundingClientRect();
+      return {
+        offset: group.getBoundingClientRect().top - bounds.top,
+        members: JSON.parse(group.dataset.transcriptMembers),
+        summary: group.querySelector(':scope > summary').textContent,
+        oldOuterGone: !conversation.querySelector('[data-transcript-id="tool-group:anchor-exec-2"]'),
+      };
+    })()`);
+    assert.deepEqual(mergedGroupAnchorAfter.members, ["anchor-exec-1", "anchor-exec-2", "anchor-exec-3"]);
+    assert.equal(mergedGroupAnchorAfter.summary, "exec ×3", JSON.stringify(mergedGroupAnchorAfter));
+    assert.equal(mergedGroupAnchorAfter.oldOuterGone, true, JSON.stringify(mergedGroupAnchorAfter));
+    assert.ok(Math.abs(mergedGroupAnchorAfter.offset - mergedGroupAnchorBefore.offset) <= 1, JSON.stringify({
+      mergedGroupAnchorBefore, mergedGroupAnchorAfter,
+    }));
+    await cdp.evaluate(`(() => {
+      document.getElementById('conversation-filters-reset').click();
+      document.querySelector('#conversation-filters-dialog .primary').click();
+      return true;
+    })()`);
+
     const composerBeforeFocus = await cdp.evaluate(`(() => {
       const box = document.getElementById('composer').getBoundingClientRect();
       return { top: box.top, bottom: box.bottom };
@@ -2536,6 +2597,63 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     }
     assert.ok(dashboard.reportSummary.includes("claude-max"));
     assert.ok(dashboard.reportSummary.includes("1,500,000 tokens · $4.00"));
+
+    // Privacy modes and restrictive embedded browsers can expose Storage but
+    // throw from every method. This script runs before app.js in a fresh
+    // document, proving initialization itself (including setRailCollapsed)
+    // fails open and still renders usable Conversation visibility controls.
+    await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: `
+      for (const method of ['getItem', 'setItem', 'removeItem', 'clear']) {
+        Object.defineProperty(Storage.prototype, method, {
+          configurable: true,
+          value() { throw new DOMException('Storage disabled by fixture', 'SecurityError'); },
+        });
+      }
+    ` });
+    await cdp.send("Page.navigate", { url: `http://127.0.0.1:${port}/?session=tron~%25100` });
+    await waitFor(
+      () => cdp.evaluate(`document.readyState === 'complete'
+        && !document.getElementById('agent-view').hidden
+        && document.getElementById('conversation-filters-indicator').textContent === 'All'`),
+      "throwing browser Storage aborted Conversation initialization",
+      5_000,
+    );
+    const storageDeniedInitialization = await cdp.evaluate(`(() => {
+      let storageThrows = false;
+      try { localStorage.getItem('probe'); } catch { storageThrows = true; }
+      const open = document.getElementById('conversation-filters-open');
+      open.click();
+      const human = document.getElementById('conversation-show-human');
+      const internal = document.getElementById('conversation-show-internal');
+      const defaults = [human.checked, internal.checked];
+      human.click();
+      const afterWriteFailure = {
+        indicator: document.getElementById('conversation-filters-indicator').textContent,
+        human: human.checked,
+        internal: internal.checked,
+      };
+      document.getElementById('conversation-filters-reset').click();
+      return {
+        storageThrows,
+        agentViewVisible: !document.getElementById('agent-view').hidden,
+        dialogOpen: document.getElementById('conversation-filters-dialog').open,
+        defaults,
+        afterWriteFailure,
+        reset: [human.checked, internal.checked],
+        resetIndicator: document.getElementById('conversation-filters-indicator').textContent,
+        overflowX: document.documentElement.scrollWidth - innerWidth,
+      };
+    })()`);
+    assert.equal(storageDeniedInitialization.storageThrows, true, JSON.stringify(storageDeniedInitialization));
+    assert.equal(storageDeniedInitialization.agentViewVisible, true, JSON.stringify(storageDeniedInitialization));
+    assert.equal(storageDeniedInitialization.dialogOpen, true, JSON.stringify(storageDeniedInitialization));
+    assert.deepEqual(storageDeniedInitialization.defaults, [true, true]);
+    assert.deepEqual(storageDeniedInitialization.afterWriteFailure, {
+      indicator: "1 off", human: false, internal: true,
+    });
+    assert.deepEqual(storageDeniedInitialization.reset, [true, true]);
+    assert.equal(storageDeniedInitialization.resetIndicator, "All", JSON.stringify(storageDeniedInitialization));
+    assert.ok(storageDeniedInitialization.overflowX <= 1, JSON.stringify(storageDeniedInitialization));
   } catch (error) {
     testError = error;
     throw error;

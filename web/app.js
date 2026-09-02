@@ -997,8 +997,7 @@ function loadConversationVisibilityPreferences(readStoredValue) {
 
 function saveConversationVisibilityPreferences(writeStoredValue, preferences) {
   try {
-    writeStoredValue(conversationVisibilityPreferenceJson(preferences));
-    return true;
+    return writeStoredValue(conversationVisibilityPreferenceJson(preferences)) !== false;
   } catch {
     return false;
   }
@@ -1623,7 +1622,14 @@ function transcriptReadingAnchor(container, retain = null) {
     const id = item.dataset.transcriptId;
     const box = item.getBoundingClientRect();
     if (id && box.bottom > bounds.top && (!retain || retain(item))) {
-      return { id, offset: box.top - bounds.top };
+      let memberId = id;
+      try {
+        const members = JSON.parse(item.dataset.transcriptMembers || "[]");
+        if (Array.isArray(members) && typeof members[0] === "string" && members[0]) {
+          memberId = members[0];
+        }
+      } catch { /* A malformed hint falls back to the exact outer id. */ }
+      return { id, memberId, offset: box.top - bounds.top };
     }
   }
   return null;
@@ -1637,8 +1643,16 @@ function restoreTranscriptReadingAnchor(container, anchor, fallbackOffset) {
     container.scrollTop = fallbackOffset;
     return;
   }
-  const item = [...container.querySelectorAll("[data-transcript-id]")]
-    .find((node) => node.dataset.transcriptId === anchor.id);
+  const items = [...container.querySelectorAll("[data-transcript-id]")];
+  let item = items.find((node) => node.dataset.transcriptId === anchor.id);
+  if (!item && anchor.memberId) {
+    item = items.find((node) => {
+      try {
+        const members = JSON.parse(node.dataset.transcriptMembers || "[]");
+        return Array.isArray(members) && members.includes(anchor.memberId);
+      } catch { return false; }
+    });
+  }
   if (!item) {
     container.scrollTop = fallbackOffset;
     return;
@@ -1945,6 +1959,14 @@ function initialize() {
   const readLocalStorage = (key) => {
     try { return localStorage.getItem(key); } catch { return null; }
   };
+  const writeLocalStorage = (key, value) => {
+    try {
+      localStorage.setItem(key, value);
+      return true;
+    } catch {
+      return false;
+    }
+  };
   const storedPulseAccount = pulseAccountId(readLocalStorage("atmux.pulse-account"));
   const storedLaunchDirectories = rememberedLaunchDirectories(
     readLocalStorage(LAUNCH_DIRECTORY_STORAGE_KEY),
@@ -2129,7 +2151,7 @@ function initialize() {
     toggle.setAttribute("aria-expanded", String(!state.railCollapsed));
     toggle.setAttribute("aria-label", state.railCollapsed ? "Expand agent list" : "Collapse agent list");
     toggle.title = state.railCollapsed ? "Expand agent list" : "Collapse agent list";
-    localStorage.setItem("atmux.rail-collapsed", String(state.railCollapsed));
+    writeLocalStorage("atmux.rail-collapsed", String(state.railCollapsed));
   }
 
   setRailCollapsed(state.railCollapsed);
@@ -2371,6 +2393,9 @@ function initialize() {
     const details = document.createElement("details");
     details.className = "tool-card tool-call-group";
     details.dataset.transcriptId = group.id;
+    details.dataset.transcriptMembers = JSON.stringify(
+      group.messages.map((message) => String(message?.id || "")).filter(Boolean),
+    );
     details.dataset.transcriptVisibility = "internal";
     details.open = expandedTools.has(group.id);
     const summary = document.createElement("summary");
@@ -2583,14 +2608,10 @@ function initialize() {
       ...state.fileReaderPreferences,
       ...change,
     });
-    try {
-      localStorage.setItem(
-        FILE_READER_STORAGE_KEY,
-        fileReaderPreferenceJson(state.fileReaderPreferences),
-      );
-    } catch {
-      // Keep the in-memory choice when browser storage is unavailable.
-    }
+    writeLocalStorage(
+      FILE_READER_STORAGE_KEY,
+      fileReaderPreferenceJson(state.fileReaderPreferences),
+    );
     applyFileReaderPreferences($("file-viewer"));
   }
 
@@ -3317,7 +3338,7 @@ function initialize() {
   function setConversationVisibility(next) {
     state.conversationVisibility = conversationVisibilityPreferences(next);
     saveConversationVisibilityPreferences(
-      (value) => localStorage.setItem(CONVERSATION_VISIBILITY_STORAGE_KEY, value),
+      (value) => writeLocalStorage(CONVERSATION_VISIBILITY_STORAGE_KEY, value),
       state.conversationVisibility,
     );
     renderConversationFilters();
@@ -4219,7 +4240,7 @@ function initialize() {
   }
 
   function rememberPulseAccount(account) {
-    localStorage.setItem("atmux.pulse-account", String(account));
+    writeLocalStorage("atmux.pulse-account", String(account));
   }
 
   async function loadPulseAccounts(force = false) {
@@ -6104,15 +6125,12 @@ function initialize() {
       machine,
       directory,
     );
-    try {
-      localStorage.setItem(
-        LAUNCH_DIRECTORY_STORAGE_KEY,
-        JSON.stringify(state.rememberedLaunchDirectories),
-      );
-    } catch {
-      // A privacy-restricted browser may deny storage. Selection still works
-      // for this page and the launch itself remains fully server-validated.
-    }
+    // A privacy-restricted browser may deny storage. Selection still works
+    // for this page and the launch itself remains fully server-validated.
+    writeLocalStorage(
+      LAUNCH_DIRECTORY_STORAGE_KEY,
+      JSON.stringify(state.rememberedLaunchDirectories),
+    );
   }
 
   function clearLaunchSessions() {
