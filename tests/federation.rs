@@ -17,7 +17,10 @@ use std::{
 use atmux::{
     attachment::{EncodedImage, ImageMessageRequest},
     config::{Config, MachineConfig},
-    control::{ControlPlane, ErrorKind, LaunchRequest, error_kind},
+    control::{
+        CloneLaunchRepositoryRequest, ControlPlane, CreateLaunchDirectoryRequest, ErrorKind,
+        LaunchRequest, error_kind,
+    },
     machine::MachineKind,
     remote::RemoteMachine,
     tmux::Tmux,
@@ -512,6 +515,39 @@ async fn launch_directories(
     .into_response()
 }
 
+async fn launch_directory_action(
+    State(state): State<Shared>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    record(&state, &headers, &uri.to_string(), &body);
+    let value: Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let parent = value
+        .get("directory")
+        .and_then(Value::as_str)
+        .unwrap_or("/srv/models");
+    let name = value
+        .get("name")
+        .or_else(|| value.get("destination"))
+        .and_then(Value::as_str)
+        .unwrap_or("cloned-repo");
+    Json(json!({
+        "directory": { "path": format!("{parent}/{name}"), "name": name },
+        "listing": {
+            "machine": "gpu-box",
+            "current": parent,
+            "parent": "/srv",
+            "directories": [{ "path": format!("{parent}/{name}"), "name": name }],
+            "truncated": false,
+        },
+    }))
+    .into_response()
+}
+
 async fn start_node() -> (SocketAddr, Shared) {
     start_node_with_memory(false).await
 }
@@ -525,6 +561,14 @@ async fn start_node_with_memory(advertise_memory: bool) -> (SocketAddr, Shared) 
         .route("/api/v1/events", get(events))
         .route("/api/v1/launch-options", get(launch_options))
         .route("/api/v1/launch-directories", get(launch_directories))
+        .route(
+            "/api/v1/launch-directories/folders",
+            post(launch_directory_action),
+        )
+        .route(
+            "/api/v1/launch-directories/clone",
+            post(launch_directory_action),
+        )
         .route("/api/v1/panes/{id}", get(pane))
         .route("/api/v1/panes/{id}/transcript", get(transcript))
         .route("/api/v1/panes/{id}/files", get(files).put(write_file))
@@ -1042,6 +1086,57 @@ async fn assert_remote_directory_browsing(control: &ControlPlane, recorder: &Sha
     );
 }
 
+async fn assert_remote_directory_actions(control: &ControlPlane, recorder: &Shared) {
+    let created = control
+        .create_launch_directory(CreateLaunchDirectoryRequest {
+            machine: Some("gpu-box".to_owned()),
+            directory: "/srv/models with space".to_owned(),
+            name: "new project".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.listing.machine, "gpu-box");
+    assert_eq!(created.directory.path, "/srv/models with space/new project");
+
+    let cloned = control
+        .clone_launch_repository(CloneLaunchRepositoryRequest {
+            machine: Some("gpu-box".to_owned()),
+            directory: "/srv/models with space".to_owned(),
+            repository: "git@example.test:team/repo.git".to_owned(),
+            destination: Some("repo copy".to_owned()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(cloned.directory.path, "/srv/models with space/repo copy");
+
+    let seen = recorder.lock().unwrap();
+    for path in [
+        "/api/v1/launch-directories/folders",
+        "/api/v1/launch-directories/clone",
+    ] {
+        assert!(
+            seen.paths.iter().any(|seen| seen == path),
+            "{:#?}",
+            seen.paths
+        );
+    }
+    assert!(seen.bodies.iter().any(|body| {
+        serde_json::from_str::<Value>(body).is_ok_and(|value| {
+            value.get("machine").is_none()
+                && value.get("directory").and_then(Value::as_str) == Some("/srv/models with space")
+                && value.get("name").and_then(Value::as_str) == Some("new project")
+        })
+    }));
+    assert!(seen.bodies.iter().any(|body| {
+        serde_json::from_str::<Value>(body).is_ok_and(|value| {
+            value.get("machine").is_none()
+                && value.get("repository").and_then(Value::as_str)
+                    == Some("git@example.test:team/repo.git")
+                && value.get("destination").and_then(Value::as_str) == Some("repo copy")
+        })
+    }));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn a_coordinator_groups_routes_and_survives_an_offline_machine() {
@@ -1273,6 +1368,7 @@ async fn a_coordinator_groups_routes_and_survives_an_offline_machine() {
     );
 
     assert_remote_directory_browsing(&control, &recorder).await;
+    assert_remote_directory_actions(&control, &recorder).await;
 
     route_commands_to_the_owning_machine(&control, &recorder).await;
 }

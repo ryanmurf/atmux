@@ -34,6 +34,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Replace the separate project finder with one typedown that filters as characters are entered | `completed/project-and-profile-launching.md` | Completed |
 | Allow a validated folder to be entered manually even when it is not in discovery results | `completed/project-and-profile-launching.md` | Completed |
 | Browse to an undiscovered launch folder and remember it per machine | `launch-folder-browser.md` | Implemented and live-tested; review pending |
+| Navigate up, create folders, and clone repositories from the selected machine's folder browser | `launch-folder-browser.md` | Implemented and locally tested; review pending |
 | Treat folders containing Claude or Codex agent-instruction files as projects | `completed/project-and-profile-launching.md` | Completed |
 | Descend through non-git grouping folders such as `nes-spring` and `nes-experimental` | `completed/project-and-profile-launching.md` | Completed |
 | Update the proposed session name when a project is selected | `completed/project-and-profile-launching.md` | Completed |

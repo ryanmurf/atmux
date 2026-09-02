@@ -31,6 +31,7 @@ use crate::{
     auto_compact::{self, Decision as AutoCompactDecision},
     auto_update::{self, Harness as UpdateHarness, PendingMarker},
     config::{AgentProfile, Config, ProfileMode},
+    launch_directory,
     machine::{MachineKind, MachineSummary, composite_id, now_ms, split_composite},
     metrics::{HardwareSampler, MachineMetrics},
     old_sessions::{self, DiscoveryLimits, ResumeCandidate},
@@ -150,6 +151,16 @@ fn workspace_error(error: &crate::workspace::WorkspaceError) -> anyhow::Error {
         WorkspaceErrorKind::NotFound => not_found(error.to_string()),
         WorkspaceErrorKind::Conflict => conflict(error.to_string()),
         WorkspaceErrorKind::Internal => {
+            ControlError::new(ErrorKind::Internal, error.to_string()).into()
+        }
+    }
+}
+
+fn launch_directory_error(error: &launch_directory::ActionError) -> anyhow::Error {
+    match error.kind() {
+        launch_directory::ErrorKind::Invalid => bad_request(error.to_string()),
+        launch_directory::ErrorKind::Conflict => conflict(error.to_string()),
+        launch_directory::ErrorKind::Internal => {
             ControlError::new(ErrorKind::Internal, error.to_string()).into()
         }
     }
@@ -443,6 +454,35 @@ pub struct LaunchDirectoryListing {
     pub parent: Option<String>,
     pub directories: Vec<BrowseDirectory>,
     pub truncated: bool,
+}
+
+/// Creates one child folder in the currently displayed launch directory.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateLaunchDirectoryRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    pub directory: String,
+    pub name: String,
+}
+
+/// Clones one repository into a new child of the displayed launch directory.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CloneLaunchRepositoryRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    pub directory: String,
+    pub repository: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+}
+
+/// A successful folder mutation and the refreshed parent listing.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct LaunchDirectoryActionResult {
+    pub directory: BrowseDirectory,
+    pub listing: LaunchDirectoryListing,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2506,6 +2546,90 @@ impl ControlPlane {
         .map_err(|error| internal(&error.into()))?
     }
 
+    /// Creates one new folder on the selected machine and refreshes its
+    /// bounded parent listing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown/offline machine, an outside-root
+    /// parent, a non-component name, an existing target, or a filesystem
+    /// failure on the owner.
+    pub async fn create_launch_directory(
+        &self,
+        request: CreateLaunchDirectoryRequest,
+    ) -> Result<LaunchDirectoryActionResult> {
+        let target = request.machine.as_deref().unwrap_or(&self.inner.local_id);
+        if target != self.inner.local_id {
+            let remote = self.remote_machine(target)?;
+            self.ensure_online(&remote.id)?;
+            let forwarded = CreateLaunchDirectoryRequest {
+                machine: None,
+                ..request
+            };
+            return remote
+                .post_json_response("/api/v1/launch-directories/folders", &forwarded)
+                .await
+                .map_err(|error| remote_workspace_error(&error));
+        }
+
+        self.ensure_local_owner_enabled()?;
+        let config = self.inner.config.clone();
+        let machine = self.inner.local_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let created =
+                launch_directory::create_folder(&config, &request.directory, &request.name)
+                    .map_err(|error| launch_directory_error(&error))?;
+            launch_directory_action_result(&config, machine, &request.directory, &created)
+        })
+        .await
+        .map_err(|error| internal(&anyhow::Error::new(error).context("folder creation panicked")))?
+    }
+
+    /// Clones one repository into a new child folder on the selected machine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown/offline machine, unsafe repository or
+    /// destination input, an existing target, or a failed owner-side clone.
+    pub async fn clone_launch_repository(
+        &self,
+        request: CloneLaunchRepositoryRequest,
+    ) -> Result<LaunchDirectoryActionResult> {
+        let target = request.machine.as_deref().unwrap_or(&self.inner.local_id);
+        if target != self.inner.local_id {
+            let remote = self.remote_machine(target)?;
+            self.ensure_online(&remote.id)?;
+            let forwarded = CloneLaunchRepositoryRequest {
+                machine: None,
+                ..request
+            };
+            return remote
+                .post_json_response_with_timeout(
+                    "/api/v1/launch-directories/clone",
+                    &forwarded,
+                    Duration::from_secs(10 * 60 + 30),
+                )
+                .await
+                .map_err(|error| remote_workspace_error(&error));
+        }
+
+        self.ensure_local_owner_enabled()?;
+        let config = self.inner.config.clone();
+        let machine = self.inner.local_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let created = launch_directory::clone_repository(
+                &config,
+                &request.directory,
+                &request.repository,
+                request.destination.as_deref(),
+            )
+            .map_err(|error| launch_directory_error(&error))?;
+            launch_directory_action_result(&config, machine, &request.directory, &created)
+        })
+        .await
+        .map_err(|error| internal(&anyhow::Error::new(error).context("git clone task panicked")))?
+    }
+
     /// Lists bounded native conversations for one exact launch selection.
     ///
     /// The owning node derives provider storage from the selected configured
@@ -3502,6 +3626,18 @@ fn browse_directory(path: &Path) -> Option<BrowseDirectory> {
         .unwrap_or(&path)
         .to_owned();
     Some(BrowseDirectory { path, name })
+}
+
+fn launch_directory_action_result(
+    config: &Config,
+    machine: String,
+    parent: &str,
+    created: &Path,
+) -> Result<LaunchDirectoryActionResult> {
+    let directory = browse_directory(created)
+        .ok_or_else(|| internal(&anyhow::anyhow!("created directory path is not UTF-8")))?;
+    let listing = browse_configured_directories(config, machine, Some(parent))?;
+    Ok(LaunchDirectoryActionResult { directory, listing })
 }
 
 fn model_capabilities(
@@ -4786,6 +4922,20 @@ mod tests {
         let nested_listing =
             browse_configured_directories(&config, "tron".to_owned(), child.to_str()).unwrap();
         assert_eq!(nested_listing.parent.as_deref(), canonical_root.to_str());
+
+        config.general.favorite_dirs = vec![child.clone()];
+        let overlapping_root =
+            browse_configured_directories(&config, "tron".to_owned(), child.to_str()).unwrap();
+        assert_eq!(
+            overlapping_root.parent.as_deref(),
+            canonical_root.to_str(),
+            "a nested configured root must still navigate up when an outer root allows it"
+        );
+        config.general.project_roots = vec![child.clone()];
+        config.general.favorite_dirs.clear();
+        let actual_root =
+            browse_configured_directories(&config, "tron".to_owned(), child.to_str()).unwrap();
+        assert_eq!(actual_root.parent, None);
 
         let error = browse_configured_directories(&config, "tron".to_owned(), outside.to_str())
             .unwrap_err();

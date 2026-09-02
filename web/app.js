@@ -490,6 +490,23 @@ function launchDirectoryBrowsePath(machine, path) {
   return `/api/v1/launch-directories?${params}`;
 }
 
+function validLaunchChildName(value) {
+  const name = typeof value === "string" ? value.trim() : "";
+  return name.length > 0
+    && new TextEncoder().encode(name).length <= 240
+    && !name.startsWith("-")
+    && !/[\/\\\u0000-\u001f\u007f]/.test(name)
+    && name !== "."
+    && name !== "..";
+}
+
+function repositoryDestinationName(value) {
+  const repository = typeof value === "string" ? value.trim() : "";
+  const withoutSuffix = repository.split(/[?#]/, 1)[0].replace(/\/+$/, "");
+  const segment = withoutSuffix.split(/[/:]/).pop()?.replace(/\.git$/, "").trim() || "";
+  return validLaunchChildName(segment) ? segment : "";
+}
+
 function harnessesForProfiles(profiles) {
   const seen = new Set();
   return (Array.isArray(profiles) ? profiles : [])
@@ -1773,6 +1790,8 @@ if (typeof module !== "undefined" && module.exports) {
     rememberLaunchDirectory,
     availableLaunchDirectories,
     launchDirectoryBrowsePath,
+    validLaunchChildName,
+    repositoryDestinationName,
     launchMachines,
     imageFilesFromTransfer,
     highlightCode,
@@ -1904,6 +1923,7 @@ function initialize() {
     launchNamePristine: true,
     rememberedLaunchDirectories: storedLaunchDirectories,
     launchBrowseGeneration: 0,
+    launchBrowseMutation: false,
     launchDialogGeneration: 0,
     launchFlow: null,
     launchSessionsGeneration: 0,
@@ -6044,6 +6064,8 @@ function initialize() {
 
   function closeLaunchBrowser() {
     state.launchBrowseGeneration += 1;
+    state.launchBrowseMutation = false;
+    closeLaunchBrowserOperation();
     $("launch-browser").hidden = true;
     $("launch-browser").dataset.current = "";
     $("launch-browser").dataset.parent = "";
@@ -6059,6 +6081,8 @@ function initialize() {
     $("launch-browser-path").title = current;
     $("launch-browser-up").disabled = !parent;
     $("launch-browser-use").disabled = !current;
+    $("launch-browser-new").disabled = !current;
+    $("launch-browser-clone").disabled = !current;
     const folders = (Array.isArray(listing?.directories) ? listing.directories : [])
       .slice(0, 512)
       .filter((folder) => validRememberedLaunchDirectory(folder?.path));
@@ -6066,6 +6090,7 @@ function initialize() {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "launch-browser-folder";
+      button.dataset.path = folder.path;
       button.textContent = `📁 ${String(folder.name || projectLabel(folder.path)).slice(0, 200)}`;
       button.title = folder.path;
       button.addEventListener("click", () => { void loadLaunchBrowser(folder.path); });
@@ -6091,6 +6116,9 @@ function initialize() {
     $("launch-browser-list").replaceChildren();
     $("launch-browser-up").disabled = true;
     $("launch-browser-use").disabled = true;
+    $("launch-browser-new").disabled = true;
+    $("launch-browser-clone").disabled = true;
+    closeLaunchBrowserOperation();
     try {
       const listing = await request(endpoint);
       if (generation !== state.launchBrowseGeneration
@@ -6120,6 +6148,135 @@ function initialize() {
     $("launch-directory").value = directory;
     closeLaunchBrowser();
     renderLaunchDirectories(machine);
+  });
+
+  function closeLaunchBrowserOperation() {
+    const operation = $("launch-browser-operation");
+    operation.hidden = true;
+    operation.dataset.kind = "";
+    $("launch-browser-new").setAttribute("aria-expanded", "false");
+    $("launch-browser-clone").setAttribute("aria-expanded", "false");
+    $("launch-browser-operation-note").textContent = "";
+    $("launch-browser-new-name").value = "";
+    $("launch-browser-repository").value = "";
+    $("launch-browser-destination").value = "";
+    $("launch-browser-destination").dataset.manual = "false";
+  }
+
+  function openLaunchBrowserOperation(kind) {
+    const current = $("launch-browser").dataset.current;
+    if (!validRememberedLaunchDirectory(current) || state.launchBrowseMutation) return;
+    const cloning = kind === "clone";
+    const operation = $("launch-browser-operation");
+    operation.dataset.kind = cloning ? "clone" : "folder";
+    operation.hidden = false;
+    $("launch-browser-operation-title").textContent = cloning ? "Clone repository here" : "Create folder here";
+    $("launch-browser-new-row").hidden = cloning;
+    $("launch-browser-repository-row").hidden = !cloning;
+    $("launch-browser-destination-row").hidden = !cloning;
+    $("launch-browser-operation-confirm").textContent = cloning ? "Clone" : "Create";
+    $("launch-browser-operation-note").textContent = "";
+    $("launch-browser-new").setAttribute("aria-expanded", String(!cloning));
+    $("launch-browser-clone").setAttribute("aria-expanded", String(cloning));
+    $("launch-browser-destination").dataset.manual = "false";
+    requestAnimationFrame(() => {
+      (cloning ? $("launch-browser-repository") : $("launch-browser-new-name")).focus();
+    });
+  }
+
+  function setLaunchBrowserMutation(busy) {
+    state.launchBrowseMutation = busy;
+    const current = validRememberedLaunchDirectory($("launch-browser").dataset.current);
+    for (const id of [
+      "launch-browser-up", "launch-browser-use", "launch-browser-new", "launch-browser-clone",
+      "launch-browser-operation-cancel", "launch-browser-operation-confirm",
+      "launch-browser-new-name", "launch-browser-repository", "launch-browser-destination",
+    ]) $(id).disabled = busy || (!current && id.startsWith("launch-browser-"));
+    if (!busy) {
+      $("launch-browser-up").disabled = !$("launch-browser").dataset.parent;
+      $("launch-browser-use").disabled = !current;
+      $("launch-browser-new").disabled = !current;
+      $("launch-browser-clone").disabled = !current;
+    }
+  }
+
+  async function submitLaunchBrowserOperation() {
+    if (state.launchBrowseMutation) return;
+    const browser = $("launch-browser");
+    const current = browser.dataset.current;
+    const machine = currentLaunchMachine();
+    const kind = $("launch-browser-operation").dataset.kind;
+    if (!validRememberedLaunchDirectory(current) || !["folder", "clone"].includes(kind)) return;
+    const body = { machine: machine.id, directory: current };
+    let endpoint;
+    let success;
+    if (kind === "folder") {
+      const name = $("launch-browser-new-name").value.trim();
+      if (!validLaunchChildName(name)) {
+        $("launch-browser-operation-note").textContent = "Enter one folder name without slashes or a leading dash.";
+        return;
+      }
+      body.name = name;
+      endpoint = "/api/v1/launch-directories/folders";
+      success = `Created ${name}`;
+    } else {
+      const repository = $("launch-browser-repository").value.trim();
+      const destination = $("launch-browser-destination").value.trim();
+      if (!repository || repository.startsWith("-") || /[\u0000-\u001f\u007f]/.test(repository)) {
+        $("launch-browser-operation-note").textContent = "Enter an HTTPS or SSH repository URL.";
+        return;
+      }
+      if (destination && !validLaunchChildName(destination)) {
+        $("launch-browser-operation-note").textContent = "Destination must be one folder name without slashes or a leading dash.";
+        return;
+      }
+      body.repository = repository;
+      body.destination = destination || null;
+      endpoint = "/api/v1/launch-directories/clone";
+      success = `Cloned ${destination || repositoryDestinationName(repository) || "repository"}`;
+    }
+    const generation = state.launchBrowseGeneration;
+    setLaunchBrowserMutation(true);
+    $("launch-browser-operation-note").textContent = kind === "clone" ? "Cloning repository…" : "Creating folder…";
+    try {
+      const result = await request(endpoint, { method: "POST", body: JSON.stringify(body) });
+      if (generation !== state.launchBrowseGeneration || machine.id !== currentLaunchMachine().id) return;
+      if (result?.listing?.machine !== machine.id
+          || !validRememberedLaunchDirectory(result?.directory?.path)) {
+        throw new Error("The owning machine returned an invalid folder result");
+      }
+      renderLaunchBrowser(result.listing, machine);
+      closeLaunchBrowserOperation();
+      [...document.querySelectorAll(".launch-browser-folder")]
+        .find((button) => button.dataset.path === result.directory.path)
+        ?.focus();
+      toast(success);
+    } catch (error) {
+      if (generation === state.launchBrowseGeneration) {
+        $("launch-browser-operation-note").textContent = error.message;
+      }
+    } finally {
+      if (generation === state.launchBrowseGeneration) setLaunchBrowserMutation(false);
+    }
+  }
+
+  $("launch-browser-new").addEventListener("click", () => openLaunchBrowserOperation("folder"));
+  $("launch-browser-clone").addEventListener("click", () => openLaunchBrowserOperation("clone"));
+  $("launch-browser-operation-cancel").addEventListener("click", closeLaunchBrowserOperation);
+  $("launch-browser-operation-confirm").addEventListener("click", () => { void submitLaunchBrowserOperation(); });
+  $("launch-browser-repository").addEventListener("input", () => {
+    const destination = $("launch-browser-destination");
+    if (destination.dataset.manual !== "true") {
+      destination.value = repositoryDestinationName($("launch-browser-repository").value);
+    }
+  });
+  $("launch-browser-destination").addEventListener("input", () => {
+    $("launch-browser-destination").dataset.manual = "true";
+  });
+  $("launch-browser-operation").addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || event.isComposing) return;
+    event.preventDefault();
+    void submitLaunchBrowserOperation();
   });
   function suggestName(preferences = {}, force = false) {
     if (!force && !state.launchNamePristine && $("launch-name").value) return;

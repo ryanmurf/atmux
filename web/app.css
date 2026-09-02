@@ -246,10 +246,19 @@ dialog::backdrop { background: #000a; }
 .launch-directory-control { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
 .launch-directory-control button { min-height: 40px; }
 .launch-browser { min-width: 0; display: grid; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: #0a1115; }
-.launch-browser-head, .launch-browser-actions { min-width: 0; display: flex; align-items: center; gap: 7px; }
+.launch-browser-head { min-width: 0; display: flex; align-items: center; gap: 7px; }
 .launch-browser-head strong { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .launch-browser-head .icon-button { min-height: 32px; height: 32px; min-width: 32px; padding: 0; }
-.launch-browser-actions button { min-height: 36px; flex: 1; }
+.launch-browser-actions { min-width: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
+.launch-browser-actions button { min-width: 0; min-height: 36px; padding-inline: 7px; }
+.launch-browser-operation { min-width: 0; display: grid; gap: 7px; padding: 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.launch-browser-operation[hidden] { display: none; }
+.launch-browser-operation > strong { font-size: 12px; }
+.launch-browser-operation label { min-width: 0; display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
+.launch-browser-operation label span { font-weight: 400; }
+.launch-browser-operation input { min-width: 0; }
+.launch-browser-operation-actions { display: flex; justify-content: flex-end; gap: 7px; }
+.launch-browser-operation-actions button { min-height: 36px; }
 .launch-browser-list { min-width: 0; max-height: min(300px, 38vh); display: grid; gap: 4px; overflow-y: auto; }
 .launch-browser-folder { width: 100%; min-width: 0; min-height: 38px; display: block; overflow: hidden; padding: 6px 9px; text-align: left; text-overflow: ellipsis; white-space: nowrap; background: var(--panel); }
 .launch-sessions { min-width: 0; display: grid; gap: 6px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: #0a1115; }
@@ -477,7 +486,9 @@ dialog::backdrop { background: #000a; }
   .launch-memory-group { grid-template-columns: minmax(0, 1fr) minmax(82px, .42fr); gap: 6px; }
   .launch-memory-group label { font-size: 12px; }
   .launch-memory-group select, .launch-memory-group input { min-width: 0; min-height: 44px; height: 44px; font-size: 16px; }
-  .launch-directory-control button, .launch-browser-actions button, .launch-browser-folder { min-height: 44px; }
+  .launch-browser-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .launch-directory-control button, .launch-browser-actions button, .launch-browser-operation-actions button, .launch-browser-folder { min-height: 44px; }
+  .launch-browser-operation input { min-height: 44px; font-size: 16px; }
   .launch-browser-list { max-height: min(260px, 32vh); }
 
 }
