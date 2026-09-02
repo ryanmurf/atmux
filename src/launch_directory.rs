@@ -6,13 +6,19 @@
 //! directory, or symlink is never reused.
 
 use std::{
-    ffi::OsStr,
-    fs,
+    ffi::{OsStr, OsString},
+    fs::{self, File, Metadata},
     io::{self, Read},
+    os::unix::{fs::MetadataExt as _, io::AsRawFd as _, process::CommandExt as _},
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
+};
+
+use rustix::{
+    fs::{AtFlags, Mode, OFlags, RenameFlags},
+    process::{Pid, Signal, kill_process_group, test_kill_process_group},
 };
 
 use crate::config::Config;
@@ -20,7 +26,12 @@ use crate::config::Config;
 const MAX_DIRECTORY_NAME_BYTES: usize = 240;
 const MAX_REPOSITORY_BYTES: usize = 4_096;
 const MAX_GIT_ERROR_BYTES: usize = 4_096;
+const MAX_STDERR_READS_PER_TICK: usize = 64;
 const GIT_CLONE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const PROCESS_GROUP_GRACE: Duration = Duration::from_millis(250);
+const PROCESS_GROUP_KILL_WAIT: Duration = Duration::from_secs(1);
+const STAGING_ATTEMPTS: usize = 64;
+const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ErrorKind {
@@ -70,24 +81,65 @@ impl std::fmt::Display for ActionError {
 
 impl std::error::Error for ActionError {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl DirectoryIdentity {
+    fn from_metadata(metadata: &Metadata) -> Result<Self, ActionError> {
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(ActionError::invalid(
+                "destination directory is not a real directory",
+            ));
+        }
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+struct HeldDirectory {
+    path: PathBuf,
+    handle: File,
+    identity: DirectoryIdentity,
+}
+
+struct StagingDirectory {
+    name: OsString,
+    handle: File,
+    identity: DirectoryIdentity,
+}
+
 /// Creates one real, previously absent child below an allowed directory.
 pub(crate) fn create_folder(
     config: &Config,
     parent: &str,
     name: &str,
 ) -> Result<PathBuf, ActionError> {
+    create_folder_with_hook(config, parent, name, None)
+}
+
+fn create_folder_with_hook(
+    config: &Config,
+    parent: &str,
+    name: &str,
+    before_publish: Option<&dyn Fn()>,
+) -> Result<PathBuf, ActionError> {
     let parent = resolve_parent(config, parent)?;
-    let name = validate_child_name(name)?;
-    let target = parent.join(name);
-    ensure_target_absent(&target)?;
-    fs::create_dir(&target).map_err(|error| create_error(&target, &error))?;
-    match revalidate_created_directory(config, &target) {
-        Ok(target) => Ok(target),
-        Err(error) => {
-            let _ = fs::remove_dir(&target);
-            Err(error)
-        }
+    let destination = validate_child_name(name)?;
+    ensure_target_absent_at(&parent.handle, OsStr::new(destination))?;
+    let staging = create_staging_directory(&parent)?;
+    rustix::fs::fchmod(&staging.handle, Mode::from_raw_mode(0o755)).map_err(|_| {
+        let _ = cleanup_staging_directory(&parent, &staging);
+        ActionError::internal("new folder permissions could not be finalized")
+    })?;
+    if let Some(hook) = before_publish {
+        hook();
     }
+    publish_staging(config, &parent, &staging, destination)
 }
 
 /// Clones one repository into a new child below an allowed directory.
@@ -115,6 +167,27 @@ fn clone_repository_with_program(
     git: &OsStr,
     timeout: Duration,
 ) -> Result<PathBuf, ActionError> {
+    clone_repository_with_program_and_hook(
+        config,
+        parent,
+        repository,
+        destination,
+        git,
+        timeout,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clone_repository_with_program_and_hook(
+    config: &Config,
+    parent: &str,
+    repository: &str,
+    destination: Option<&str>,
+    git: &OsStr,
+    timeout: Duration,
+    before_publish: Option<&dyn Fn()>,
+) -> Result<PathBuf, ActionError> {
     let parent = resolve_parent(config, parent)?;
     let repository = validate_repository(repository)?;
     let destination =
@@ -125,32 +198,23 @@ fn clone_repository_with_program(
             validate_child_name(&derived)?;
             derived
         };
-    let target = parent.join(&destination);
-    ensure_target_absent(&target)?;
-    fs::create_dir(&target).map_err(|error| create_error(&target, &error))?;
-    let target = match revalidate_created_directory(config, &target) {
-        Ok(target) => target,
-        Err(error) => {
-            let _ = fs::remove_dir(&target);
-            return Err(error);
-        }
-    };
-
-    let result = run_git_clone(git, repository, &target, timeout);
-    match result {
-        Ok(()) => revalidate_created_directory(config, &target).inspect_err(|_| {
-            let _ = fs::remove_dir_all(&target);
-        }),
-        Err(error) => match fs::remove_dir_all(&target) {
+    ensure_target_absent_at(&parent.handle, OsStr::new(&destination))?;
+    let staging = create_staging_directory(&parent)?;
+    if let Err(error) = run_git_clone(git, repository, &staging.handle, timeout) {
+        return match cleanup_staging_directory(&parent, &staging) {
             Ok(()) => Err(error),
             Err(cleanup) => Err(ActionError::internal(format!(
-                "git clone failed and its incomplete destination could not be removed: {cleanup}"
+                "git clone failed and its private staging directory could not be removed: {cleanup}"
             ))),
-        },
+        };
     }
+    if let Some(hook) = before_publish {
+        hook();
+    }
+    publish_staging(config, &parent, &staging, &destination)
 }
 
-fn resolve_parent(config: &Config, parent: &str) -> Result<PathBuf, ActionError> {
+fn resolve_parent(config: &Config, parent: &str) -> Result<HeldDirectory, ActionError> {
     let parent = parent.trim();
     if parent.is_empty()
         || parent.len() > 4_096
@@ -161,9 +225,22 @@ fn resolve_parent(config: &Config, parent: &str) -> Result<PathBuf, ActionError>
             "destination directory must be an absolute, readable path",
         ));
     }
-    config
+    let path = config
         .resolve_launch_directory(Path::new(parent))
-        .ok_or_else(|| ActionError::invalid("destination directory is outside the allowed roots"))
+        .ok_or_else(|| {
+            ActionError::invalid("destination directory is outside the allowed roots")
+        })?;
+    let handle = open_absolute_directory(&path)?;
+    let identity = DirectoryIdentity::from_metadata(
+        &handle
+            .metadata()
+            .map_err(|_| ActionError::invalid("destination directory could not be inspected"))?,
+    )?;
+    Ok(HeldDirectory {
+        path,
+        handle,
+        identity,
+    })
 }
 
 fn validate_child_name(name: &str) -> Result<&str, ActionError> {
@@ -277,105 +354,391 @@ fn repository_destination(repository: &str) -> Result<String, ActionError> {
     Ok(name.to_owned())
 }
 
-fn ensure_target_absent(target: &Path) -> Result<(), ActionError> {
-    match fs::symlink_metadata(target) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+fn open_absolute_directory(path: &Path) -> Result<File, ActionError> {
+    let expected = fs::symlink_metadata(path)
+        .map_err(|_| ActionError::invalid("destination directory is unavailable"))?;
+    let expected_identity = DirectoryIdentity::from_metadata(&expected)?;
+    let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY;
+    let mut current = rustix::fs::open("/", flags, Mode::empty())
+        .map(File::from)
+        .map_err(|_| ActionError::invalid("destination directory could not be opened safely"))?;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                current = rustix::fs::openat(&current, name, flags, Mode::empty())
+                    .map(File::from)
+                    .map_err(|_| {
+                        ActionError::invalid("destination directory could not be opened safely")
+                    })?;
+            }
+            _ => {
+                return Err(ActionError::invalid(
+                    "destination directory could not be opened safely",
+                ));
+            }
+        }
+    }
+    let actual = DirectoryIdentity::from_metadata(
+        &current
+            .metadata()
+            .map_err(|_| ActionError::invalid("destination directory could not be inspected"))?,
+    )?;
+    if actual != expected_identity {
+        return Err(ActionError::invalid(
+            "destination directory changed while it was being opened",
+        ));
+    }
+    Ok(current)
+}
+
+fn open_child_directory(
+    parent: &File,
+    name: &OsStr,
+) -> Result<(File, DirectoryIdentity), ActionError> {
+    let before = named_directory_identity(parent, name)
+        .map_err(|_| ActionError::internal("private staging directory could not be inspected"))?;
+    let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY;
+    let handle = rustix::fs::openat(parent, name, flags, Mode::empty())
+        .map(File::from)
+        .map_err(|_| ActionError::internal("private staging directory could not be opened"))?;
+    let after =
+        DirectoryIdentity::from_metadata(&handle.metadata().map_err(|_| {
+            ActionError::internal("private staging directory could not be inspected")
+        })?)?;
+    if before != after {
+        return Err(ActionError::internal(
+            "private staging directory changed while it was being opened",
+        ));
+    }
+    Ok((handle, after))
+}
+
+fn named_directory_identity(parent: &File, name: &OsStr) -> rustix::io::Result<DirectoryIdentity> {
+    let stat = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir() {
+        return Err(rustix::io::Errno::NOTDIR);
+    }
+    Ok(DirectoryIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+    })
+}
+
+fn ensure_target_absent_at(parent: &File, destination: &OsStr) -> Result<(), ActionError> {
+    match rustix::fs::statat(parent, destination, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(error) if error == rustix::io::Errno::NOENT => Ok(()),
         Ok(_) => Err(ActionError::conflict(
             "destination already exists; choose a new folder name",
         )),
-        Err(error) => Err(ActionError::internal(format!(
-            "destination could not be inspected: {error}"
-        ))),
+        Err(_) => Err(ActionError::internal(
+            "destination could not be inspected safely",
+        )),
     }
 }
 
-fn create_error(target: &Path, error: &io::Error) -> ActionError {
-    if error.kind() == io::ErrorKind::AlreadyExists {
-        ActionError::conflict("destination already exists; choose a new folder name")
-    } else {
-        ActionError::internal(format!("failed to create {}: {error}", target.display()))
+fn create_staging_directory(parent: &HeldDirectory) -> Result<StagingDirectory, ActionError> {
+    for _ in 0..STAGING_ATTEMPTS {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random)
+            .map_err(|_| ActionError::internal("private staging name could not be generated"))?;
+        let mut suffix = String::with_capacity(random.len() * 2);
+        for byte in random {
+            suffix.push(char::from(HEX[usize::from(byte >> 4)]));
+            suffix.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        let name = OsString::from(format!(".atmux-stage-{suffix}"));
+        match rustix::fs::mkdirat(&parent.handle, &name, Mode::from_raw_mode(0o700)) {
+            Ok(()) => {
+                let (handle, identity) = open_child_directory(&parent.handle, &name)?;
+                return Ok(StagingDirectory {
+                    name,
+                    handle,
+                    identity,
+                });
+            }
+            Err(error) if error == rustix::io::Errno::EXIST => {}
+            Err(_) => {
+                return Err(ActionError::internal(
+                    "private staging directory could not be created",
+                ));
+            }
+        }
     }
+    Err(ActionError::internal(
+        "private staging directory name could not be allocated",
+    ))
 }
 
-fn revalidate_created_directory(config: &Config, target: &Path) -> Result<PathBuf, ActionError> {
-    let resolved = config
-        .resolve_launch_directory(target)
-        .ok_or_else(|| ActionError::internal("created directory failed its owner policy check"))?;
-    let metadata = fs::symlink_metadata(&resolved).map_err(|error| {
-        ActionError::internal(format!("created directory disappeared: {error}"))
-    })?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(ActionError::internal(
-            "created destination is not a real directory",
+fn parent_is_still_authorized(config: &Config, parent: &HeldDirectory) -> bool {
+    let Some(current_path) = config.resolve_launch_directory(&parent.path) else {
+        return false;
+    };
+    if current_path != parent.path {
+        return false;
+    }
+    open_absolute_directory(&current_path)
+        .and_then(|handle| {
+            DirectoryIdentity::from_metadata(&handle.metadata().map_err(|_| {
+                ActionError::invalid("destination directory could not be inspected")
+            })?)
+        })
+        .is_ok_and(|identity| identity == parent.identity)
+}
+
+fn publish_staging(
+    config: &Config,
+    parent: &HeldDirectory,
+    staging: &StagingDirectory,
+    destination: &str,
+) -> Result<PathBuf, ActionError> {
+    if !parent_is_still_authorized(config, parent) {
+        let _ = cleanup_staging_directory(parent, staging);
+        return Err(ActionError::conflict(
+            "destination directory changed before the operation completed",
         ));
     }
-    Ok(resolved)
+    match rustix::fs::renameat_with(
+        &parent.handle,
+        &staging.name,
+        &parent.handle,
+        destination,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::EXIST | rustix::io::Errno::NOTEMPTY) => {
+            let _ = cleanup_staging_directory(parent, staging);
+            return Err(ActionError::conflict(
+                "destination already exists; choose a new folder name",
+            ));
+        }
+        Err(_) => {
+            let _ = cleanup_staging_directory(parent, staging);
+            return Err(ActionError::internal(
+                "private staging directory could not be published atomically",
+            ));
+        }
+    }
+
+    let target = parent.path.join(destination);
+    let named_matches = named_directory_identity(&parent.handle, OsStr::new(destination))
+        .is_ok_and(|identity| identity == staging.identity);
+    let resolved_matches = config
+        .resolve_launch_directory(&target)
+        .is_some_and(|resolved| resolved == target)
+        && open_absolute_directory(&target)
+            .and_then(|handle| {
+                DirectoryIdentity::from_metadata(&handle.metadata().map_err(|_| {
+                    ActionError::internal("published directory could not be inspected")
+                })?)
+            })
+            .is_ok_and(|identity| identity == staging.identity);
+    if named_matches && resolved_matches {
+        return Ok(target);
+    }
+
+    cleanup_published_directory(parent, destination, staging);
+    Err(ActionError::conflict(
+        "destination changed while the operation was being published",
+    ))
+}
+
+fn descriptor_path(directory: &File) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    let base = "/proc/self/fd";
+    #[cfg(target_vendor = "apple")]
+    let base = "/dev/fd";
+    Path::new(base).join(directory.as_raw_fd().to_string())
+}
+
+fn clear_directory(directory: &File) -> io::Result<()> {
+    for entry in fs::read_dir(descriptor_path(directory))? {
+        let entry = entry?;
+        let path = descriptor_path(directory).join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_dir() && !kind.is_symlink() {
+            fs::remove_dir_all(path)?;
+        } else {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_staging_directory(
+    parent: &HeldDirectory,
+    staging: &StagingDirectory,
+) -> Result<(), ActionError> {
+    clear_directory(&staging.handle)
+        .map_err(|_| ActionError::internal("private staging contents could not be removed"))?;
+    if !named_directory_identity(&parent.handle, &staging.name)
+        .is_ok_and(|identity| identity == staging.identity)
+    {
+        return Err(ActionError::internal(
+            "private staging name no longer identifies the retained directory",
+        ));
+    }
+    rustix::fs::unlinkat(&parent.handle, &staging.name, AtFlags::REMOVEDIR)
+        .map_err(|_| ActionError::internal("private staging directory could not be removed"))
+}
+
+fn cleanup_published_directory(
+    parent: &HeldDirectory,
+    destination: &str,
+    published: &StagingDirectory,
+) {
+    let _ = clear_directory(&published.handle);
+    if named_directory_identity(&parent.handle, OsStr::new(destination))
+        .is_ok_and(|identity| identity == published.identity)
+    {
+        let _ = rustix::fs::unlinkat(&parent.handle, destination, AtFlags::REMOVEDIR);
+    }
 }
 
 fn run_git_clone(
     git: &OsStr,
     repository: &str,
-    target: &Path,
+    staging: &File,
     timeout: Duration,
 ) -> Result<(), ActionError> {
     let mut child = Command::new(git)
         .arg("clone")
         .arg("--")
         .arg(repository)
-        .arg(target)
+        .arg(".")
+        .current_dir(descriptor_path(staging))
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .map_err(|error| ActionError::internal(format!("could not start git clone: {error}")))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| ActionError::internal("git clone did not expose an error stream"))?;
-    let reader = thread::spawn(move || read_bounded_and_drain(stderr));
+    let Some(group) = i32::try_from(child.id()).ok().and_then(Pid::from_raw) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(ActionError::internal(
+            "git clone did not expose a process group",
+        ));
+    };
+    let Some(mut stderr) = child.stderr.take() else {
+        let _ = abort_started_clone(&mut child, group);
+        return Err(ActionError::internal(
+            "git clone did not expose an error stream",
+        ));
+    };
+    let Ok(flags) = rustix::fs::fcntl_getfl(&stderr) else {
+        let _ = abort_started_clone(&mut child, group);
+        return Err(ActionError::internal(
+            "git clone error stream could not be inspected",
+        ));
+    };
+    if rustix::fs::fcntl_setfl(&stderr, flags | OFlags::NONBLOCK).is_err() {
+        let _ = abort_started_clone(&mut child, group);
+        return Err(ActionError::internal(
+            "git clone error stream could not be bounded",
+        ));
+    }
+    let mut retained = Vec::new();
     let deadline = Instant::now() + timeout;
     let status = loop {
+        drain_available(&mut stderr, &mut retained)?;
         match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
+            Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err(ActionError::internal("git clone timed out"));
+                if !terminate_process_group(&mut child, group, &mut stderr, &mut retained) {
+                    return Err(ActionError::internal(
+                        "git clone timed out and its process group could not be stopped",
+                    ));
+                }
+                return Err(ActionError::internal("git clone timed out"));
             }
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err(ActionError::internal(format!(
+                let _ = terminate_process_group(&mut child, group, &mut stderr, &mut retained);
+                return Err(ActionError::internal(format!(
                     "could not wait for git clone: {error}"
                 )));
             }
         }
     };
-    let stderr = reader
-        .join()
-        .map_err(|_| ActionError::internal("git clone error reader panicked"))?;
-    let status = status?;
+    if test_kill_process_group(group).is_ok()
+        && !terminate_process_group(&mut child, group, &mut stderr, &mut retained)
+    {
+        return Err(ActionError::internal(
+            "git clone left a process group that could not be stopped",
+        ));
+    }
+    drain_available(&mut stderr, &mut retained)?;
     if status.success() {
         return Ok(());
     }
     Err(ActionError::invalid(git_failure_message(
-        status, &stderr, repository,
+        status, &retained, repository,
     )))
 }
 
-fn read_bounded_and_drain(mut reader: impl Read) -> Vec<u8> {
-    let mut retained = Vec::new();
+fn drain_available(reader: &mut impl Read, retained: &mut Vec<u8>) -> Result<(), ActionError> {
     let mut buffer = [0_u8; 1_024];
-    while let Ok(read) = reader.read(&mut buffer) {
-        if read == 0 {
-            break;
+    for _ in 0..MAX_STDERR_READS_PER_TICK {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read) => {
+                let remaining = MAX_GIT_ERROR_BYTES.saturating_sub(retained.len());
+                retained.extend_from_slice(&buffer[..read.min(remaining)]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(_) => {
+                return Err(ActionError::internal(
+                    "git clone error stream could not be read",
+                ));
+            }
         }
-        let remaining = MAX_GIT_ERROR_BYTES.saturating_sub(retained.len());
-        retained.extend_from_slice(&buffer[..read.min(remaining)]);
     }
-    retained
+    Ok(())
+}
+
+fn abort_started_clone(child: &mut std::process::Child, group: Pid) -> bool {
+    let _ = kill_process_group(group, Signal::KILL);
+    let deadline = Instant::now() + PROCESS_GROUP_KILL_WAIT;
+    let mut leader_reaped = false;
+    while Instant::now() < deadline {
+        leader_reaped |= child.try_wait().is_ok_and(|status| status.is_some());
+        if leader_reaped && test_kill_process_group(group).is_err() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    leader_reaped && test_kill_process_group(group).is_err()
+}
+
+fn terminate_process_group(
+    child: &mut std::process::Child,
+    group: Pid,
+    stderr: &mut impl Read,
+    retained: &mut Vec<u8>,
+) -> bool {
+    let _ = kill_process_group(group, Signal::TERM);
+    let term_deadline = Instant::now() + PROCESS_GROUP_GRACE;
+    let mut leader_reaped = child.try_wait().is_ok_and(|status| status.is_some());
+    while Instant::now() < term_deadline && test_kill_process_group(group).is_ok() {
+        let _ = drain_available(stderr, retained);
+        leader_reaped |= child.try_wait().is_ok_and(|status| status.is_some());
+        thread::sleep(Duration::from_millis(10));
+    }
+    if test_kill_process_group(group).is_ok() {
+        let _ = kill_process_group(group, Signal::KILL);
+    }
+    let kill_deadline = Instant::now() + PROCESS_GROUP_KILL_WAIT;
+    while Instant::now() < kill_deadline {
+        let _ = drain_available(stderr, retained);
+        leader_reaped |= child.try_wait().is_ok_and(|status| status.is_some());
+        if leader_reaped && test_kill_process_group(group).is_err() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    leader_reaped && test_kill_process_group(group).is_err()
 }
 
 fn git_failure_message(status: ExitStatus, stderr: &[u8], repository: &str) -> String {
@@ -504,7 +867,7 @@ mod tests {
                 .unwrap()
                 .lines()
                 .collect::<Vec<_>>(),
-            ["clone", "--", repository, cloned.to_str().unwrap()]
+            ["clone", "--", repository, "."]
         );
 
         let failed = clone_repository_with_program(
@@ -588,5 +951,106 @@ mod tests {
         ] {
             assert_eq!(validate_repository(supported).unwrap(), supported);
         }
+    }
+
+    #[test]
+    fn held_parent_and_no_replace_publish_resist_parent_and_target_swaps() {
+        let fixture = Fixture::new();
+        let moved = fixture.base.join("moved allowed root");
+        let replacement_marker = fixture.root.join("replacement-marker");
+        let swap_parent = || {
+            fs::rename(&fixture.root, &moved).unwrap();
+            fs::create_dir(&fixture.root).unwrap();
+            fs::write(&replacement_marker, "unrelated").unwrap();
+        };
+        let error = create_folder_with_hook(
+            &fixture.config,
+            fixture.root.to_str().unwrap(),
+            "must not escape",
+            Some(&swap_parent),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Conflict);
+        assert_eq!(fs::read_to_string(replacement_marker).unwrap(), "unrelated");
+        assert!(!moved.join("must not escape").exists());
+        assert!(staging_names(&moved).is_empty());
+
+        let fixture = Fixture::new();
+        let target = fixture.root.join("raced target");
+        let install_target = || {
+            fs::create_dir(&target).unwrap();
+            fs::write(target.join("keep"), "unrelated").unwrap();
+        };
+        let error = clone_repository_with_program_and_hook(
+            &fixture.config,
+            fixture.root.to_str().unwrap(),
+            "https://example.test/team/repo.git",
+            Some("raced target"),
+            fixture.fake_git(true).as_os_str(),
+            Duration::from_secs(2),
+            Some(&install_target),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Conflict);
+        assert_eq!(
+            fs::read_to_string(target.join("keep")).unwrap(),
+            "unrelated"
+        );
+        assert!(staging_names(&fixture.root).is_empty());
+    }
+
+    #[test]
+    fn timeout_kills_descendants_retaining_stderr_and_cleans_staging() {
+        let fixture = Fixture::new();
+        let script = fixture.base.join("git-hangs-with-descendant");
+        let pid_file = fixture.base.join("descendant.pid");
+        let pid_file_text = pid_file.display().to_string();
+        let quoted_pid_file = shell_words::quote(&pid_file_text);
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n(trap '' TERM; while :; do printf 0123456789abcdef >&2; done) &\nprintf '%s' \"$!\" >{quoted_pid_file}\nwait\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let started = Instant::now();
+        let error = clone_repository_with_program(
+            &fixture.config,
+            fixture.root.to_str().unwrap(),
+            "https://example.test/team/hanging.git",
+            Some("hanging clone"),
+            script.as_os_str(),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Internal);
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!fixture.root.join("hanging clone").exists());
+        assert!(staging_names(&fixture.root).is_empty());
+
+        let raw_pid = fs::read_to_string(pid_file).unwrap();
+        let pid = Pid::from_raw(raw_pid.parse().unwrap()).unwrap();
+        for _ in 0..100 {
+            if rustix::process::test_kill_process(pid).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            rustix::process::test_kill_process(pid).is_err(),
+            "timeout left a descendant alive"
+        );
+    }
+
+    fn staging_names(parent: &Path) -> Vec<OsString> {
+        fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".atmux-stage-"))
+            .collect()
     }
 }

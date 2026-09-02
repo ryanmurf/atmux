@@ -22,6 +22,7 @@ const launchBrowserChildren = new Set();
 let failLiveModels = false;
 let launchOptionsDelayMs = 0;
 let launchResponseDelayMs = 0;
+let launchDirectoryMutationDelayMs = 0;
 let launchMachinesUnavailable = false;
 let overviewRevision = 1;
 let delayProjectFilePane = null;
@@ -320,28 +321,35 @@ function mockApi(url, response, request) {
       let parsed = null;
       try { parsed = JSON.parse(body); } catch { /* asserted below */ }
       launchDirectoryMutationRequests.push({ pathname, body: parsed });
-      if (parsed?.name === "existing") {
-        errorJson(response, 409, "destination already exists");
-        return;
-      }
-      if (/^https:\/\/[^/]*@/.test(String(parsed?.repository || ""))) {
-        errorJson(response, 400, "credential-bearing HTTPS repository URLs are not allowed");
-        return;
-      }
-      const derived = String(parsed?.repository || "").split(/[?#]/, 1)[0]
-        .replace(/\/+$/, "").split(/[/:]/).pop()?.replace(/\.git$/, "");
-      const name = parsed?.name || parsed?.destination || derived;
-      launchBrowserChildren.add(name);
-      json(response, {
-        directory: { path: `/workspace/custom/${name}`, name },
-        listing: {
-          machine: "tron", current: "/workspace/custom", parent: "/workspace",
-          directories: [...launchBrowserChildren].map((child) => ({
-            path: `/workspace/custom/${child}`, name: child,
-          })),
-          truncated: false,
-        },
-      });
+      const reply = () => {
+        if (parsed?.name === "existing") {
+          errorJson(response, 409, "destination already exists");
+          return;
+        }
+        if (/^https:\/\/[^/]*@/.test(String(parsed?.repository || ""))) {
+          errorJson(response, 400, "credential-bearing HTTPS repository URLs are not allowed");
+          return;
+        }
+        const derived = String(parsed?.repository || "").split(/[?#]/, 1)[0]
+          .replace(/\/+$/, "").split(/[/:]/).pop()?.replace(/\.git$/, "");
+        const name = parsed?.name || parsed?.destination || derived;
+        launchBrowserChildren.add(name);
+        json(response, {
+          directory: { path: `/workspace/custom/${name}`, name },
+          listing: {
+            machine: "tron", current: "/workspace/custom", parent: "/workspace",
+            directories: [...launchBrowserChildren].map((child) => ({
+              path: `/workspace/custom/${child}`, name: child,
+            })),
+            truncated: false,
+          },
+        });
+      };
+      if (launchDirectoryMutationDelayMs > 0) {
+        const delayMs = launchDirectoryMutationDelayMs;
+        launchDirectoryMutationDelayMs = 0;
+        setTimeout(reply, delayMs);
+      } else reply();
     });
     return true;
   }
@@ -690,6 +698,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
   failLiveModels = false;
   launchOptionsDelayMs = 0;
   launchResponseDelayMs = 0;
+  launchDirectoryMutationDelayMs = 0;
   overviewRevision = 1;
   const transcript = (start, count, hash) => ({
     available: true,
@@ -2291,6 +2300,49 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     );
     const credentialError = await cdp.evaluate("document.getElementById('launch-browser-operation-note').textContent");
     assert.doesNotMatch(credentialError, /super-secret|oauth2|private\.git/);
+    await cdp.evaluate("document.getElementById('launch-browser-operation-cancel').click(); true");
+
+    launchDirectoryMutationDelayMs = 600;
+    await cdp.evaluate(`(() => {
+      document.getElementById('launch-browser-clone').click();
+      const repository = document.getElementById('launch-browser-repository');
+      repository.value = 'https://example.test/team/stale-clone.git';
+      repository.dispatchEvent(new Event('input', { bubbles: true }));
+      document.getElementById('launch-browser-operation-confirm').click();
+      return true;
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('launch-browser-operation-confirm').disabled"),
+      "delayed clone did not enter its disabled mutation state",
+    );
+    await cdp.evaluate("document.getElementById('launch-browser-close').click(); true");
+    await cdp.evaluate("document.getElementById('launch-browse').click(); true");
+    await waitFor(
+      () => cdp.evaluate("!document.getElementById('launch-browser').hidden && document.querySelector('.launch-browser-folder')?.dataset.path === '/workspace/custom'"),
+      "folder browser did not reopen while an old clone response was pending",
+    );
+    await cdp.evaluate("document.querySelector('.launch-browser-folder').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('launch-browser-path').textContent === '/workspace/custom'"),
+      "folder browser did not navigate after reopening during an old clone request",
+    );
+    await cdp.evaluate("document.getElementById('launch-browser-clone').click(); true");
+    const reopenedControls = await cdp.evaluate(`(() => ({
+      repository: document.getElementById('launch-browser-repository').disabled,
+      destination: document.getElementById('launch-browser-destination').disabled,
+      cancel: document.getElementById('launch-browser-operation-cancel').disabled,
+      confirm: document.getElementById('launch-browser-operation-confirm').disabled,
+    }))()`);
+    assert.deepEqual(reopenedControls, {
+      repository: false, destination: false, cancel: false, confirm: false,
+    });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 700));
+    assert.equal(
+      await cdp.evaluate("[...document.querySelectorAll('.launch-browser-folder')].some((button) => button.dataset.path.endsWith('/stale-clone'))"),
+      false,
+      "a stale clone response mutated the reopened browser",
+    );
+    assert.equal(await cdp.evaluate("document.getElementById('launch-browser-operation').hidden"), false);
     await cdp.evaluate("document.getElementById('launch-browser-operation-cancel').click(); true");
 
     await cdp.evaluate("document.getElementById('launch-browser-use').click(); true");

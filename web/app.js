@@ -6064,7 +6064,7 @@ function initialize() {
 
   function closeLaunchBrowser() {
     state.launchBrowseGeneration += 1;
-    state.launchBrowseMutation = false;
+    resetLaunchBrowserMutation();
     closeLaunchBrowserOperation();
     $("launch-browser").hidden = true;
     $("launch-browser").dataset.current = "";
@@ -6111,6 +6111,7 @@ function initialize() {
       return;
     }
     const generation = ++state.launchBrowseGeneration;
+    resetLaunchBrowserMutation();
     $("launch-browser").hidden = false;
     $("launch-browser-path").textContent = "Loading folders…";
     $("launch-browser-list").replaceChildren();
@@ -6198,6 +6199,14 @@ function initialize() {
       $("launch-browser-new").disabled = !current;
       $("launch-browser-clone").disabled = !current;
     }
+  }
+
+  function resetLaunchBrowserMutation() {
+    state.launchBrowseMutation = false;
+    for (const id of [
+      "launch-browser-operation-cancel", "launch-browser-operation-confirm",
+      "launch-browser-new-name", "launch-browser-repository", "launch-browser-destination",
+    ]) $(id).disabled = false;
   }
 
   async function submitLaunchBrowserOperation() {
