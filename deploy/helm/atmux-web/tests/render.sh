@@ -32,7 +32,7 @@ assert_unique_top_level_keys() {
 }
 
 "$helm_bin" lint "$chart"
-grep -Eq '^version: 0\.4\.3$' "$chart/Chart.yaml"
+grep -Eq '^version: 0\.4\.4$' "$chart/Chart.yaml"
 "$helm_bin" template atmux-web "$chart" --namespace murphytek >"$work/default.yaml"
 assert_unique_top_level_keys "$work/default.yaml"
 
