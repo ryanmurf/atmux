@@ -992,6 +992,17 @@ impl Tmux {
     ///
     /// Returns an error for oversized/NUL-containing input or a failed tmux operation.
     pub fn send_text(&self, pane_id: &str, text: &str, submit: bool) -> Result<()> {
+        Self::send_text_checked(pane_id, text, submit, || Ok(()))
+    }
+
+    /// Sends text with a caller-supplied pane-generation check immediately
+    /// before paste and again before submit.
+    pub(crate) fn send_text_checked(
+        pane_id: &str,
+        text: &str,
+        submit: bool,
+        mut validate_target: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
         const MAX_INPUT_BYTES: usize = 64 * 1024;
         if text.len() > MAX_INPUT_BYTES {
             bail!("message exceeds the {MAX_INPUT_BYTES}-byte limit");
@@ -1024,12 +1035,17 @@ impl Tmux {
         write_result?;
         check_output(&output, "tmux load-buffer")?;
 
+        if let Err(error) = validate_target() {
+            let _ = Self::output(["delete-buffer", "-b", &buffer]);
+            return Err(error);
+        }
         if let Err(error) = Self::output(paste_buffer_args(&buffer, pane_id)) {
             let _ = Self::output(["delete-buffer", "-b", &buffer]);
             return Err(error);
         }
         if submit {
             thread::sleep(TEXT_PASTE_SUBMIT_SETTLE);
+            validate_target()?;
         }
         for key in submission_keys(submit) {
             Self::output(["send-keys", "-t", pane_id, key])?;
@@ -2141,7 +2157,7 @@ fn publish_scope_metadata(pane_id: &str, scope: &PreparedScope) -> Result<()> {
     .map(|_| ())
 }
 
-fn valid_pane_identity(value: &str) -> bool {
+pub(crate) fn valid_pane_identity(value: &str) -> bool {
     value.strip_prefix("pane-v1-").is_some_and(|digest| {
         digest.len() == 64
             && digest

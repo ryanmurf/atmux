@@ -44,7 +44,7 @@ const MAX_COMPOSER_DRAFT_STORAGE_CHARS = 512 * 1024;
 const MAX_COMPOSER_DRAFT_TEXT_CHARS = 65_536;
 const COMPOSER_DRAFT_TOMBSTONE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const PANE_INSTANCE_PATTERN = /^pane-v1-[a-f0-9]{64}$/;
-const PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN = /^pane:([A-Za-z0-9_.%~-]{1,96}):pane-v1-[a-f0-9]{64}$/;
+const PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN = /^pane:([A-Za-z0-9_.%~-]{1,96}):(pane-v1-[a-f0-9]{64})$/;
 const FILE_READER_SIZES = new Set(["small", "medium", "large"]);
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg"]);
 const COMPOSITE_SEPARATOR = "~";
@@ -287,6 +287,7 @@ function composerDraftIdentity(session, localMachineId = "local") {
     return {
       key: `pane:${encodeURIComponent(sessionMachineId(session, localMachineId))}:${instanceId}`,
       persistent: true,
+      instanceId,
     };
   }
   return { key: `ephemeral:${session.id}`, persistent: false };
@@ -296,6 +297,16 @@ function composerDraftMachine(key) {
   const match = typeof key === "string" ? key.match(PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN) : null;
   if (!match) return null;
   try { return decodeURIComponent(match[1]); } catch { return null; }
+}
+
+function composerDraftInstanceId(key) {
+  const match = typeof key === "string" ? key.match(PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN) : null;
+  return match?.[2] || null;
+}
+
+function sessionMatchesComposerIdentity(session, identityKey, localMachineId = "local") {
+  if (!PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN.test(String(identityKey || ""))) return false;
+  return composerDraftIdentity(session, localMachineId)?.key === identityKey;
 }
 
 /// Only owners explicitly reported online in a complete snapshot have an
@@ -2113,12 +2124,14 @@ if (typeof module !== "undefined" && module.exports) {
     composerDraftCanClear,
     composerDraftEntries,
     composerDraftIdentity,
+    composerDraftInstanceId,
     composerDraftMachine,
     composerDraftJson,
     composerDraftTombstones,
     mergeComposerDraftState,
     pruneComposerDraftEntries,
     staleComposerDraftKeys,
+    sessionMatchesComposerIdentity,
     composerSubmissionCanRestore,
     composerSubmissionMatches,
     contentToLines,
@@ -5642,10 +5655,19 @@ function initialize() {
   $("mobile-back").addEventListener("click", backToAgentMenu);
   $("machine-mobile-back").addEventListener("click", backToAgentMenu);
 
-  function selectedComposerDraftIdentity() {
-    const session = state.sessions.get(state.selected);
+  function composerDraftIdentityForPane(paneId) {
+    const session = state.sessions.get(paneId);
     const localMachineId = state.machines.find((machine) => machine.kind === "local")?.id || "local";
     return composerDraftIdentity(session, localMachineId);
+  }
+
+  function selectedComposerDraftIdentity() {
+    return composerDraftIdentityForPane(state.selected);
+  }
+
+  function composerTargetMatches(paneId, identityKey) {
+    const localMachineId = state.machines.find((machine) => machine.kind === "local")?.id || "local";
+    return sessionMatchesComposerIdentity(state.sessions.get(paneId), identityKey, localMachineId);
   }
 
   function protectedComposerDraftKeys() {
@@ -5786,9 +5808,7 @@ function initialize() {
   }
 
   function captureComposerDraftSubmission(paneId, message) {
-    const session = state.sessions.get(paneId);
-    const localMachineId = state.machines.find((machine) => machine.kind === "local")?.id || "local";
-    const identity = composerDraftIdentity(session, localMachineId);
+    const identity = composerDraftIdentityForPane(paneId);
     if (!identity) return { draftIdentity: null, draftVersion: null };
     if (state.composerDraftIdentity?.key === identity.key && $("message").value === message) {
       persistBoundComposerDraft();
@@ -5854,7 +5874,7 @@ function initialize() {
       $("message").value,
       state.composerRevision,
       submission,
-    );
+    ) && composerTargetMatches(submission.paneId, submission.draftIdentity?.key);
     // Consume the rollback token even if newer composer activity made it stale.
     const pending = submission.draftIdentity
       ? state.optimisticComposerClears.get(submission.draftIdentity.key) : null;
@@ -5881,6 +5901,12 @@ function initialize() {
 
   async function sendComposerMessage(paneId = state.selected, messageOverride = null, options = {}) {
     const input = $("message");
+    const abortStaleTarget = (submission = options.composerSubmission || null) => {
+      restoreComposerSubmission(submission);
+      toast("Agent restarted before this message could be sent. Review the preserved draft and try again.");
+      if (options.fromQueue === true) drainQueuedComposerMessage();
+      return false;
+    };
     if (!paneId || (messageOverride === null && input.disabled)) {
       if (options.fromQueue === true) drainQueuedComposerMessage();
       return false;
@@ -5891,7 +5917,7 @@ function initialize() {
       state.attachmentPaneId,
       state.attachmentInstanceKey,
       paneId,
-      composerDraftIdentity(state.sessions.get(paneId))?.key,
+      composerDraftIdentityForPane(paneId)?.key,
     )) {
       toast("These images belong to another agent. Return to that agent or clear them before sending.");
       return false;
@@ -5899,10 +5925,15 @@ function initialize() {
     const targetPaneId = attachments.length
       ? attachmentDeliveryTarget(state.attachmentPaneId, paneId)
       : paneId;
+    const targetIdentityKey = options.targetIdentityKey
+      || options.composerSubmission?.draftIdentity?.key
+      || (attachments.length ? state.attachmentInstanceKey : composerDraftIdentityForPane(targetPaneId)?.key);
     if (!message.trim() && !attachments.length) {
       if (options.fromQueue === true) drainQueuedComposerMessage();
       return false;
     }
+    if (!composerTargetMatches(targetPaneId, targetIdentityKey)) return abortStaleTarget();
+    const targetInstanceId = composerDraftInstanceId(targetIdentityKey);
     const messageLimit = attachments.length ? MAX_MESSAGE_BYTES - IMAGE_MESSAGE_TEXT_RESERVE : MAX_MESSAGE_BYTES;
     if (utf8ByteLength(message) > messageLimit) {
       toast("Message exceeds the 64 KiB UTF-8 limit");
@@ -5934,12 +5965,21 @@ function initialize() {
         state.queuedComposerMessages.push({
           paneId,
           message,
-          options: { clearOnAccept, composerSubmission, fromQueue: options.fromQueue === true },
+          options: {
+            clearOnAccept,
+            composerSubmission,
+            targetIdentityKey,
+            fromQueue: options.fromQueue === true,
+          },
           resolve,
         });
       });
     }
     markAccepted();
+    if (composerSubmission?.draftIdentity?.key !== targetIdentityKey
+        || !composerTargetMatches(targetPaneId, targetIdentityKey)) {
+      return abortStaleTarget(composerSubmission);
+    }
     const button = $("send");
     state.composerSending = true;
     state.inFlightComposerText = message;
@@ -5952,12 +5992,21 @@ function initialize() {
           media_type: file.type,
           data: arrayBufferToBase64(await file.arrayBuffer()),
         })));
+        if (!composerTargetMatches(targetPaneId, targetIdentityKey)) {
+          throw new Error("Agent restarted while images were being prepared. Images were kept; return to the original agent or clear them.");
+        }
         await request(`/api/v1/panes/${encodeURIComponent(targetPaneId)}/image-messages`, {
           method: "POST",
-          body: JSON.stringify({ text: message, images }),
+          body: JSON.stringify({ text: message, images, instance_id: targetInstanceId }),
         });
       } else {
-        await request(`/api/v1/panes/${encodeURIComponent(targetPaneId)}/messages`, { method: "POST", body: JSON.stringify({ text: message, submit: true }) });
+        if (!composerTargetMatches(targetPaneId, targetIdentityKey)) {
+          throw new Error("Agent restarted before this message could be sent. The draft was kept.");
+        }
+        await request(`/api/v1/panes/${encodeURIComponent(targetPaneId)}/messages`, {
+          method: "POST",
+          body: JSON.stringify({ text: message, submit: true, instance_id: targetInstanceId }),
+        });
       }
       if (message.trim()) rememberMessage(composerSubmission?.draftIdentity, message);
       finishComposerDraftSubmission(composerSubmission);
@@ -6208,6 +6257,7 @@ function initialize() {
     releaseRequested: false,
     failed: false,
     paneId: null,
+    identityKey: null,
     prefix: "",
     finalText: "",
     interimText: "",
@@ -6243,10 +6293,22 @@ function initialize() {
     }
     talkButton.classList.remove("recording");
     talkButton.textContent = "Hold to talk";
-    const delivery = dictationDelivery(dictation.paneId, dictation.prefix, dictation.finalText);
+    const paneId = dictation.paneId;
+    const identityKey = dictation.identityKey;
+    const targetMatches = composerTargetMatches(paneId, identityKey);
+    const delivery = targetMatches
+      ? dictationDelivery(paneId, dictation.prefix, dictation.finalText)
+      : null;
     dictation.paneId = null;
+    dictation.identityKey = null;
+    if (!targetMatches && !dictation.failed) {
+      toast("Agent restarted while listening. Speech was not sent to the replacement agent.");
+    }
     if (!dictation.failed && delivery) {
-      void sendComposerMessage(delivery.paneId, delivery.message, { clearOnAccept: true });
+      void sendComposerMessage(delivery.paneId, delivery.message, {
+        clearOnAccept: true,
+        targetIdentityKey: identityKey,
+      });
     }
   }
 
@@ -6274,6 +6336,14 @@ function initialize() {
     };
     const startRecognition = () => {
       if (!dictation.holding || dictation.releaseRequested || dictation.failed || dictation.active) return;
+      if (!composerTargetMatches(dictation.paneId, dictation.identityKey)) {
+        dictation.failed = true;
+        dictation.holding = false;
+        dictation.releaseRequested = true;
+        toast("Agent restarted while listening. Speech was not sent to the replacement agent.");
+        finishDictation(true);
+        return;
+      }
       const generation = dictation.generation;
       const recognition = new SpeechRecognition();
       recognition.continuous = true;
@@ -6283,6 +6353,14 @@ function initialize() {
         && recognition === dictation.recognition;
       recognition.onresult = (event) => {
         if (!isCurrent()) return;
+        if (!composerTargetMatches(dictation.paneId, dictation.identityKey)) {
+          dictation.failed = true;
+          dictation.holding = false;
+          dictation.releaseRequested = true;
+          toast("Agent restarted while listening. Speech was not sent to the replacement agent.");
+          requestRecognitionStop(generation, recognition);
+          return;
+        }
         dictation.restartAttempts = 0;
         let interim = "";
         for (let index = event.resultIndex; index < event.results.length; index += 1) {
@@ -6291,7 +6369,10 @@ function initialize() {
           else interim = [interim, transcript].filter(Boolean).join(" ");
         }
         dictation.interimText = interim;
-        if (state.selected === dictation.paneId) replaceComposerValue(dictationText());
+        if (state.selected === dictation.paneId
+            && composerTargetMatches(dictation.paneId, dictation.identityKey)) {
+          replaceComposerValue(dictationText());
+        }
       };
       recognition.onerror = (event) => {
         if (!isCurrent()) return;
@@ -6356,6 +6437,11 @@ function initialize() {
     };
     talkButton.addEventListener("pointerdown", (event) => {
       if (!state.selected || dictation.holding || dictation.active || dictation.restartTimer !== null) return;
+      const identity = selectedComposerDraftIdentity();
+      if (!identity?.persistent) {
+        toast("This agent's identity is unavailable; reconnect before using Quick Talk");
+        return;
+      }
       event.preventDefault();
       talkButton.setPointerCapture?.(event.pointerId);
       // Starting another hold is composer activity even before speech arrives;
@@ -6366,6 +6452,7 @@ function initialize() {
       dictation.releaseRequested = false;
       dictation.failed = false;
       dictation.paneId = state.selected;
+      dictation.identityKey = identity.key;
       dictation.prefix = dictationPrefix(
         $("message").value,
         state.composerSending,

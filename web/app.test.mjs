@@ -25,12 +25,14 @@ const {
   composerDraftCanClear,
   composerDraftEntries,
   composerDraftIdentity,
+  composerDraftInstanceId,
   composerDraftMachine,
   composerDraftJson,
   composerDraftTombstones,
   mergeComposerDraftState,
   pruneComposerDraftEntries,
   staleComposerDraftKeys,
+  sessionMatchesComposerIdentity,
   composerSubmissionCanRestore,
   composerSubmissionMatches,
   contentToLines,
@@ -381,7 +383,15 @@ test("composer drafts use pane generations, bounded storage, and plain hostile t
     instance_id: `pane-v1-${"b".repeat(64)}`,
   });
   assert.equal(first.persistent, true);
+  assert.equal(first.instanceId, `pane-v1-${"a".repeat(64)}`);
+  assert.equal(composerDraftInstanceId(first.key), first.instanceId);
   assert.notEqual(first.key, replacement.key);
+  assert.equal(sessionMatchesComposerIdentity({
+    id: "midnight~%7", machine: "midnight", instance_id: first.instanceId,
+  }, first.key), true);
+  assert.equal(sessionMatchesComposerIdentity({
+    id: "midnight~%7", machine: "midnight", instance_id: replacement.instanceId,
+  }, first.key), false);
   assert.deepEqual(composerDraftIdentity({ id: "midnight~%7", machine: "midnight" }), {
     key: "ephemeral:midnight~%7", persistent: false,
   });
@@ -1314,7 +1324,7 @@ test("push-to-talk keeps the pane selected when recording began", () => {
   assert.equal(composerSubmissionCanRestore("midnight~%7", "", 5, clearedSubmission), false);
   assert.equal(composerSubmissionCanRestore("midnight~%8", "", 4, clearedSubmission), false);
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
-  assert.match(source, /sendComposerMessage\(delivery\.paneId, delivery\.message, \{ clearOnAccept: true \}\)/);
+  assert.match(source, /sendComposerMessage\(delivery\.paneId, delivery\.message, \{[\s\S]*clearOnAccept: true,[\s\S]*targetIdentityKey: identityKey/);
   assert.match(source, /restoreComposerSubmission\(composerSubmission\)/);
 });
 
@@ -1332,7 +1342,7 @@ test("push-to-talk restarts recognition while held and stops cleanly on release"
   assert.match(source, /recognition\.continuous = true/);
   assert.match(source, /dictationEndAction\([\s\S]*=== "restart"\)[\s\S]*scheduleRestart\(generation\)/);
   assert.match(source, /window\.addEventListener\("blur", stopTalking\)/);
-  assert.match(source, /queuedComposerMessages\.push\(\{[\s\S]*options: \{ clearOnAccept, composerSubmission, fromQueue:[^}]+\}[\s\S]*resolve,[\s\S]*\}\)/);
+  assert.match(source, /queuedComposerMessages\.push\(\{[\s\S]*options: \{[\s\S]*clearOnAccept,[\s\S]*composerSubmission,[\s\S]*targetIdentityKey,[\s\S]*fromQueue:[^}]+\}[\s\S]*resolve,[\s\S]*\}\)/);
   assert.match(source, /state\.inFlightComposerText = message;/);
   assert.match(source, /Message exceeds the 64 KiB UTF-8 limit"\);\s*if \(options\.fromQueue === true\) drainQueuedComposerMessage\(\);/s);
   assert.match(css, /#talk \{[^}]*touch-action: none;/s);

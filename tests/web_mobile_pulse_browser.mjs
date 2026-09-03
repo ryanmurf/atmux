@@ -785,8 +785,30 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     const browser = await launchChrome(profileDirectory);
     chrome = browser.chrome;
     const { browserSocket } = browser;
-    cdp = await openCdp(browserSocket, `http://127.0.0.1:${port}/?session=tron~%25100`);
+    cdp = await openCdp(browserSocket, "about:blank");
     await cdp.send("Page.enable");
+    await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: String.raw`
+      window.__speechInstances = [];
+      class FakeSpeechRecognition {
+        constructor() { window.__speechInstances.push(this); }
+        start() {}
+        stop() { queueMicrotask(() => this.onend?.()); }
+        abort() {}
+      }
+      window.SpeechRecognition = FakeSpeechRecognition;
+      Element.prototype.setPointerCapture = function setPointerCapture() {};
+      const nativeArrayBuffer = File.prototype.arrayBuffer;
+      File.prototype.arrayBuffer = function delayedArrayBuffer() {
+        if (!window.__delayNextFileRead) return nativeArrayBuffer.call(this);
+        window.__delayNextFileRead = false;
+        return new Promise((resolve) => {
+          window.__releaseDelayedFileRead = async () => resolve(await nativeArrayBuffer.call(this));
+        });
+      };
+    ` });
+    await cdp.send("Page.navigate", {
+      url: `http://127.0.0.1:${port}/?session=tron~%25100`,
+    });
     await waitFor(
       () => cdp.evaluate("document.readyState === 'complete' && Boolean(document.getElementById('agent-view')) && !document.getElementById('agent-view').hidden"),
       "agent detail did not render",
@@ -981,7 +1003,11 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(await cdp.evaluate("document.getElementById('message').value"), "beta agent private draft");
     assert.deepEqual(messageRequests.at(-1), {
       paneId: "tron~%100",
-      body: JSON.stringify({ text: pagehideDraft, submit: true }),
+      body: JSON.stringify({
+        text: pagehideDraft,
+        submit: true,
+        instance_id: `pane-v1-${"1".repeat(64)}`,
+      }),
     });
     assert.equal(await cdp.evaluate(`(() => {
       document.querySelector('[data-session-id="tron~%100"]').click();
@@ -1109,6 +1135,129 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       () => cdp.evaluate("Boolean(document.querySelector('[data-session-id=\"midnight~%5\"]'))"),
       "the fixture pane was not restored after snapshot cleanup",
     );
+
+    const messagesBeforeRecognitionRace = messageRequests.length;
+    await cdp.evaluate(`(() => {
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      const input = document.getElementById('message');
+      input.value = 'old incarnation speech prefix';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'x' }));
+      document.getElementById('talk').dispatchEvent(new PointerEvent(
+        'pointerdown', { bubbles: true, pointerId: 70, pointerType: 'touch' },
+      ));
+      window.__activeReincarnationRecognition = window.__speechInstances.at(-1);
+    })()`);
+    emitOverviewPatch([
+      mockSession("midnight", "%5", "alpha-planner", "working", {
+        instance_id: `pane-v1-${"7".repeat(64)}`,
+      }),
+    ]);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('message').value === ''"),
+      "replacement composer did not detach from active recognition",
+    );
+    const activeRecognitionRace = await cdp.evaluate(`(async () => {
+      const recognition = window.__activeReincarnationRecognition;
+      recognition.onresult?.({
+        resultIndex: 0,
+        results: [Object.assign([{ transcript: 'must not reach replacement UI' }], { isFinal: true })],
+      });
+      document.getElementById('talk').dispatchEvent(new PointerEvent(
+        'pointerup', { bubbles: true, pointerId: 70, pointerType: 'touch' },
+      ));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return {
+        text: document.getElementById('message').value,
+        notice: document.getElementById('toast').textContent,
+      };
+    })()`);
+    assert.equal(activeRecognitionRace.text, "", JSON.stringify(activeRecognitionRace));
+    assert.match(activeRecognitionRace.notice, /restarted while listening/);
+    assert.equal(messageRequests.length, messagesBeforeRecognitionRace,
+      "active recognition posted to a replacement pane incarnation");
+
+    messageResponseDelayMs = 500;
+    const messagesBeforeQueuedRace = messageRequests.length;
+    await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.value = 'busy race send';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'x' }));
+      document.getElementById('send').click();
+    })()`);
+    await waitFor(
+      () => messageRequests.length === messagesBeforeQueuedRace + 1,
+      "busy send did not reach the queue race fixture",
+    );
+    await cdp.evaluate(`(() => {
+      const talk = document.getElementById('talk');
+      talk.dispatchEvent(new PointerEvent(
+        'pointerdown', { bubbles: true, pointerId: 71, pointerType: 'touch' },
+      ));
+      const recognition = window.__speechInstances.at(-1);
+      recognition.onresult({
+        resultIndex: 0,
+        results: [Object.assign([{ transcript: 'queued stale speech' }], { isFinal: true })],
+      });
+      talk.dispatchEvent(new PointerEvent(
+        'pointerup', { bubbles: true, pointerId: 71, pointerType: 'touch' },
+      ));
+    })()`);
+    emitOverviewPatch([
+      mockSession("midnight", "%5", "alpha-planner", "working", {
+        instance_id: `pane-v1-${"8".repeat(64)}`,
+      }),
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    messageResponseDelayMs = 0;
+    assert.equal(messageRequests.filter(({ body }) => body.includes("queued stale speech")).length, 0,
+      "queued recognition posted after its pane incarnation was replaced");
+    assert.equal(await cdp.evaluate("document.getElementById('message').value"), "",
+      "queued recognition mutated the replacement composer");
+
+    const imagesBeforeConversionRace = imageMessageRequests.length;
+    await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.value = 'delayed image from old incarnation';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'x' }));
+      const transfer = new DataTransfer();
+      transfer.items.add(new File(
+        [new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])],
+        'delayed.png',
+        { type: 'image/png' },
+      ));
+      window.__delayNextFileRead = true;
+      const picker = document.getElementById('image-input');
+      picker.files = transfer.files;
+      picker.dispatchEvent(new Event('change', { bubbles: true }));
+      document.getElementById('send').click();
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("typeof window.__releaseDelayedFileRead === 'function'"),
+      "image conversion did not reach its delayed boundary",
+    );
+    emitOverviewPatch([
+      mockSession("midnight", "%5", "alpha-planner", "working", {
+        instance_id: `pane-v1-${"9".repeat(64)}`,
+      }),
+    ]);
+    await cdp.evaluate("window.__releaseDelayedFileRead(); true");
+    await waitFor(
+      () => cdp.evaluate("!document.getElementById('attachment-clear').disabled"),
+      "stale image conversion did not finish",
+    );
+    const imageConversionRace = await cdp.evaluate(`({
+      text: document.getElementById('message').value,
+      attachments: document.querySelectorAll('.attachment-preview').length,
+      target: document.getElementById('attachment-target').textContent,
+      notice: document.getElementById('toast').textContent,
+    })`);
+    assert.equal(imageMessageRequests.length, imagesBeforeConversionRace,
+      "delayed image conversion posted to a replacement pane incarnation");
+    assert.equal(imageConversionRace.text, "", JSON.stringify(imageConversionRace));
+    assert.equal(imageConversionRace.attachments, 1, JSON.stringify(imageConversionRace));
+    assert.match(imageConversionRace.target, /Return to that agent or clear them/);
+    assert.match(imageConversionRace.notice, /Images were kept/);
+    await cdp.evaluate("document.getElementById('attachment-clear').click(); true");
 
     // The first launch option is online but cannot launch. The federated
     // `tron~pane` owner remains the contextual target and Home/local cannot be

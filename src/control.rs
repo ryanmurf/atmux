@@ -40,7 +40,10 @@ use crate::{
     remote::{self, RemoteMachine, encode_segment},
     status::{AgentKind, AgentStatus},
     systemd_scope,
-    tmux::{RESERVED_SERVICE_SESSION, Session, Tmux, UnsupportedModelControl, known_models},
+    tmux::{
+        RESERVED_SERVICE_SESSION, Session, Tmux, UnsupportedModelControl, known_models,
+        valid_pane_identity,
+    },
     transcript::Transcript,
     workspace::{FileWriteRequest, FilesResponse, GitResponse, WorkspaceErrorKind},
 };
@@ -576,6 +579,7 @@ impl std::error::Error for ResumeRejected {}
 enum Target {
     Local {
         pane_id: String,
+        instance_id: String,
         name: String,
         agent: AgentKind,
         resume_lease: Option<String>,
@@ -583,6 +587,7 @@ enum Target {
     Remote {
         machine: Arc<RemoteMachine>,
         pane_id: String,
+        instance_id: String,
         name: String,
     },
 }
@@ -1962,6 +1967,7 @@ impl ControlPlane {
                 machine,
                 pane_id,
                 name,
+                ..
             } => self
                 .remote_pane_output(&machine, &pane_id, &name, known_hash, max_lines)
                 .await
@@ -2723,9 +2729,31 @@ impl ControlPlane {
     ///
     /// Returns an error when the agent is unknown or tmux rejects the input.
     pub async fn send_text(&self, id: &str, text: String, submit: bool) -> Result<()> {
+        self.send_text_for_instance(id, text, submit, None).await
+    }
+
+    /// Sends text only while the owner still reports the caller's pane generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the pane was deleted or reincarnated before the
+    /// owner-local tmux mutation boundary.
+    pub async fn send_text_for_instance(
+        &self,
+        id: &str,
+        text: String,
+        submit: bool,
+        expected_instance_id: Option<String>,
+    ) -> Result<()> {
         match self.resolve(id)? {
-            Target::Local { pane_id, .. } => {
+            Target::Local {
+                pane_id,
+                instance_id,
+                ..
+            } => {
+                validate_expected_pane_instance(expected_instance_id.as_deref(), &instance_id)?;
                 let prompt_lock = self.prompt_lock(&pane_id);
+                let expected_instance_id = expected_instance_id.clone();
                 local_tmux(
                     tokio::task::spawn_blocking(move || {
                         let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
@@ -2733,8 +2761,11 @@ impl ControlPlane {
                             .state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        validate_live_pane_instance(&pane_id, expected_instance_id.as_deref())?;
                         begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
-                        Tmux.send_text(&pane_id, &text, submit)?;
+                        Tmux::send_text_checked(&pane_id, &text, submit, || {
+                            validate_live_pane_instance(&pane_id, expected_instance_id.as_deref())
+                        })?;
                         Ok(())
                     })
                     .await,
@@ -2742,13 +2773,21 @@ impl ControlPlane {
                 self.inner.refresh_now.notify_one();
             }
             Target::Remote {
-                machine, pane_id, ..
+                machine,
+                pane_id,
+                instance_id,
+                ..
             } => {
+                validate_expected_pane_instance(expected_instance_id.as_deref(), &instance_id)?;
                 self.ensure_online(&machine.id)?;
+                let mut request = serde_json::json!({ "text": text, "submit": submit });
+                if let Some(instance_id) = expected_instance_id {
+                    request["instance_id"] = serde_json::Value::String(instance_id);
+                }
                 machine
                     .post_json(
                         &format!("/api/v1/panes/{}/messages", encode_segment(&pane_id)),
-                        &serde_json::json!({ "text": text, "submit": submit }),
+                        &request,
                     )
                     .await
                     .map_err(|error| upstream(&error))?;
@@ -2951,8 +2990,15 @@ impl ControlPlane {
     /// Returns an error for malformed images, an unknown/offline pane, or a
     /// storage/tmux failure on the owning node.
     pub async fn send_image_message(&self, id: &str, request: ImageMessageRequest) -> Result<()> {
+        let expected_instance_id = request.instance_id.clone();
         match self.resolve(id)? {
-            Target::Local { pane_id, agent, .. } => {
+            Target::Local {
+                pane_id,
+                instance_id,
+                agent,
+                ..
+            } => {
+                validate_expected_pane_instance(expected_instance_id.as_deref(), &instance_id)?;
                 if let Err(error) = attachment::validate_request(&request) {
                     return if error.kind() == DeliveryErrorKind::Invalid {
                         Err(bad_request(error.to_string()))
@@ -2961,12 +3007,14 @@ impl ControlPlane {
                     };
                 }
                 let prompt_lock = self.prompt_lock(&pane_id);
+                let expected_instance_id = expected_instance_id.clone();
                 let delivered = tokio::task::spawn_blocking(move || -> Result<_> {
                     let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
                     let mut guard = prompt_lock
                         .state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    validate_live_pane_instance(&pane_id, expected_instance_id.as_deref())?;
                     begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
                     Ok(attachment::deliver(
                         &pane_id,
@@ -2984,6 +3032,9 @@ impl ControlPlane {
                     Err(error) if error.kind() == DeliveryErrorKind::Invalid => {
                         return Err(bad_request(error.to_string()));
                     }
+                    Err(error) if error.kind() == DeliveryErrorKind::Conflict => {
+                        return Err(conflict(error.to_string()));
+                    }
                     Err(error) => {
                         return Err(internal(
                             &anyhow::Error::new(error)
@@ -2994,8 +3045,12 @@ impl ControlPlane {
                 self.inner.refresh_now.notify_one();
             }
             Target::Remote {
-                machine, pane_id, ..
+                machine,
+                pane_id,
+                instance_id,
+                ..
             } => {
+                validate_expected_pane_instance(expected_instance_id.as_deref(), &instance_id)?;
                 self.ensure_online(&machine.id)?;
                 machine
                     .post_json(
@@ -3480,6 +3535,7 @@ impl ControlPlane {
         {
             matches.push(Target::Local {
                 pane_id: session.pane_id.clone(),
+                instance_id: session.pane_identity.clone(),
                 name: session.name.clone(),
                 agent: session.agent,
                 resume_lease: session.resume_lease.clone(),
@@ -3500,6 +3556,7 @@ impl ControlPlane {
                 matches.push(Target::Remote {
                     machine: Arc::clone(&machine),
                     pane_id: session.pane_id.clone(),
+                    instance_id: session.instance_id.clone(),
                     name: session.name.clone(),
                 });
             }
@@ -3827,6 +3884,30 @@ fn begin_pane_mutation(
     Tmux::advance_pane_mutation_sequence(pane_id)?;
     mark_gate_mutated(gate, state);
     Ok(())
+}
+
+fn validate_expected_pane_instance(expected: Option<&str>, actual: &str) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if !valid_pane_identity(expected) {
+        return Err(bad_request("invalid pane instance id"));
+    }
+    if expected != actual {
+        return Err(conflict(
+            "agent pane restarted before the message could be delivered",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_live_pane_instance(pane_id: &str, expected: Option<&str>) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let live = Tmux::live_pane_identity(pane_id)?
+        .ok_or_else(|| conflict("agent pane disappeared before message delivery"))?;
+    validate_expected_pane_instance(Some(expected), &live.pane_identity)
 }
 
 fn mark_gate_mutated(gate: &PaneMutationGate, state: &mut PaneMutationState) {
@@ -5786,6 +5867,20 @@ mod tests {
             control.machine_overview("gpu-box").unwrap().sessions[0].instance_id,
             replacement.instance_id
         );
+    }
+
+    #[test]
+    fn expected_pane_instances_fail_closed_on_malformed_or_recycled_generations() {
+        let current = format!("pane-v1-{}", "a".repeat(64));
+        assert!(validate_expected_pane_instance(None, &current).is_ok());
+        assert!(validate_expected_pane_instance(Some(&current), &current).is_ok());
+
+        let recycled =
+            validate_expected_pane_instance(Some(&format!("pane-v1-{}", "b".repeat(64))), &current)
+                .unwrap_err();
+        assert_eq!(error_kind(&recycled), ErrorKind::Conflict);
+        let malformed = validate_expected_pane_instance(Some("%7"), &current).unwrap_err();
+        assert_eq!(error_kind(&malformed), ErrorKind::BadRequest);
     }
 
     #[tokio::test]

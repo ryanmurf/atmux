@@ -95,6 +95,8 @@ struct SendRequest {
     text: String,
     #[serde(default = "default_submit")]
     submit: bool,
+    #[serde(default)]
+    instance_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1138,7 +1140,7 @@ async fn send_message(
     ensure_origin(&headers, &state.allowed_origins)?;
     state
         .control
-        .send_text(&id, request.text, request.submit)
+        .send_text_for_instance(&id, request.text, request.submit, request.instance_id)
         .await
         .map_err(|error| ApiError::from_control(&error))?;
     Ok(Json(OkResponse { ok: true }))
@@ -2633,6 +2635,50 @@ mod tests {
         assert_eq!(
             status_of(&app, "GET", "/api/v1/panes/%254294967295", None).await,
             StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn message_routes_reject_a_recycled_pane_generation_before_delivery() {
+        let control = crate::control::test_control(&[]);
+        let mut replacement = crate::control::test_session("agent", "%4294967295", "replacement");
+        replacement.pane_identity = format!("pane-v1-{}", "b".repeat(64));
+        control.apply_refresh(vec![replacement]);
+        let (app, _shutdown) = real_app(control);
+        let stale_instance = format!("pane-v1-{}", "a".repeat(64));
+
+        let message = serde_json::json!({
+            "text": "must stay with the old agent",
+            "submit": true,
+            "instance_id": stale_instance,
+        })
+        .to_string();
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/%254294967295/messages",
+                Some(&message),
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+
+        let image = serde_json::json!({
+            "text": "must stay with the old agent",
+            "images": [],
+            "instance_id": stale_instance,
+        })
+        .to_string();
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/%254294967295/image-messages",
+                Some(&image),
+            )
+            .await,
+            StatusCode::CONFLICT
         );
     }
 

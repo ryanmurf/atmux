@@ -142,6 +142,7 @@ fn exercise_model_shaped_pane(tmux: &Tmux, socket: &str, directory: &Path, harne
                 media_type: "image/png".to_owned(),
                 data: STANDARD.encode(PNG),
             }],
+            instance_id: None,
         },
         false,
     )

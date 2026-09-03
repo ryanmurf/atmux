@@ -49,7 +49,9 @@ class Cdp {
 
 const overview = await fetch(`${baseUrl}/api/v1/sessions`).then((response) => response.json());
 const paneId = overview.sessions?.[0]?.id;
+const paneInstanceId = overview.sessions?.[0]?.instance_id;
 assert.ok(paneId, "atmux overview must expose at least one pane");
+assert.match(paneInstanceId, /^pane-v1-[a-f0-9]{64}$/, "pane must expose a stable instance id");
 
 const page = await waitFor(async () => {
   const pages = await fetch(`http://127.0.0.1:${debugPort}/json/list`).then((response) => response.json());
@@ -337,60 +339,61 @@ assert.equal(observed.recording, false);
 assert.deepEqual(observed.sent, [
   {
     url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
-    body: { text: "quick talk integration", submit: true },
+    body: { text: "quick talk integration", submit: true, instance_id: paneInstanceId },
   },
   {
     url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
-    body: { text: "second quick talk", submit: true },
+    body: { text: "second quick talk", submit: true, instance_id: paneInstanceId },
   },
   {
     url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
-    body: { text: "busy send", submit: true },
+    body: { text: "busy send", submit: true, instance_id: paneInstanceId },
   },
   {
     url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
-    body: { text: "queued speech", submit: true },
+    body: { text: "queued speech", submit: true, instance_id: paneInstanceId },
   },
   {
     url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
-    body: { text: "second queued", submit: true },
+    body: { text: "second queued", submit: true, instance_id: paneInstanceId },
   },
   {
     url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
-    body: { text: "validation blocker", submit: true },
+    body: { text: "validation blocker", submit: true, instance_id: paneInstanceId },
   },
   {
     url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
-    body: { text: "queue survived validation", submit: true },
+    body: { text: "queue survived validation", submit: true, instance_id: paneInstanceId },
   },
   {
     url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
-    body: { text: "first delayed", submit: true },
+    body: { text: "first delayed", submit: true, instance_id: paneInstanceId },
   },
   {
     url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
-    body: { text: "fresh second", submit: true },
+    body: { text: "fresh second", submit: true, instance_id: paneInstanceId },
   },
   {
     url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
-    body: { text: "clear on release", submit: true },
+    body: { text: "clear on release", submit: true, instance_id: paneInstanceId },
   },
   {
     url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
-    body: { text: "restore failed speech", submit: true },
+    body: { text: "restore failed speech", submit: true, instance_id: paneInstanceId },
   },
   {
     url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
-    body: { text: "failed before new draft", submit: true },
+    body: { text: "failed before new draft", submit: true, instance_id: paneInstanceId },
   },
   {
     url: `/api/v1/panes/${encodeURIComponent(paneId)}/messages`,
-    body: { text: "ios cancelled pointer", submit: true },
+    body: { text: "ios cancelled pointer", submit: true, instance_id: paneInstanceId },
   },
 ]);
 assert.equal(observed.sentImages.length, 1);
 assert.equal(observed.sentImages[0].url, `/api/v1/panes/${encodeURIComponent(paneId)}/image-messages`);
 assert.equal(observed.sentImages[0].body.text, "image race");
+assert.equal(observed.sentImages[0].body.instance_id, paneInstanceId);
 assert.equal(observed.sentImages[0].body.images.length, 1);
 
 cdp.close();

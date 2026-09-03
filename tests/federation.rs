@@ -114,8 +114,10 @@ fn record_locked(recorder: &mut Recorder, headers: &HeaderMap, path: &str, body:
 }
 
 fn session(pane: &str, name: &str, status: &str, hash: &str) -> Value {
+    let instance = if pane == "%7" { 'a' } else { 'b' };
     json!({
         "id": format!("local~{pane}"),
+        "instance_id": format!("pane-v1-{}", instance.to_string().repeat(64)),
         "machine": "local",
         "name": name,
         "pane_id": pane,
@@ -1376,8 +1378,14 @@ async fn a_coordinator_groups_routes_and_survives_an_offline_machine() {
 /// exact wire form the node received.
 #[allow(clippy::too_many_lines)]
 async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: &Shared) {
+    let trainer_instance = format!("pane-v1-{}", "a".repeat(64));
     control
-        .send_text("gpu-box~%7", "resume training".to_owned(), true)
+        .send_text_for_instance(
+            "gpu-box~%7",
+            "resume training".to_owned(),
+            true,
+            Some(trainer_instance.clone()),
+        )
         .await
         .unwrap();
     control
@@ -1389,10 +1397,23 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
                     media_type: "image/png".to_owned(),
                     data: "iVBORw0KGgo=".to_owned(),
                 }],
+                instance_id: Some(trainer_instance.clone()),
             },
         )
         .await
         .unwrap();
+    let sent_before_mismatch = recorder.lock().unwrap().bodies.len();
+    let error = control
+        .send_text_for_instance(
+            "gpu-box~%7",
+            "must not cross generations".to_owned(),
+            true,
+            Some(format!("pane-v1-{}", "f".repeat(64))),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_kind(&error), ErrorKind::Conflict);
+    assert_eq!(recorder.lock().unwrap().bodies.len(), sent_before_mismatch);
     control.tmux_prefix_twice("gpu-box~%7").await.unwrap();
     control.interrupt("gpu-box~%7").await.unwrap();
     control.resume_current_claude("gpu-box~%7").await.unwrap();
@@ -1445,6 +1466,7 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
     let sent: Value = serde_json::from_str(sent).unwrap();
     assert_eq!(sent["text"], "resume training");
     assert_eq!(sent["submit"], true);
+    assert_eq!(sent["instance_id"], trainer_instance);
     let image_message: Value = seen
         .bodies
         .iter()
@@ -1453,6 +1475,7 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
         .expect("image message body");
     assert_eq!(image_message["images"][0]["media_type"], "image/png");
     assert_eq!(image_message["images"][0]["data"], "iVBORw0KGgo=");
+    assert_eq!(image_message["instance_id"], trainer_instance);
     let special_keys: Value = seen
         .bodies
         .iter()
