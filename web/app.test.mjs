@@ -942,6 +942,7 @@ test("launch dialog uses a bounded accessible Project combobox", () => {
   assert.match(source, /event\.key === "Escape"/);
   assert.match(source, /Math\.hypot\([^)]*\) >= 10/);
   assert.doesNotMatch(source, /pointerdown[\s\S]{0,240}selectLaunchDirectorySuggestion\(directory\)/);
+  assert.match(source, /addEventListener\("mousedown", \(event\) => event\.preventDefault\(\)\)/);
   assert.match(source, /new AbortController\(\)/);
   assert.equal(isManualDirectory("/Users/ryan/work/plain"), true);
   assert.equal(isManualDirectory("~/work/plain"), true);

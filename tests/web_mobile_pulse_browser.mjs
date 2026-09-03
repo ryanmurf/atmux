@@ -883,6 +883,45 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(mobileSearch.activeBeforeEscape, mobileSearch.firstActive, JSON.stringify(mobileSearch));
     assert.equal(mobileSearch.expandedAfterEscape, "false", JSON.stringify(mobileSearch));
     assert.equal(mobileSearch.activeAfterEscape, null, JSON.stringify(mobileSearch));
+    const mouseTarget = await cdp.evaluate(`(async () => {
+      const input = document.getElementById('launch-directory');
+      input.focus({ preventScroll: true });
+      input.value = 'mobile-search-1666';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: '6' }));
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const button = document.querySelector('#launch-directory-suggestions [role=option]');
+      const box = button.getBoundingClientRect();
+      return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+    })()`);
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mousePressed", x: mouseTarget.x, y: mouseTarget.y, button: "left", clickCount: 1,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(await cdp.evaluate(`(() => {
+      const input = document.getElementById('launch-directory');
+      return {
+        active: document.activeElement?.id || null,
+        expanded: input.getAttribute('aria-expanded'),
+        hidden: document.getElementById('launch-directory-suggestions').hidden,
+        value: input.value,
+      };
+    })()`), {
+      active: "launch-directory",
+      expanded: "true",
+      hidden: false,
+      value: "mobile-search-1666",
+    });
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mouseReleased", x: mouseTarget.x, y: mouseTarget.y, button: "left", clickCount: 1,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(await cdp.evaluate(`(() => {
+      const input = document.getElementById('launch-directory');
+      return { value: input.value, selectedDirectory: input.dataset.selectedDirectory };
+    })()`), {
+      value: "/workspace/mobile-search-1666",
+      selectedDirectory: "/workspace/mobile-search-1666",
+    });
     await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
     await cdp.send("Emulation.setDeviceMetricsOverride", {
       width: 390, height: 844, deviceScaleFactor: 1, mobile: true,
@@ -962,15 +1001,26 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       touchDragResult.events.some(([name]) => name === "pointermove"),
       JSON.stringify(touchDragResult),
     );
-    const clickSelection = await cdp.evaluate(`(async () => {
+    const touchTarget = await cdp.evaluate(`(async () => {
       const input = document.getElementById('launch-directory');
       input.value = 'mobile-search-1777';
       input.dispatchEvent(new InputEvent('input', { bubbles: true, data: '7' }));
       await new Promise((resolve) => setTimeout(resolve, 250));
-      document.querySelector('#launch-directory-suggestions [role=option]').click();
-      return { value: input.value, selectedDirectory: input.dataset.selectedDirectory };
+      const button = document.querySelector('#launch-directory-suggestions [role=option]');
+      const box = button.getBoundingClientRect();
+      return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
     })()`);
-    assert.deepEqual(clickSelection, {
+    await cdp.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [{ x: touchTarget.x, y: touchTarget.y, radiusX: 4, radiusY: 4, force: 1 }],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(await cdp.evaluate(`(() => {
+      const input = document.getElementById('launch-directory');
+      return { value: input.value, selectedDirectory: input.dataset.selectedDirectory };
+    })()`), {
       value: "/workspace/mobile-search-1777",
       selectedDirectory: "/workspace/mobile-search-1777",
     });

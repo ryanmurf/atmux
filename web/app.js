@@ -6133,6 +6133,10 @@ function initialize() {
       };
       button.addEventListener("pointerup", finishPointerGesture);
       button.addEventListener("pointercancel", finishPointerGesture);
+      // Keep the combobox focused between mouse press and release so its blur
+      // frame cannot hide the option before the click. This is intentionally a
+      // mouse event: touch/pen pointer events remain uncancelled for pan-y.
+      button.addEventListener("mousedown", (event) => event.preventDefault());
       button.addEventListener("click", (event) => {
         if (state.launchDirectorySuppressClick) {
           event.preventDefault();
