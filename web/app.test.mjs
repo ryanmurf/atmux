@@ -9,6 +9,9 @@ const {
   MAX_IMAGE_ATTACHMENTS,
   MAX_IMAGE_BYTES,
   MAX_TOTAL_IMAGE_BYTES,
+  MAX_LAUNCH_DIRECTORY_CANDIDATES,
+  MAX_LAUNCH_DIRECTORY_SUGGESTIONS,
+  LAUNCH_DIRECTORY_SEARCH_DEBOUNCE_MS,
   MAX_FILE_REFERENCE_CHARS,
   MAX_FILE_REFERENCE_LINES,
   attachmentDeliveryTarget,
@@ -900,6 +903,28 @@ test("filterDirectories narrows launch projects case-insensitively as the user t
   assert.deepEqual(filterDirectories(directories, "MERC"), ["/work/mercury"]);
   assert.deepEqual(filterDirectories(directories, ""), directories);
   assert.deepEqual(filterDirectories(null, "atmux"), []);
+  const many = Array.from({ length: 2_000 }, (_, index) => `/work/project-${index}`);
+  assert.deepEqual(
+    filterDirectories(many, "", Number.MAX_SAFE_INTEGER),
+    many.slice(0, MAX_LAUNCH_DIRECTORY_SUGGESTIONS),
+  );
+  assert.deepEqual(filterDirectories(many, "project-1999"), ["/work/project-1999"]);
+  assert.deepEqual(filterDirectories(many, "project", 0), []);
+  assert.equal(LAUNCH_DIRECTORY_SEARCH_DEBOUNCE_MS, 140);
+});
+
+test("launch directory candidates and rendered matches stay bounded", () => {
+  const listed = Array.from(
+    { length: MAX_LAUNCH_DIRECTORY_CANDIDATES + 1_000 },
+    (_, index) => `/work/project-${index}`,
+  );
+  const available = availableLaunchDirectories(
+    { id: "tron", directories: listed },
+    { tron: ["/work/remembered"] },
+  );
+  assert.equal(available.length, MAX_LAUNCH_DIRECTORY_CANDIDATES);
+  assert.equal(available[0], "/work/remembered");
+  assert.equal(filterDirectories(available, "").length, MAX_LAUNCH_DIRECTORY_SUGGESTIONS);
 });
 
 test("launch dialog uses the Project typeahead itself instead of a separate find field", () => {
@@ -908,7 +933,11 @@ test("launch dialog uses the Project typeahead itself instead of a separate find
   assert.doesNotMatch(markup, /launch-directory-filter/);
   assert.match(markup, /id="launch-directory" type="search" list="launch-directory-options"/);
   assert.match(markup, /<datalist id="launch-directory-options">/);
+  assert.match(markup, /id="launch-directory-suggestions"[^>]*role="group"[^>]*aria-label="Matching projects"/);
   assert.match(source, /launch-directory-options"\)\.replaceChildren/);
+  assert.match(source, /removeAttribute\("list"\)/);
+  assert.match(source, /addEventListener\("input", scheduleLaunchDirectorySearch\)/);
+  assert.match(source, /new AbortController\(\)/);
   assert.equal(isManualDirectory("/Users/ryan/work/plain"), true);
   assert.equal(isManualDirectory("~/work/plain"), true);
   assert.equal(isManualDirectory("plain/relative"), false);

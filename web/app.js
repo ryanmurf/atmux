@@ -9,6 +9,9 @@ const MAX_TOTAL_IMAGE_BYTES = 12 * 1024 * 1024;
 const IMAGE_MESSAGE_TEXT_RESERVE = 2 * 1024;
 const MAX_QUEUED_COMPOSER_MESSAGES = 4;
 const MAX_REMEMBERED_LAUNCH_DIRECTORIES = 32;
+const MAX_LAUNCH_DIRECTORY_CANDIDATES = 4_096;
+const MAX_LAUNCH_DIRECTORY_SUGGESTIONS = 40;
+const LAUNCH_DIRECTORY_SEARCH_DEBOUNCE_MS = 140;
 const MAX_PROJECT_ENTRIES = 512;
 const MAX_PROJECT_SOURCE_CHARS = 256 * 1024;
 const MAX_PROJECT_SOURCE_LINES = 4_000;
@@ -428,11 +431,22 @@ function moveMessageHistory(history, index, direction) {
   return current < entries.length ? current + 1 : null;
 }
 
-function filterDirectories(directories, query) {
+function filterDirectories(directories, query, limit = MAX_LAUNCH_DIRECTORY_SUGGESTIONS) {
   const normalized = typeof query === "string" ? query.trim().toLowerCase() : "";
-  return (Array.isArray(directories) ? directories : [])
-    .filter((directory) => !normalized
-      || `${directory} ${projectLabel(directory)}`.toLowerCase().includes(normalized));
+  const boundedLimit = Math.max(0, Math.min(
+    Number.isSafeInteger(limit) ? limit : MAX_LAUNCH_DIRECTORY_SUGGESTIONS,
+    MAX_LAUNCH_DIRECTORY_SUGGESTIONS,
+  ));
+  const matches = [];
+  if (!boundedLimit) return matches;
+  for (const directory of Array.isArray(directories) ? directories : []) {
+    if (!normalized
+        || `${directory} ${projectLabel(directory)}`.toLowerCase().includes(normalized)) {
+      matches.push(directory);
+      if (matches.length === boundedLimit) break;
+    }
+  }
+  return matches;
 }
 
 function isManualDirectory(value) {
@@ -480,7 +494,20 @@ function rememberLaunchDirectory(remembered, machine, directory) {
 function availableLaunchDirectories(machine, remembered) {
   const listed = Array.isArray(machine?.directories) ? machine.directories : [];
   const saved = remembered?.[machine?.id] || [];
-  return [...new Set([...saved, ...listed].filter(validRememberedLaunchDirectory))];
+  const directories = [];
+  const seen = new Set();
+  let inspected = 0;
+  candidateSources: for (const source of [saved, listed]) {
+    for (const directory of source) {
+      inspected += 1;
+      if (inspected > MAX_LAUNCH_DIRECTORY_CANDIDATES * 4) break candidateSources;
+      if (!validRememberedLaunchDirectory(directory) || seen.has(directory)) continue;
+      seen.add(directory);
+      directories.push(directory);
+      if (directories.length === MAX_LAUNCH_DIRECTORY_CANDIDATES) break candidateSources;
+    }
+  }
+  return directories;
 }
 
 function launchDirectoryBrowsePath(machine, path) {
@@ -1843,6 +1870,9 @@ if (typeof module !== "undefined" && module.exports) {
     MAX_IMAGE_ATTACHMENTS,
     MAX_IMAGE_BYTES,
     MAX_TOTAL_IMAGE_BYTES,
+    MAX_LAUNCH_DIRECTORY_CANDIDATES,
+    MAX_LAUNCH_DIRECTORY_SUGGESTIONS,
+    LAUNCH_DIRECTORY_SEARCH_DEBOUNCE_MS,
     MAX_FILE_REFERENCE_CHARS,
     MAX_FILE_REFERENCE_LINES,
     attachmentDeliveryTarget,
@@ -2040,6 +2070,8 @@ function initialize() {
     launchFlow: null,
     launchSessionsGeneration: 0,
     launchSessionsKey: "",
+    launchSessionsController: null,
+    launchDirectorySearchTimer: null,
     paneError: null,
     panePointerDown: false,
     pendingPaneRender: false,
@@ -2160,6 +2192,17 @@ function initialize() {
   // the composer above the keyboard with no visual viewport offset -- so this
   // single measurement is correct on both platforms.
   function syncMobileViewport() {
+    const directoryInput = $("launch-directory");
+    const directorySuggestions = $("launch-directory-suggestions");
+    if (mobileViewportActive()) {
+      // iOS Chrome uses WebKit's native datalist implementation. Replacing a
+      // populated datalist while its search popup is open can lock the main
+      // thread, so mobile gets the bounded in-page list rendered below.
+      directoryInput.removeAttribute("list");
+    } else {
+      directoryInput.setAttribute("list", "launch-directory-options");
+      directorySuggestions.hidden = true;
+    }
     if (!mobileViewportActive()) {
       document.documentElement.style.removeProperty("--app-height");
       return;
@@ -3508,6 +3551,7 @@ function initialize() {
   function invalidateLaunchDialog(close = true) {
     state.launchDialogGeneration += 1;
     state.launchFlow = null;
+    cancelLaunchDirectorySearch();
     clearLaunchSessions();
     const dialog = $("launch-dialog");
     if (close && dialog.open) {
@@ -5946,6 +5990,7 @@ function initialize() {
   }
 
   function applyLaunchMachine() {
+    cancelLaunchDirectorySearch();
     const machines = launchMachines(state.launchOptions);
     const candidate = machines.find((machine) => machine.id === $("launch-machine").value);
     const selected = isLaunchCapableMachine(candidate) ? candidate : fallbackLaunchMachine();
@@ -5969,10 +6014,12 @@ function initialize() {
   }
 
   function renderLaunchDirectories(selected = currentLaunchMachine()) {
+    cancelLaunchDirectorySearch();
     const input = $("launch-directory");
     const available = availableLaunchDirectories(selected, state.rememberedLaunchDirectories);
     const directories = filterDirectories(available, input.value);
     $("launch-directory-options").replaceChildren(...directories.map(directoryOption));
+    renderMobileLaunchDirectorySuggestions(directories);
     const directory = available.includes(input.value) ? input.value : "";
     const manual = !directory && isManualDirectory(input.value) ? input.value.trim() : "";
     const previous = input.dataset.selectedDirectory || "";
@@ -5984,6 +6031,58 @@ function initialize() {
     }
     updateLaunchAvailability(selected, directories, directory || manual);
     void refreshLaunchSessions();
+  }
+
+  function renderMobileLaunchDirectorySuggestions(directories) {
+    const suggestions = $("launch-directory-suggestions");
+    if (!mobileViewportActive() || !directories.length) {
+      suggestions.replaceChildren();
+      suggestions.hidden = true;
+      return;
+    }
+    suggestions.replaceChildren(...directories.map((directory) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "launch-directory-suggestion";
+      button.dataset.directory = directory;
+      button.setAttribute("aria-label", `${projectLabel(directory)}, ${directory}`);
+      const label = document.createElement("strong");
+      label.textContent = projectLabel(directory);
+      const path = document.createElement("small");
+      path.textContent = directory;
+      button.append(label, path);
+      button.addEventListener("click", () => {
+        $("launch-directory").value = directory;
+        renderLaunchDirectories();
+        suggestions.hidden = true;
+      });
+      return button;
+    }));
+    suggestions.hidden = false;
+  }
+
+  function cancelLaunchDirectorySearch() {
+    if (state.launchDirectorySearchTimer !== null) {
+      clearTimeout(state.launchDirectorySearchTimer);
+      state.launchDirectorySearchTimer = null;
+    }
+  }
+
+  function scheduleLaunchDirectorySearch() {
+    cancelLaunchDirectorySearch();
+    const machine = currentLaunchMachine();
+    const input = $("launch-directory");
+    input.dataset.selectedDirectory = "";
+    clearLaunchSessions();
+    const manual = isManualDirectory(input.value) ? input.value.trim() : "";
+    updateLaunchAvailability(machine, [], manual);
+    const machineId = machine.id;
+    state.launchDirectorySearchTimer = setTimeout(() => {
+      state.launchDirectorySearchTimer = null;
+      if ($("launch-dialog").open && currentLaunchMachine().id === machineId) {
+        renderLaunchDirectories();
+      }
+    }, LAUNCH_DIRECTORY_SEARCH_DEBOUNCE_MS);
   }
 
   function applyDuplicateLaunchSelection(selection) {
@@ -6137,7 +6236,7 @@ function initialize() {
   }
 
   $("launch-machine").addEventListener("change", applyLaunchMachine);
-  $("launch-directory").addEventListener("input", () => renderLaunchDirectories());
+  $("launch-directory").addEventListener("input", scheduleLaunchDirectorySearch);
   $("launch-directory").addEventListener("change", () => renderLaunchDirectories());
   $("launch-harness").addEventListener("change", () => {
     renderLaunchProfiles();
@@ -6171,6 +6270,8 @@ function initialize() {
   }
 
   function clearLaunchSessions() {
+    state.launchSessionsController?.abort();
+    state.launchSessionsController = null;
     state.launchSessionsGeneration += 1;
     state.launchSessionsKey = "";
     $("launch-session").replaceChildren(option("", "Start a new conversation"));
@@ -6194,6 +6295,9 @@ function initialize() {
     }
     const key = JSON.stringify([machine.id, directory, profileId]);
     if (state.launchSessionsKey === key) return;
+    state.launchSessionsController?.abort();
+    const controller = new AbortController();
+    state.launchSessionsController = controller;
     const generation = ++state.launchSessionsGeneration;
     state.launchSessionsKey = key;
     const section = $("launch-sessions");
@@ -6208,7 +6312,7 @@ function initialize() {
       profile_id: profileId,
     });
     try {
-      const listing = await request(`/api/v1/launch-sessions?${params}`);
+      const listing = await request(`/api/v1/launch-sessions?${params}`, { signal: controller.signal });
       if (generation !== state.launchSessionsGeneration || state.launchSessionsKey !== key) return;
       if (listing?.directory !== directory || listing?.profile_id !== profileId) {
         throw new Error("Saved conversations changed; select the folder again");
@@ -6236,11 +6340,14 @@ function initialize() {
         ? "Showing the newest saved conversations."
         : "Choose one to continue it, or start a new conversation.";
     } catch (error) {
+      if (error?.name === "AbortError") return;
       if (generation !== state.launchSessionsGeneration) return;
       state.launchSessionsKey = "";
       select.replaceChildren(option("", "Start a new conversation"));
       note.textContent = `${error.message}. A new conversation can still be launched.`;
       section.hidden = false;
+    } finally {
+      if (state.launchSessionsController === controller) state.launchSessionsController = null;
     }
   }
 

@@ -24,6 +24,8 @@ let launchOptionsDelayMs = 0;
 let launchResponseDelayMs = 0;
 let launchDirectoryMutationDelayMs = 0;
 let launchMachinesUnavailable = false;
+let largeLaunchDirectoryFixture = false;
+let launchSessionResponseDelayMs = 0;
 let overviewRevision = 1;
 let delayProjectFilePane = null;
 let delayFileSavePane = null;
@@ -255,6 +257,9 @@ function mockApi(url, response, request) {
     return true;
   }
   if (pathname === "/api/v1/launch-options") {
+    const tronDirectories = largeLaunchDirectoryFixture
+      ? Array.from({ length: 2_000 }, (_, index) => `/workspace/mobile-search-${index}`)
+      : ["/workspace", "/workspace/discovered"];
     const value = {
       directories: ["/workspace/discovered"],
       profiles: [{ id: "profile-0", name: "Default", harness: "codex" }],
@@ -268,7 +273,7 @@ function mockApi(url, response, request) {
         },
         {
           id: "tron", label: "Tron", online: true,
-          directories: ["/workspace", "/workspace/discovered"],
+          directories: tronDirectories,
           profiles: [{
             id: "profile-codex-max", name: "codex-max", harness: "codex",
             modes: [
@@ -357,7 +362,7 @@ function mockApi(url, response, request) {
     const directory = url.searchParams.get("directory");
     const profileId = url.searchParams.get("profile_id");
     launchSessionRequests.push({ directory, profileId, machine: url.searchParams.get("machine") });
-    json(response, {
+    const reply = {
       machine: "tron", directory, profile_id: profileId, truncated: false,
       sessions: directory === "/workspace/custom" && profileId === "profile-codex-max"
         ? [{
@@ -366,7 +371,12 @@ function mockApi(url, response, request) {
           preview: "Continue the mobile launch flow",
         }]
         : [],
-    });
+    };
+    if (launchSessionResponseDelayMs > 0) {
+      const delayMs = launchSessionResponseDelayMs;
+      launchSessionResponseDelayMs = 0;
+      setTimeout(() => json(response, reply), delayMs);
+    } else json(response, reply);
     return true;
   }
   if (pathname === "/api/v1/sessions" && request.method === "POST") {
@@ -768,6 +778,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     // The first launch option is online but cannot launch. The federated
     // `tron~pane` owner remains the contextual target and Home/local cannot be
     // selected accidentally.
+    largeLaunchDirectoryFixture = true;
     await cdp.evaluate("document.getElementById('launch-open').click(); true");
     await waitFor(
       () => cdp.evaluate("document.getElementById('launch-dialog').open"),
@@ -778,7 +789,77 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       await cdp.evaluate("document.querySelector('#launch-machine option[value=local]').disabled"),
       true,
     );
+    launchSessionResponseDelayMs = 1_000;
+    const mobileSearch = await cdp.evaluate(`(async () => {
+      const input = document.getElementById('launch-directory');
+      const datalist = document.getElementById('launch-directory-options');
+      const suggestions = document.getElementById('launch-directory-suggestions');
+      const nativeFetch = window.fetch;
+      let savedSessionAborted = false;
+      window.fetch = (resource, options = {}) => {
+        if (String(resource).startsWith('/api/v1/launch-sessions?')) {
+          options.signal?.addEventListener('abort', () => { savedSessionAborted = true; });
+        }
+        return nativeFetch.call(window, resource, options);
+      };
+      input.focus({ preventScroll: true });
+      let mutations = 0;
+      const observer = new MutationObserver((records) => { mutations += records.length; });
+      observer.observe(datalist, { childList: true });
+      const started = performance.now();
+      for (const value of [
+        'm', 'mo', 'mob', 'mobi', 'mobile', 'mobile-', 'mobile-s',
+        'mobile-se', 'mobile-sea', 'mobile-sear', 'mobile-searc',
+        'mobile-search', 'mobile-search-', 'mobile-search-1',
+        'mobile-search-19', 'mobile-search-199', 'mobile-search-1999',
+      ]) {
+        input.value = value;
+        input.dispatchEvent(new InputEvent('input', { bubbles: true, data: value.at(-1) }));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      observer.disconnect();
+      const result = {
+        elapsed: performance.now() - started,
+        nativeList: input.getAttribute('list'),
+        datalistCount: datalist.children.length,
+        suggestionCount: suggestions.children.length,
+        suggestionDisplay: getComputedStyle(suggestions).display,
+        suggestionTapHeight: suggestions.querySelector('button')?.getBoundingClientRect().height || 0,
+        overflowX: document.documentElement.scrollWidth - innerWidth,
+        mutations,
+        machine: document.getElementById('launch-machine').value,
+        match: suggestions.querySelector('button')?.dataset.directory || null,
+      };
+      suggestions.querySelector('button')?.click();
+      result.selected = input.value;
+      result.selectedDirectory = input.dataset.selectedDirectory;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      input.value = 'no-project-matches-this';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'x' }));
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      result.savedSessionAborted = savedSessionAborted;
+      result.savedSessionsHidden = document.getElementById('launch-sessions').hidden;
+      window.fetch = nativeFetch;
+      return result;
+    })()`);
+    launchSessionResponseDelayMs = 0;
+    assert.equal(mobileSearch.nativeList, null, JSON.stringify(mobileSearch));
+    assert.ok(mobileSearch.datalistCount <= 40, JSON.stringify(mobileSearch));
+    assert.ok(mobileSearch.suggestionCount <= 40, JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.suggestionDisplay, "grid", JSON.stringify(mobileSearch));
+    assert.ok(mobileSearch.suggestionTapHeight >= 44, JSON.stringify(mobileSearch));
+    assert.ok(mobileSearch.overflowX <= 1, JSON.stringify(mobileSearch));
+    assert.ok(mobileSearch.mutations <= 2, JSON.stringify(mobileSearch));
+    assert.ok(mobileSearch.elapsed < 1_500, JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.machine, "tron", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.match, "/workspace/mobile-search-1999", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.selected, "/workspace/mobile-search-1999", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.selectedDirectory, "/workspace/mobile-search-1999", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.savedSessionAborted, true, JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.savedSessionsHidden, true, JSON.stringify(mobileSearch));
     await cdp.evaluate("document.querySelector('#launch-dialog .dialog-cancel').click(); true");
+    largeLaunchDirectoryFixture = false;
+    launchSessionRequests.length = 0;
 
     // Machine details expose owner-sampled system identity without inventing a
     // coordinator Home machine. Values are rendered as text, not owner markup.
