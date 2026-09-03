@@ -792,7 +792,6 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     launchSessionResponseDelayMs = 1_000;
     const mobileSearch = await cdp.evaluate(`(async () => {
       const input = document.getElementById('launch-directory');
-      const datalist = document.getElementById('launch-directory-options');
       const suggestions = document.getElementById('launch-directory-suggestions');
       const nativeFetch = window.fetch;
       let savedSessionAborted = false;
@@ -805,7 +804,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       input.focus({ preventScroll: true });
       let mutations = 0;
       const observer = new MutationObserver((records) => { mutations += records.length; });
-      observer.observe(datalist, { childList: true });
+      observer.observe(suggestions, { childList: true });
       const started = performance.now();
       for (const value of [
         'm', 'mo', 'mob', 'mobi', 'mobile', 'mobile-', 'mobile-s',
@@ -821,7 +820,9 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       const result = {
         elapsed: performance.now() - started,
         nativeList: input.getAttribute('list'),
-        datalistCount: datalist.children.length,
+        comboboxRole: input.getAttribute('role'),
+        controls: input.getAttribute('aria-controls'),
+        expanded: input.getAttribute('aria-expanded'),
         suggestionCount: suggestions.children.length,
         suggestionDisplay: getComputedStyle(suggestions).display,
         suggestionTapHeight: suggestions.querySelector('button')?.getBoundingClientRect().height || 0,
@@ -830,7 +831,11 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
         machine: document.getElementById('launch-machine').value,
         match: suggestions.querySelector('button')?.dataset.directory || null,
       };
-      suggestions.querySelector('button')?.click();
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+      result.activeDescendant = input.getAttribute('aria-activedescendant');
+      result.activeSelected = document.getElementById(result.activeDescendant)
+        ?.getAttribute('aria-selected');
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
       result.selected = input.value;
       result.selectedDirectory = input.dataset.selectedDirectory;
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -839,12 +844,26 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       await new Promise((resolve) => setTimeout(resolve, 25));
       result.savedSessionAborted = savedSessionAborted;
       result.savedSessionsHidden = document.getElementById('launch-sessions').hidden;
+      input.value = 'mobile-search-1';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: '1' }));
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+      result.firstActive = input.getAttribute('aria-activedescendant');
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+      result.secondActive = input.getAttribute('aria-activedescendant');
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
+      result.activeBeforeEscape = input.getAttribute('aria-activedescendant');
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      result.expandedAfterEscape = input.getAttribute('aria-expanded');
+      result.activeAfterEscape = input.getAttribute('aria-activedescendant');
       window.fetch = nativeFetch;
       return result;
     })()`);
     launchSessionResponseDelayMs = 0;
     assert.equal(mobileSearch.nativeList, null, JSON.stringify(mobileSearch));
-    assert.ok(mobileSearch.datalistCount <= 40, JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.comboboxRole, "combobox", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.controls, "launch-directory-suggestions", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.expanded, "true", JSON.stringify(mobileSearch));
     assert.ok(mobileSearch.suggestionCount <= 40, JSON.stringify(mobileSearch));
     assert.equal(mobileSearch.suggestionDisplay, "grid", JSON.stringify(mobileSearch));
     assert.ok(mobileSearch.suggestionTapHeight >= 44, JSON.stringify(mobileSearch));
@@ -853,10 +872,65 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.ok(mobileSearch.elapsed < 1_500, JSON.stringify(mobileSearch));
     assert.equal(mobileSearch.machine, "tron", JSON.stringify(mobileSearch));
     assert.equal(mobileSearch.match, "/workspace/mobile-search-1999", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.activeDescendant, "launch-directory-suggestion-0", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.activeSelected, "true", JSON.stringify(mobileSearch));
     assert.equal(mobileSearch.selected, "/workspace/mobile-search-1999", JSON.stringify(mobileSearch));
     assert.equal(mobileSearch.selectedDirectory, "/workspace/mobile-search-1999", JSON.stringify(mobileSearch));
     assert.equal(mobileSearch.savedSessionAborted, true, JSON.stringify(mobileSearch));
     assert.equal(mobileSearch.savedSessionsHidden, true, JSON.stringify(mobileSearch));
+    assert.ok(mobileSearch.firstActive, JSON.stringify(mobileSearch));
+    assert.notEqual(mobileSearch.secondActive, mobileSearch.firstActive, JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.activeBeforeEscape, mobileSearch.firstActive, JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.expandedAfterEscape, "false", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.activeAfterEscape, null, JSON.stringify(mobileSearch));
+    await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: 1024, height: 768, deviceScaleFactor: 1, mobile: false,
+    });
+    const wideTouchSearch = await cdp.evaluate(`(async () => {
+      const input = document.getElementById('launch-directory');
+      input.focus({ preventScroll: true });
+      input.value = 'mobile-search-1888';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: '8' }));
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const suggestions = document.getElementById('launch-directory-suggestions');
+      return {
+        wideLayout: !matchMedia('(max-width: 720px)').matches,
+        touchPoints: navigator.maxTouchPoints,
+        nativeList: input.getAttribute('list'),
+        role: input.getAttribute('role'),
+        expanded: input.getAttribute('aria-expanded'),
+        count: suggestions.children.length,
+        match: suggestions.querySelector('[role=option]')?.dataset.directory || null,
+      };
+    })()`);
+    assert.deepEqual(wideTouchSearch, {
+      wideLayout: true,
+      touchPoints: 5,
+      nativeList: null,
+      role: "combobox",
+      expanded: "true",
+      count: 1,
+      match: "/workspace/mobile-search-1888",
+    });
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: 768, height: 1024, deviceScaleFactor: 1, mobile: false,
+    });
+    assert.deepEqual(await cdp.evaluate(`({
+      wideLayout: !matchMedia('(max-width: 720px)').matches,
+      nativeList: document.getElementById('launch-directory').getAttribute('list'),
+      role: document.getElementById('launch-directory').getAttribute('role'),
+      match: document.querySelector('#launch-directory-suggestions [role=option]')?.dataset.directory || null,
+    })`), {
+      wideLayout: true,
+      nativeList: null,
+      role: "combobox",
+      match: "/workspace/mobile-search-1888",
+    });
+    await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: 390, height: 844, deviceScaleFactor: 1, mobile: false,
+    });
     await cdp.evaluate("document.querySelector('#launch-dialog .dialog-cancel').click(); true");
     largeLaunchDirectoryFixture = false;
     launchSessionRequests.length = 0;
@@ -2827,7 +2901,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     );
     assert.equal(await cdp.evaluate("document.getElementById('launch-machine').value"), "tron");
     await waitFor(
-      () => cdp.evaluate("[...document.querySelectorAll('#launch-directory-options option')].some((option) => option.value === '/workspace/custom')"),
+      () => cdp.evaluate("[...document.querySelectorAll('#launch-directory-suggestions [role=option]')].some((option) => option.dataset.directory === '/workspace/custom')"),
       "remembered folder did not return to the project picker",
     );
     await cdp.evaluate("document.querySelector('#launch-dialog .dialog-cancel').click(); true");

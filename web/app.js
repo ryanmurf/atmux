@@ -2072,6 +2072,9 @@ function initialize() {
     launchSessionsKey: "",
     launchSessionsController: null,
     launchDirectorySearchTimer: null,
+    launchDirectoryCandidates: null,
+    launchDirectoryActiveIndex: -1,
+    launchDirectorySuggestionsDismissed: false,
     paneError: null,
     panePointerDown: false,
     pendingPaneRender: false,
@@ -2192,17 +2195,6 @@ function initialize() {
   // the composer above the keyboard with no visual viewport offset -- so this
   // single measurement is correct on both platforms.
   function syncMobileViewport() {
-    const directoryInput = $("launch-directory");
-    const directorySuggestions = $("launch-directory-suggestions");
-    if (mobileViewportActive()) {
-      // iOS Chrome uses WebKit's native datalist implementation. Replacing a
-      // populated datalist while its search popup is open can lock the main
-      // thread, so mobile gets the bounded in-page list rendered below.
-      directoryInput.removeAttribute("list");
-    } else {
-      directoryInput.setAttribute("list", "launch-directory-options");
-      directorySuggestions.hidden = true;
-    }
     if (!mobileViewportActive()) {
       document.documentElement.style.removeProperty("--app-height");
       return;
@@ -3552,6 +3544,7 @@ function initialize() {
     state.launchDialogGeneration += 1;
     state.launchFlow = null;
     cancelLaunchDirectorySearch();
+    hideLaunchDirectorySuggestions(true);
     clearLaunchSessions();
     const dialog = $("launch-dialog");
     if (close && dialog.open) {
@@ -5991,6 +5984,8 @@ function initialize() {
 
   function applyLaunchMachine() {
     cancelLaunchDirectorySearch();
+    state.launchDirectoryCandidates = null;
+    state.launchDirectorySuggestionsDismissed = false;
     const machines = launchMachines(state.launchOptions);
     const candidate = machines.find((machine) => machine.id === $("launch-machine").value);
     const selected = isLaunchCapableMachine(candidate) ? candidate : fallbackLaunchMachine();
@@ -6013,13 +6008,25 @@ function initialize() {
     return isLaunchCapableMachine(selected) ? selected : fallbackLaunchMachine();
   }
 
+  function launchDirectoryCandidates(selected = currentLaunchMachine()) {
+    const cache = state.launchDirectoryCandidates;
+    if (cache?.machine === selected
+        && cache.remembered === state.rememberedLaunchDirectories) return cache.directories;
+    const directories = availableLaunchDirectories(selected, state.rememberedLaunchDirectories);
+    state.launchDirectoryCandidates = {
+      machine: selected,
+      remembered: state.rememberedLaunchDirectories,
+      directories,
+    };
+    return directories;
+  }
+
   function renderLaunchDirectories(selected = currentLaunchMachine()) {
     cancelLaunchDirectorySearch();
     const input = $("launch-directory");
-    const available = availableLaunchDirectories(selected, state.rememberedLaunchDirectories);
+    const available = launchDirectoryCandidates(selected);
     const directories = filterDirectories(available, input.value);
-    $("launch-directory-options").replaceChildren(...directories.map(directoryOption));
-    renderMobileLaunchDirectorySuggestions(directories);
+    renderLaunchDirectorySuggestions(directories);
     const directory = available.includes(input.value) ? input.value : "";
     const manual = !directory && isManualDirectory(input.value) ? input.value.trim() : "";
     const previous = input.dataset.selectedDirectory || "";
@@ -6033,17 +6040,58 @@ function initialize() {
     void refreshLaunchSessions();
   }
 
-  function renderMobileLaunchDirectorySuggestions(directories) {
+  function hideLaunchDirectorySuggestions(dismissed = false) {
+    const input = $("launch-directory");
     const suggestions = $("launch-directory-suggestions");
-    if (!mobileViewportActive() || !directories.length) {
-      suggestions.replaceChildren();
-      suggestions.hidden = true;
-      return;
-    }
-    suggestions.replaceChildren(...directories.map((directory) => {
+    suggestions.hidden = true;
+    input.setAttribute("aria-expanded", "false");
+    input.removeAttribute("aria-activedescendant");
+    state.launchDirectoryActiveIndex = -1;
+    state.launchDirectorySuggestionsDismissed = dismissed;
+    for (const option of suggestions.children) option.setAttribute("aria-selected", "false");
+  }
+
+  function showLaunchDirectorySuggestions() {
+    const suggestions = $("launch-directory-suggestions");
+    if (!suggestions.children.length || state.launchDirectorySuggestionsDismissed) return;
+    suggestions.hidden = false;
+    $("launch-directory").setAttribute("aria-expanded", "true");
+  }
+
+  function activateLaunchDirectorySuggestion(index) {
+    const input = $("launch-directory");
+    const suggestions = $("launch-directory-suggestions");
+    const options = [...suggestions.children];
+    if (!options.length) return;
+    const next = Math.max(0, Math.min(index, options.length - 1));
+    state.launchDirectoryActiveIndex = next;
+    options.forEach((option, optionIndex) => {
+      option.setAttribute("aria-selected", String(optionIndex === next));
+    });
+    input.setAttribute("aria-activedescendant", options[next].id);
+    options[next].scrollIntoView({ block: "nearest" });
+  }
+
+  function selectLaunchDirectorySuggestion(directory) {
+    if (!launchDirectoryCandidates().includes(directory)) return;
+    $("launch-directory").value = directory;
+    state.launchDirectorySuggestionsDismissed = true;
+    renderLaunchDirectories();
+    hideLaunchDirectorySuggestions(true);
+  }
+
+  function renderLaunchDirectorySuggestions(directories) {
+    const suggestions = $("launch-directory-suggestions");
+    state.launchDirectoryActiveIndex = -1;
+    $("launch-directory").removeAttribute("aria-activedescendant");
+    suggestions.replaceChildren(...directories.map((directory, index) => {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "launch-directory-suggestion";
+      button.id = `launch-directory-suggestion-${index}`;
+      button.setAttribute("role", "option");
+      button.setAttribute("aria-selected", "false");
+      button.tabIndex = -1;
       button.dataset.directory = directory;
       button.setAttribute("aria-label", `${projectLabel(directory)}, ${directory}`);
       const label = document.createElement("strong");
@@ -6051,14 +6099,22 @@ function initialize() {
       const path = document.createElement("small");
       path.textContent = directory;
       button.append(label, path);
-      button.addEventListener("click", () => {
-        $("launch-directory").value = directory;
-        renderLaunchDirectories();
-        suggestions.hidden = true;
+      button.addEventListener("pointerdown", (event) => {
+        if (!["touch", "pen"].includes(event.pointerType)) return;
+        event.preventDefault();
+        selectLaunchDirectorySuggestion(directory);
       });
+      button.addEventListener("mousedown", (event) => event.preventDefault());
+      button.addEventListener("click", () => selectLaunchDirectorySuggestion(directory));
       return button;
     }));
-    suggestions.hidden = false;
+    if (document.activeElement === $("launch-directory")
+        && directories.length
+        && !state.launchDirectorySuggestionsDismissed) {
+      showLaunchDirectorySuggestions();
+    } else {
+      hideLaunchDirectorySuggestions(state.launchDirectorySuggestionsDismissed);
+    }
   }
 
   function cancelLaunchDirectorySearch() {
@@ -6072,6 +6128,8 @@ function initialize() {
     cancelLaunchDirectorySearch();
     const machine = currentLaunchMachine();
     const input = $("launch-directory");
+    state.launchDirectorySuggestionsDismissed = false;
+    hideLaunchDirectorySuggestions();
     input.dataset.selectedDirectory = "";
     clearLaunchSessions();
     const manual = isManualDirectory(input.value) ? input.value.trim() : "";
@@ -6199,15 +6257,14 @@ function initialize() {
 
   function updateLaunchAvailability(
     selected = currentLaunchMachine(),
-    directories = filterDirectories(
-      availableLaunchDirectories(selected, state.rememberedLaunchDirectories),
-      $("launch-directory").value,
-    ),
-    directory = availableLaunchDirectories(selected, state.rememberedLaunchDirectories)
-      .includes($("launch-directory").value)
-      ? $("launch-directory").value
-      : (isManualDirectory($("launch-directory").value) ? $("launch-directory").value.trim() : ""),
+    directories = null,
+    directory = null,
   ) {
+    const available = launchDirectoryCandidates(selected);
+    const matches = directories ?? filterDirectories(available, $("launch-directory").value);
+    const chosen = directory ?? (available.includes($("launch-directory").value)
+      ? $("launch-directory").value
+      : (isManualDirectory($("launch-directory").value) ? $("launch-directory").value.trim() : ""));
     const profiles = profilesForHarness(selected.profiles, $("launch-harness").value);
     const button = $("launch-form").querySelector("button[type=submit]");
     let memoryError = "";
@@ -6220,12 +6277,11 @@ function initialize() {
     } catch (error) {
       memoryError = error.message;
     }
-    button.disabled = !isLaunchCapableMachine(selected) || !directory || !profiles.length || Boolean(memoryError);
+    button.disabled = !isLaunchCapableMachine(selected) || !chosen || !profiles.length || Boolean(memoryError);
     const note = $("launch-note");
-    const listed = availableLaunchDirectories(selected, state.rememberedLaunchDirectories)
-      .includes(directory);
-    const message = selected.note || memoryError || (!directory
-      ? (!directories.length
+    const listed = available.includes(chosen);
+    const message = selected.note || memoryError || (!chosen
+      ? (!matches.length
         ? "No project matches. Type an absolute folder within a configured project root."
         : "Choose a project or type an absolute folder within a configured project root.")
       : (!profiles.length
@@ -6238,6 +6294,42 @@ function initialize() {
   $("launch-machine").addEventListener("change", applyLaunchMachine);
   $("launch-directory").addEventListener("input", scheduleLaunchDirectorySearch);
   $("launch-directory").addEventListener("change", () => renderLaunchDirectories());
+  $("launch-directory").addEventListener("focus", () => {
+    state.launchDirectorySuggestionsDismissed = false;
+    showLaunchDirectorySuggestions();
+  });
+  $("launch-directory").addEventListener("blur", () => {
+    requestAnimationFrame(() => {
+      if (document.activeElement !== $("launch-directory")) hideLaunchDirectorySuggestions();
+    });
+  });
+  $("launch-directory").addEventListener("keydown", (event) => {
+    if (event.isComposing) return;
+    const suggestions = $("launch-directory-suggestions");
+    const options = suggestions.children;
+    if (["ArrowDown", "ArrowUp"].includes(event.key) && options.length) {
+      event.preventDefault();
+      state.launchDirectorySuggestionsDismissed = false;
+      showLaunchDirectorySuggestions();
+      const next = event.key === "ArrowDown"
+        ? (state.launchDirectoryActiveIndex + 1) % options.length
+        : (state.launchDirectoryActiveIndex <= 0
+          ? options.length - 1
+          : state.launchDirectoryActiveIndex - 1);
+      activateLaunchDirectorySuggestion(next);
+      return;
+    }
+    if (event.key === "Enter" && !suggestions.hidden && state.launchDirectoryActiveIndex >= 0) {
+      event.preventDefault();
+      selectLaunchDirectorySuggestion(options[state.launchDirectoryActiveIndex]?.dataset.directory);
+      return;
+    }
+    if (event.key === "Escape" && !suggestions.hidden) {
+      event.preventDefault();
+      event.stopPropagation();
+      hideLaunchDirectorySuggestions(true);
+    }
+  });
   $("launch-harness").addEventListener("change", () => {
     renderLaunchProfiles();
     updateLaunchAvailability();
@@ -6261,6 +6353,7 @@ function initialize() {
       machine,
       directory,
     );
+    state.launchDirectoryCandidates = null;
     // A privacy-restricted browser may deny storage. Selection still works
     // for this page and the launch itself remains fully server-validated.
     writeLocalStorage(
@@ -6584,11 +6677,6 @@ function initialize() {
   function option(value, label, disabled = false) {
     const node = document.createElement("option");
     node.value = value; node.textContent = label; node.disabled = disabled;
-    return node;
-  }
-  function directoryOption(directory) {
-    const node = option(directory, projectLabel(directory));
-    node.label = projectLabel(directory);
     return node;
   }
   $("launch-form").addEventListener("submit", async (event) => {

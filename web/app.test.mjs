@@ -927,16 +927,19 @@ test("launch directory candidates and rendered matches stay bounded", () => {
   assert.equal(filterDirectories(available, "").length, MAX_LAUNCH_DIRECTORY_SUGGESTIONS);
 });
 
-test("launch dialog uses the Project typeahead itself instead of a separate find field", () => {
+test("launch dialog uses a bounded accessible Project combobox", () => {
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
   const markup = readFileSync(new URL("./index.html", import.meta.url), "utf8");
   assert.doesNotMatch(markup, /launch-directory-filter/);
-  assert.match(markup, /id="launch-directory" type="search" list="launch-directory-options"/);
-  assert.match(markup, /<datalist id="launch-directory-options">/);
-  assert.match(markup, /id="launch-directory-suggestions"[^>]*role="group"[^>]*aria-label="Matching projects"/);
-  assert.match(source, /launch-directory-options"\)\.replaceChildren/);
-  assert.match(source, /removeAttribute\("list"\)/);
+  assert.match(markup, /id="launch-directory" type="search" role="combobox"[^>]*aria-autocomplete="list"[^>]*aria-controls="launch-directory-suggestions"[^>]*aria-expanded="false"/);
+  assert.doesNotMatch(markup, /<datalist|\slist="/);
+  assert.match(markup, /id="launch-directory-suggestions"[^>]*role="listbox"[^>]*aria-label="Matching projects"/);
+  assert.match(source, /setAttribute\("role", "option"\)/);
+  assert.match(source, /setAttribute\("aria-activedescendant"/);
   assert.match(source, /addEventListener\("input", scheduleLaunchDirectorySearch\)/);
+  assert.match(source, /\["ArrowDown", "ArrowUp"\]/);
+  assert.match(source, /event\.key === "Enter"/);
+  assert.match(source, /event\.key === "Escape"/);
   assert.match(source, /new AbortController\(\)/);
   assert.equal(isManualDirectory("/Users/ryan/work/plain"), true);
   assert.equal(isManualDirectory("~/work/plain"), true);
