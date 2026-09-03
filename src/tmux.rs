@@ -1644,6 +1644,8 @@ fn claude_resume_invocation(
         format!("CLAUDE_CONFIG_DIR={config_dir}"),
         claude_program.to_owned(),
         CLAUDE_SKIP_PERMISSIONS_FLAG.to_owned(),
+        CLAUDE_PERMISSION_MODE_FLAG.to_owned(),
+        CLAUDE_BYPASS_PERMISSIONS_MODE.to_owned(),
         "--resume".to_owned(),
         session_id.to_owned(),
     ])
@@ -3804,9 +3806,34 @@ mod tests {
                 "CLAUDE_CONFIG_DIR=/tmp/.claude max",
                 "/tmp/Claude Code/claude",
                 CLAUDE_SKIP_PERMISSIONS_FLAG,
+                CLAUDE_PERMISSION_MODE_FLAG,
+                CLAUDE_BYPASS_PERMISSIONS_MODE,
                 "--resume",
                 session_id,
             ]
+        );
+        let invocation = claude_resume_invocation(
+            Path::new("/tmp/Claude Code/claude"),
+            Path::new("/tmp/.claude max"),
+            session_id,
+        )
+        .unwrap();
+        assert_eq!(
+            invocation
+                .iter()
+                .filter(|argument| argument.as_str() == CLAUDE_SKIP_PERMISSIONS_FLAG)
+                .count(),
+            1
+        );
+        assert!(
+            invocation
+                .windows(2)
+                .any(|pair| pair == [CLAUDE_PERMISSION_MODE_FLAG, CLAUDE_BYPASS_PERMISSIONS_MODE])
+        );
+        assert!(
+            invocation
+                .windows(2)
+                .any(|pair| pair == ["--resume", session_id])
         );
         assert!(
             claude_resume_command(
