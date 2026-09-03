@@ -39,9 +39,12 @@ const FILE_READER_STORAGE_KEY = "atmux.file-reader-preferences";
 const CONVERSATION_VISIBILITY_STORAGE_KEY = "atmux.conversation-visibility";
 const COMPOSER_DRAFT_STORAGE_KEY = "atmux.composer-drafts.v1";
 const MAX_COMPOSER_DRAFT_ENTRIES = 64;
+const MAX_COMPOSER_DRAFT_TOMBSTONES = 256;
 const MAX_COMPOSER_DRAFT_STORAGE_CHARS = 512 * 1024;
 const MAX_COMPOSER_DRAFT_TEXT_CHARS = 65_536;
+const COMPOSER_DRAFT_TOMBSTONE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const PANE_INSTANCE_PATTERN = /^pane-v1-[a-f0-9]{64}$/;
+const PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN = /^pane:([A-Za-z0-9_.%~-]{1,96}):pane-v1-[a-f0-9]{64}$/;
 const FILE_READER_SIZES = new Set(["small", "medium", "large"]);
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg"]);
 const COMPOSITE_SEPARATOR = "~";
@@ -289,6 +292,34 @@ function composerDraftIdentity(session, localMachineId = "local") {
   return { key: `ephemeral:${session.id}`, persistent: false };
 }
 
+function composerDraftMachine(key) {
+  const match = typeof key === "string" ? key.match(PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN) : null;
+  if (!match) return null;
+  try { return decodeURIComponent(match[1]); } catch { return null; }
+}
+
+/// Only owners explicitly reported online in a complete snapshot have an
+/// authoritative inventory. Drafts for offline or not-yet-connected owners
+/// survive coordinator startup until that owner can report its panes.
+function staleComposerDraftKeys(drafts, sessions, machines) {
+  const authoritativeMachines = new Set((Array.isArray(machines) ? machines : [])
+    .filter((machine) => machine?.online === true && typeof machine.id === "string")
+    .map((machine) => machine.id));
+  if (!authoritativeMachines.size) return [];
+  const live = new Set();
+  const currentSessions = sessions instanceof Map ? sessions.values() : sessions || [];
+  for (const session of currentSessions) {
+    const identity = composerDraftIdentity(session);
+    if (identity?.persistent) live.add(identity.key);
+  }
+  const stale = [];
+  for (const key of drafts instanceof Map ? drafts.keys() : []) {
+    const machine = composerDraftMachine(key);
+    if (machine && authoritativeMachines.has(machine) && !live.has(key)) stale.push(key);
+  }
+  return stale;
+}
+
 function normalizedComposerDraft(entry) {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)
       || typeof entry.text !== "string" || !entry.text
@@ -306,6 +337,34 @@ function normalizedComposerDraft(entry) {
   };
 }
 
+/// Keeps both persistent and legacy in-memory drafts within a fixed live
+/// budget. Map insertion order is the LRU order, so pruning is linear and the
+/// serializer never has an unbounded collection to sort or stringify.
+function pruneComposerDraftEntries(value, protectedKeys = []) {
+  const drafts = value instanceof Map ? value : new Map();
+  const protectedSet = protectedKeys instanceof Set ? protectedKeys : new Set(protectedKeys || []);
+  const sizes = new Map();
+  let totalChars = 32;
+  for (const [key, entry] of drafts) {
+    const draft = normalizedComposerDraft(entry);
+    if (typeof key !== "string" || key.length > 192 || !draft) {
+      drafts.delete(key);
+      continue;
+    }
+    const size = JSON.stringify({ key, ...draft }).length + 1;
+    sizes.set(key, size);
+    totalChars += size;
+  }
+  for (const key of drafts.keys()) {
+    if (drafts.size <= MAX_COMPOSER_DRAFT_ENTRIES
+        && totalChars <= MAX_COMPOSER_DRAFT_STORAGE_CHARS) break;
+    if (protectedSet.has(key)) continue;
+    totalChars -= sizes.get(key) || 0;
+    drafts.delete(key);
+  }
+  return drafts;
+}
+
 /// Parses a bounded array representation instead of an object keyed by
 /// attacker-controlled strings. Draft text remains plain textarea data.
 function composerDraftEntries(value) {
@@ -317,28 +376,108 @@ function composerDraftEntries(value) {
   }
   if (!parsed || typeof parsed !== "object" || parsed.version !== 1
       || !Array.isArray(parsed.drafts)) return drafts;
-  for (const item of parsed.drafts.slice(0, MAX_COMPOSER_DRAFT_ENTRIES)) {
+  for (const item of parsed.drafts.slice(-MAX_COMPOSER_DRAFT_ENTRIES)) {
     if (!item || typeof item.key !== "string" || item.key.length > 192
-        || !/^pane:[A-Za-z0-9_.%~-]{1,192}:pane-v1-[a-f0-9]{64}$/.test(item.key)) continue;
+        || !PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN.test(item.key)) continue;
     const draft = normalizedComposerDraft(item);
     if (draft) drafts.set(item.key, draft);
   }
-  return drafts;
+  return pruneComposerDraftEntries(drafts);
 }
 
-function composerDraftJson(value) {
-  const candidates = [...(value instanceof Map ? value : new Map())]
-    .filter(([key, draft]) => typeof key === "string" && key.startsWith("pane:")
+function composerDraftTombstones(value, now = Date.now()) {
+  const tombstones = new Map();
+  let parsed = value;
+  if (typeof value === "string") {
+    if (value.length > MAX_COMPOSER_DRAFT_STORAGE_CHARS) return tombstones;
+    try { parsed = JSON.parse(value); } catch { return tombstones; }
+  }
+  if (!parsed || typeof parsed !== "object" || parsed.version !== 1
+      || !Array.isArray(parsed.tombstones)) return tombstones;
+  const cutoff = now - COMPOSER_DRAFT_TOMBSTONE_TTL_MS;
+  for (const item of parsed.tombstones.slice(-MAX_COMPOSER_DRAFT_TOMBSTONES)) {
+    if (!item || typeof item.key !== "string"
+        || !PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN.test(item.key)
+        || !Number.isSafeInteger(item.deletedAt) || item.deletedAt <= cutoff) continue;
+    const prior = tombstones.get(item.key);
+    if (!prior || item.deletedAt > prior.deletedAt) {
+      tombstones.delete(item.key);
+      tombstones.set(item.key, { deletedAt: item.deletedAt });
+    }
+  }
+  return tombstones;
+}
+
+function composerDraftIsNewer(candidate, prior) {
+  if (!prior || candidate.updatedAt !== prior.updatedAt) {
+    return !prior || candidate.updatedAt > prior.updatedAt;
+  }
+  return JSON.stringify([
+    candidate.version, candidate.text, candidate.selectionStart, candidate.selectionEnd,
+  ]) > JSON.stringify([
+    prior.version, prior.text, prior.selectionStart, prior.selectionEnd,
+  ]);
+}
+
+/// Merges a storage snapshot into this tab's live state by per-entry clocks.
+/// Tombstones win ties so a stale tab cannot revive a successfully submitted
+/// or deleted pane draft with a whole-map last-writer-wins update.
+function mergeComposerDraftState(drafts, tombstones, incoming, now = Date.now(), protectedKeys = []) {
+  const localDrafts = drafts instanceof Map ? drafts : new Map();
+  const localTombstones = tombstones instanceof Map ? tombstones : new Map();
+  const cutoff = now - COMPOSER_DRAFT_TOMBSTONE_TTL_MS;
+  for (const [key, tombstone] of localTombstones) {
+    if (!Number.isSafeInteger(tombstone?.deletedAt) || tombstone.deletedAt <= cutoff) {
+      localTombstones.delete(key);
+    }
+  }
+  for (const [key, tombstone] of composerDraftTombstones(incoming, now)) {
+    const prior = localTombstones.get(key);
+    if (!prior || tombstone.deletedAt > prior.deletedAt) {
+      localTombstones.delete(key);
+      localTombstones.set(key, tombstone);
+    }
+  }
+  for (const [key, draft] of composerDraftEntries(incoming)) {
+    const deletedAt = localTombstones.get(key)?.deletedAt || 0;
+    const prior = localDrafts.get(key);
+    if (draft.updatedAt > deletedAt && composerDraftIsNewer(draft, prior)) {
+      localDrafts.delete(key);
+      localDrafts.set(key, draft);
+    }
+  }
+  for (const [key, tombstone] of localTombstones) {
+    if ((localDrafts.get(key)?.updatedAt || 0) <= tombstone.deletedAt) localDrafts.delete(key);
+    else localTombstones.delete(key);
+  }
+  while (localTombstones.size > MAX_COMPOSER_DRAFT_TOMBSTONES) {
+    localTombstones.delete(localTombstones.keys().next().value);
+  }
+  pruneComposerDraftEntries(localDrafts, protectedKeys);
+  return { drafts: localDrafts, tombstones: localTombstones };
+}
+
+function composerDraftJson(value, protectedKeys = [], tombstoneValue = new Map()) {
+  const candidates = [...pruneComposerDraftEntries(value, protectedKeys)]
+    .filter(([key, draft]) => typeof key === "string"
+      && PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN.test(key)
       && normalizedComposerDraft(draft))
     .map(([key, draft]) => ({ key, ...normalizedComposerDraft(draft) }))
-    .sort((left, right) => right.updatedAt - left.updatedAt)
-    .slice(0, MAX_COMPOSER_DRAFT_ENTRIES);
-  while (candidates.length) {
-    const encoded = JSON.stringify({ version: 1, drafts: candidates });
+    .slice(-MAX_COMPOSER_DRAFT_ENTRIES);
+  const tombstones = [...(tombstoneValue instanceof Map ? tombstoneValue : new Map())]
+    .filter(([key, tombstone]) => PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN.test(key)
+      && Number.isSafeInteger(tombstone?.deletedAt) && tombstone.deletedAt > 0)
+    .slice(-MAX_COMPOSER_DRAFT_TOMBSTONES)
+    .map(([key, tombstone]) => ({ key, deletedAt: tombstone.deletedAt }));
+  while (candidates.length || tombstones.length) {
+    const encoded = JSON.stringify({ version: 1, drafts: candidates, tombstones });
     if (encoded.length <= MAX_COMPOSER_DRAFT_STORAGE_CHARS) return encoded;
-    candidates.pop();
+    // In-flight drafts stay pinned in memory for rollback, but browser storage
+    // has a non-negotiable hard cap even when escaping expands every entry.
+    if (candidates.length) candidates.shift();
+    else tombstones.shift();
   }
-  return JSON.stringify({ version: 1, drafts: [] });
+  return JSON.stringify({ version: 1, drafts: [], tombstones: [] });
 }
 
 function composerDraftCanClear(draft, submission) {
@@ -456,6 +595,13 @@ function validateImageSelection(files, existing = []) {
 
 function attachmentDeliveryTarget(capturedPaneId, selectedPaneId) {
   return capturedPaneId || selectedPaneId || null;
+}
+
+function attachmentSelectionMatches(capturedPaneId, capturedInstanceKey, selectedPaneId, selectedInstanceKey) {
+  return Boolean(capturedPaneId && capturedInstanceKey)
+    && PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN.test(capturedInstanceKey)
+    && capturedPaneId === selectedPaneId
+    && capturedInstanceKey === selectedInstanceKey;
 }
 
 function remainingAttachmentsAfterDelivery(current, delivered) {
@@ -1654,9 +1800,10 @@ function dictationDelivery(paneId, prefix, finalText) {
   };
 }
 
-function dictationPrefix(inputText, composerSending, inFlightText) {
+function dictationPrefix(inputText, composerSending, inFlightText, inFlightTarget, currentTarget) {
   const current = String(inputText || "").trim();
-  return composerSending && current === String(inFlightText || "").trim() ? "" : current;
+  const sameTarget = Boolean(inFlightTarget && currentTarget && inFlightTarget === currentTarget);
+  return composerSending && sameTarget && current === String(inFlightText || "").trim() ? "" : current;
 }
 
 function composerSubmissionMatches(selectedPaneId, targetPaneId, inputText, submittedText) {
@@ -1954,6 +2101,7 @@ if (typeof module !== "undefined" && module.exports) {
     MAX_FILE_REFERENCE_CHARS,
     MAX_FILE_REFERENCE_LINES,
     attachmentDeliveryTarget,
+    attachmentSelectionMatches,
     agentMenuUrl,
     appRoute,
     remainingAttachmentsAfterDelivery,
@@ -1965,7 +2113,12 @@ if (typeof module !== "undefined" && module.exports) {
     composerDraftCanClear,
     composerDraftEntries,
     composerDraftIdentity,
+    composerDraftMachine,
     composerDraftJson,
+    composerDraftTombstones,
+    mergeComposerDraftState,
+    pruneComposerDraftEntries,
+    staleComposerDraftKeys,
     composerSubmissionCanRestore,
     composerSubmissionMatches,
     contentToLines,
@@ -2126,9 +2279,13 @@ function initialize() {
   const storedConversationVisibility = loadConversationVisibilityPreferences(
     () => readLocalStorage(CONVERSATION_VISIBILITY_STORAGE_KEY),
   );
-  const storedComposerDrafts = composerDraftEntries(
-    readLocalStorage(COMPOSER_DRAFT_STORAGE_KEY),
+  const storedComposerDraftValue = readLocalStorage(COMPOSER_DRAFT_STORAGE_KEY);
+  const storedComposerDraftState = mergeComposerDraftState(
+    new Map(),
+    new Map(),
+    storedComposerDraftValue,
   );
+  const storedComposerDrafts = storedComposerDraftState.drafts;
   const requestedPulseAccount = pulseAccountId(pageUrl.searchParams.get("pulseAccount"));
   const state = {
     revision: 0,
@@ -2196,14 +2353,22 @@ function initialize() {
       0,
       ...[...storedComposerDrafts.values()].map((draft) => draft.version),
     ),
+    composerDraftTimestamp: Math.max(
+      Date.now(),
+      ...[...storedComposerDrafts.values()].map((draft) => draft.updatedAt),
+      ...[...storedComposerDraftState.tombstones.values()].map((item) => item.deletedAt),
+    ),
     composerDraftStorageTimer: null,
+    composerDraftTombstones: storedComposerDraftState.tombstones,
     optimisticComposerClears: new Map(),
     composerSending: false,
     inFlightComposerText: null,
+    inFlightComposerIdentity: null,
     composerRevision: 0,
     queuedComposerMessages: [],
     attachments: [],
     attachmentPaneId: null,
+    attachmentInstanceKey: null,
     pendingKillId: null,
     pendingResumeId: null,
     paneModels: null,
@@ -2329,6 +2494,7 @@ function initialize() {
   }
 
   function applyOverview(data) {
+    const previousSessions = state.sessions;
     const result = reduceOverview({ revision: state.revision, sessions: state.sessions }, data);
     if (result.resync) {
       // This patch does not continue the revision we hold, so the session list
@@ -2337,10 +2503,36 @@ function initialize() {
       connectOverview();
       return;
     }
-    for (const id of Array.isArray(data?.remove) ? data.remove : []) {
-      const removed = state.sessions.get(id);
-      if (removed) forgetComposerDraft(composerDraftIdentity(removed), true);
+    mergeComposerDraftState(
+      state.composerDrafts,
+      state.composerDraftTombstones,
+      readLocalStorage(COMPOSER_DRAFT_STORAGE_KEY),
+      Date.now(),
+      protectedComposerDraftKeys(),
+    );
+    syncComposerDraftTimestamp();
+    const snapshotMachines = Array.isArray(data.sessions)
+      ? new Set((Array.isArray(data.machines) ? data.machines : [])
+        .filter((machine) => machine?.online === true)
+        .map((machine) => machine.id))
+      : null;
+    let draftsChanged = false;
+    for (const [id, previous] of previousSessions) {
+      const current = result.sessions.get(id);
+      if (!current && snapshotMachines
+          && !snapshotMachines.has(sessionMachineId(previous))) continue;
+      const previousIdentity = composerDraftIdentity(previous);
+      const currentIdentity = composerDraftIdentity(current);
+      if (!currentIdentity || currentIdentity.key !== previousIdentity?.key) {
+        draftsChanged = forgetComposerDraft(previousIdentity, true, false) || draftsChanged;
+      }
     }
+    if (Array.isArray(data.sessions)) {
+      for (const key of staleComposerDraftKeys(state.composerDrafts, result.sessions, data.machines)) {
+        draftsChanged = forgetComposerDraft({ key, persistent: true }, true, false) || draftsChanged;
+      }
+    }
+    if (draftsChanged) saveComposerDraftStorage(true);
     state.sessions = result.sessions;
     state.revision = result.revision;
     if (Array.isArray(data.machines) && data.machines.length) state.machines = data.machines;
@@ -3876,7 +4068,8 @@ function initialize() {
     for (const id of ["tmux-prefix-twice", "interrupt", "kill-open", "attach", "quick-actions-open", "quick-duplicate", "quick-compact", "quick-tmux-prefix-twice", "quick-interrupt", "quick-kill-open"]) $(id).disabled = !controllable || state.composerSending || resuming || preparingDuplicate;
     $("quick-duplicate").textContent = preparingDuplicate ? "Preparing duplicate…" : "Duplicate agent";
     $("message").disabled = !controllable || resuming;
-    $("send").disabled = !controllable || state.composerSending || resuming;
+    $("send").disabled = !controllable || state.composerSending || resuming
+      || (state.attachments.length > 0 && !attachmentsMatchCurrentSelection());
     const notice = paneNotice(machine, state.paneError, Date.now());
     const offline = $("agent-offline");
     offline.hidden = !notice;
@@ -5177,9 +5370,21 @@ function initialize() {
 
   function attachmentTargetLabel() {
     const target = state.sessions.get(state.attachmentPaneId);
-    if (!target) return `Sending to ${state.attachmentPaneId || "the selected agent"}`;
+    if (!target) return "These images belong to an unavailable agent. Clear them before sending.";
     const machine = machineOf(target);
-    return `Sending to ${target.name}${machine?.label ? ` on ${machine.label}` : ""}`;
+    const label = `${target.name}${machine?.label ? ` on ${machine.label}` : ""}`;
+    return attachmentsMatchCurrentSelection()
+      ? `Sending to ${label}`
+      : `Images belong to ${label}. Return to that agent or clear them before sending.`;
+  }
+
+  function attachmentsMatchCurrentSelection() {
+    return attachmentSelectionMatches(
+      state.attachmentPaneId,
+      state.attachmentInstanceKey,
+      state.selected,
+      selectedComposerDraftIdentity()?.key,
+    );
   }
 
   function renderAttachments() {
@@ -5214,8 +5419,9 @@ function initialize() {
     for (const attachment of state.attachments) URL.revokeObjectURL?.(attachment.url);
     state.attachments = [];
     state.attachmentPaneId = null;
+    state.attachmentInstanceKey = null;
     $("image-input").value = "";
-    renderAttachments();
+    render();
     return true;
   }
 
@@ -5226,8 +5432,11 @@ function initialize() {
     }
     const [removed] = state.attachments.splice(index, 1);
     if (removed) URL.revokeObjectURL?.(removed.url);
-    if (!state.attachments.length) state.attachmentPaneId = null;
-    renderAttachments();
+    if (!state.attachments.length) {
+      state.attachmentPaneId = null;
+      state.attachmentInstanceKey = null;
+    }
+    render();
     return Boolean(removed);
   }
 
@@ -5238,9 +5447,12 @@ function initialize() {
       if (!retained.has(attachment)) URL.revokeObjectURL?.(attachment.url);
     }
     state.attachments = remaining;
-    if (!remaining.length) state.attachmentPaneId = null;
+    if (!remaining.length) {
+      state.attachmentPaneId = null;
+      state.attachmentInstanceKey = null;
+    }
     $("image-input").value = "";
-    renderAttachments();
+    render();
   }
 
   function addAttachmentFiles(files) {
@@ -5252,7 +5464,12 @@ function initialize() {
       toast("Select an agent before attaching an image");
       return false;
     }
-    if (state.attachments.length && state.attachmentPaneId !== state.selected) {
+    const selectedIdentity = selectedComposerDraftIdentity();
+    if (!selectedIdentity?.persistent) {
+      toast("This agent's identity is unavailable; reconnect before attaching images");
+      return false;
+    }
+    if (state.attachments.length && !attachmentsMatchCurrentSelection()) {
       toast("These images belong to another agent; clear them before adding more");
       return false;
     }
@@ -5261,37 +5478,41 @@ function initialize() {
       toast(selection.error);
       return false;
     }
-    if (!state.attachmentPaneId) state.attachmentPaneId = state.selected;
+    if (!state.attachmentPaneId) {
+      state.attachmentPaneId = state.selected;
+      state.attachmentInstanceKey = selectedIdentity.key;
+    }
     state.attachments = state.attachments.concat(selection.files.map((file) => ({
       file,
       url: URL.createObjectURL(file),
     })));
-    renderAttachments();
+    render();
     return true;
   }
 
-  function rememberMessage(paneId, message) {
-    const history = state.messageHistory.get(paneId) || [];
+  function rememberMessage(identity, message) {
+    if (!identity) return;
+    const history = state.messageHistory.get(identity.key) || [];
     if (history[history.length - 1] !== message) history.push(message);
     if (history.length > MAX_MESSAGE_HISTORY_ENTRIES) {
       history.splice(0, history.length - MAX_MESSAGE_HISTORY_ENTRIES);
     }
-    state.messageHistory.set(paneId, history);
+    state.messageHistory.set(identity.key, history);
     state.messageHistoryNavigation = null;
   }
 
   function browseMessageHistory(direction) {
-    const paneId = state.selected;
+    const identity = selectedComposerDraftIdentity();
     const input = $("message");
-    if (!paneId || input.disabled) return false;
-    const history = state.messageHistory.get(paneId) || [];
+    if (!identity || input.disabled) return false;
+    const history = state.messageHistory.get(identity.key) || [];
     const navigation = state.messageHistoryNavigation;
-    const samePane = navigation?.paneId === paneId;
+    const samePane = navigation?.draftKey === identity.key;
     const index = samePane ? navigation.index : history.length;
     const draft = samePane ? navigation.draft : input.value;
     const next = moveMessageHistory(history, index, direction);
     if (next === null) return false;
-    state.messageHistoryNavigation = { paneId, index: next, draft };
+    state.messageHistoryNavigation = { draftKey: identity.key, index: next, draft };
     replaceComposerValue(next === history.length ? draft : history[next]);
     input.setSelectionRange(input.value.length, input.value.length);
     return true;
@@ -5427,12 +5648,63 @@ function initialize() {
     return composerDraftIdentity(session, localMachineId);
   }
 
+  function protectedComposerDraftKeys() {
+    const keys = new Set(state.optimisticComposerClears.keys());
+    if (state.composerDraftIdentity) keys.add(state.composerDraftIdentity.key);
+    if (state.inFlightComposerIdentity) keys.add(state.inFlightComposerIdentity);
+    for (const queued of state.queuedComposerMessages) {
+      const key = queued.options?.composerSubmission?.draftIdentity?.key;
+      if (key) keys.add(key);
+    }
+    return keys;
+  }
+
+  function nextComposerDraftTimestamp() {
+    state.composerDraftTimestamp = Math.max(state.composerDraftTimestamp + 1, Date.now());
+    return state.composerDraftTimestamp;
+  }
+
+  function syncComposerDraftTimestamp() {
+    for (const draft of state.composerDrafts.values()) {
+      state.composerDraftTimestamp = Math.max(state.composerDraftTimestamp, draft.updatedAt);
+    }
+    for (const tombstone of state.composerDraftTombstones.values()) {
+      state.composerDraftTimestamp = Math.max(state.composerDraftTimestamp, tombstone.deletedAt);
+    }
+  }
+
+  function recordComposerDraftTombstone(identity) {
+    if (!identity?.persistent) return false;
+    const deletedAt = nextComposerDraftTimestamp();
+    state.composerDraftTombstones.delete(identity.key);
+    state.composerDraftTombstones.set(identity.key, { deletedAt });
+    while (state.composerDraftTombstones.size > MAX_COMPOSER_DRAFT_TOMBSTONES) {
+      state.composerDraftTombstones.delete(state.composerDraftTombstones.keys().next().value);
+    }
+    return true;
+  }
+
   function saveComposerDraftStorage(immediate = false) {
     if (state.composerDraftStorageTimer !== null) clearTimeout(state.composerDraftStorageTimer);
     state.composerDraftStorageTimer = null;
     const write = () => {
       state.composerDraftStorageTimer = null;
-      writeLocalStorage(COMPOSER_DRAFT_STORAGE_KEY, composerDraftJson(state.composerDrafts));
+      mergeComposerDraftState(
+        state.composerDrafts,
+        state.composerDraftTombstones,
+        readLocalStorage(COMPOSER_DRAFT_STORAGE_KEY),
+        Date.now(),
+        protectedComposerDraftKeys(),
+      );
+      syncComposerDraftTimestamp();
+      writeLocalStorage(
+        COMPOSER_DRAFT_STORAGE_KEY,
+        composerDraftJson(
+          state.composerDrafts,
+          protectedComposerDraftKeys(),
+          state.composerDraftTombstones,
+        ),
+      );
     };
     if (immediate) write();
     else state.composerDraftStorageTimer = setTimeout(write, 250);
@@ -5449,10 +5721,14 @@ function initialize() {
     const input = $("message");
     if (!input.value) {
       if (composerClearRevisionIsPending(identity, state.composerRevision)) {
+        if (flush && identity.persistent) saveComposerDraftStorage(true);
         return state.composerDrafts.get(identity.key) || null;
       }
       const removed = state.composerDrafts.delete(identity.key);
-      if (removed && identity.persistent) saveComposerDraftStorage(flush);
+      if (removed && identity.persistent) {
+        recordComposerDraftTombstone(identity);
+        saveComposerDraftStorage(flush);
+      }
       return null;
     }
     const selectionStart = input.selectionStart ?? input.value.length;
@@ -5464,9 +5740,14 @@ function initialize() {
       selectionStart,
       selectionEnd,
       version: textChanged ? ++state.composerDraftSequence : existing.version,
-      updatedAt: textChanged ? Date.now() : existing.updatedAt,
+      updatedAt: textChanged ? nextComposerDraftTimestamp() : existing.updatedAt,
     };
+    if (textChanged) {
+      state.composerDrafts.delete(identity.key);
+      state.composerDraftTombstones.delete(identity.key);
+    }
     state.composerDrafts.set(identity.key, draft);
+    pruneComposerDraftEntries(state.composerDrafts, protectedComposerDraftKeys());
     if (identity.persistent) saveComposerDraftStorage(flush);
     return draft;
   }
@@ -5487,16 +5768,21 @@ function initialize() {
     }
   }
 
-  function forgetComposerDraft(identity, detach = false) {
+  function forgetComposerDraft(identity, detach = false, save = true) {
     if (!identity) return false;
     const removed = state.composerDrafts.delete(identity.key);
+    const tombstoned = removed && recordComposerDraftTombstone(identity);
+    state.messageHistory.delete(identity.key);
+    if (state.messageHistoryNavigation?.draftKey === identity.key) {
+      state.messageHistoryNavigation = null;
+    }
     state.optimisticComposerClears.delete(identity.key);
     if (detach && state.composerDraftIdentity?.key === identity.key) {
       state.composerDraftIdentity = null;
       replaceComposerValue("", false);
     }
-    if (removed && identity.persistent) saveComposerDraftStorage(true);
-    return removed;
+    if ((removed || tombstoned) && identity.persistent && save) saveComposerDraftStorage(true);
+    return removed || tombstoned;
   }
 
   function captureComposerDraftSubmission(paneId, message) {
@@ -5601,6 +5887,15 @@ function initialize() {
     }
     const message = messageOverride === null ? input.value : String(messageOverride);
     const attachments = messageOverride === null ? [...state.attachments] : [];
+    if (attachments.length && !attachmentSelectionMatches(
+      state.attachmentPaneId,
+      state.attachmentInstanceKey,
+      paneId,
+      composerDraftIdentity(state.sessions.get(paneId))?.key,
+    )) {
+      toast("These images belong to another agent. Return to that agent or clear them before sending.");
+      return false;
+    }
     const targetPaneId = attachments.length
       ? attachmentDeliveryTarget(state.attachmentPaneId, paneId)
       : paneId;
@@ -5648,6 +5943,7 @@ function initialize() {
     const button = $("send");
     state.composerSending = true;
     state.inFlightComposerText = message;
+    state.inFlightComposerIdentity = composerSubmission?.draftIdentity?.key || null;
     button.disabled = true;
     render();
     try {
@@ -5663,7 +5959,7 @@ function initialize() {
       } else {
         await request(`/api/v1/panes/${encodeURIComponent(targetPaneId)}/messages`, { method: "POST", body: JSON.stringify({ text: message, submit: true }) });
       }
-      if (message.trim()) rememberMessage(targetPaneId, message);
+      if (message.trim()) rememberMessage(composerSubmission?.draftIdentity, message);
       finishComposerDraftSubmission(composerSubmission);
       if (attachments.length) removeDeliveredAttachments(attachments);
       toast(attachments.length === 1 ? "Image sent" : attachments.length > 1 ? "Images sent" : "Message sent");
@@ -5675,6 +5971,7 @@ function initialize() {
     finally {
       state.composerSending = false;
       state.inFlightComposerText = null;
+      state.inFlightComposerIdentity = null;
       render();
       drainQueuedComposerMessage();
     }
@@ -6073,6 +6370,8 @@ function initialize() {
         $("message").value,
         state.composerSending,
         state.inFlightComposerText,
+        state.inFlightComposerIdentity,
+        selectedComposerDraftIdentity()?.key,
       );
       dictation.finalText = "";
       dictation.interimText = "";
@@ -7058,6 +7357,28 @@ function initialize() {
         void loadPulseAccounts(true);
       }
       if (state.recoveryStatus?.phase === "running") void refreshRecoveryStatus(false);
+    }
+  });
+  window.addEventListener("storage", (event) => {
+    if (event.key !== COMPOSER_DRAFT_STORAGE_KEY) return;
+    const identity = state.composerDraftIdentity;
+    const before = identity ? state.composerDrafts.get(identity.key) : null;
+    mergeComposerDraftState(
+      state.composerDrafts,
+      state.composerDraftTombstones,
+      event.newValue,
+      Date.now(),
+      protectedComposerDraftKeys(),
+    );
+    syncComposerDraftTimestamp();
+    const after = identity ? state.composerDrafts.get(identity.key) : null;
+    if (before?.updatedAt === after?.updatedAt && before?.text === after?.text) return;
+    const input = $("message");
+    input.value = after?.text || "";
+    state.composerRevision += 1;
+    if (after) {
+      try { input.setSelectionRange(after.selectionStart, after.selectionEnd); }
+      catch { /* An unfocused mobile textarea can reject selection updates. */ }
     }
   });
   window.addEventListener("pagehide", () => { persistBoundComposerDraft(true); });

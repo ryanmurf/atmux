@@ -4041,6 +4041,7 @@ fn observable_summaries_equal(previous: &[SessionSummary], current: &[SessionSum
 
 fn observable_summary_equal(left: &SessionSummary, right: &SessionSummary) -> bool {
     left.id == right.id
+        && left.instance_id == right.instance_id
         && left.machine == right.machine
         && left.name == right.name
         && left.pane_id == right.pane_id
@@ -5760,6 +5761,30 @@ mod tests {
             !control
                 .wait_for_machine_revision("ghost", 0, Duration::from_millis(50))
                 .await
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_pane_reincarnation_advances_revision_and_notifies_subscribers() {
+        let control = control_with_machines(&["gpu-box"]);
+        let mut original = remote_summary("gpu-box", "%4", "trainer", "aaaa");
+        original.instance_id = format!("pane-v1-{}", "a".repeat(64));
+        control.apply_machine_sessions("gpu-box", vec![original.clone()], None);
+        let prior_revision = control.machine_revision("gpu-box").unwrap();
+        let mut updates = control.subscribe();
+
+        let mut replacement = original;
+        replacement.instance_id = format!("pane-v1-{}", "b".repeat(64));
+        control.apply_machine_sessions("gpu-box", vec![replacement.clone()], None);
+
+        tokio::time::timeout(Duration::from_secs(1), updates.changed())
+            .await
+            .expect("pane reincarnation must wake federation observers")
+            .expect("revision sender must remain live");
+        assert!(control.machine_revision("gpu-box").unwrap() > prior_revision);
+        assert_eq!(
+            control.machine_overview("gpu-box").unwrap().sessions[0].instance_id,
+            replacement.instance_id
         );
     }
 

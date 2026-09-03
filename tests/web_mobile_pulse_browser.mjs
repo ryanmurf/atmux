@@ -34,6 +34,7 @@ let delayGitDiffPane = null;
 let nextFileSaveConflict = false;
 const fileSaveRequests = [];
 const messageRequests = [];
+const imageMessageRequests = [];
 let nextMessageFailurePane = null;
 let messageResponseDelayMs = 0;
 const projectFileContents = new Map();
@@ -69,6 +70,20 @@ function mockSession(machine, pane, name, status, extra = {}) {
   };
 }
 
+function mockOverviewMachines() {
+  return [
+    {
+      id: "tron", label: "Tron", kind: "local", online: true, sessions: 1,
+      metrics: {
+        uptime_seconds: 183_840,
+        kernel_version: LONG_KERNEL_VERSION,
+        os_version: LONG_OS_VERSION,
+      },
+    },
+    { id: "midnight", label: "Midnight", kind: "remote", online: true, sessions: 2 },
+  ];
+}
+
 function emitOverviewPatch(upsert, remove = []) {
   const baseRevision = overviewRevision;
   overviewRevision += 1;
@@ -79,6 +94,17 @@ function emitOverviewPatch(upsert, remove = []) {
     remove,
     health: null,
     machines: [],
+  })}\n\n`;
+  for (const response of overviewStreams) response.write(payload);
+}
+
+function emitOverviewSnapshot(sessions) {
+  overviewRevision += 1;
+  const payload = `event: sessions.snapshot\ndata: ${JSON.stringify({
+    revision: overviewRevision,
+    sessions,
+    health: null,
+    machines: mockOverviewMachines(),
   })}\n\n`;
   for (const response of overviewStreams) response.write(payload);
 }
@@ -112,17 +138,7 @@ function mockApi(url, response, request) {
       mockSession("midnight", "%5", "alpha-planner", "working"),
       mockSession("midnight", "%7", "beta-planner", "waiting"),
       ],
-      machines: [
-        {
-          id: "tron", label: "Tron", kind: "local", online: true, sessions: 1,
-          metrics: {
-            uptime_seconds: 183_840,
-            kernel_version: LONG_KERNEL_VERSION,
-            os_version: LONG_OS_VERSION,
-          },
-        },
-        { id: "midnight", label: "Midnight", kind: "remote", online: true, sessions: 2 },
-      ],
+      machines: mockOverviewMachines(),
       health: null,
     })}\n\n`);
     overviewStreams.add(response);
@@ -254,6 +270,17 @@ function mockApi(url, response, request) {
       };
       if (messageResponseDelayMs > 0) setTimeout(reply, messageResponseDelayMs);
       else reply();
+    });
+    return true;
+  }
+  if (/^\/api\/v1\/panes\/[^/]+\/image-messages$/.test(pathname) && request.method === "POST") {
+    const paneId = decodeURIComponent(pathname.split("/")[4]);
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      imageMessageRequests.push({ paneId, body: JSON.parse(body) });
+      json(response, {});
     });
     return true;
   }
@@ -719,6 +746,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
   launchBrowserChildren.clear();
   fileSaveRequests.length = 0;
   messageRequests.length = 0;
+  imageMessageRequests.length = 0;
   projectFileContents.clear();
   projectFileVersions.clear();
   delayFileSavePane = null;
@@ -845,14 +873,32 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     );
     assert.equal(await cdp.evaluate("document.getElementById('message').value"), hostileDraft);
 
-    await new Promise((resolve) => setTimeout(resolve, 350));
-    await cdp.evaluate("window.__atmuxBeforeDraftReload = true");
+    const pagehideDraft = `${hostileDraft}\nflush immediately on pagehide`;
+    assert.equal(await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.value = ${JSON.stringify(pagehideDraft)};
+      input.setSelectionRange(7, 19);
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'e' }));
+      window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }));
+      const stored = JSON.parse(localStorage.getItem('atmux.composer-drafts.v1'));
+      stored.drafts.push({
+        key: 'pane:midnight:pane-v1-${"d".repeat(64)}',
+        text: 'pane deleted while this browser was closed',
+        selectionStart: 0,
+        selectionEnd: 0,
+        version: 1,
+        updatedAt: 1,
+      });
+      localStorage.setItem('atmux.composer-drafts.v1', JSON.stringify(stored));
+      window.__atmuxBeforeDraftReload = true;
+      return stored.drafts.some((draft) => draft.text === input.value);
+    })()`), true, "pagehide did not flush the draft before its debounce elapsed");
     await cdp.send("Page.reload", { ignoreCache: true });
     await waitFor(
       () => cdp.evaluate(`window.__atmuxBeforeDraftReload !== true
         && document.readyState === 'complete'
         && !document.getElementById('agent-view').hidden
-        && document.getElementById('message').value === ${JSON.stringify(hostileDraft)}`),
+        && document.getElementById('message').value === ${JSON.stringify(pagehideDraft)}`),
       "the selected agent draft did not survive a mobile refresh",
     );
     const refreshedDraft = await cdp.evaluate(`(() => {
@@ -865,11 +911,60 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
         shellTop: document.querySelector('.terminal-shell').getBoundingClientRect().top,
       };
     })()`);
-    assert.equal(refreshedDraft.value, hostileDraft, JSON.stringify(refreshedDraft));
-    assert.equal(refreshedDraft.selectionStart, 5, JSON.stringify(refreshedDraft));
-    assert.equal(refreshedDraft.selectionEnd, 17, JSON.stringify(refreshedDraft));
+    assert.equal(refreshedDraft.value, pagehideDraft, JSON.stringify(refreshedDraft));
+    assert.equal(refreshedDraft.selectionStart, 7, JSON.stringify(refreshedDraft));
+    assert.equal(refreshedDraft.selectionEnd, 19, JSON.stringify(refreshedDraft));
     assert.equal(refreshedDraft.focused, false, JSON.stringify(refreshedDraft));
     assert.equal(refreshedDraft.shellTop, switchedDrafts.shellTopBefore, JSON.stringify(refreshedDraft));
+    assert.equal(await cdp.evaluate(`JSON.parse(
+      localStorage.getItem('atmux.composer-drafts.v1')
+    ).drafts.some((draft) => draft.text === 'pane deleted while this browser was closed')`), false,
+    "an online owner's cold-start orphan survived its authoritative snapshot");
+
+    const messagesBeforeMismatchedAttachment = messageRequests.length;
+    const imagesBeforeMismatchedAttachment = imageMessageRequests.length;
+    const mismatchedAttachment = await cdp.evaluate(`(async () => {
+      const picker = document.getElementById('image-input');
+      const transfer = new DataTransfer();
+      transfer.items.add(new File(
+        [new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])],
+        'draft.png',
+        { type: 'image/png' },
+      ));
+      picker.files = transfer.files;
+      picker.dispatchEvent(new Event('change', { bubbles: true }));
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      const input = document.getElementById('message');
+      const mismatch = {
+        draftB: input.value,
+        sendDisabled: document.getElementById('send').disabled,
+        guidance: document.getElementById('attachment-target').textContent,
+      };
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      document.querySelector('[data-session-id="tron~%100"]').click();
+      mismatch.returnedA = input.value;
+      mismatch.sendEnabledOnA = !document.getElementById('send').disabled;
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      document.getElementById('attachment-clear').click();
+      mismatch.draftBAfterClear = input.value;
+      mismatch.sendEnabledAfterClear = !document.getElementById('send').disabled;
+      mismatch.attachmentsAfterClear = document.querySelectorAll('.attachment-preview').length;
+      document.querySelector('[data-session-id="tron~%100"]').click();
+      mismatch.returnedAAfterClear = input.value;
+      return mismatch;
+    })()`);
+    assert.equal(mismatchedAttachment.draftB, "beta agent private draft", JSON.stringify(mismatchedAttachment));
+    assert.equal(mismatchedAttachment.sendDisabled, true, JSON.stringify(mismatchedAttachment));
+    assert.match(mismatchedAttachment.guidance, /Return to that agent or clear them before sending/);
+    assert.equal(mismatchedAttachment.returnedA, pagehideDraft, JSON.stringify(mismatchedAttachment));
+    assert.equal(mismatchedAttachment.sendEnabledOnA, true, JSON.stringify(mismatchedAttachment));
+    assert.equal(mismatchedAttachment.draftBAfterClear, "beta agent private draft", JSON.stringify(mismatchedAttachment));
+    assert.equal(mismatchedAttachment.sendEnabledAfterClear, true, JSON.stringify(mismatchedAttachment));
+    assert.equal(mismatchedAttachment.attachmentsAfterClear, 0, JSON.stringify(mismatchedAttachment));
+    assert.equal(mismatchedAttachment.returnedAAfterClear, pagehideDraft, JSON.stringify(mismatchedAttachment));
+    assert.equal(messageRequests.length, messagesBeforeMismatchedAttachment);
+    assert.equal(imageMessageRequests.length, imagesBeforeMismatchedAttachment);
 
     messageResponseDelayMs = 250;
     const messagesBeforeDraftSubmit = messageRequests.length;
@@ -886,7 +981,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(await cdp.evaluate("document.getElementById('message').value"), "beta agent private draft");
     assert.deepEqual(messageRequests.at(-1), {
       paneId: "tron~%100",
-      body: JSON.stringify({ text: hostileDraft, submit: true }),
+      body: JSON.stringify({ text: pagehideDraft, submit: true }),
     });
     assert.equal(await cdp.evaluate(`(() => {
       document.querySelector('[data-session-id="tron~%100"]').click();
@@ -910,14 +1005,44 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     });
 
     nextMessageFailurePane = "midnight~%5";
+    messageResponseDelayMs = 2_000;
+    const messagesBeforeFailedDraftSubmit = messageRequests.length;
     await cdp.evaluate(`(() => {
       document.querySelector('[data-session-id="midnight~%5"]').click();
       document.getElementById('send').click();
     })()`);
     await waitFor(
+      () => messageRequests.length === messagesBeforeFailedDraftSubmit + 1,
+      "the protected failed-send fixture was not accepted",
+    );
+    const pressureSessions = Array.from({ length: 65 }, (_, index) => mockSession(
+      "midnight",
+      `%${200 + index}`,
+      `draft-pressure-${index}`,
+      "waiting",
+      { instance_id: `pane-v1-${(index + 1_000).toString(16).padStart(64, "0")}` },
+    ));
+    emitOverviewPatch(pressureSessions);
+    await waitFor(
+      () => cdp.evaluate("Boolean(document.querySelector('[data-session-id=\"midnight~%264\"]'))"),
+      "draft-pressure panes were not rendered",
+    );
+    assert.equal(await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      for (let index = 0; index < 65; index += 1) {
+        document.querySelector('[data-session-id="midnight~%' + (200 + index) + '"]').click();
+        input.value = 'pressure draft ' + index;
+        input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'x' }));
+      }
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      return input.value;
+    })()`), "beta agent private draft", "capacity pressure evicted an in-flight failed-send draft");
+    await waitFor(
       () => cdp.evaluate("document.getElementById('toast').textContent.includes('rejected the send')"),
       "the failed-send fixture did not reach the composer",
+      5_000,
     );
+    messageResponseDelayMs = 0;
     assert.equal(await cdp.evaluate("document.getElementById('message').value"), "beta agent private draft");
     assert.deepEqual(await cdp.evaluate(`(() => {
       const input = document.getElementById('message');
@@ -927,18 +1052,63 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       return { a, b: input.value };
     })()`), { a: "", b: "beta agent private draft" });
 
+    messageResponseDelayMs = 250;
+    const messagesBeforeReincarnation = messageRequests.length;
+    await cdp.evaluate("document.getElementById('send').click(); true");
+    await waitFor(
+      () => messageRequests.length === messagesBeforeReincarnation + 1,
+      "the old incarnation send was not accepted by the fixture",
+    );
     emitOverviewPatch([
       mockSession("midnight", "%5", "alpha-planner", "working", {
         instance_id: `pane-v1-${"e".repeat(64)}`,
       }),
-    ], ["midnight~%5"]);
+    ]);
     await waitFor(
       () => cdp.evaluate("document.getElementById('message').value === ''"),
       "a recreated pane id inherited the deleted agent's draft",
     );
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    messageResponseDelayMs = 0;
+    assert.equal(await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
+      return input.value;
+    })()`), "", "late success history leaked into a new pane incarnation");
     assert.equal(await cdp.evaluate(`JSON.parse(
       localStorage.getItem('atmux.composer-drafts.v1')
-    ).drafts.length`), 0, "deleted pane draft remained in browser storage");
+    ).drafts.some((draft) => draft.text === 'beta agent private draft')`), false,
+    "reincarnated pane's old draft remained in browser storage");
+
+    await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.value = 'draft for a pane omitted by the next snapshot';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 't' }));
+    })()`);
+    emitOverviewSnapshot([
+      {
+        id: "tron~%100", pane_id: "%100", machine: "tron", name: "codex-main",
+        instance_id: `pane-v1-${"1".repeat(64)}`,
+        status: "waiting", agent: "codex", profile: "codex-max", path: "/workspace", command: "codex",
+      },
+      mockSession("midnight", "%7", "beta-planner", "waiting"),
+    ]);
+    await waitFor(
+      () => cdp.evaluate("!document.body.classList.contains('has-selection')"),
+      "authoritative snapshot did not remove the selected pane",
+    );
+    assert.equal(await cdp.evaluate(`JSON.parse(
+      localStorage.getItem('atmux.composer-drafts.v1')
+    ).drafts.length`), 0, "snapshot-removed pane draft remained in browser storage");
+    emitOverviewPatch([
+      mockSession("midnight", "%5", "alpha-planner", "working", {
+        instance_id: `pane-v1-${"f".repeat(64)}`,
+      }),
+    ]);
+    await waitFor(
+      () => cdp.evaluate("Boolean(document.querySelector('[data-session-id=\"midnight~%5\"]'))"),
+      "the fixture pane was not restored after snapshot cleanup",
+    );
 
     // The first launch option is online but cannot launch. The federated
     // `tron~pane` owner remains the contextual target and Home/local cannot be

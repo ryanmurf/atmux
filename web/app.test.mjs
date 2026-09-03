@@ -15,6 +15,7 @@ const {
   MAX_FILE_REFERENCE_CHARS,
   MAX_FILE_REFERENCE_LINES,
   attachmentDeliveryTarget,
+  attachmentSelectionMatches,
   agentMenuUrl,
   appRoute,
   arrayBufferToBase64,
@@ -24,7 +25,12 @@ const {
   composerDraftCanClear,
   composerDraftEntries,
   composerDraftIdentity,
+  composerDraftMachine,
   composerDraftJson,
+  composerDraftTombstones,
+  mergeComposerDraftState,
+  pruneComposerDraftEntries,
+  staleComposerDraftKeys,
   composerSubmissionCanRestore,
   composerSubmissionMatches,
   contentToLines,
@@ -361,6 +367,8 @@ test("browser storage access is centralized behind fail-open initialization help
   assert.match(source, /const writeLocalStorage = \(key, value\) => \{\s*try \{\s*localStorage\.setItem\(key, value\);\s*return true;\s*\} catch \{\s*return false;\s*\}\s*\};/s);
   assert.match(source, /setRailCollapsed\(state\.railCollapsed\)/);
   assert.match(source, /writeLocalStorage\("atmux\.rail-collapsed"/);
+  assert.match(source, /window\.addEventListener\("pagehide", \(\) => \{ persistBoundComposerDraft\(true\); \}\)/);
+  assert.match(source, /document\.addEventListener\("visibilitychange", \(\) => \{\s*if \(document\.hidden\) \{\s*persistBoundComposerDraft\(true\)/s);
 });
 
 test("composer drafts use pane generations, bounded storage, and plain hostile text", () => {
@@ -377,6 +385,8 @@ test("composer drafts use pane generations, bounded storage, and plain hostile t
   assert.deepEqual(composerDraftIdentity({ id: "midnight~%7", machine: "midnight" }), {
     key: "ephemeral:midnight~%7", persistent: false,
   });
+  assert.equal(composerDraftMachine(first.key), "midnight");
+  assert.equal(composerDraftMachine("ephemeral:midnight~%7"), null);
 
   const hostile = `<img src=x onerror=alert(1)>\n<script>alert("draft")</script>`;
   const drafts = new Map([[first.key, {
@@ -411,9 +421,98 @@ test("composer drafts use pane generations, bounded storage, and plain hostile t
       updatedAt: index + 1,
     },
   ]));
+  pruneComposerDraftEntries(many);
+  assert.ok(many.size < 64, "the live map must obey the same character budget as storage");
   const bounded = composerDraftJson(many);
   assert.ok(bounded.length <= 512 * 1024);
-  assert.ok(composerDraftEntries(bounded).size < many.size);
+  assert.equal(composerDraftEntries(bounded).size, many.size);
+
+  const identities = new Map(Array.from({ length: 65 }, (_, index) => [
+    `pane:midnight:pane-v1-${index.toString(16).padStart(64, "0")}`,
+    { text: `draft-${index}`, version: index + 1, updatedAt: index + 1 },
+  ]));
+  pruneComposerDraftEntries(identities);
+  assert.equal(identities.size, 64);
+  assert.equal(identities.has(`pane:midnight:pane-v1-${"0".repeat(64)}`), false);
+  assert.equal(identities.has(`pane:midnight:pane-v1-${"40".padStart(64, "0")}`), true);
+
+  const pinnedOldestKey = `pane:tron:pane-v1-${"f".repeat(64)}`;
+  const underPressure = new Map([
+    [pinnedOldestKey, { text: "failed send rollback", version: 1, updatedAt: 1 }],
+    ...Array.from({ length: 64 }, (_, index) => [
+      `pane:midnight:pane-v1-${(index + 500).toString(16).padStart(64, "0")}`,
+      { text: `pressure-${index}`, version: index + 2, updatedAt: index + 2 },
+    ]),
+  ]);
+  pruneComposerDraftEntries(underPressure, new Set([pinnedOldestKey]));
+  assert.equal(underPressure.size, 64);
+  assert.equal(underPressure.get(pinnedOldestKey)?.text, "failed send rollback");
+  assert.equal(
+    underPressure.has(`pane:midnight:pane-v1-${(500).toString(16).padStart(64, "0")}`),
+    false,
+    "the oldest unpinned entry is evicted before a failed-send rollback",
+  );
+
+  const escapedProtected = new Map(Array.from({ length: 6 }, (_, index) => [
+    `pane:tron:pane-v1-${(index + 100).toString(16).padStart(64, "0")}`,
+    {
+      text: "\u0000".repeat(65_536),
+      selectionStart: 0,
+      selectionEnd: 0,
+      version: index + 1,
+      updatedAt: index + 1,
+    },
+  ]));
+  const protectedKeys = new Set(escapedProtected.keys());
+  const escapedJson = composerDraftJson(escapedProtected, protectedKeys);
+  assert.ok(escapedJson.length <= 512 * 1024, "persistent output must honor its hard cap");
+  assert.equal(escapedProtected.size, 6, "pinned rollback drafts stay available in memory");
+  assert.ok(composerDraftEntries(escapedJson).size < escapedProtected.size);
+
+  const onlineOrphan = `pane:midnight:pane-v1-${"c".repeat(64)}`;
+  const offlineOrphan = `pane:clue:pane-v1-${"d".repeat(64)}`;
+  const coldDrafts = new Map([
+    [first.key, drafts.get(first.key)],
+    [onlineOrphan, { text: "deleted while closed", version: 1, updatedAt: 1 }],
+    [offlineOrphan, { text: "offline owner", version: 1, updatedAt: 1 }],
+  ]);
+  assert.deepEqual(staleComposerDraftKeys(coldDrafts, [{
+    id: "midnight~%7", machine: "midnight", instance_id: first.key.split(":").at(-1),
+  }], [
+    { id: "midnight", online: true },
+    { id: "clue", online: false },
+  ]), [onlineOrphan]);
+
+  const tabAKey = `pane:tron:pane-v1-${"a".repeat(64)}`;
+  const tabBKey = `pane:midnight:pane-v1-${"b".repeat(64)}`;
+  const tabA = new Map([[tabAKey, {
+    text: "draft from tab A", selectionStart: 0, selectionEnd: 0, version: 1, updatedAt: 100,
+  }]]);
+  const tabBJson = composerDraftJson(new Map([[tabBKey, {
+    text: "draft from tab B", selectionStart: 0, selectionEnd: 0, version: 1, updatedAt: 101,
+  }]]));
+  const merged = mergeComposerDraftState(tabA, new Map(), tabBJson, 1_000);
+  assert.deepEqual([...merged.drafts.keys()], [tabAKey, tabBKey], "cross-tab writes merge per entry");
+  const deletedAt = 200;
+  merged.tombstones.set(tabAKey, { deletedAt });
+  merged.drafts.delete(tabAKey);
+  const deletedJson = composerDraftJson(merged.drafts, [], merged.tombstones);
+  assert.equal(composerDraftTombstones(deletedJson, 1_000).get(tabAKey)?.deletedAt, deletedAt);
+  assert.equal(composerDraftTombstones(deletedJson, 8 * 24 * 60 * 60 * 1_000).has(tabAKey), false);
+  const staleTabWrite = composerDraftJson(new Map([
+    [tabAKey, {
+      text: "stale resurrection", selectionStart: 0, selectionEnd: 0, version: 1, updatedAt: 100,
+    }],
+    [tabBKey, merged.drafts.get(tabBKey)],
+  ]));
+  const reconciled = mergeComposerDraftState(
+    composerDraftEntries(staleTabWrite),
+    new Map(),
+    deletedJson,
+    1_000,
+  );
+  assert.equal(reconciled.drafts.has(tabAKey), false, "a stale tab cannot resurrect a cleared draft");
+  assert.equal(reconciled.drafts.get(tabBKey)?.text, "draft from tab B");
 });
 
 test("conversation filtering happens before exec grouping and never counts hidden calls", () => {
@@ -701,6 +800,14 @@ test("image attachments retain their captured pane and encode bytes without corr
   assert.equal(attachmentDeliveryTarget("midnight~%7", "max~%2"), "midnight~%7");
   assert.equal(attachmentDeliveryTarget(null, "max~%2"), "max~%2");
   assert.equal(attachmentDeliveryTarget(null, null), null);
+  const first = `pane:midnight:pane-v1-${"a".repeat(64)}`;
+  const replacement = `pane:midnight:pane-v1-${"b".repeat(64)}`;
+  assert.equal(attachmentSelectionMatches("midnight~%7", first, "midnight~%7", first), true);
+  assert.equal(attachmentSelectionMatches("midnight~%7", first, "max~%2", replacement), false);
+  assert.equal(attachmentSelectionMatches("midnight~%7", first, "midnight~%7", replacement), false);
+  assert.equal(attachmentSelectionMatches(
+    "midnight~%7", "ephemeral:midnight~%7", "midnight~%7", "ephemeral:midnight~%7",
+  ), false);
   assert.equal(arrayBufferToBase64(Uint8Array.from([0, 1, 2, 253, 254, 255]).buffer), "AAEC/f7/");
 });
 
@@ -1187,8 +1294,13 @@ test("push-to-talk keeps the pane selected when recording began", () => {
   });
   assert.equal(dictationDelivery(null, "", "review this"), null);
   assert.equal(dictationDelivery("midnight~%7", "draft", "  "), null);
-  assert.equal(dictationPrefix("sending now", true, "sending now"), "");
-  assert.equal(dictationPrefix("new draft", true, "sending now"), "new draft");
+  assert.equal(dictationPrefix("sending now", true, "sending now", "pane:a", "pane:a"), "");
+  assert.equal(dictationPrefix("new draft", true, "sending now", "pane:a", "pane:a"), "new draft");
+  assert.equal(
+    dictationPrefix("sending now", true, "sending now", "pane:a", "pane:b"),
+    "sending now",
+    "equal text in another agent is still that agent's dictation prefix",
+  );
   assert.equal(composerSubmissionMatches("midnight~%7", "midnight~%7", "review this", "review this"), true);
   assert.equal(composerSubmissionMatches("midnight~%8", "midnight~%7", "review this", "review this"), false);
   assert.equal(composerSubmissionMatches("midnight~%7", "midnight~%7", "new draft", "review this"), false);
@@ -1769,7 +1881,7 @@ test("composer Send has a dedicated tap handler and stays disabled while sending
   const markup = readFileSync(new URL("./index.html", import.meta.url), "utf8");
   assert.match(markup, /<button id="send" class="primary" type="button">Send<\/button>/);
   assert.match(source, /\$\("send"\)\.addEventListener\("click", \(\) => \{ void sendComposerMessage\(\); \}\);/);
-  assert.match(source, /\$\("send"\)\.disabled = !controllable \|\| state\.composerSending \|\| resuming;/);
+  assert.match(source, /\$\("send"\)\.disabled = !controllable \|\| state\.composerSending \|\| resuming\s*\|\| \(state\.attachments\.length > 0 && !attachmentsMatchCurrentSelection\(\)\);/);
   assert.match(source, /state\.composerSending = true;/);
 });
 
