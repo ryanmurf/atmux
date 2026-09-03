@@ -885,7 +885,97 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(mobileSearch.activeAfterEscape, null, JSON.stringify(mobileSearch));
     await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
     await cdp.send("Emulation.setDeviceMetricsOverride", {
-      width: 1024, height: 768, deviceScaleFactor: 1, mobile: false,
+      width: 390, height: 844, deviceScaleFactor: 1, mobile: true,
+    });
+    const touchDrag = await cdp.evaluate(`(async () => {
+      const input = document.getElementById('launch-directory');
+      input.focus({ preventScroll: true });
+      input.value = 'mobile-search';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'h' }));
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const suggestions = document.getElementById('launch-directory-suggestions');
+      suggestions.scrollTop = 0;
+      const box = suggestions.getBoundingClientRect();
+      window.__folderTouchEvents = [];
+      for (const name of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'touchstart', 'touchmove', 'touchend', 'touchcancel']) {
+        suggestions.addEventListener(name, (event) => {
+          window.__folderTouchEvents.push([name, event.defaultPrevented]);
+        });
+      }
+      const x = Math.round(box.left + box.width / 2);
+      const visibleY = [];
+      for (let y = Math.max(0, Math.ceil(box.top) + 4); y < Math.min(innerHeight, Math.floor(box.bottom) - 4); y += 8) {
+        if (suggestions.contains(document.elementFromPoint(x, y))) visibleY.push(y);
+      }
+      return {
+        x,
+        startY: visibleY.at(-1) || 0,
+        endY: visibleY[0] || 0,
+        before: suggestions.scrollTop,
+        value: input.value,
+        selectedDirectory: input.dataset.selectedDirectory,
+        scrollHeight: suggestions.scrollHeight,
+        clientHeight: suggestions.clientHeight,
+        visiblePoints: visibleY.length,
+      };
+    })()`);
+    assert.ok(touchDrag.scrollHeight > touchDrag.clientHeight, JSON.stringify(touchDrag));
+    assert.ok(touchDrag.visiblePoints > 8, JSON.stringify(touchDrag));
+    await cdp.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [{ x: touchDrag.x, y: touchDrag.startY, radiusX: 4, radiusY: 4, force: 1 }],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    for (const y of [touchDrag.startY - 40, touchDrag.startY - 80, touchDrag.endY]) {
+      await cdp.send("Input.dispatchTouchEvent", {
+        type: "touchMove",
+        touchPoints: [{ x: touchDrag.x, y, radiusX: 4, radiusY: 4, force: 1 }],
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const touchDragResult = await cdp.evaluate(`(() => {
+      const input = document.getElementById('launch-directory');
+      const suggestions = document.getElementById('launch-directory-suggestions');
+      return {
+        scrollTop: suggestions.scrollTop,
+        value: input.value,
+        selectedDirectory: input.dataset.selectedDirectory,
+        expanded: input.getAttribute('aria-expanded'),
+        events: window.__folderTouchEvents,
+      };
+    })()`);
+    assert.ok(
+      touchDragResult.scrollTop > touchDrag.before,
+      JSON.stringify({ touchDrag, touchDragResult }),
+    );
+    assert.equal(touchDragResult.value, touchDrag.value, JSON.stringify(touchDragResult));
+    assert.equal(touchDragResult.selectedDirectory, touchDrag.selectedDirectory, JSON.stringify(touchDragResult));
+    assert.equal(touchDragResult.expanded, "true", JSON.stringify(touchDragResult));
+    assert.deepEqual(
+      touchDragResult.events.find(([name]) => name === "pointerdown"),
+      ["pointerdown", false],
+      JSON.stringify(touchDragResult),
+    );
+    assert.ok(
+      touchDragResult.events.some(([name]) => name === "pointermove"),
+      JSON.stringify(touchDragResult),
+    );
+    const clickSelection = await cdp.evaluate(`(async () => {
+      const input = document.getElementById('launch-directory');
+      input.value = 'mobile-search-1777';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: '7' }));
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      document.querySelector('#launch-directory-suggestions [role=option]').click();
+      return { value: input.value, selectedDirectory: input.dataset.selectedDirectory };
+    })()`);
+    assert.deepEqual(clickSelection, {
+      value: "/workspace/mobile-search-1777",
+      selectedDirectory: "/workspace/mobile-search-1777",
+    });
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: 1024, height: 768, deviceScaleFactor: 1, mobile: true,
     });
     const wideTouchSearch = await cdp.evaluate(`(async () => {
       const input = document.getElementById('launch-directory');
@@ -914,7 +1004,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       match: "/workspace/mobile-search-1888",
     });
     await cdp.send("Emulation.setDeviceMetricsOverride", {
-      width: 768, height: 1024, deviceScaleFactor: 1, mobile: false,
+      width: 768, height: 1024, deviceScaleFactor: 1, mobile: true,
     });
     assert.deepEqual(await cdp.evaluate(`({
       wideLayout: !matchMedia('(max-width: 720px)').matches,

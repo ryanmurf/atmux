@@ -258,8 +258,8 @@ dialog::backdrop { background: #000a; }
 .dialog-note { margin: 0; color: #e0975f; font-size: 12px; }
 .launch-directory-control { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
 .launch-directory-control button { min-height: 40px; }
-.launch-directory-suggestions:not([hidden]) { position: absolute; z-index: 20; top: 100%; right: 0; left: 0; max-height: min(300px, 38vh); display: grid; gap: 3px; padding: 5px; overflow-y: auto; overscroll-behavior: contain; border: 1px solid var(--line); border-radius: 8px; background: #0a1115; box-shadow: 0 12px 28px #000a; }
-.launch-directory-suggestion { min-width: 0; min-height: 40px; display: grid; gap: 2px; padding: 6px 9px; border: 1px solid transparent; border-radius: 6px; color: var(--text); background: transparent; text-align: left; cursor: pointer; }
+.launch-directory-suggestions:not([hidden]) { position: absolute; z-index: 20; top: 100%; right: 0; left: 0; max-height: min(300px, 38vh); display: grid; gap: 3px; padding: 5px; overflow-y: auto; overscroll-behavior: contain; touch-action: pan-y; border: 1px solid var(--line); border-radius: 8px; background: #0a1115; box-shadow: 0 12px 28px #000a; }
+.launch-directory-suggestion { min-width: 0; min-height: 40px; display: grid; gap: 2px; padding: 6px 9px; touch-action: pan-y; border: 1px solid transparent; border-radius: 6px; color: var(--text); background: transparent; text-align: left; cursor: pointer; }
 .launch-directory-suggestion:hover, .launch-directory-suggestion[aria-selected="true"] { border-color: var(--cyan); background: #12303a; }
 .launch-directory-suggestion strong, .launch-directory-suggestion small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .launch-directory-suggestion strong { color: var(--text); font-size: 12px; }

@@ -2075,6 +2075,8 @@ function initialize() {
     launchDirectoryCandidates: null,
     launchDirectoryActiveIndex: -1,
     launchDirectorySuggestionsDismissed: false,
+    launchDirectoryPointerGesture: null,
+    launchDirectorySuppressClick: null,
     paneError: null,
     panePointerDown: false,
     pendingPaneRender: false,
@@ -6100,12 +6102,45 @@ function initialize() {
       path.textContent = directory;
       button.append(label, path);
       button.addEventListener("pointerdown", (event) => {
+        state.launchDirectorySuppressClick = null;
         if (!["touch", "pen"].includes(event.pointerType)) return;
-        event.preventDefault();
+        state.launchDirectoryPointerGesture = {
+          pointerId: event.pointerId,
+          x: event.clientX,
+          y: event.clientY,
+          moved: false,
+        };
+      });
+      button.addEventListener("pointermove", (event) => {
+        const gesture = state.launchDirectoryPointerGesture;
+        if (!gesture || gesture.pointerId !== event.pointerId) return;
+        if (Math.hypot(event.clientX - gesture.x, event.clientY - gesture.y) >= 10) {
+          gesture.moved = true;
+        }
+      });
+      const finishPointerGesture = (event) => {
+        const gesture = state.launchDirectoryPointerGesture;
+        if (!gesture || gesture.pointerId !== event.pointerId) return;
+        state.launchDirectoryPointerGesture = null;
+        if (!gesture.moved) return;
+        const suppression = {};
+        state.launchDirectorySuppressClick = suppression;
+        setTimeout(() => {
+          if (state.launchDirectorySuppressClick === suppression) {
+            state.launchDirectorySuppressClick = null;
+          }
+        }, 250);
+      };
+      button.addEventListener("pointerup", finishPointerGesture);
+      button.addEventListener("pointercancel", finishPointerGesture);
+      button.addEventListener("click", (event) => {
+        if (state.launchDirectorySuppressClick) {
+          event.preventDefault();
+          state.launchDirectorySuppressClick = null;
+          return;
+        }
         selectLaunchDirectorySuggestion(directory);
       });
-      button.addEventListener("mousedown", (event) => event.preventDefault());
-      button.addEventListener("click", () => selectLaunchDirectorySuggestion(directory));
       return button;
     }));
     if (document.activeElement === $("launch-directory")
