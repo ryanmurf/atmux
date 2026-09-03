@@ -88,6 +88,9 @@ struct Recorder {
     /// Latency injected into pane reads, so a test can hold several callers
     /// inside one fetch window at the same time.
     pane_latency: Duration,
+    /// Simulates an owner discovering that a coordinator-cached pane
+    /// generation was replaced after the command was forwarded.
+    reject_generation_mutations: bool,
 }
 
 type Shared = Arc<Mutex<Recorder>>;
@@ -132,6 +135,13 @@ fn session(pane: &str, name: &str, status: &str, hash: &str) -> Value {
         "window_index": 0,
         "pane_index": 0,
         "content_hash": hash,
+    })
+}
+
+fn fixture_accepts_trainer_instance(body: &str) -> bool {
+    serde_json::from_str::<Value>(body).is_ok_and(|value| {
+        value.get("instance_id").and_then(Value::as_str)
+            == Some(format!("pane-v1-{}", "a".repeat(64)).as_str())
     })
 }
 
@@ -344,12 +354,26 @@ async fn messages(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    record(
-        &state,
-        &headers,
-        &format!("/api/v1/panes/{id}/messages"),
-        &body,
-    );
+    let reject = {
+        let mut recorder = state.lock().unwrap();
+        record_locked(
+            &mut recorder,
+            &headers,
+            &format!("/api/v1/panes/{id}/messages"),
+            &body,
+        );
+        recorder.reject_generation_mutations
+    };
+    if reject && fixture_accepts_trainer_instance(&body) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "owner-only-generation-detail" })),
+        )
+            .into_response();
+    }
+    if reject {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -359,12 +383,26 @@ async fn image_messages(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    record(
-        &state,
-        &headers,
-        &format!("/api/v1/panes/{id}/image-messages"),
-        &body,
-    );
+    let reject = {
+        let mut recorder = state.lock().unwrap();
+        record_locked(
+            &mut recorder,
+            &headers,
+            &format!("/api/v1/panes/{id}/image-messages"),
+            &body,
+        );
+        recorder.reject_generation_mutations
+    };
+    if reject && fixture_accepts_trainer_instance(&body) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "owner-only-generation-detail" })),
+        )
+            .into_response();
+    }
+    if reject {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -1792,4 +1830,89 @@ async fn the_http_surface_reports_an_upstream_rejection_as_a_gateway_failure() {
         StatusCode::NOT_FOUND,
         "a pane no machine reports is simply missing"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owner_generation_conflicts_remain_conflicts_through_a_coordinator() {
+    if !tmux_available("owner_generation_conflicts_remain_conflicts_through_a_coordinator") {
+        return;
+    }
+    let (address, recorder) = start_node().await;
+    let control = ControlPlane::start(federated_config(address))
+        .await
+        .unwrap();
+    assert!(wait_for_session(&control, "gpu-box~%7").await);
+    recorder.lock().unwrap().reject_generation_mutations = true;
+    let instance_id = format!("pane-v1-{}", "a".repeat(64));
+
+    let direct = control
+        .send_text_for_instance(
+            "gpu-box~%7",
+            "direct conflict".to_owned(),
+            true,
+            Some(instance_id.clone()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_kind(&direct), ErrorKind::Conflict);
+    assert!(
+        !direct.to_string().contains("owner-only-generation-detail"),
+        "owner response detail escaped through the coordinator: {direct:#}"
+    );
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let app = atmux::web::api_router(control, Vec::new(), shutdown_rx);
+    let cases = [
+        (
+            "/api/v1/panes/gpu-box~%257/messages",
+            json!({
+                "text": "HTTP text conflict",
+                "submit": true,
+                "instance_id": instance_id,
+            }),
+        ),
+        (
+            "/api/v1/panes/gpu-box~%257/image-messages",
+            json!({
+                "text": "HTTP image conflict",
+                "images": [{ "media_type": "image/png", "data": "iVBORw0KGgo=" }],
+                "instance_id": instance_id,
+            }),
+        ),
+    ];
+    for (uri, body) in cases {
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{uri}");
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            !body
+                .windows("owner-only-generation-detail".len())
+                .any(|window| window == b"owner-only-generation-detail"),
+            "owner response detail escaped through {uri}"
+        );
+    }
+
+    let seen = recorder.lock().unwrap();
+    let rejected = seen
+        .bodies
+        .iter()
+        .filter_map(|body| serde_json::from_str::<Value>(body).ok())
+        .filter(|body| {
+            body.get("instance_id").and_then(Value::as_str) == Some(instance_id.as_str())
+        })
+        .count();
+    assert!(rejected >= 3, "forwarded bodies: {:#?}", seen.bodies);
 }

@@ -134,11 +134,18 @@ fn upstream(error: &anyhow::Error) -> anyhow::Error {
     ControlError::new(ErrorKind::Upstream, format!("{error:#}")).into()
 }
 
-fn remote_workspace_error(error: &anyhow::Error) -> anyhow::Error {
+/// Preserves safe owner-side mutation classifications without reflecting the
+/// owner's response body through a coordinator.
+fn remote_mutation_error(error: &anyhow::Error) -> anyhow::Error {
     match remote::rejected_status(error) {
-        Some(400) => bad_request(error.to_string()),
-        Some(404) => not_found(error.to_string()),
-        Some(409) => conflict(error.to_string()),
+        Some(400) => bad_request("owning machine rejected the mutation as invalid"),
+        Some(404) => not_found("owning machine no longer has the requested resource"),
+        Some(409) => conflict("owning machine reports that the target changed"),
+        Some(status) => ControlError::new(
+            ErrorKind::Upstream,
+            format!("owning machine rejected the mutation with HTTP {status}"),
+        )
+        .into(),
         _ => upstream(error),
     }
 }
@@ -730,6 +737,9 @@ struct Inner {
     deny_local_claude_resume: bool,
     #[cfg(test)]
     local_claude_resume_attempts: AtomicU64,
+    /// Synthetic live pane generations for owner-local message race tests.
+    #[cfg(test)]
+    test_message_live_instances: Mutex<HashMap<String, Option<String>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -863,6 +873,8 @@ impl ControlPlane {
                 deny_local_claude_resume: false,
                 #[cfg(test)]
                 local_claude_resume_attempts: AtomicU64::new(0),
+                #[cfg(test)]
+                test_message_live_instances: Mutex::new(HashMap::new()),
             }),
         };
         if !control.inner.config.node.coordinator_only {
@@ -2150,7 +2162,7 @@ impl ControlPlane {
                 let response: FilesResponse = machine
                     .put_json_response(&route, &request)
                     .await
-                    .map_err(|error| remote_workspace_error(&error))?;
+                    .map_err(|error| remote_mutation_error(&error))?;
                 Ok(Some(
                     response.with_pane_id(composite_id(&machine.id, &pane_id)),
                 ))
@@ -2395,6 +2407,43 @@ impl ControlPlane {
         lock
     }
 
+    #[cfg(not(test))]
+    #[allow(clippy::unused_self)] // Test builds consult the owner-live race seam below.
+    fn validate_live_message_instance(&self, pane_id: &str, expected: Option<&str>) -> Result<()> {
+        validate_live_pane_instance(pane_id, expected)
+    }
+
+    #[cfg(test)]
+    fn validate_live_message_instance(&self, pane_id: &str, expected: Option<&str>) -> Result<()> {
+        if let Some(live) = self
+            .inner
+            .test_message_live_instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(pane_id)
+            .cloned()
+        {
+            return live.map_or_else(
+                || Err(conflict("agent pane disappeared before message delivery")),
+                |instance| validate_expected_pane_instance(expected, &instance),
+            );
+        }
+        validate_live_pane_instance(pane_id, expected)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_message_live_instance(
+        &self,
+        pane_id: &str,
+        instance_id: Option<String>,
+    ) {
+        self.inner
+            .test_message_live_instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(pane_id.to_owned(), instance_id);
+    }
+
     fn cached_output(&self, composite: &str, expected_hash: &str) -> Option<CachedOutput> {
         self.inner
             .outputs
@@ -2581,7 +2630,7 @@ impl ControlPlane {
             return remote
                 .post_json_response("/api/v1/launch-directories/folders", &forwarded)
                 .await
-                .map_err(|error| remote_workspace_error(&error));
+                .map_err(|error| remote_mutation_error(&error));
         }
 
         self.ensure_local_owner_enabled()?;
@@ -2622,7 +2671,7 @@ impl ControlPlane {
                     Duration::from_secs(10 * 60 + 30),
                 )
                 .await
-                .map_err(|error| remote_workspace_error(&error));
+                .map_err(|error| remote_mutation_error(&error));
         }
 
         self.ensure_local_owner_enabled()?;
@@ -2754,17 +2803,24 @@ impl ControlPlane {
                 validate_expected_pane_instance(expected_instance_id.as_deref(), &instance_id)?;
                 let prompt_lock = self.prompt_lock(&pane_id);
                 let expected_instance_id = expected_instance_id.clone();
-                local_tmux(
+                let live_control = self.clone();
+                local_message_mutation(
                     tokio::task::spawn_blocking(move || {
                         let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
                         let mut guard = prompt_lock
                             .state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        validate_live_pane_instance(&pane_id, expected_instance_id.as_deref())?;
+                        live_control.validate_live_message_instance(
+                            &pane_id,
+                            expected_instance_id.as_deref(),
+                        )?;
                         begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
                         Tmux::send_text_checked(&pane_id, &text, submit, || {
-                            validate_live_pane_instance(&pane_id, expected_instance_id.as_deref())
+                            live_control.validate_live_message_instance(
+                                &pane_id,
+                                expected_instance_id.as_deref(),
+                            )
                         })?;
                         Ok(())
                     })
@@ -2790,7 +2846,7 @@ impl ControlPlane {
                         &request,
                     )
                     .await
-                    .map_err(|error| upstream(&error))?;
+                    .map_err(|error| remote_mutation_error(&error))?;
             }
         }
         Ok(())
@@ -3008,25 +3064,27 @@ impl ControlPlane {
                 }
                 let prompt_lock = self.prompt_lock(&pane_id);
                 let expected_instance_id = expected_instance_id.clone();
-                let delivered = tokio::task::spawn_blocking(move || -> Result<_> {
-                    let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
-                    let mut guard = prompt_lock
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    validate_live_pane_instance(&pane_id, expected_instance_id.as_deref())?;
-                    begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
-                    Ok(attachment::deliver(
-                        &pane_id,
-                        request,
-                        agent == AgentKind::Claude,
-                    ))
-                })
-                .await
-                .map_err(|error| {
-                    internal(&anyhow::Error::new(error).context("an attachment task panicked"))
-                })?
-                .map_err(|error| internal(&error))?;
+                let live_control = self.clone();
+                let delivered = local_message_mutation(
+                    tokio::task::spawn_blocking(move || -> Result<_> {
+                        let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
+                        let mut guard = prompt_lock
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        live_control.validate_live_message_instance(
+                            &pane_id,
+                            expected_instance_id.as_deref(),
+                        )?;
+                        begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
+                        Ok(attachment::deliver(
+                            &pane_id,
+                            request,
+                            agent == AgentKind::Claude,
+                        ))
+                    })
+                    .await,
+                )?;
                 match delivered {
                     Ok(()) => {}
                     Err(error) if error.kind() == DeliveryErrorKind::Invalid => {
@@ -3058,7 +3116,7 @@ impl ControlPlane {
                         &request,
                     )
                     .await
-                    .map_err(|error| upstream(&error))?;
+                    .map_err(|error| remote_mutation_error(&error))?;
             }
         }
         Ok(())
@@ -4009,6 +4067,21 @@ fn local_tmux(joined: std::result::Result<Result<()>, tokio::task::JoinError>) -
     }
 }
 
+/// Classifies a blocking message mutation while preserving an intentional
+/// caller-visible conflict from its owner-local generation checks.
+fn local_message_mutation<T>(
+    joined: std::result::Result<Result<T>, tokio::task::JoinError>,
+) -> Result<T> {
+    match joined {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) if error_kind(&error) != ErrorKind::Internal => Err(error),
+        Ok(Err(error)) => Err(internal(&error)),
+        Err(error) => Err(internal(
+            &anyhow::Error::new(error).context("a message mutation task panicked"),
+        )),
+    }
+}
+
 fn local_model_switch(
     joined: std::result::Result<Result<()>, tokio::task::JoinError>,
 ) -> Result<()> {
@@ -4682,6 +4755,7 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
             recovery: RecoveryRunner::production(&local_id),
             deny_local_claude_resume: true,
             local_claude_resume_attempts: AtomicU64::new(0),
+            test_message_live_instances: Mutex::new(HashMap::new()),
         }),
     }
 }
@@ -5881,6 +5955,17 @@ mod tests {
         assert_eq!(error_kind(&recycled), ErrorKind::Conflict);
         let malformed = validate_expected_pane_instance(Some("%7"), &current).unwrap_err();
         assert_eq!(error_kind(&malformed), ErrorKind::BadRequest);
+    }
+
+    #[test]
+    fn message_task_preserves_generation_conflicts_but_not_raw_tmux_failures() {
+        let changed = local_message_mutation::<()>(Ok(Err(conflict("pane changed"))))
+            .expect_err("a changed pane must fail");
+        assert_eq!(error_kind(&changed), ErrorKind::Conflict);
+
+        let tmux = local_message_mutation::<()>(Ok(Err(anyhow::anyhow!("tmux paste failed"))))
+            .expect_err("a tmux failure must fail");
+        assert_eq!(error_kind(&tmux), ErrorKind::Internal);
     }
 
     #[tokio::test]

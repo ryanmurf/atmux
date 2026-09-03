@@ -2642,8 +2642,13 @@ mod tests {
     async fn message_routes_reject_a_recycled_pane_generation_before_delivery() {
         let control = crate::control::test_control(&[]);
         let mut replacement = crate::control::test_session("agent", "%4294967295", "replacement");
-        replacement.pane_identity = format!("pane-v1-{}", "b".repeat(64));
+        let current_instance = format!("pane-v1-{}", "b".repeat(64));
+        replacement.pane_identity.clone_from(&current_instance);
         control.apply_refresh(vec![replacement]);
+        control.test_set_message_live_instance(
+            "%4294967295",
+            Some(format!("pane-v1-{}", "c".repeat(64))),
+        );
         let (app, _shutdown) = real_app(control);
         let stale_instance = format!("pane-v1-{}", "a".repeat(64));
 
@@ -2676,6 +2681,46 @@ mod tests {
                 "POST",
                 "/api/v1/panes/%254294967295/image-messages",
                 Some(&image),
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+
+        // The cached generation matches, but the owner-live seam reports a
+        // same-id replacement. The blocking check must retain its Conflict
+        // classification rather than becoming a local 500.
+        let live_race_message = serde_json::json!({
+            "text": "must not reach a replacement pane",
+            "submit": true,
+            "instance_id": current_instance,
+        })
+        .to_string();
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/%254294967295/messages",
+                Some(&live_race_message),
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+
+        let live_race_image = serde_json::json!({
+            "text": "must not reach a replacement pane",
+            "images": [{
+                "media_type": "image/png",
+                "data": "iVBORw0KGgo=",
+            }],
+            "instance_id": current_instance,
+        })
+        .to_string();
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/%254294967295/image-messages",
+                Some(&live_race_image),
             )
             .await,
             StatusCode::CONFLICT
