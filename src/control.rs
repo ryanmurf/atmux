@@ -179,6 +179,11 @@ const REMOTE_FETCH_LINES: usize = 2_000;
 pub struct SessionSummary {
     /// Stable composite identity: `machine~pane`.
     pub id: String,
+    /// Opaque owner-issued pane generation used to scope browser-local state.
+    ///
+    /// Unlike a tmux pane id, this changes when a deleted pane id is reused.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instance_id: String,
     /// Machine that owns this session.
     #[serde(default)]
     pub machine: String,
@@ -213,6 +218,7 @@ impl SessionSummary {
     fn from_local(machine: &str, id: String, session: &Session) -> Self {
         Self {
             id,
+            instance_id: session.pane_identity.clone(),
             machine: machine.to_owned(),
             name: session.name.clone(),
             pane_id: session.pane_id.clone(),
@@ -4003,6 +4009,7 @@ fn observable_sessions_equal(previous: &[Session], current: &[Session]) -> bool 
 fn observable_session_equal(left: &Session, right: &Session) -> bool {
     left.name == right.name
         && left.pane_id == right.pane_id
+        && left.pane_identity == right.pane_identity
         && left.status == right.status
         && left.agent == right.agent
         && left.attached == right.attached
@@ -4642,6 +4649,7 @@ mod tests {
     fn summary(id: &str, status: &str) -> SessionSummary {
         SessionSummary {
             id: composite_id(LOCAL_MACHINE_ID, id),
+            instance_id: String::new(),
             machine: LOCAL_MACHINE_ID.to_owned(),
             name: format!("session-{id}"),
             pane_id: id.to_owned(),
@@ -4746,13 +4754,20 @@ mod tests {
             "atmux-tmux-spawn-1-2-0123456789abcdef.scope"
         );
         assert_eq!(json["memory_max_bytes"], 34_359_738_368_u64);
+        assert_eq!(json["instance_id"], format!("pane-v1-{}", "a".repeat(64)));
 
         let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("instance_id");
         legacy.as_object_mut().unwrap().remove("systemd_scope");
         legacy.as_object_mut().unwrap().remove("memory_max_bytes");
         let decoded: SessionSummary = serde_json::from_value(legacy).unwrap();
         assert_eq!(decoded.systemd_scope, None);
         assert_eq!(decoded.memory_max_bytes, None);
+        assert!(decoded.instance_id.is_empty());
+
+        let mut replacement = managed.clone();
+        replacement.pane_identity = format!("pane-v1-{}", "b".repeat(64));
+        assert!(!observable_session_equal(&managed, &replacement));
     }
 
     fn local_control() -> ControlPlane {
@@ -4818,6 +4833,7 @@ mod tests {
     fn remote_summary(machine: &str, pane: &str, name: &str, hash: &str) -> SessionSummary {
         SessionSummary {
             id: composite_id(machine, pane),
+            instance_id: String::new(),
             machine: machine.to_owned(),
             name: name.to_owned(),
             pane_id: pane.to_owned(),

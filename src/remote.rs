@@ -1089,6 +1089,7 @@ mod tests {
     fn summary(machine: &str, pane: &str, name: &str) -> SessionSummary {
         SessionSummary {
             id: format!("{machine}~{pane}"),
+            instance_id: String::new(),
             machine: machine.to_owned(),
             name: name.to_owned(),
             pane_id: pane.to_owned(),

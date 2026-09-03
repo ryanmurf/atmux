@@ -551,6 +551,7 @@ mod tests {
 
         let session = |machine: &str, pane: &str, name: &str| SessionSummary {
             id: format!("{machine}~{pane}"),
+            instance_id: String::new(),
             machine: machine.to_owned(),
             name: name.to_owned(),
             pane_id: pane.to_owned(),
@@ -680,6 +681,7 @@ mod tests {
             "gpu-box",
             vec![crate::control::SessionSummary {
                 id: "gpu-box~%4".to_owned(),
+                instance_id: String::new(),
                 machine: "gpu-box".to_owned(),
                 name: "trainer".to_owned(),
                 pane_id: "%4".to_owned(),

@@ -34,6 +34,8 @@ let delayGitDiffPane = null;
 let nextFileSaveConflict = false;
 const fileSaveRequests = [];
 const messageRequests = [];
+let nextMessageFailurePane = null;
+let messageResponseDelayMs = 0;
 const projectFileContents = new Map();
 const projectFileVersions = new Map();
 const LONG_KERNEL_VERSION = "k".repeat(160);
@@ -56,8 +58,12 @@ function fixtureProjectHash(paneId) {
 }
 
 function mockSession(machine, pane, name, status, extra = {}) {
+  const digit = [...`${machine}:${pane}`]
+    .reduce((sum, character) => sum + character.charCodeAt(0), 0)
+    .toString(16).at(-1);
   return {
     id: `${machine}~${pane}`, pane_id: pane, machine, name, status,
+    instance_id: `pane-v1-${digit.repeat(64)}`,
     agent: "claude", profile: "max", path: "/workspace", command: "claude",
     ...extra,
   };
@@ -100,6 +106,7 @@ function mockApi(url, response, request) {
       revision: overviewRevision,
       sessions: [{
         id: "tron~%100", pane_id: "%100", machine: "tron", name: "codex-main",
+        instance_id: `pane-v1-${"1".repeat(64)}`,
         status: "waiting", agent: "codex", profile: "codex-max", path: "/workspace", command: "codex",
       },
       mockSession("midnight", "%5", "alpha-planner", "working"),
@@ -233,10 +240,21 @@ function mockApi(url, response, request) {
     return true;
   }
   if (/^\/api\/v1\/panes\/[^/]+\/messages$/.test(pathname) && request.method === "POST") {
+    const paneId = decodeURIComponent(pathname.split("/")[4]);
     let body = "";
     request.setEncoding("utf8");
     request.on("data", (chunk) => { body += chunk; });
-    request.on("end", () => { messageRequests.push(body); json(response, {}); });
+    request.on("end", () => {
+      messageRequests.push({ paneId, body });
+      const reply = () => {
+        if (nextMessageFailurePane === paneId) {
+          nextMessageFailurePane = null;
+          errorJson(response, 503, "message fixture rejected the send");
+        } else json(response, {});
+      };
+      if (messageResponseDelayMs > 0) setTimeout(reply, messageResponseDelayMs);
+      else reply();
+    });
     return true;
   }
   if (/^\/api\/v1\/panes\/[^/]+\/models$/.test(pathname)) {
@@ -705,6 +723,8 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
   projectFileVersions.clear();
   delayFileSavePane = null;
   nextFileSaveConflict = false;
+  nextMessageFailurePane = null;
+  messageResponseDelayMs = 0;
   failLiveModels = false;
   launchOptionsDelayMs = 0;
   launchResponseDelayMs = 0;
@@ -774,6 +794,151 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(mobile.branchVisible, true, JSON.stringify(mobile));
     assert.equal(mobile.branch, "Git · feature/tron~%100/<script>alert(1)</script>");
     assert.equal(mobile.overflowX, 0, JSON.stringify(mobile));
+
+    const hostileDraft = `<img src=x onerror=alert(1)>\n<script>window.draftLeaked=true</script>`;
+    const switchedDrafts = await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      const shellTopBefore = document.querySelector('.terminal-shell').getBoundingClientRect().top;
+      input.focus({ preventScroll: true });
+      input.value = ${JSON.stringify(hostileDraft)};
+      input.setSelectionRange(5, 17);
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'x' }));
+      input.blur();
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      const blankOnB = input.value;
+      const focusOnB = document.activeElement.id;
+      input.value = 'beta agent private draft';
+      input.setSelectionRange(4, 10);
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 't' }));
+      document.querySelector('[data-session-id="tron~%100"]').click();
+      return {
+        blankOnB,
+        focusOnB,
+        restoredA: input.value,
+        selectionStart: input.selectionStart,
+        selectionEnd: input.selectionEnd,
+        injectedNode: Boolean(document.querySelector('[src="x"]')),
+        injectedScriptRan: window.draftLeaked === true,
+        shellTopBefore,
+        shellTop: document.querySelector('.terminal-shell').getBoundingClientRect().top,
+      };
+    })()`);
+    assert.equal(switchedDrafts.blankOnB, "", JSON.stringify(switchedDrafts));
+    assert.notEqual(switchedDrafts.focusOnB, "message", JSON.stringify(switchedDrafts));
+    assert.equal(switchedDrafts.restoredA, hostileDraft, JSON.stringify(switchedDrafts));
+    assert.equal(switchedDrafts.selectionStart, 5, JSON.stringify(switchedDrafts));
+    assert.equal(switchedDrafts.selectionEnd, 17, JSON.stringify(switchedDrafts));
+    assert.equal(switchedDrafts.injectedNode, false, JSON.stringify(switchedDrafts));
+    assert.equal(switchedDrafts.injectedScriptRan, false, JSON.stringify(switchedDrafts));
+    assert.equal(switchedDrafts.shellTop, switchedDrafts.shellTopBefore, JSON.stringify(switchedDrafts));
+
+    await cdp.evaluate("document.getElementById('launch-open').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('launch-dialog').open"),
+      "new-agent dialog did not open over the pane draft",
+    );
+    assert.equal(await cdp.evaluate("document.getElementById('message').value"), hostileDraft);
+    await cdp.evaluate("document.querySelector('#launch-dialog .dialog-cancel').click(); true");
+    await waitFor(
+      () => cdp.evaluate("!document.getElementById('launch-dialog').open"),
+      "new-agent dialog did not close",
+    );
+    assert.equal(await cdp.evaluate("document.getElementById('message').value"), hostileDraft);
+
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    await cdp.evaluate("window.__atmuxBeforeDraftReload = true");
+    await cdp.send("Page.reload", { ignoreCache: true });
+    await waitFor(
+      () => cdp.evaluate(`window.__atmuxBeforeDraftReload !== true
+        && document.readyState === 'complete'
+        && !document.getElementById('agent-view').hidden
+        && document.getElementById('message').value === ${JSON.stringify(hostileDraft)}`),
+      "the selected agent draft did not survive a mobile refresh",
+    );
+    const refreshedDraft = await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      return {
+        value: input.value,
+        selectionStart: input.selectionStart,
+        selectionEnd: input.selectionEnd,
+        focused: document.activeElement === input,
+        shellTop: document.querySelector('.terminal-shell').getBoundingClientRect().top,
+      };
+    })()`);
+    assert.equal(refreshedDraft.value, hostileDraft, JSON.stringify(refreshedDraft));
+    assert.equal(refreshedDraft.selectionStart, 5, JSON.stringify(refreshedDraft));
+    assert.equal(refreshedDraft.selectionEnd, 17, JSON.stringify(refreshedDraft));
+    assert.equal(refreshedDraft.focused, false, JSON.stringify(refreshedDraft));
+    assert.equal(refreshedDraft.shellTop, switchedDrafts.shellTopBefore, JSON.stringify(refreshedDraft));
+
+    messageResponseDelayMs = 250;
+    const messagesBeforeDraftSubmit = messageRequests.length;
+    await cdp.evaluate(`(() => {
+      document.getElementById('send').click();
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+    })()`);
+    await waitFor(
+      () => messageRequests.length === messagesBeforeDraftSubmit + 1,
+      "the first agent draft was not submitted",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    messageResponseDelayMs = 0;
+    assert.equal(await cdp.evaluate("document.getElementById('message').value"), "beta agent private draft");
+    assert.deepEqual(messageRequests.at(-1), {
+      paneId: "tron~%100",
+      body: JSON.stringify({ text: hostileDraft, submit: true }),
+    });
+    assert.equal(await cdp.evaluate(`(() => {
+      document.querySelector('[data-session-id="tron~%100"]').click();
+      return document.getElementById('message').value;
+    })()`), "");
+    assert.deepEqual(await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.value = 'new draft after a successful send';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'd' }));
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      const b = input.value;
+      document.querySelector('[data-session-id="tron~%100"]').click();
+      const restoredA = input.value;
+      input.value = '';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: null }));
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      return { b, restoredA };
+    })()`), {
+      b: "beta agent private draft",
+      restoredA: "new draft after a successful send",
+    });
+
+    nextMessageFailurePane = "midnight~%5";
+    await cdp.evaluate(`(() => {
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      document.getElementById('send').click();
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('toast').textContent.includes('rejected the send')"),
+      "the failed-send fixture did not reach the composer",
+    );
+    assert.equal(await cdp.evaluate("document.getElementById('message').value"), "beta agent private draft");
+    assert.deepEqual(await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      document.querySelector('[data-session-id="tron~%100"]').click();
+      const a = input.value;
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      return { a, b: input.value };
+    })()`), { a: "", b: "beta agent private draft" });
+
+    emitOverviewPatch([
+      mockSession("midnight", "%5", "alpha-planner", "working", {
+        instance_id: `pane-v1-${"e".repeat(64)}`,
+      }),
+    ], ["midnight~%5"]);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('message').value === ''"),
+      "a recreated pane id inherited the deleted agent's draft",
+    );
+    assert.equal(await cdp.evaluate(`JSON.parse(
+      localStorage.getItem('atmux.composer-drafts.v1')
+    ).drafts.length`), 0, "deleted pane draft remained in browser storage");
 
     // The first launch option is online but cannot launch. The federated
     // `tron~pane` owner remains the contextual target and Home/local cannot be

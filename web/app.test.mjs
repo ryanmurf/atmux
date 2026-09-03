@@ -21,6 +21,10 @@ const {
   applyPanePatch,
   classifyOverviewUpdate,
   composerEnterAction,
+  composerDraftCanClear,
+  composerDraftEntries,
+  composerDraftIdentity,
+  composerDraftJson,
   composerSubmissionCanRestore,
   composerSubmissionMatches,
   contentToLines,
@@ -357,6 +361,59 @@ test("browser storage access is centralized behind fail-open initialization help
   assert.match(source, /const writeLocalStorage = \(key, value\) => \{\s*try \{\s*localStorage\.setItem\(key, value\);\s*return true;\s*\} catch \{\s*return false;\s*\}\s*\};/s);
   assert.match(source, /setRailCollapsed\(state\.railCollapsed\)/);
   assert.match(source, /writeLocalStorage\("atmux\.rail-collapsed"/);
+});
+
+test("composer drafts use pane generations, bounded storage, and plain hostile text", () => {
+  const first = composerDraftIdentity({
+    id: "midnight~%7", machine: "midnight",
+    instance_id: `pane-v1-${"a".repeat(64)}`,
+  });
+  const replacement = composerDraftIdentity({
+    id: "midnight~%7", machine: "midnight",
+    instance_id: `pane-v1-${"b".repeat(64)}`,
+  });
+  assert.equal(first.persistent, true);
+  assert.notEqual(first.key, replacement.key);
+  assert.deepEqual(composerDraftIdentity({ id: "midnight~%7", machine: "midnight" }), {
+    key: "ephemeral:midnight~%7", persistent: false,
+  });
+
+  const hostile = `<img src=x onerror=alert(1)>\n<script>alert("draft")</script>`;
+  const drafts = new Map([[first.key, {
+    text: hostile, selectionStart: 4, selectionEnd: 12, version: 9, updatedAt: 20,
+  }]]);
+  const encoded = composerDraftJson(drafts);
+  const restored = composerDraftEntries(encoded).get(first.key);
+  assert.equal(restored.text, hostile);
+  assert.equal(restored.selectionStart, 4);
+  assert.equal(restored.selectionEnd, 12);
+  assert.equal(composerDraftCanClear(restored, { message: hostile, draftVersion: 9 }), true);
+  assert.equal(composerDraftCanClear(restored, { message: hostile, draftVersion: 10 }), false);
+  assert.equal(composerDraftCanClear(restored, { message: "different", draftVersion: 9 }), false);
+
+  const oversized = JSON.stringify({
+    version: 1,
+    drafts: [{ key: first.key, text: "x".repeat(65_537), version: 1, updatedAt: 1 }],
+  });
+  assert.equal(composerDraftEntries(oversized).size, 0);
+  assert.equal(composerDraftEntries("not json").size, 0);
+  assert.equal(composerDraftEntries(JSON.stringify({ version: 1, drafts: [
+    { key: "__proto__", text: "nope", version: 1, updatedAt: 1 },
+  ] })).size, 0);
+
+  const many = new Map(Array.from({ length: 64 }, (_, index) => [
+    `pane:tron:pane-v1-${index.toString(16).padStart(64, "0")}`,
+    {
+      text: `${index}:${"x".repeat(32_000)}`,
+      selectionStart: 0,
+      selectionEnd: 0,
+      version: index + 1,
+      updatedAt: index + 1,
+    },
+  ]));
+  const bounded = composerDraftJson(many);
+  assert.ok(bounded.length <= 512 * 1024);
+  assert.ok(composerDraftEntries(bounded).size < many.size);
 });
 
 test("conversation filtering happens before exec grouping and never counts hidden calls", () => {

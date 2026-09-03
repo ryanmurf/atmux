@@ -37,6 +37,11 @@ const BENIGN_COORDINATION_STATUSES = new Set([
 const LAUNCH_DIRECTORY_STORAGE_KEY = "atmux.launch-directories";
 const FILE_READER_STORAGE_KEY = "atmux.file-reader-preferences";
 const CONVERSATION_VISIBILITY_STORAGE_KEY = "atmux.conversation-visibility";
+const COMPOSER_DRAFT_STORAGE_KEY = "atmux.composer-drafts.v1";
+const MAX_COMPOSER_DRAFT_ENTRIES = 64;
+const MAX_COMPOSER_DRAFT_STORAGE_CHARS = 512 * 1024;
+const MAX_COMPOSER_DRAFT_TEXT_CHARS = 65_536;
+const PANE_INSTANCE_PATTERN = /^pane-v1-[a-f0-9]{64}$/;
 const FILE_READER_SIZES = new Set(["small", "medium", "large"]);
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg"]);
 const COMPOSITE_SEPARATOR = "~";
@@ -267,6 +272,79 @@ function parseCompositeId(id) {
 
 function sessionMachineId(session, localMachineId = "local") {
   return session.machine || parseCompositeId(session.id).machine || localMachineId;
+}
+
+/// Returns an incarnation-safe identity for browser-local composer state.
+/// Old owners without `instance_id` still get same-page isolation, but their
+/// recyclable pane ids are deliberately never written to persistent storage.
+function composerDraftIdentity(session, localMachineId = "local") {
+  if (!session || typeof session.id !== "string" || !session.id) return null;
+  const instanceId = typeof session.instance_id === "string" ? session.instance_id : "";
+  if (PANE_INSTANCE_PATTERN.test(instanceId)) {
+    return {
+      key: `pane:${encodeURIComponent(sessionMachineId(session, localMachineId))}:${instanceId}`,
+      persistent: true,
+    };
+  }
+  return { key: `ephemeral:${session.id}`, persistent: false };
+}
+
+function normalizedComposerDraft(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)
+      || typeof entry.text !== "string" || !entry.text
+      || entry.text.length > MAX_COMPOSER_DRAFT_TEXT_CHARS) return null;
+  const selectionStart = Number.isSafeInteger(entry.selectionStart)
+    ? Math.max(0, Math.min(entry.text.length, entry.selectionStart)) : entry.text.length;
+  const selectionEnd = Number.isSafeInteger(entry.selectionEnd)
+    ? Math.max(selectionStart, Math.min(entry.text.length, entry.selectionEnd)) : selectionStart;
+  return {
+    text: entry.text,
+    selectionStart,
+    selectionEnd,
+    version: Number.isSafeInteger(entry.version) && entry.version > 0 ? entry.version : 1,
+    updatedAt: Number.isSafeInteger(entry.updatedAt) && entry.updatedAt > 0 ? entry.updatedAt : 1,
+  };
+}
+
+/// Parses a bounded array representation instead of an object keyed by
+/// attacker-controlled strings. Draft text remains plain textarea data.
+function composerDraftEntries(value) {
+  const drafts = new Map();
+  let parsed = value;
+  if (typeof value === "string") {
+    if (value.length > MAX_COMPOSER_DRAFT_STORAGE_CHARS) return drafts;
+    try { parsed = JSON.parse(value); } catch { return drafts; }
+  }
+  if (!parsed || typeof parsed !== "object" || parsed.version !== 1
+      || !Array.isArray(parsed.drafts)) return drafts;
+  for (const item of parsed.drafts.slice(0, MAX_COMPOSER_DRAFT_ENTRIES)) {
+    if (!item || typeof item.key !== "string" || item.key.length > 192
+        || !/^pane:[A-Za-z0-9_.%~-]{1,192}:pane-v1-[a-f0-9]{64}$/.test(item.key)) continue;
+    const draft = normalizedComposerDraft(item);
+    if (draft) drafts.set(item.key, draft);
+  }
+  return drafts;
+}
+
+function composerDraftJson(value) {
+  const candidates = [...(value instanceof Map ? value : new Map())]
+    .filter(([key, draft]) => typeof key === "string" && key.startsWith("pane:")
+      && normalizedComposerDraft(draft))
+    .map(([key, draft]) => ({ key, ...normalizedComposerDraft(draft) }))
+    .sort((left, right) => right.updatedAt - left.updatedAt)
+    .slice(0, MAX_COMPOSER_DRAFT_ENTRIES);
+  while (candidates.length) {
+    const encoded = JSON.stringify({ version: 1, drafts: candidates });
+    if (encoded.length <= MAX_COMPOSER_DRAFT_STORAGE_CHARS) return encoded;
+    candidates.pop();
+  }
+  return JSON.stringify({ version: 1, drafts: [] });
+}
+
+function composerDraftCanClear(draft, submission) {
+  return Boolean(draft && submission)
+    && draft.version === submission.draftVersion
+    && draft.text === submission.message;
 }
 
 /// A launch needs both an owner-configured profile and a project root. The
@@ -1884,6 +1962,10 @@ if (typeof module !== "undefined" && module.exports) {
     classifyOverviewUpdate,
     compareSessions,
     composerEnterAction,
+    composerDraftCanClear,
+    composerDraftEntries,
+    composerDraftIdentity,
+    composerDraftJson,
     composerSubmissionCanRestore,
     composerSubmissionMatches,
     contentToLines,
@@ -2044,6 +2126,9 @@ function initialize() {
   const storedConversationVisibility = loadConversationVisibilityPreferences(
     () => readLocalStorage(CONVERSATION_VISIBILITY_STORAGE_KEY),
   );
+  const storedComposerDrafts = composerDraftEntries(
+    readLocalStorage(COMPOSER_DRAFT_STORAGE_KEY),
+  );
   const requestedPulseAccount = pulseAccountId(pageUrl.searchParams.get("pulseAccount"));
   const state = {
     revision: 0,
@@ -2105,6 +2190,14 @@ function initialize() {
     fileReaderPreferences: storedFileReaderPreferences,
     messageHistory: new Map(),
     messageHistoryNavigation: null,
+    composerDrafts: storedComposerDrafts,
+    composerDraftIdentity: null,
+    composerDraftSequence: Math.max(
+      0,
+      ...[...storedComposerDrafts.values()].map((draft) => draft.version),
+    ),
+    composerDraftStorageTimer: null,
+    optimisticComposerClears: new Map(),
     composerSending: false,
     inFlightComposerText: null,
     composerRevision: 0,
@@ -2244,9 +2337,14 @@ function initialize() {
       connectOverview();
       return;
     }
+    for (const id of Array.isArray(data?.remove) ? data.remove : []) {
+      const removed = state.sessions.get(id);
+      if (removed) forgetComposerDraft(composerDraftIdentity(removed), true);
+    }
     state.sessions = result.sessions;
     state.revision = result.revision;
     if (Array.isArray(data.machines) && data.machines.length) state.machines = data.machines;
+    bindComposerDraftToSelection();
     setHealth(data.health);
     reconcileSelection();
     render();
@@ -2367,7 +2465,10 @@ function initialize() {
       scheduleTranscript(350);
       $("stream-state").textContent = "Live";
     });
-    source.addEventListener("pane.removed", () => selectSession(null, "replace"));
+    source.addEventListener("pane.removed", () => {
+      forgetComposerDraft(selectedComposerDraftIdentity(), true);
+      selectSession(null, "replace");
+    });
     // A failure on the owning machine belongs to this pane, not to the local
     // tmux monitor, so it never touches the global health alert.
     source.addEventListener("pane.error", (event) => {
@@ -3559,10 +3660,14 @@ function initialize() {
     const changed = state.selected !== id || state.selectedMachine !== null || state.pulseOpen;
     const paneChanged = state.selected !== id;
     if (changed && !confirmDiscardFileEdit()) return false;
-    if (changed) invalidateLaunchDialog();
+    if (changed) {
+      persistBoundComposerDraft(true);
+      invalidateLaunchDialog();
+    }
     state.selected = id;
     state.selectedMachine = null;
     state.pulseOpen = false;
+    bindComposerDraftToSelection();
     stopPulseRefresh();
     stopPulseEvents();
     document.body.classList.toggle("has-selection", Boolean(id));
@@ -3582,10 +3687,14 @@ function initialize() {
   function selectMachine(id, historyMode = "push") {
     const changed = state.selected !== null || state.selectedMachine !== id || state.pulseOpen;
     if (changed && !confirmDiscardFileEdit()) return false;
-    if (changed) invalidateLaunchDialog();
+    if (changed) {
+      persistBoundComposerDraft(true);
+      invalidateLaunchDialog();
+    }
     state.selected = null;
     state.selectedMachine = id;
     state.pulseOpen = false;
+    bindComposerDraftToSelection();
     resetProjectView();
     stopPulseRefresh();
     stopPulseEvents();
@@ -3609,10 +3718,14 @@ function initialize() {
     const nextOpen = Boolean(open);
     const changed = state.selected !== null || state.selectedMachine !== null || state.pulseOpen !== nextOpen;
     if (changed && !confirmDiscardFileEdit()) return false;
-    if (changed) invalidateLaunchDialog();
+    if (changed) {
+      persistBoundComposerDraft(true);
+      invalidateLaunchDialog();
+    }
     state.pulseOpen = nextOpen;
     state.selected = null;
     state.selectedMachine = null;
+    bindComposerDraftToSelection();
     resetProjectView();
     const url = new URL(location.href);
     url.searchParams.delete("session");
@@ -3668,6 +3781,7 @@ function initialize() {
     }
   });
   window.addEventListener("beforeunload", (event) => {
+    persistBoundComposerDraft(true);
     if (!fileEditHasUnsavedWork(state.projectView?.files)) return;
     event.preventDefault();
     event.returnValue = "";
@@ -5307,20 +5421,142 @@ function initialize() {
   $("mobile-back").addEventListener("click", backToAgentMenu);
   $("machine-mobile-back").addEventListener("click", backToAgentMenu);
 
-  function replaceComposerValue(value) {
+  function selectedComposerDraftIdentity() {
+    const session = state.sessions.get(state.selected);
+    const localMachineId = state.machines.find((machine) => machine.kind === "local")?.id || "local";
+    return composerDraftIdentity(session, localMachineId);
+  }
+
+  function saveComposerDraftStorage(immediate = false) {
+    if (state.composerDraftStorageTimer !== null) clearTimeout(state.composerDraftStorageTimer);
+    state.composerDraftStorageTimer = null;
+    const write = () => {
+      state.composerDraftStorageTimer = null;
+      writeLocalStorage(COMPOSER_DRAFT_STORAGE_KEY, composerDraftJson(state.composerDrafts));
+    };
+    if (immediate) write();
+    else state.composerDraftStorageTimer = setTimeout(write, 250);
+  }
+
+  function composerClearRevisionIsPending(identity, revision) {
+    return Boolean(identity)
+      && state.optimisticComposerClears.get(identity.key)?.has(revision);
+  }
+
+  function persistBoundComposerDraft(flush = false) {
+    const identity = state.composerDraftIdentity;
+    if (!identity) return null;
+    const input = $("message");
+    if (!input.value) {
+      if (composerClearRevisionIsPending(identity, state.composerRevision)) {
+        return state.composerDrafts.get(identity.key) || null;
+      }
+      const removed = state.composerDrafts.delete(identity.key);
+      if (removed && identity.persistent) saveComposerDraftStorage(flush);
+      return null;
+    }
+    const selectionStart = input.selectionStart ?? input.value.length;
+    const selectionEnd = input.selectionEnd ?? selectionStart;
+    const existing = state.composerDrafts.get(identity.key);
+    const textChanged = existing?.text !== input.value;
+    const draft = {
+      text: input.value,
+      selectionStart,
+      selectionEnd,
+      version: textChanged ? ++state.composerDraftSequence : existing.version,
+      updatedAt: textChanged ? Date.now() : existing.updatedAt,
+    };
+    state.composerDrafts.set(identity.key, draft);
+    if (identity.persistent) saveComposerDraftStorage(flush);
+    return draft;
+  }
+
+  function bindComposerDraftToSelection() {
+    const nextIdentity = selectedComposerDraftIdentity();
+    if (state.composerDraftIdentity?.key === nextIdentity?.key) return;
+    persistBoundComposerDraft(true);
+    state.composerDraftIdentity = nextIdentity;
+    state.messageHistoryNavigation = null;
+    const input = $("message");
+    const draft = nextIdentity ? state.composerDrafts.get(nextIdentity.key) : null;
+    input.value = draft?.text || "";
+    state.composerRevision += 1;
+    if (draft) {
+      try { input.setSelectionRange(draft.selectionStart, draft.selectionEnd); }
+      catch { /* An unfocused mobile textarea can reject selection updates. */ }
+    }
+  }
+
+  function forgetComposerDraft(identity, detach = false) {
+    if (!identity) return false;
+    const removed = state.composerDrafts.delete(identity.key);
+    state.optimisticComposerClears.delete(identity.key);
+    if (detach && state.composerDraftIdentity?.key === identity.key) {
+      state.composerDraftIdentity = null;
+      replaceComposerValue("", false);
+    }
+    if (removed && identity.persistent) saveComposerDraftStorage(true);
+    return removed;
+  }
+
+  function captureComposerDraftSubmission(paneId, message) {
+    const session = state.sessions.get(paneId);
+    const localMachineId = state.machines.find((machine) => machine.kind === "local")?.id || "local";
+    const identity = composerDraftIdentity(session, localMachineId);
+    if (!identity) return { draftIdentity: null, draftVersion: null };
+    if (state.composerDraftIdentity?.key === identity.key && $("message").value === message) {
+      persistBoundComposerDraft();
+    }
+    const draft = state.composerDrafts.get(identity.key);
+    return {
+      draftIdentity: identity,
+      draftVersion: draft?.text === message ? draft.version : null,
+    };
+  }
+
+  function finishComposerDraftSubmission(submission) {
+    const identity = submission?.draftIdentity;
+    if (!identity) return false;
+    const pending = state.optimisticComposerClears.get(identity.key);
+    if (submission.clearedRevision !== null) {
+      pending?.delete(submission.clearedRevision);
+      if (!pending?.size) state.optimisticComposerClears.delete(identity.key);
+    }
+    const draft = state.composerDrafts.get(identity.key);
+    if (!composerDraftCanClear(draft, submission)) return false;
+    forgetComposerDraft(identity);
+    if (state.composerDraftIdentity?.key === identity.key
+        && $("message").value === submission.message) {
+      replaceComposerValue("", false);
+    }
+    return true;
+  }
+
+  function replaceComposerValue(value, persist = true) {
     const input = $("message");
     const next = String(value);
     if (input.value === next) return state.composerRevision;
     input.value = next;
     state.composerRevision += 1;
+    if (persist) persistBoundComposerDraft();
     return state.composerRevision;
   }
 
   function acceptComposerSubmission(paneId, message) {
-    const submission = { paneId, message, clearedRevision: null };
+    const submission = {
+      paneId,
+      message,
+      clearedRevision: null,
+      ...captureComposerDraftSubmission(paneId, message),
+    };
     const input = $("message");
     if (composerSubmissionMatches(state.selected, paneId, input.value, message)) {
-      submission.clearedRevision = replaceComposerValue("");
+      submission.clearedRevision = replaceComposerValue("", false);
+      if (submission.draftIdentity) {
+        const revisions = state.optimisticComposerClears.get(submission.draftIdentity.key) || new Set();
+        revisions.add(submission.clearedRevision);
+        state.optimisticComposerClears.set(submission.draftIdentity.key, revisions);
+      }
     }
     return submission;
   }
@@ -5334,10 +5570,16 @@ function initialize() {
       submission,
     );
     // Consume the rollback token even if newer composer activity made it stale.
+    const pending = submission.draftIdentity
+      ? state.optimisticComposerClears.get(submission.draftIdentity.key) : null;
+    pending?.delete(submission.clearedRevision);
+    if (submission.draftIdentity && !pending?.size) {
+      state.optimisticComposerClears.delete(submission.draftIdentity.key);
+    }
     submission.clearedRevision = null;
     if (!canRestore) return false;
     const input = $("message");
-    replaceComposerValue(submission.message);
+    replaceComposerValue(submission.message, false);
     input.setSelectionRange(input.value.length, input.value.length);
     return true;
   }
@@ -5375,9 +5617,15 @@ function initialize() {
     const clearOnAccept = options.clearOnAccept === true;
     let composerSubmission = options.composerSubmission || null;
     const markAccepted = () => {
-      if (clearOnAccept && !composerSubmission) {
-        composerSubmission = acceptComposerSubmission(targetPaneId, message);
-      }
+      if (composerSubmission) return;
+      composerSubmission = clearOnAccept
+        ? acceptComposerSubmission(targetPaneId, message)
+        : {
+          paneId: targetPaneId,
+          message,
+          clearedRevision: null,
+          ...captureComposerDraftSubmission(targetPaneId, message),
+        };
     };
     if (state.composerSending) {
       if (messageOverride === null) return false;
@@ -5416,9 +5664,7 @@ function initialize() {
         await request(`/api/v1/panes/${encodeURIComponent(targetPaneId)}/messages`, { method: "POST", body: JSON.stringify({ text: message, submit: true }) });
       }
       if (message.trim()) rememberMessage(targetPaneId, message);
-      if (!clearOnAccept
-        && (attachments.length || state.selected === targetPaneId)
-        && input.value === message) replaceComposerValue("");
+      finishComposerDraftSubmission(composerSubmission);
       if (attachments.length) removeDeliveredAttachments(attachments);
       toast(attachments.length === 1 ? "Image sent" : attachments.length > 1 ? "Images sent" : "Message sent");
       return true;
@@ -5577,7 +5823,9 @@ function initialize() {
   $("message").addEventListener("input", () => {
     state.composerRevision += 1;
     state.messageHistoryNavigation = null;
+    persistBoundComposerDraft();
   });
+  $("message").addEventListener("select", () => { persistBoundComposerDraft(); });
   $("message").addEventListener("keydown", (event) => {
     const action = composerEnterAction(event);
     if (action === "send") {
@@ -5859,6 +6107,8 @@ function initialize() {
     if (state.selected === target && !confirmDiscardFileEdit()) return;
     try {
       await request(sessionDeletePath(target), { method: "DELETE" });
+      const deleted = state.sessions.get(target);
+      if (deleted) forgetComposerDraft(composerDraftIdentity(deleted), true);
       $("kill-dialog").close();
       state.pendingKillId = null;
       if (state.selected === target) selectSession(null, "replace");
@@ -6794,6 +7044,7 @@ function initialize() {
 
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
+      persistBoundComposerDraft(true);
       state.overviewSource?.close();
       state.paneSource?.close();
       state.overviewConnection = "paused";
@@ -6809,6 +7060,7 @@ function initialize() {
       if (state.recoveryStatus?.phase === "running") void refreshRecoveryStatus(false);
     }
   });
+  window.addEventListener("pagehide", () => { persistBoundComposerDraft(true); });
 
   render();
   connectOverview();
