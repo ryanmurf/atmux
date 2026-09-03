@@ -244,17 +244,19 @@ owner-local per-pane OS lock plus a durable tmux mutation sequence, so briefly
 overlapping old/new web processes cannot race. Working, approval, unknown,
 wrapper, Grok, and unmapped panes fail closed.
 
-Every native Claude command that atmux reconstructs for a saved-conversation
-launch, explicit in-place resume, or CLI-maintenance relaunch includes Claude's
-`--dangerously-skip-permissions` global option. For the default
-`atmux_injects` profile policy, atmux keeps one configured active copy or
-inserts one immediately before the native resume selector; a same-looking value
-after `--` remains literal data. Discovery does not inspect opaque executable
-wrappers, so they retain the safe `atmux_injects` default. A manually configured
-wrapper that provides the option and owns any `--` forwarding boundary must set
+Every native Claude command that atmux launches with the default
+`atmux_injects` profile policy includes exactly one
+`--dangerously-skip-permissions` global option and an explicit
+`--permission-mode bypassPermissions`. The explicit mode prevents a profile's
+`defaultMode = "auto"` setting from silently weakening the requested bypass.
+This applies to fresh sessions, saved-conversation launches, explicit in-place
+resumes, and CLI-maintenance relaunches. Same-looking values after `--` remain
+literal data. Discovery does not inspect opaque executable wrappers, so they
+retain the safe `atmux_injects` default. A manually configured wrapper that
+provides the arguments and owns any `--` forwarding boundary must set
 `claude_relaunch_permissions = "launcher_provides"`; a forwarding wrapper that
-wants atmux to provide it may explicitly select `"atmux_injects"`. Fresh
-Claude launches and every non-Claude harness keep their existing argv.
+wants atmux to provide it may explicitly select `"atmux_injects"`. All
+non-Claude harnesses keep their existing argv.
 
 A persisted pending plan repairs partial marker writes after a crash. A Ready
 marker remains deferred through transient working, approval, and unrecognized

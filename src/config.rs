@@ -410,10 +410,12 @@ pub struct AgentProfile {
     /// existing local wrapper/alias while this config supplies its modes.
     #[serde(default)]
     pub inherit_discovered: bool,
-    /// Declares which typed boundary supplies Claude's permission flag when
-    /// atmux reconstructs a saved conversation. `None` keeps old configs
-    /// compatible by keeping atmux-managed injection. An opaque wrapper that
-    /// supplies the option itself must opt into launcher ownership explicitly.
+    /// Declares which typed boundary supplies Claude's permission arguments.
+    /// `None` keeps old configs compatible by keeping atmux-managed injection.
+    /// An opaque wrapper that supplies the arguments itself must opt into
+    /// launcher ownership explicitly. The field retains its original name for
+    /// configuration compatibility even though the policy applies to fresh and
+    /// reconstructed launches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_relaunch_permissions: Option<ClaudeRelaunchPermissions>,
     /// Explicit model/effort/tier combinations available to this profile.

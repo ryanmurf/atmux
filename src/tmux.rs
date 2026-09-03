@@ -47,6 +47,8 @@ impl Drop for SocketOverrideRestore {
 const MODEL_MENU_TIMEOUT: Duration = Duration::from_secs(4);
 const MODEL_MENU_POLL: Duration = Duration::from_millis(25);
 const CLAUDE_SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
+const CLAUDE_PERMISSION_MODE_FLAG: &str = "--permission-mode";
+const CLAUDE_BYPASS_PERMISSIONS_MODE: &str = "bypassPermissions";
 /// Give interactive TUIs one input turn to finish decoding bracketed paste
 /// before Enter arrives. Without this boundary Claude and Codex can consume
 /// both terminal writes in one read and leave the pasted text unsubmitted.
@@ -721,21 +723,21 @@ impl Tmux {
         mode: Option<&ProfileMode>,
         resume: Option<&ResumeCandidate>,
     ) -> Result<Vec<String>> {
-        Self::build_invocation(profile, mode, resume, resume.is_some())
+        Self::build_invocation(profile, mode, resume)
     }
 
     fn build_invocation(
         profile: &AgentProfile,
         mode: Option<&ProfileMode>,
         resume: Option<&ResumeCandidate>,
-        reconstructing: bool,
     ) -> Result<Vec<String>> {
         let mut arguments = profile.args.clone();
-        let claude_relaunch_permissions = (reconstructing
-            && profile.harness.eq_ignore_ascii_case("claude"))
-        .then(|| profile.effective_claude_relaunch_permissions());
+        let claude_permissions = profile
+            .harness
+            .eq_ignore_ascii_case("claude")
+            .then(|| profile.effective_claude_relaunch_permissions());
         let atmux_manages_claude_permissions =
-            claude_relaunch_permissions == Some(ClaudeRelaunchPermissions::AtmuxInjects);
+            claude_permissions == Some(ClaudeRelaunchPermissions::AtmuxInjects);
         if let Some(mode) = mode {
             if !valid_model_id(&mode.model) {
                 bail!("profile mode has an invalid model id");
@@ -779,10 +781,9 @@ impl Tmux {
             if atmux_manages_claude_permissions {
                 insert_before_option_terminator(&mut arguments, mode_arguments);
             } else {
-                // Preserve the established fresh-launch argv byte-for-byte.
-                // Only atmux-managed Claude reconstruction moves generated
-                // options ahead of its native option terminator. Opaque
-                // launchers and non-Claude harnesses retain legacy ordering.
+                // Opaque launchers and non-Claude harnesses retain their
+                // established ordering. Atmux-managed Claude arguments move
+                // ahead of the native option terminator so they remain active.
                 arguments.extend(mode_arguments);
             }
         }
@@ -792,10 +793,7 @@ impl Tmux {
                 bail!("saved conversation does not match the selected profile harness");
             }
             let has_selector = match harness.as_str() {
-                "claude"
-                    if claude_relaunch_permissions
-                        == Some(ClaudeRelaunchPermissions::AtmuxInjects) =>
-                {
+                "claude" if claude_permissions == Some(ClaudeRelaunchPermissions::AtmuxInjects) => {
                     active_arguments(&arguments)
                         .iter()
                         .any(|arg| is_claude_resume_selector(arg))
@@ -810,10 +808,12 @@ impl Tmux {
             let resume_arguments = old_sessions::resume_arguments(resume)?;
             if atmux_manages_claude_permissions {
                 insert_before_option_terminator(&mut arguments, resume_arguments);
-                normalize_claude_relaunch_arguments(&mut arguments);
             } else {
                 arguments.extend(resume_arguments);
             }
+        }
+        if atmux_manages_claude_permissions {
+            normalize_claude_permission_arguments(&mut arguments);
         }
         let mut invocation = vec!["env".to_owned()];
         invocation.extend(
@@ -1528,37 +1528,49 @@ fn is_claude_resume_selector(argument: &str) -> bool {
     matches!(argument, "--resume" | "-r" | "--continue" | "-c") || argument.starts_with("--resume=")
 }
 
-/// Applies the permission policy only to an argv which atmux has already
-/// classified as a reconstructed Claude conversation. The first configured
-/// active copy keeps its position and later active duplicates are removed; an
-/// absent copy is inserted immediately ahead of the native resume selector. A
-/// same-looking value after `--` remains literal data.
-fn normalize_claude_relaunch_arguments(arguments: &mut Vec<String>) {
-    if !active_arguments(arguments)
-        .iter()
-        .any(|argument| is_claude_resume_selector(argument))
-    {
-        return;
-    }
-    let first_flag = active_arguments(arguments)
-        .iter()
-        .position(|argument| argument == CLAUDE_SKIP_PERMISSIONS_FLAG);
-    if let Some(first_flag) = first_flag {
-        let mut index = first_flag + 1;
-        while index < arguments.len() && arguments[index] != "--" {
-            if arguments[index] == CLAUDE_SKIP_PERMISSIONS_FLAG {
+/// Normalizes atmux-owned Claude permission arguments for both fresh and
+/// reconstructed launches. One dangerous flag and one explicit bypass mode
+/// are required because a profile setting such as `defaultMode = "auto"` may
+/// otherwise override the flag in current Claude releases. Same-looking values
+/// after `--` remain literal data.
+fn normalize_claude_permission_arguments(arguments: &mut Vec<String>) {
+    let mut index = 0;
+    let mut saw_skip = false;
+    while index < arguments.len() && arguments[index] != "--" {
+        if arguments[index] == CLAUDE_SKIP_PERMISSIONS_FLAG {
+            if saw_skip {
                 arguments.remove(index);
             } else {
+                saw_skip = true;
                 index += 1;
             }
+            continue;
         }
-    } else {
-        let selector = active_arguments(arguments)
-            .iter()
-            .position(|argument| is_claude_resume_selector(argument))
-            .expect("the validated Claude resume selector disappeared");
-        arguments.insert(selector, CLAUDE_SKIP_PERMISSIONS_FLAG.to_owned());
+        if arguments[index] == CLAUDE_PERMISSION_MODE_FLAG {
+            arguments.remove(index);
+            if index < arguments.len()
+                && arguments[index] != "--"
+                && !arguments[index].starts_with('-')
+            {
+                arguments.remove(index);
+            }
+            continue;
+        }
+        if arguments[index].starts_with("--permission-mode=") {
+            arguments.remove(index);
+            continue;
+        }
+        index += 1;
     }
+    if !saw_skip {
+        insert_before_option_terminator(arguments, [CLAUDE_SKIP_PERMISSIONS_FLAG.to_owned()]);
+    }
+    let skip = active_arguments(arguments)
+        .iter()
+        .position(|argument| argument == CLAUDE_SKIP_PERMISSIONS_FLAG)
+        .expect("the normalized Claude permission flag disappeared");
+    arguments.insert(skip + 1, CLAUDE_PERMISSION_MODE_FLAG.to_owned());
+    arguments.insert(skip + 2, CLAUDE_BYPASS_PERMISSIONS_MODE.to_owned());
 }
 
 fn append_native_resume_arguments(
@@ -1573,7 +1585,7 @@ fn append_native_resume_arguments(
     }
     let mut arguments = invocation.split_off(argument_start);
     insert_before_option_terminator(&mut arguments, resume_arguments);
-    normalize_claude_relaunch_arguments(&mut arguments);
+    normalize_claude_permission_arguments(&mut arguments);
     invocation.extend(arguments);
 }
 
@@ -1590,7 +1602,7 @@ fn build_native_relaunch_invocation(
         // permission handling to an opaque wrapper.
         exact_profile.claude_relaunch_permissions = Some(ClaudeRelaunchPermissions::AtmuxInjects);
     }
-    let mut invocation = Tmux::build_invocation(&exact_profile, Some(mode), None, true)?;
+    let mut invocation = Tmux::build_invocation(&exact_profile, Some(mode), None)?;
     let argument_start = 2 + exact_profile.env.len();
     append_native_resume_arguments(
         &mut invocation,
@@ -3441,7 +3453,7 @@ mod tests {
         assert!(command.contains("/Users/ryan/.local/share/claude/versions/2.2.0"));
         assert!(command.contains("--model opus --effort high"));
         assert!(command.ends_with(
-            "--dangerously-skip-permissions --resume 22222222-2222-2222-2222-222222222222"
+            "--dangerously-skip-permissions --permission-mode bypassPermissions --resume 22222222-2222-2222-2222-222222222222"
         ));
         assert!(!command.contains("/Users/ryan/.claude "));
         assert!(!command.contains("claude-max-wrapper"));
@@ -3457,6 +3469,9 @@ mod tests {
             args: vec![
                 "--settings".to_owned(),
                 "literal $(touch /tmp/never) ' quote".to_owned(),
+                CLAUDE_PERMISSION_MODE_FLAG.to_owned(),
+                "acceptEdits".to_owned(),
+                "--permission-mode=auto".to_owned(),
                 CLAUDE_SKIP_PERMISSIONS_FLAG.to_owned(),
                 CLAUDE_SKIP_PERMISSIONS_FLAG.to_owned(),
                 "--".to_owned(),
@@ -3494,6 +3509,8 @@ mod tests {
                 "--settings",
                 "literal $(touch /tmp/never) ' quote",
                 CLAUDE_SKIP_PERMISSIONS_FLAG,
+                CLAUDE_PERMISSION_MODE_FLAG,
+                CLAUDE_BYPASS_PERMISSIONS_MODE,
                 "--model",
                 "opus",
                 "--effort",
@@ -3512,6 +3529,24 @@ mod tests {
                 .filter(|argument| argument.as_str() == CLAUDE_SKIP_PERMISSIONS_FLAG)
                 .count(),
             1
+        );
+        let active = active_arguments(&invocation[3..]);
+        assert_eq!(
+            active
+                .iter()
+                .filter(|argument| argument.as_str() == CLAUDE_PERMISSION_MODE_FLAG)
+                .count(),
+            1
+        );
+        assert!(
+            active
+                .windows(2)
+                .any(|pair| pair == [CLAUDE_PERMISSION_MODE_FLAG, CLAUDE_BYPASS_PERMISSIONS_MODE])
+        );
+        assert!(
+            !active
+                .iter()
+                .any(|argument| argument == "acceptEdits" || argument == "--permission-mode=auto")
         );
         assert_eq!(
             shell_words::split(&shell_words::join(invocation.clone())).unwrap(),
@@ -3582,7 +3617,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_claude_and_saved_codex_do_not_inherit_claude_relaunch_policy() {
+    fn fresh_claude_gets_bypass_permissions_while_saved_codex_does_not() {
         let fresh_claude = AgentProfile {
             name: "Fresh Claude".to_owned(),
             harness: "claude".to_owned(),
@@ -3590,6 +3625,10 @@ mod tests {
             args: vec![
                 "--settings".to_owned(),
                 "fresh.json".to_owned(),
+                CLAUDE_SKIP_PERMISSIONS_FLAG.to_owned(),
+                CLAUDE_PERMISSION_MODE_FLAG.to_owned(),
+                "auto".to_owned(),
+                CLAUDE_SKIP_PERMISSIONS_FLAG.to_owned(),
                 "--".to_owned(),
                 "literal".to_owned(),
             ],
@@ -3606,11 +3645,6 @@ mod tests {
             service_tier: None,
         };
         let fresh = Tmux::build_launch_invocation(&fresh_claude, Some(&mode), None).unwrap();
-        assert!(
-            !fresh
-                .iter()
-                .any(|argument| argument == CLAUDE_SKIP_PERMISSIONS_FLAG)
-        );
         assert_eq!(
             fresh,
             [
@@ -3618,12 +3652,15 @@ mod tests {
                 "claude",
                 "--settings",
                 "fresh.json",
-                "--",
-                "literal",
+                CLAUDE_SKIP_PERMISSIONS_FLAG,
+                CLAUDE_PERMISSION_MODE_FLAG,
+                CLAUDE_BYPASS_PERMISSIONS_MODE,
                 "--model",
                 "opus",
                 "--effort",
                 "high",
+                "--",
+                "literal",
             ]
         );
 
