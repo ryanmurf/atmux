@@ -226,6 +226,17 @@
         <select id="quick-agent-model" aria-describedby="quick-model-status"></select>
         <p id="quick-model-status" class="dialog-note" role="status"></p>
       </div>
+      <fieldset class="quick-pane-keys">
+        <legend>Agent keys</legend>
+        <div class="quick-pane-keypad" role="group" aria-label="Send interactive keys to this agent">
+          <button class="subtle quick-pane-key quick-pane-key-up" type="button" data-pane-key="up" aria-label="Send Up arrow" title="Send Up arrow">↑</button>
+          <button class="subtle quick-pane-key quick-pane-key-left" type="button" data-pane-key="left" aria-label="Send Left arrow" title="Send Left arrow">←</button>
+          <button class="subtle quick-pane-key quick-pane-key-down" type="button" data-pane-key="down" aria-label="Send Down arrow" title="Send Down arrow">↓</button>
+          <button class="subtle quick-pane-key quick-pane-key-right" type="button" data-pane-key="right" aria-label="Send Right arrow" title="Send Right arrow">→</button>
+          <button class="subtle quick-pane-key quick-pane-key-enter" type="button" data-pane-key="enter" aria-label="Send blank Enter" title="Submit the current Claude prompt without adding text">Enter ↵</button>
+        </div>
+        <p id="quick-pane-key-status" class="dialog-note" role="status" aria-live="polite">One key is sent per tap.</p>
+      </fieldset>
       <div class="quick-actions-grid">
         <button id="quick-duplicate" class="subtle" type="button">Duplicate agent</button>
         <button id="quick-resume" class="subtle" type="button" hidden>Relaunch &amp; resume</button>

@@ -6,6 +6,10 @@ Status: completed
 - [x] Push-to-talk captures the pane selected when recording begins.
 - [x] Raw/conversation pane typing is routed to the composer without breaking selection.
 - [x] Prompt history arrows, Ctrl+B twice, `/compact`, interrupt, and confirmed kill are available.
+- [x] Actions exposes fixed Up, Down, Left, Right, and blank Enter tmux keys for interactive
+  agent prompts without consuming or clearing the message draft.
+- [x] Pane-key requests bind the owning machine and immutable pane instance, revalidate at the
+  owner mutation boundary, and reject stale/reused panes with HTTP 409.
 - [x] `atmux-web` service sessions are hidden from the inventory.
 - [x] Browser unit tests, tmux smoke tests, live browser checks, Fable review, and independent review
   passed.

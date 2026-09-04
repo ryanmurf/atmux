@@ -35,6 +35,7 @@ use crate::{
     machine::{MachineSummary, Secret, resolve_token},
     mcp,
     recovery::RecoveryStatus,
+    tmux::PaneSpecialKey,
     transcript::Transcript,
     workspace::{FileWriteRequest, FilesResponse, GitResponse, MAX_FILE_WRITE_REQUEST_BYTES},
 };
@@ -100,8 +101,11 @@ struct SendRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SpecialKeyRequest {
     action: String,
+    machine: String,
+    instance_id: String,
 }
 
 /// Deliberately empty: the owning node derives the Claude config root and
@@ -1168,12 +1172,18 @@ async fn send_special_keys(
     Json(request): Json<SpecialKeyRequest>,
 ) -> Result<Json<OkResponse>, ApiError> {
     ensure_origin(&headers, &state.allowed_origins)?;
-    if request.action != "tmux_prefix_twice" {
-        return Err(ApiError::bad_request("unsupported special key action"));
-    }
+    let key = match request.action.as_str() {
+        "up" => PaneSpecialKey::Up,
+        "down" => PaneSpecialKey::Down,
+        "left" => PaneSpecialKey::Left,
+        "right" => PaneSpecialKey::Right,
+        "enter" => PaneSpecialKey::Enter,
+        "tmux_prefix_twice" => PaneSpecialKey::TmuxPrefixTwice,
+        _ => return Err(ApiError::bad_request("unsupported special key action")),
+    };
     state
         .control
-        .tmux_prefix_twice(&id)
+        .send_special_key_for_instance(&id, key, request.machine, request.instance_id)
         .await
         .map_err(|error| ApiError::from_control(&error))?;
     Ok(Json(OkResponse { ok: true }))
@@ -2612,7 +2622,10 @@ mod tests {
             (
                 "POST",
                 "/api/v1/panes/gpu-box~%251/special-keys",
-                Some(r#"{"action":"tmux_prefix_twice"}"#),
+                Some(concat!(
+                    r#"{"action":"tmux_prefix_twice","machine":"gpu-box","instance_id":"pane-v1-"#,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+                )),
             ),
             ("POST", "/api/v1/panes/gpu-box~%251/interrupt", Some("{}")),
             ("DELETE", "/api/v1/sessions/gpu-box~%251", None),
@@ -2639,7 +2652,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_routes_reject_a_recycled_pane_generation_before_delivery() {
+    async fn pane_mutation_routes_reject_a_recycled_generation_before_delivery() {
         let control = crate::control::test_control(&[]);
         let mut replacement = crate::control::test_session("agent", "%4294967295", "replacement");
         let current_instance = format!("pane-v1-{}", "b".repeat(64));
@@ -2724,6 +2737,24 @@ mod tests {
             )
             .await,
             StatusCode::CONFLICT
+        );
+
+        let live_race_key = serde_json::json!({
+            "action": "enter",
+            "machine": "local",
+            "instance_id": current_instance,
+        })
+        .to_string();
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/%254294967295/special-keys",
+                Some(&live_race_key),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "a blank Enter must revalidate the live generation under the mutation lock",
         );
     }
 
@@ -3028,21 +3059,71 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn special_key_route_is_allowlisted() {
         let control = crate::control::test_control(&[]);
-        control.apply_refresh(vec![crate::control::test_session(
-            "agent",
-            "%4294967295",
-            "hello",
-        )]);
-        let (app, _shutdown) = real_app(control);
+        let mut session = crate::control::test_session("agent", "%4294967295", "hello");
+        session.pane_identity = format!("pane-v1-{}", "b".repeat(64));
+        control.apply_refresh(vec![session]);
+        let (app, _shutdown) = real_app(control.clone());
+        let (authenticated, _authenticated_shutdown) = authenticated_real_app(control);
+        let current = format!("pane-v1-{}", "b".repeat(64));
+        let stale = format!("pane-v1-{}", "a".repeat(64));
+        let valid_body = serde_json::json!({
+            "action": "enter",
+            "machine": "local",
+            "instance_id": current,
+        })
+        .to_string();
+
+        let anonymous = protected_api(
+            "POST",
+            "/api/v1/panes/%254294967295/special-keys",
+            &valid_body,
+            None,
+            Some("http://localhost:7345"),
+        );
+        assert_eq!(
+            authenticated.oneshot(anonymous).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+        );
+
+        let cross_origin = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/v1/panes/%254294967295/special-keys")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "https://attacker.example")
+            .body(Body::from(valid_body))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(cross_origin).await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+        );
 
         assert_eq!(
             status_of(
                 &app,
                 "POST",
                 "/api/v1/panes/%254294967295/special-keys",
-                Some(r#"{"action":"anything_else"}"#),
+                Some(r#"{"action":"enter"}"#),
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "machine and instance bindings are mandatory",
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/%254294967295/special-keys",
+                Some(
+                    &serde_json::json!({
+                        "action": "anything_else",
+                        "machine": "local",
+                        "instance_id": current,
+                    })
+                    .to_string(),
+                ),
             )
             .await,
             StatusCode::BAD_REQUEST
@@ -3051,8 +3132,51 @@ mod tests {
             status_of(
                 &app,
                 "POST",
+                "/api/v1/panes/%254294967295/special-keys",
+                Some(
+                    &serde_json::json!({
+                        "action": "enter",
+                        "machine": "local",
+                        "instance_id": stale,
+                    })
+                    .to_string(),
+                ),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "a blank Enter must not reach a recycled pane id",
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/%254294967295/special-keys",
+                Some(
+                    &serde_json::json!({
+                        "action": "down",
+                        "machine": "midnight",
+                        "instance_id": current,
+                    })
+                    .to_string(),
+                ),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "the body machine cannot retarget a local pane",
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
                 "/api/v1/panes/nope/special-keys",
-                Some(r#"{"action":"tmux_prefix_twice"}"#),
+                Some(
+                    &serde_json::json!({
+                        "action": "tmux_prefix_twice",
+                        "machine": "local",
+                        "instance_id": current,
+                    })
+                    .to_string(),
+                ),
             )
             .await,
             StatusCode::NOT_FOUND

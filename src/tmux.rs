@@ -241,6 +241,34 @@ fn pane_rank(pane: &RawPane, agent: AgentKind) -> (bool, u8) {
 #[derive(Clone, Debug, Default)]
 pub struct Tmux;
 
+/// One browser-exposed, fixed tmux key action.
+///
+/// Keeping this as an enum prevents request data from ever becoming a tmux
+/// argument. Each variant maps to a single audited tmux key name below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneSpecialKey {
+    Up,
+    Down,
+    Left,
+    Right,
+    Enter,
+    TmuxPrefixTwice,
+}
+
+impl PaneSpecialKey {
+    #[must_use]
+    pub(crate) const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Enter => "enter",
+            Self::TmuxPrefixTwice => "tmux_prefix_twice",
+        }
+    }
+}
+
 impl Tmux {
     /// Replaces this process with one exact command in a configured agent scope.
     ///
@@ -1215,6 +1243,19 @@ impl Tmux {
         Self::output(["send-keys", "-t", pane_id, "Escape"]).map(|_| ())
     }
 
+    /// Sends one fixed interactive key, or the existing fixed tmux-prefix
+    /// sequence, to a pane.
+    ///
+    /// Request strings are converted to [`PaneSpecialKey`] before reaching
+    /// this boundary, so no browser-controlled value can become a command or
+    /// tmux key argument.
+    pub(crate) fn send_special_key(&self, pane_id: &str, key: PaneSpecialKey) -> Result<()> {
+        if key == PaneSpecialKey::TmuxPrefixTwice {
+            return self.tmux_prefix_twice(pane_id);
+        }
+        Self::output(special_key_args(pane_id, key)).map(|_| ())
+    }
+
     /// Sends the literal `Ctrl+B` key sequence twice to a pane.
     ///
     /// This is deliberately a fixed sequence rather than a generic browser
@@ -2028,6 +2069,20 @@ fn submission_keys(submit: bool) -> &'static [&'static str] {
 
 fn submit_args(pane_id: &str) -> [&str; 4] {
     ["send-keys", "-t", pane_id, "Enter"]
+}
+
+fn special_key_args(pane_id: &str, key: PaneSpecialKey) -> [&str; 4] {
+    let key = match key {
+        PaneSpecialKey::Up => "Up",
+        PaneSpecialKey::Down => "Down",
+        PaneSpecialKey::Left => "Left",
+        PaneSpecialKey::Right => "Right",
+        PaneSpecialKey::Enter => "Enter",
+        PaneSpecialKey::TmuxPrefixTwice => {
+            unreachable!("tmux prefix uses its fixed two-key command path")
+        }
+    };
+    ["send-keys", "-t", pane_id, key]
 }
 
 fn tmux_prefix_twice_keys() -> &'static [&'static str] {
@@ -3365,6 +3420,27 @@ mod tests {
                 "Enter",
             ]
         );
+    }
+
+    #[test]
+    fn interactive_special_keys_are_fixed_tmux_arguments() {
+        for (action, expected) in [
+            (PaneSpecialKey::Up, "Up"),
+            (PaneSpecialKey::Down, "Down"),
+            (PaneSpecialKey::Left, "Left"),
+            (PaneSpecialKey::Right, "Right"),
+            (PaneSpecialKey::Enter, "Enter"),
+        ] {
+            assert_eq!(
+                special_key_args("%7; run-shell 'touch /tmp/pwned'", action),
+                [
+                    "send-keys",
+                    "-t",
+                    "%7; run-shell 'touch /tmp/pwned'",
+                    expected,
+                ],
+            );
+        }
     }
 
     #[test]

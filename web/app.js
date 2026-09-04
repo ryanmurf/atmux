@@ -44,6 +44,10 @@ const MAX_COMPOSER_DRAFT_STORAGE_CHARS = 512 * 1024;
 const MAX_COMPOSER_DRAFT_TEXT_CHARS = 65_536;
 const COMPOSER_DRAFT_TOMBSTONE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const PANE_INSTANCE_PATTERN = /^pane-v1-[a-f0-9]{64}$/;
+const MACHINE_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+const PANE_SPECIAL_KEY_ACTIONS = new Set([
+  "up", "down", "left", "right", "enter", "tmux_prefix_twice",
+]);
 const PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN = /^pane:([A-Za-z0-9_.%~-]{1,96}):(pane-v1-[a-f0-9]{64})$/;
 const FILE_READER_SIZES = new Set(["small", "medium", "large"]);
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg"]);
@@ -275,6 +279,25 @@ function parseCompositeId(id) {
 
 function sessionMachineId(session, localMachineId = "local") {
   return session.machine || parseCompositeId(session.id).machine || localMachineId;
+}
+
+/// Captures the complete immutable target for one pane-key request. The
+/// request path binds the pane (and its coordinator machine namespace), while
+/// the body independently binds the owning machine and pane generation.
+function paneSpecialKeyDelivery(session, action, localMachineId = "local") {
+  if (!session || typeof session.id !== "string" || !session.id
+      || !PANE_SPECIAL_KEY_ACTIONS.has(action)
+      || !PANE_INSTANCE_PATTERN.test(String(session.instance_id || ""))) return null;
+  const machine = sessionMachineId(session, localMachineId);
+  const compositeMachine = parseCompositeId(session.id).machine;
+  if (!MACHINE_ID_PATTERN.test(machine)
+      || (compositeMachine && compositeMachine !== machine)) return null;
+  return {
+    paneId: session.id,
+    machine,
+    instanceId: session.instance_id,
+    action,
+  };
 }
 
 /// Returns an incarnation-safe identity for browser-local composer state.
@@ -2175,6 +2198,7 @@ if (typeof module !== "undefined" && module.exports) {
     messageFitsByteLimit,
     moveMessageHistory,
     paneTypingText,
+    paneSpecialKeyDelivery,
     paneErrorLabel,
     paneFilesPath,
     paneGitPath,
@@ -2375,6 +2399,7 @@ function initialize() {
     composerDraftTombstones: storedComposerDraftState.tombstones,
     optimisticComposerClears: new Map(),
     composerSending: false,
+    specialKeySending: null,
     inFlightComposerText: null,
     inFlightComposerIdentity: null,
     composerRevision: 0,
@@ -4078,7 +4103,11 @@ function initialize() {
     renderClaudeResumeAction(selected, controllable);
     const resuming = Boolean(state.resumingPaneId);
     const preparingDuplicate = Boolean(state.duplicatingPaneId);
-    for (const id of ["tmux-prefix-twice", "interrupt", "kill-open", "attach", "quick-actions-open", "quick-duplicate", "quick-compact", "quick-tmux-prefix-twice", "quick-interrupt", "quick-kill-open"]) $(id).disabled = !controllable || state.composerSending || resuming || preparingDuplicate;
+    const sendingSpecialKey = Boolean(state.specialKeySending);
+    for (const id of ["tmux-prefix-twice", "interrupt", "kill-open", "attach", "quick-actions-open", "quick-duplicate", "quick-compact", "quick-tmux-prefix-twice", "quick-interrupt", "quick-kill-open"]) $(id).disabled = !controllable || state.composerSending || sendingSpecialKey || resuming || preparingDuplicate;
+    document.querySelectorAll("[data-pane-key]").forEach((button) => {
+      button.disabled = !controllable || state.composerSending || sendingSpecialKey || resuming || preparingDuplicate;
+    });
     $("quick-duplicate").textContent = preparingDuplicate ? "Preparing duplicate…" : "Duplicate agent";
     $("message").disabled = !controllable || resuming;
     $("send").disabled = !controllable || state.composerSending || resuming
@@ -6156,15 +6185,47 @@ function initialize() {
     } catch (error) { toast(error.message); }
     finally { render(); }
   }
-  $("tmux-prefix-twice").addEventListener("click", async () => {
-    const paneId = state.selected;
-    if (!paneId) return;
-    const button = $("tmux-prefix-twice"); button.disabled = true;
+  async function sendPaneSpecialKey(action, label) {
+    if (state.specialKeySending) return;
+    const delivery = paneSpecialKeyDelivery(state.sessions.get(state.selected), action);
+    if (!delivery) {
+      toast("This agent changed or does not report a safe key-delivery target");
+      return;
+    }
+    state.specialKeySending = delivery;
+    const status = $("quick-pane-key-status");
+    status.textContent = `Sending ${label}…`;
+    render();
     try {
-      await request(`/api/v1/panes/${encodeURIComponent(paneId)}/special-keys`, { method: "POST", body: JSON.stringify({ action: "tmux_prefix_twice" }) });
-      toast("Sent Ctrl+B twice");
-    } catch (error) { toast(error.message); }
-    finally { render(); }
+      await request(`/api/v1/panes/${encodeURIComponent(delivery.paneId)}/special-keys`, {
+        method: "POST",
+        body: JSON.stringify({
+          action: delivery.action,
+          machine: delivery.machine,
+          instance_id: delivery.instanceId,
+        }),
+      });
+      status.textContent = `Sent ${label}.`;
+    } catch (error) {
+      const message = error.status === 400 || error.status === 422
+        ? "Key controls and this atmux server are out of sync. Refresh after the server updates, then try again."
+        : error.message;
+      status.textContent = message;
+      toast(message);
+    } finally {
+      state.specialKeySending = null;
+      render();
+    }
+  }
+  document.querySelectorAll("[data-pane-key]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (button.disabled) return;
+      const labels = { up: "Up", down: "Down", left: "Left", right: "Right", enter: "blank Enter" };
+      void sendPaneSpecialKey(button.dataset.paneKey, labels[button.dataset.paneKey] || "key");
+    });
+  });
+  $("tmux-prefix-twice").addEventListener("click", () => {
+    void sendPaneSpecialKey("tmux_prefix_twice", "Ctrl+B twice");
   });
   $("message").addEventListener("input", () => {
     state.composerRevision += 1;

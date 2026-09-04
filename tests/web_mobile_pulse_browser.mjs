@@ -35,6 +35,8 @@ let nextFileSaveConflict = false;
 const fileSaveRequests = [];
 const messageRequests = [];
 const imageMessageRequests = [];
+const specialKeyRequests = [];
+let nextSpecialKeyStatus = null;
 let nextMessageFailurePane = null;
 let messageResponseDelayMs = 0;
 const projectFileContents = new Map();
@@ -281,6 +283,21 @@ function mockApi(url, response, request) {
     request.on("end", () => {
       imageMessageRequests.push({ paneId, body: JSON.parse(body) });
       json(response, {});
+    });
+    return true;
+  }
+  if (/^\/api\/v1\/panes\/[^/]+\/special-keys$/.test(pathname) && request.method === "POST") {
+    const paneId = decodeURIComponent(pathname.split("/")[4]);
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      specialKeyRequests.push({ paneId, body: JSON.parse(body) });
+      if (nextSpecialKeyStatus) {
+        const status = nextSpecialKeyStatus;
+        nextSpecialKeyStatus = null;
+        errorJson(response, status, "fixture mixed-version rejection");
+      } else json(response, {});
     });
     return true;
   }
@@ -747,6 +764,8 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
   fileSaveRequests.length = 0;
   messageRequests.length = 0;
   imageMessageRequests.length = 0;
+  specialKeyRequests.length = 0;
+  nextSpecialKeyStatus = null;
   projectFileContents.clear();
   projectFileVersions.clear();
   delayFileSavePane = null;
@@ -1621,6 +1640,100 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(quickActions.modelControl, true, JSON.stringify(quickActions));
     assert.deepEqual(quickActions.actions, ["Duplicate agent", "Relaunch & resume", "Compact", "Ctrl+B ×2", "Interrupt", "Kill agent"]);
     assert.equal(quickActions.compactInComposer, false, JSON.stringify(quickActions));
+
+    const keyLayout = await cdp.evaluate(`(() => ({
+      labels: [...document.querySelectorAll('[data-pane-key]')].map((button) => button.getAttribute('aria-label')),
+      targets: [...document.querySelectorAll('[data-pane-key]')].map((button) => {
+        const box = button.getBoundingClientRect();
+        return { width: box.width, height: box.height };
+      }),
+      dialogOverflow: document.getElementById('quick-actions-dialog').scrollWidth
+        - document.getElementById('quick-actions-dialog').clientWidth,
+    }))()`);
+    assert.deepEqual(keyLayout.labels, [
+      "Send Up arrow", "Send Left arrow", "Send Down arrow", "Send Right arrow", "Send blank Enter",
+    ]);
+    assert.ok(keyLayout.targets.every(({ width, height }) => width >= 44 && height >= 44), JSON.stringify(keyLayout));
+    assert.ok(keyLayout.dialogOverflow <= 1, JSON.stringify(keyLayout));
+
+    // Interactive keys use their own generation-bound route. They neither
+    // submit nor clear a per-agent draft, and synchronous double taps cannot
+    // enqueue an unbounded repeat while the first request is in flight.
+    const messagesBeforePaneKeys = messageRequests.length;
+    await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.value = 'draft stays with this agent';
+      input.setSelectionRange(6, 11);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      const down = document.querySelector('[data-pane-key="down"]');
+      down.click(); down.click();
+      return true;
+    })()`);
+    await waitFor(() => specialKeyRequests.length === 1, "Down arrow was not delivered exactly once");
+    const draftAfterArrow = await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      return { value: input.value, start: input.selectionStart, end: input.selectionEnd };
+    })()`);
+    assert.deepEqual(draftAfterArrow, { value: "draft stays with this agent", start: 6, end: 11 });
+    assert.equal(messageRequests.length, messagesBeforePaneKeys, "a pane key must not become a chat message");
+
+    await cdp.evaluate("document.querySelector('[data-pane-key=\"enter\"]').click(); true");
+    await waitFor(() => specialKeyRequests.length === 2, "blank Enter was not delivered with a draft present");
+    assert.equal(await cdp.evaluate("document.getElementById('message').value"), "draft stays with this agent");
+    await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.value = '';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('[data-pane-key="enter"]').click();
+      return true;
+    })()`);
+    await waitFor(() => specialKeyRequests.length === 3, "blank Enter was disabled by an empty composer");
+    await waitFor(
+      () => cdp.evaluate("!document.querySelector('[data-pane-key=\"up\"]').disabled"),
+      "key controls stayed busy after blank Enter",
+    );
+
+    // Native button semantics provide keyboard activation without installing
+    // a page-level arrow-key handler that could steal textarea cursor keys.
+    await cdp.evaluate("document.querySelector('[data-pane-key=\"up\"]').focus(); true");
+    await cdp.send("Input.dispatchKeyEvent", {
+      type: "rawKeyDown", key: " ", code: "Space", windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32,
+    });
+    await cdp.send("Input.dispatchKeyEvent", {
+      type: "keyUp", key: " ", code: "Space", windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32,
+    });
+    await waitFor(() => specialKeyRequests.length === 4, "keyboard activation did not send Up");
+    for (const action of ["left", "right"]) {
+      await waitFor(
+        () => cdp.evaluate(`!document.querySelector('[data-pane-key="${action}"]').disabled`),
+        `${action} arrow stayed disabled after the prior request`,
+      );
+      await cdp.evaluate(`document.querySelector('[data-pane-key="${action}"]').click(); true`);
+      await waitFor(
+        () => specialKeyRequests.length === (action === "left" ? 5 : 6),
+        `${action} arrow was not delivered`,
+      );
+    }
+    const expectedInstance = `pane-v1-${"1".repeat(64)}`;
+    assert.deepEqual(specialKeyRequests, ["down", "enter", "enter", "up", "left", "right"].map((action) => ({
+      paneId: "tron~%100",
+      body: { action, machine: "tron", instance_id: expectedInstance },
+    })));
+    assert.equal(messageRequests.length, messagesBeforePaneKeys, "blank Enter must bypass the empty chat composer");
+    await waitFor(
+      () => cdp.evaluate("!document.querySelector('[data-pane-key=\"down\"]').disabled"),
+      "key controls stayed busy before the mixed-version check",
+    );
+    nextSpecialKeyStatus = 422;
+    await cdp.evaluate("document.querySelector('[data-pane-key=\"down\"]').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('quick-pane-key-status').textContent.includes('out of sync')"),
+      "a mixed-version key rejection did not provide refresh guidance",
+    );
+    assert.match(
+      await cdp.evaluate("document.getElementById('quick-pane-key-status').textContent"),
+      /Refresh after the server updates/,
+    );
 
     // A cached model observation must never authorize Duplicate when the
     // owner's live capability endpoint fails.

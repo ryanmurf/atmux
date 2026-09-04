@@ -32,7 +32,9 @@ use crate::{
     auto_update::{self, Harness as UpdateHarness, PendingMarker},
     config::{AgentProfile, Config, ProfileMode},
     launch_directory,
-    machine::{MachineKind, MachineSummary, composite_id, now_ms, split_composite},
+    machine::{
+        MachineKind, MachineSummary, composite_id, now_ms, split_composite, validate_machine_id,
+    },
     metrics::{HardwareSampler, MachineMetrics},
     old_sessions::{self, DiscoveryLimits, ResumeCandidate},
     project::{self, ProjectPreferences},
@@ -41,8 +43,8 @@ use crate::{
     status::{AgentKind, AgentStatus},
     systemd_scope,
     tmux::{
-        RESERVED_SERVICE_SESSION, Session, Tmux, UnsupportedModelControl, known_models,
-        valid_pane_identity,
+        PaneSpecialKey, RESERVED_SERVICE_SESSION, Session, Tmux, UnsupportedModelControl,
+        known_models, valid_pane_identity,
     },
     transcript::Transcript,
     workspace::{FileWriteRequest, FilesResponse, GitResponse, WorkspaceErrorKind},
@@ -3129,18 +3131,56 @@ impl ControlPlane {
     /// Returns an error when the agent is unknown, offline, or tmux rejects
     /// either key.
     pub async fn tmux_prefix_twice(&self, id: &str) -> Result<()> {
+        let (machine, instance) = match self.resolve(id)? {
+            Target::Local { instance_id, .. } => (self.inner.local_id.clone(), instance_id),
+            Target::Remote {
+                machine,
+                instance_id,
+                ..
+            } => (machine.id.clone(), instance_id),
+        };
+        self.send_special_key_for_instance(id, PaneSpecialKey::TmuxPrefixTwice, machine, instance)
+            .await
+    }
+
+    /// Sends one allowlisted interactive tmux key to an exact pane generation
+    /// on its expected owning machine.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the machine, pane generation, or live pane
+    /// changes before delivery. Offline/upstream and tmux failures retain
+    /// their normal control-plane classifications.
+    pub async fn send_special_key_for_instance(
+        &self,
+        id: &str,
+        key: PaneSpecialKey,
+        expected_machine_id: String,
+        expected_instance_id: String,
+    ) -> Result<()> {
         match self.resolve(id)? {
-            Target::Local { pane_id, .. } => {
+            Target::Local {
+                pane_id,
+                instance_id,
+                ..
+            } => {
+                validate_expected_pane_machine(&expected_machine_id, &self.inner.local_id)?;
+                validate_expected_pane_instance(Some(&expected_instance_id), &instance_id)?;
                 let prompt_lock = self.prompt_lock(&pane_id);
-                local_tmux(
+                let live_control = self.clone();
+                local_message_mutation(
                     tokio::task::spawn_blocking(move || {
                         let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
                         let mut guard = prompt_lock
                             .state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        live_control.validate_live_message_instance(
+                            &pane_id,
+                            Some(&expected_instance_id),
+                        )?;
                         begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
-                        Tmux.tmux_prefix_twice(&pane_id)?;
+                        Tmux.send_special_key(&pane_id, key)?;
                         Ok(())
                     })
                     .await,
@@ -3148,16 +3188,25 @@ impl ControlPlane {
                 self.inner.refresh_now.notify_one();
             }
             Target::Remote {
-                machine, pane_id, ..
+                machine,
+                pane_id,
+                instance_id,
+                ..
             } => {
+                validate_expected_pane_machine(&expected_machine_id, &machine.id)?;
+                validate_expected_pane_instance(Some(&expected_instance_id), &instance_id)?;
                 self.ensure_online(&machine.id)?;
                 machine
                     .post_json(
                         &format!("/api/v1/panes/{}/special-keys", encode_segment(&pane_id)),
-                        &serde_json::json!({ "action": "tmux_prefix_twice" }),
+                        &serde_json::json!({
+                            "action": key.wire_name(),
+                            "machine": expected_machine_id,
+                            "instance_id": expected_instance_id,
+                        }),
                     )
                     .await
-                    .map_err(|error| upstream(&error))?;
+                    .map_err(|error| remote_mutation_error(&error))?;
             }
         }
         Ok(())
@@ -3954,6 +4003,16 @@ fn validate_expected_pane_instance(expected: Option<&str>, actual: &str) -> Resu
     if expected != actual {
         return Err(conflict(
             "agent pane restarted before the message could be delivered",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_expected_pane_machine(expected: &str, actual: &str) -> Result<()> {
+    validate_machine_id(expected).map_err(|_| bad_request("invalid pane machine id"))?;
+    if expected != actual {
+        return Err(conflict(
+            "agent owning machine changed before the key could be delivered",
         ));
     }
     Ok(())
@@ -4989,7 +5048,7 @@ mod tests {
     fn remote_summary(machine: &str, pane: &str, name: &str, hash: &str) -> SessionSummary {
         SessionSummary {
             id: composite_id(machine, pane),
-            instance_id: String::new(),
+            instance_id: format!("pane-v1-{}", "a".repeat(64)),
             machine: machine.to_owned(),
             name: name.to_owned(),
             pane_id: pane.to_owned(),

@@ -23,7 +23,7 @@ use atmux::{
     },
     machine::MachineKind,
     remote::RemoteMachine,
-    tmux::Tmux,
+    tmux::{PaneSpecialKey, Tmux},
     workspace::{FileWriteRequest, FilesResponse, GitResponse},
 };
 
@@ -412,12 +412,23 @@ async fn special_keys(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    record(
-        &state,
-        &headers,
-        &format!("/api/v1/panes/{id}/special-keys"),
-        &body,
-    );
+    let reject = {
+        let mut recorder = state.lock().unwrap();
+        record_locked(
+            &mut recorder,
+            &headers,
+            &format!("/api/v1/panes/{id}/special-keys"),
+            &body,
+        );
+        recorder.reject_generation_mutations
+    };
+    if reject && fixture_accepts_trainer_instance(&body) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "owner-only-generation-detail" })),
+        )
+            .into_response();
+    }
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -1452,7 +1463,52 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
         .unwrap_err();
     assert_eq!(error_kind(&error), ErrorKind::Conflict);
     assert_eq!(recorder.lock().unwrap().bodies.len(), sent_before_mismatch);
-    control.tmux_prefix_twice("gpu-box~%7").await.unwrap();
+    for key in [
+        PaneSpecialKey::Up,
+        PaneSpecialKey::Down,
+        PaneSpecialKey::Left,
+        PaneSpecialKey::Right,
+        PaneSpecialKey::Enter,
+        PaneSpecialKey::TmuxPrefixTwice,
+    ] {
+        control
+            .send_special_key_for_instance(
+                "gpu-box~%7",
+                key,
+                "gpu-box".to_owned(),
+                trainer_instance.clone(),
+            )
+            .await
+            .unwrap();
+    }
+    let sent_before_key_mismatch = recorder.lock().unwrap().bodies.len();
+    for error in [
+        control
+            .send_special_key_for_instance(
+                "gpu-box~%8",
+                PaneSpecialKey::Enter,
+                "gpu-box".to_owned(),
+                trainer_instance.clone(),
+            )
+            .await
+            .unwrap_err(),
+        control
+            .send_special_key_for_instance(
+                "gpu-box~%7",
+                PaneSpecialKey::Down,
+                "midnight".to_owned(),
+                trainer_instance.clone(),
+            )
+            .await
+            .unwrap_err(),
+    ] {
+        assert_eq!(error_kind(&error), ErrorKind::Conflict);
+    }
+    assert_eq!(
+        recorder.lock().unwrap().bodies.len(),
+        sent_before_key_mismatch,
+        "mismatched machine or generation must not cross federation",
+    );
     control.interrupt("gpu-box~%7").await.unwrap();
     control.resume_current_claude("gpu-box~%7").await.unwrap();
     control.kill("gpu-box~%8").await.unwrap();
@@ -1521,6 +1577,18 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
         .map(|body| serde_json::from_str(body).unwrap())
         .expect("special key body");
     assert_eq!(special_keys["action"], "tmux_prefix_twice");
+    assert_eq!(special_keys["machine"], "gpu-box");
+    assert_eq!(special_keys["instance_id"], trainer_instance);
+    for action in ["up", "down", "left", "right", "enter"] {
+        assert!(seen.bodies.iter().any(|body| {
+            serde_json::from_str::<Value>(body).is_ok_and(|value| {
+                value.get("action").and_then(Value::as_str) == Some(action)
+                    && value.get("machine").and_then(Value::as_str) == Some("gpu-box")
+                    && value.get("instance_id").and_then(Value::as_str)
+                        == Some(trainer_instance.as_str())
+            })
+        }));
+    }
     let resume: Value = seen
         .bodies
         .iter()
@@ -1833,6 +1901,7 @@ async fn the_http_surface_reports_an_upstream_rejection_as_a_gateway_failure() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn owner_generation_conflicts_remain_conflicts_through_a_coordinator() {
     if !tmux_available("owner_generation_conflicts_remain_conflicts_through_a_coordinator") {
         return;
@@ -1859,6 +1928,22 @@ async fn owner_generation_conflicts_remain_conflicts_through_a_coordinator() {
         !direct.to_string().contains("owner-only-generation-detail"),
         "owner response detail escaped through the coordinator: {direct:#}"
     );
+    let key_conflict = control
+        .send_special_key_for_instance(
+            "gpu-box~%7",
+            PaneSpecialKey::Enter,
+            "gpu-box".to_owned(),
+            instance_id.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_kind(&key_conflict), ErrorKind::Conflict);
+    assert!(
+        !key_conflict
+            .to_string()
+            .contains("owner-only-generation-detail"),
+        "owner response detail escaped through special-key federation: {key_conflict:#}"
+    );
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let app = atmux::web::api_router(control, Vec::new(), shutdown_rx);
@@ -1876,6 +1961,14 @@ async fn owner_generation_conflicts_remain_conflicts_through_a_coordinator() {
             json!({
                 "text": "HTTP image conflict",
                 "images": [{ "media_type": "image/png", "data": "iVBORw0KGgo=" }],
+                "instance_id": instance_id,
+            }),
+        ),
+        (
+            "/api/v1/panes/gpu-box~%257/special-keys",
+            json!({
+                "action": "enter",
+                "machine": "gpu-box",
                 "instance_id": instance_id,
             }),
         ),
@@ -1914,5 +2007,5 @@ async fn owner_generation_conflicts_remain_conflicts_through_a_coordinator() {
             body.get("instance_id").and_then(Value::as_str) == Some(instance_id.as_str())
         })
         .count();
-    assert!(rejected >= 3, "forwarded bodies: {:#?}", seen.bodies);
+    assert!(rejected >= 5, "forwarded bodies: {:#?}", seen.bodies);
 }

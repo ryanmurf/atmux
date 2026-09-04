@@ -79,6 +79,7 @@ const {
   messageFitsByteLimit,
   moveMessageHistory,
   paneTypingText,
+  paneSpecialKeyDelivery,
   paneErrorLabel,
   paneFilesPath,
   paneGitPath,
@@ -1044,6 +1045,22 @@ test("focused live panes forward only ordinary typing to the message composer", 
   assert.equal(paneTypingText({ key: "a", isComposing: true }), "");
 });
 
+test("special-key delivery binds one allowlisted action to machine and pane generation", () => {
+  const instanceId = `pane-v1-${"a".repeat(64)}`;
+  const session = {
+    id: "midnight~%7", machine: "midnight", instance_id: instanceId,
+  };
+  for (const action of ["up", "down", "left", "right", "enter", "tmux_prefix_twice"]) {
+    assert.deepEqual(paneSpecialKeyDelivery(session, action), {
+      paneId: "midnight~%7", machine: "midnight", instanceId, action,
+    });
+  }
+  assert.equal(paneSpecialKeyDelivery(session, "C-x; run-shell pwn"), null);
+  assert.equal(paneSpecialKeyDelivery({ ...session, instance_id: "%7" }, "enter"), null);
+  assert.equal(paneSpecialKeyDelivery({ ...session, machine: "tron" }, "enter"), null);
+  assert.equal(paneSpecialKeyDelivery({ ...session, id: "midnight~%8" }, "enter")?.paneId, "midnight~%8");
+});
+
 test("message history moves through sent comments and restores the draft", () => {
   const history = ["first", "second"];
   assert.equal(moveMessageHistory(history, history.length, "up"), 1);
@@ -1880,7 +1897,12 @@ test("Actions groups fixed special keys and Compact outside the composer", () =>
   assert.match(markup, /id="quick-compact"/);
   assert.doesNotMatch(markup, /id="compact"/);
   assert.match(source, /special-keys/);
-  assert.match(source, /action: "tmux_prefix_twice"/);
+  assert.match(source, /sendPaneSpecialKey\("tmux_prefix_twice", "Ctrl\+B twice"\)/);
+  for (const action of ["up", "down", "left", "right", "enter"]) {
+    assert.match(markup, new RegExp(`data-pane-key="${action}"`));
+  }
+  assert.match(markup, /data-pane-key="enter"[^>]*aria-label="Send blank Enter"/);
+  assert.match(source, /document\.querySelectorAll\("\[data-pane-key\]"\)/);
   assert.match(source, /compactSelectedAgent/);
   assert.match(source, /text: "\/compact"/);
   assert.match(source, /duplicateLaunchSelection\([\s\S]*\[\.\.\.state\.sessions\.values\(\)\]/);
