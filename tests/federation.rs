@@ -406,7 +406,7 @@ async fn image_messages(
     Json(json!({ "ok": true })).into_response()
 }
 
-async fn special_keys(
+async fn input_keys(
     State(state): State<Shared>,
     Path(id): Path<String>,
     headers: HeaderMap,
@@ -417,7 +417,7 @@ async fn special_keys(
         record_locked(
             &mut recorder,
             &headers,
-            &format!("/api/v1/panes/{id}/special-keys"),
+            &format!("/api/v1/panes/{id}/input-keys"),
             &body,
         );
         recorder.reject_generation_mutations
@@ -429,6 +429,21 @@ async fn special_keys(
         )
             .into_response();
     }
+    Json(json!({ "ok": true })).into_response()
+}
+
+async fn legacy_special_keys(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    record(
+        &state,
+        &headers,
+        &format!("/api/v1/panes/{id}/special-keys"),
+        &body,
+    );
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -626,7 +641,8 @@ async fn start_node_with_memory(advertise_memory: bool) -> (SocketAddr, Shared) 
         .route("/api/v1/panes/{id}/git", get(git_view))
         .route("/api/v1/panes/{id}/messages", post(messages))
         .route("/api/v1/panes/{id}/image-messages", post(image_messages))
-        .route("/api/v1/panes/{id}/special-keys", post(special_keys))
+        .route("/api/v1/panes/{id}/special-keys", post(legacy_special_keys))
+        .route("/api/v1/panes/{id}/input-keys", post(input_keys))
         .route("/api/v1/panes/{id}/interrupt", post(interrupt))
         .route("/api/v1/panes/{id}/resume", post(resume))
         .route(
@@ -636,6 +652,22 @@ async fn start_node_with_memory(advertise_memory: bool) -> (SocketAddr, Shared) 
         .route("/api/v1/sessions", post(launch))
         .route("/api/v1/memory-launches/v1", post(launch_with_memory))
         .route("/api/v1/sessions/{id}", delete(kill))
+        .with_state(Arc::clone(&recorder));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (address, recorder)
+}
+
+async fn start_legacy_input_node() -> (SocketAddr, Shared) {
+    let recorder: Shared = Arc::new(Mutex::new(Recorder::default()));
+    let app = Router::new()
+        .route("/api/v1/events", get(events))
+        // This intentionally models the prior owner: it would execute the
+        // unbound Ctrl+B command here, but knows nothing about /input-keys.
+        .route("/api/v1/panes/{id}/special-keys", post(legacy_special_keys))
         .with_state(Arc::clone(&recorder));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -715,6 +747,57 @@ async fn an_unauthenticated_machine_sends_no_authorization_header() {
     let _: atmux::control::LaunchOptions =
         machine.get_json("/api/v1/launch-options").await.unwrap();
     assert_eq!(recorder.lock().unwrap().authorizations, [None]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn generation_bound_keys_fail_closed_against_a_legacy_owner() {
+    if !tmux_available("generation_bound_keys_fail_closed_against_a_legacy_owner") {
+        return;
+    }
+    let (address, recorder) = start_legacy_input_node().await;
+    let control = ControlPlane::start(federated_config(address))
+        .await
+        .unwrap();
+    assert!(wait_for_session(&control, "gpu-box~%7").await);
+    let error = control
+        .send_special_key_for_instance(
+            "gpu-box~%7",
+            PaneSpecialKey::TmuxPrefixTwice,
+            "gpu-box".to_owned(),
+            format!("pane-v1-{}", "a".repeat(64)),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_kind(&error), ErrorKind::NotFound, "{error:#}");
+
+    {
+        let seen = recorder.lock().unwrap();
+        assert!(
+            !seen
+                .paths
+                .iter()
+                .any(|path| path.ends_with("/special-keys")),
+            "a new coordinator must never fall back to the legacy unbound route: {:#?}",
+            seen.paths,
+        );
+        assert!(
+            seen.bodies.iter().all(String::is_empty),
+            "the legacy mutation handler must receive no key body: {:#?}",
+            seen.bodies,
+        );
+    }
+
+    control.tmux_prefix_twice("gpu-box~%7").await.unwrap();
+    let seen = recorder.lock().unwrap();
+    assert!(
+        seen.paths
+            .iter()
+            .any(|path| path == "/api/v1/panes/%7/special-keys"),
+        "only the explicit legacy control may use the old owner route",
+    );
+    assert!(seen.bodies.iter().any(|body| {
+        serde_json::from_str::<Value>(body).ok() == Some(json!({ "action": "tmux_prefix_twice" }))
+    }));
 }
 
 #[tokio::test]
@@ -1539,7 +1622,14 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
     assert!(
         seen.paths
             .iter()
-            .any(|path| path == "/api/v1/panes/%7/special-keys")
+            .any(|path| path == "/api/v1/panes/%7/input-keys")
+    );
+    assert!(
+        !seen
+            .paths
+            .iter()
+            .any(|path| path == "/api/v1/panes/%7/special-keys"),
+        "generation-bound controls must never use the legacy route",
     );
     assert!(
         seen.paths
@@ -1965,7 +2055,7 @@ async fn owner_generation_conflicts_remain_conflicts_through_a_coordinator() {
             }),
         ),
         (
-            "/api/v1/panes/gpu-box~%257/special-keys",
+            "/api/v1/panes/gpu-box~%257/input-keys",
             json!({
                 "action": "enter",
                 "machine": "gpu-box",

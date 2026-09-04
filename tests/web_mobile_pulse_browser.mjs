@@ -36,7 +36,10 @@ const fileSaveRequests = [];
 const messageRequests = [];
 const imageMessageRequests = [];
 const specialKeyRequests = [];
+const legacySpecialKeyRequests = [];
 let nextSpecialKeyStatus = null;
+let nextSpecialKeyResponseDelayMs = 0;
+let simulateOldCoordinatorInputRoute = false;
 let nextMessageFailurePane = null;
 let messageResponseDelayMs = 0;
 const projectFileContents = new Map();
@@ -286,18 +289,40 @@ function mockApi(url, response, request) {
     });
     return true;
   }
-  if (/^\/api\/v1\/panes\/[^/]+\/special-keys$/.test(pathname) && request.method === "POST") {
+  if (/^\/api\/v1\/panes\/[^/]+\/input-keys$/.test(pathname) && request.method === "POST") {
+    if (simulateOldCoordinatorInputRoute) {
+      simulateOldCoordinatorInputRoute = false;
+      request.resume();
+      errorJson(response, 404, "legacy coordinator has no input-key route");
+      return true;
+    }
     const paneId = decodeURIComponent(pathname.split("/")[4]);
     let body = "";
     request.setEncoding("utf8");
     request.on("data", (chunk) => { body += chunk; });
     request.on("end", () => {
       specialKeyRequests.push({ paneId, body: JSON.parse(body) });
-      if (nextSpecialKeyStatus) {
-        const status = nextSpecialKeyStatus;
-        nextSpecialKeyStatus = null;
-        errorJson(response, status, "fixture mixed-version rejection");
-      } else json(response, {});
+      const status = nextSpecialKeyStatus;
+      const delayMs = nextSpecialKeyResponseDelayMs;
+      nextSpecialKeyStatus = null;
+      nextSpecialKeyResponseDelayMs = 0;
+      const reply = () => {
+        if (status) errorJson(response, status, "fixture input-key rejection");
+        else json(response, {});
+      };
+      if (delayMs > 0) setTimeout(reply, delayMs);
+      else reply();
+    });
+    return true;
+  }
+  if (/^\/api\/v1\/panes\/[^/]+\/special-keys$/.test(pathname) && request.method === "POST") {
+    const paneId = decodeURIComponent(pathname.split("/")[4]);
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      legacySpecialKeyRequests.push({ paneId, body: JSON.parse(body) });
+      json(response, {});
     });
     return true;
   }
@@ -765,7 +790,10 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
   messageRequests.length = 0;
   imageMessageRequests.length = 0;
   specialKeyRequests.length = 0;
+  legacySpecialKeyRequests.length = 0;
   nextSpecialKeyStatus = null;
+  nextSpecialKeyResponseDelayMs = 0;
+  simulateOldCoordinatorInputRoute = false;
   projectFileContents.clear();
   projectFileVersions.clear();
   delayFileSavePane = null;
@@ -1656,20 +1684,35 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.ok(keyLayout.targets.every(({ width, height }) => width >= 44 && height >= 44), JSON.stringify(keyLayout));
     assert.ok(keyLayout.dialogOverflow <= 1, JSON.stringify(keyLayout));
 
-    // Interactive keys use their own generation-bound route. They neither
-    // submit nor clear a per-agent draft, and synchronous double taps cannot
-    // enqueue an unbounded repeat while the first request is in flight.
+    // Interactive keys use their own generation-bound route and a bounded
+    // ordered queue. Deliberate rapid taps remain distinct without touching
+    // the per-agent composer draft.
     const messagesBeforePaneKeys = messageRequests.length;
+    nextSpecialKeyResponseDelayMs = 250;
     await cdp.evaluate(`(() => {
       const input = document.getElementById('message');
       input.value = 'draft stays with this agent';
       input.setSelectionRange(6, 11);
       input.dispatchEvent(new Event('input', { bubbles: true }));
       const down = document.querySelector('[data-pane-key="down"]');
-      down.click(); down.click();
+      down.click(); down.click(); down.click();
+      document.querySelector('[data-pane-key="enter"]').click();
       return true;
     })()`);
-    await waitFor(() => specialKeyRequests.length === 1, "Down arrow was not delivered exactly once");
+    await waitFor(() => specialKeyRequests.length === 1, "the first delayed Down was not dispatched");
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(specialKeyRequests.length, 1, "queued keys were dispatched concurrently");
+    const queuedStatus = await cdp.evaluate(`({
+      status: document.getElementById('quick-pane-key-status').textContent,
+      keyDisabled: document.querySelector('[data-pane-key="down"]').disabled,
+      duplicateDisabled: document.getElementById('quick-duplicate').disabled,
+      busy: document.querySelector('.quick-pane-keypad').getAttribute('aria-busy'),
+    })`);
+    assert.match(queuedStatus.status, /4 keys sending or queued/);
+    assert.equal(queuedStatus.keyDisabled, false, JSON.stringify(queuedStatus));
+    assert.equal(queuedStatus.duplicateDisabled, false, JSON.stringify(queuedStatus));
+    assert.equal(queuedStatus.busy, "true", JSON.stringify(queuedStatus));
+    await waitFor(() => specialKeyRequests.length === 4, "Down×3 then Enter did not drain in order");
     const draftAfterArrow = await cdp.evaluate(`(() => {
       const input = document.getElementById('message');
       return { value: input.value, start: input.selectionStart, end: input.selectionEnd };
@@ -1677,8 +1720,6 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.deepEqual(draftAfterArrow, { value: "draft stays with this agent", start: 6, end: 11 });
     assert.equal(messageRequests.length, messagesBeforePaneKeys, "a pane key must not become a chat message");
 
-    await cdp.evaluate("document.querySelector('[data-pane-key=\"enter\"]').click(); true");
-    await waitFor(() => specialKeyRequests.length === 2, "blank Enter was not delivered with a draft present");
     assert.equal(await cdp.evaluate("document.getElementById('message').value"), "draft stays with this agent");
     await cdp.evaluate(`(() => {
       const input = document.getElementById('message');
@@ -1687,7 +1728,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       document.querySelector('[data-pane-key="enter"]').click();
       return true;
     })()`);
-    await waitFor(() => specialKeyRequests.length === 3, "blank Enter was disabled by an empty composer");
+    await waitFor(() => specialKeyRequests.length === 5, "blank Enter was disabled by an empty composer");
     await waitFor(
       () => cdp.evaluate("!document.querySelector('[data-pane-key=\"up\"]').disabled"),
       "key controls stayed busy after blank Enter",
@@ -1702,7 +1743,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     await cdp.send("Input.dispatchKeyEvent", {
       type: "keyUp", key: " ", code: "Space", windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32,
     });
-    await waitFor(() => specialKeyRequests.length === 4, "keyboard activation did not send Up");
+    await waitFor(() => specialKeyRequests.length === 6, "keyboard activation did not send Up");
     for (const action of ["left", "right"]) {
       await waitFor(
         () => cdp.evaluate(`!document.querySelector('[data-pane-key="${action}"]').disabled`),
@@ -1710,22 +1751,97 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       );
       await cdp.evaluate(`document.querySelector('[data-pane-key="${action}"]').click(); true`);
       await waitFor(
-        () => specialKeyRequests.length === (action === "left" ? 5 : 6),
+        () => specialKeyRequests.length === (action === "left" ? 7 : 8),
         `${action} arrow was not delivered`,
       );
     }
     const expectedInstance = `pane-v1-${"1".repeat(64)}`;
-    assert.deepEqual(specialKeyRequests, ["down", "enter", "enter", "up", "left", "right"].map((action) => ({
+    assert.deepEqual(specialKeyRequests, ["down", "down", "down", "enter", "enter", "up", "left", "right"].map((action) => ({
       paneId: "tron~%100",
       body: { action, machine: "tron", instance_id: expectedInstance },
     })));
     assert.equal(messageRequests.length, messagesBeforePaneKeys, "blank Enter must bypass the empty chat composer");
+
+    // The cap includes the in-flight request. Only this target's key buttons
+    // disable at the cap; the rest of Quick actions remains usable.
+    nextSpecialKeyResponseDelayMs = 250;
+    await cdp.evaluate(`(() => {
+      const down = document.querySelector('[data-pane-key="down"]');
+      for (let index = 0; index < 20; index += 1) down.click();
+      return true;
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('quick-pane-key-status').textContent.includes('full (16)')"),
+      "the pane-key queue did not expose its cap",
+    );
+    const capState = await cdp.evaluate(`({
+      keyDisabled: document.querySelector('[data-pane-key="down"]').disabled,
+      duplicateDisabled: document.getElementById('quick-duplicate').disabled,
+    })`);
+    assert.equal(capState.keyDisabled, true, JSON.stringify(capState));
+    assert.equal(capState.duplicateDisabled, false, JSON.stringify(capState));
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(specialKeyRequests.length, 9, "a delayed key allowed concurrent queue dispatch");
+    await waitFor(() => specialKeyRequests.length === 24, "the bounded queue did not drain exactly 16 taps");
     await waitFor(
       () => cdp.evaluate("!document.querySelector('[data-pane-key=\"down\"]').disabled"),
-      "key controls stayed busy before the mixed-version check",
+      "key controls stayed capped after the queue drained",
     );
+
+    // A conflict invalidates only the queued events for that exact pane
+    // generation. Keys captured after switching agents retain their original
+    // pane and machine while the first target is still in flight.
+    nextSpecialKeyStatus = 409;
+    nextSpecialKeyResponseDelayMs = 250;
+    await cdp.evaluate(`(() => {
+      const down = document.querySelector('[data-pane-key="down"]');
+      down.click(); down.click(); down.click();
+      document.getElementById('quick-actions-dialog').close();
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      document.getElementById('quick-actions-open').click();
+      document.querySelector('[data-pane-key="left"]').click();
+      document.querySelector('[data-pane-key="enter"]').click();
+      return true;
+    })()`);
+    await waitFor(() => specialKeyRequests.length === 27, "the cross-agent queue did not finish safely");
+    const midnightInstance = `pane-v1-${"9".repeat(64)}`;
+    assert.deepEqual(specialKeyRequests.slice(24), [
+      { paneId: "tron~%100", body: { action: "down", machine: "tron", instance_id: expectedInstance } },
+      { paneId: "midnight~%5", body: { action: "left", machine: "midnight", instance_id: midnightInstance } },
+      { paneId: "midnight~%5", body: { action: "enter", machine: "midnight", instance_id: midnightInstance } },
+    ]);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('quick-pane-key-status').textContent.includes('Sent blank Enter')"),
+      "the switched agent did not receive a completed queue status",
+    );
+    assert.match(
+      await cdp.evaluate("document.getElementById('quick-pane-key-status').textContent"),
+      /Sent blank Enter/,
+    );
+    await cdp.evaluate(`(() => {
+      document.getElementById('quick-actions-dialog').close();
+      document.querySelector('[data-session-id="tron~%100"]').click();
+      document.getElementById('quick-actions-open').click();
+      return true;
+    })()`);
+    const conflictStatus = await cdp.evaluate("document.getElementById('quick-pane-key-status').textContent");
+    assert.match(conflictStatus, /agent changed/);
+    assert.match(conflictStatus, /2 queued keys were discarded/);
+
+    // A new browser must not fall back to an old coordinator's unbound
+    // /special-keys route. Its 404 is actionable mixed-version guidance.
+    simulateOldCoordinatorInputRoute = true;
+    await cdp.evaluate("document.querySelector('[data-pane-key=\"right\"]').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('quick-pane-key-status').textContent.includes('out of sync')"),
+      "an old coordinator did not produce refresh guidance",
+    );
+    assert.equal(specialKeyRequests.length, 27, "an old coordinator accepted a generation-bound key");
+    assert.equal(legacySpecialKeyRequests.length, 0, "the new browser fell back to legacy special-keys");
+
     nextSpecialKeyStatus = 422;
     await cdp.evaluate("document.querySelector('[data-pane-key=\"down\"]').click(); true");
+    await waitFor(() => specialKeyRequests.length === 28, "the mixed-version fixture did not receive the key");
     await waitFor(
       () => cdp.evaluate("document.getElementById('quick-pane-key-status').textContent.includes('out of sync')"),
       "a mixed-version key rejection did not provide refresh guidance",
@@ -1734,6 +1850,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       await cdp.evaluate("document.getElementById('quick-pane-key-status').textContent"),
       /Refresh after the server updates/,
     );
+    assert.equal(legacySpecialKeyRequests.length, 0, "generation-bound keys used the legacy route");
 
     // A cached model observation must never authorize Duplicate when the
     // owner's live capability endpoint fails.

@@ -1051,9 +1051,11 @@ test("special-key delivery binds one allowlisted action to machine and pane gene
     id: "midnight~%7", machine: "midnight", instance_id: instanceId,
   };
   for (const action of ["up", "down", "left", "right", "enter", "tmux_prefix_twice"]) {
-    assert.deepEqual(paneSpecialKeyDelivery(session, action), {
+    const delivery = paneSpecialKeyDelivery(session, action);
+    assert.deepEqual(delivery, {
       paneId: "midnight~%7", machine: "midnight", instanceId, action,
     });
+    assert.equal(Object.isFrozen(delivery), true);
   }
   assert.equal(paneSpecialKeyDelivery(session, "C-x; run-shell pwn"), null);
   assert.equal(paneSpecialKeyDelivery({ ...session, instance_id: "%7" }, "enter"), null);
@@ -1896,7 +1898,14 @@ test("Actions groups fixed special keys and Compact outside the composer", () =>
   assert.match(markup, /id="quick-duplicate"[^>]*>Duplicate agent</);
   assert.match(markup, /id="quick-compact"/);
   assert.doesNotMatch(markup, /id="compact"/);
-  assert.match(source, /special-keys/);
+  assert.match(source, /input-keys/);
+  assert.doesNotMatch(
+    source.match(/async function drainPaneSpecialKeyQueue\(\)[\s\S]*?\n  \}/)?.[0] || "",
+    /special-keys/,
+  );
+  assert.match(source, /MAX_QUEUED_PANE_KEYS = 16/);
+  assert.match(source, /MAX_PANE_KEY_STATUSES = 64/);
+  assert.match(source, /\[400, 404, 422\]\.includes\(error\.status\)/);
   assert.match(source, /sendPaneSpecialKey\("tmux_prefix_twice", "Ctrl\+B twice"\)/);
   for (const action of ["up", "down", "left", "right", "enter"]) {
     assert.match(markup, new RegExp(`data-pane-key="${action}"`));

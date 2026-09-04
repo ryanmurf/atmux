@@ -3124,23 +3124,49 @@ impl ControlPlane {
         Ok(())
     }
 
-    /// Sends the fixed `Ctrl+B`, `Ctrl+B` sequence to one agent pane.
+    /// Sends the legacy fixed `Ctrl+B`, `Ctrl+B` sequence to one agent pane.
+    ///
+    /// This compatibility path intentionally has no browser-supplied pane
+    /// generation. New clients must call [`Self::send_special_key_for_instance`]
+    /// through the generation-bound `/input-keys` route instead.
     ///
     /// # Errors
     ///
     /// Returns an error when the agent is unknown, offline, or tmux rejects
     /// either key.
     pub async fn tmux_prefix_twice(&self, id: &str) -> Result<()> {
-        let (machine, instance) = match self.resolve(id)? {
-            Target::Local { instance_id, .. } => (self.inner.local_id.clone(), instance_id),
+        match self.resolve(id)? {
+            Target::Local { pane_id, .. } => {
+                let prompt_lock = self.prompt_lock(&pane_id);
+                local_tmux(
+                    tokio::task::spawn_blocking(move || {
+                        let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
+                        let mut guard = prompt_lock
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
+                        Tmux.tmux_prefix_twice(&pane_id)?;
+                        Ok(())
+                    })
+                    .await,
+                )?;
+                self.inner.refresh_now.notify_one();
+            }
             Target::Remote {
-                machine,
-                instance_id,
-                ..
-            } => (machine.id.clone(), instance_id),
-        };
-        self.send_special_key_for_instance(id, PaneSpecialKey::TmuxPrefixTwice, machine, instance)
-            .await
+                machine, pane_id, ..
+            } => {
+                self.ensure_online(&machine.id)?;
+                machine
+                    .post_json(
+                        &format!("/api/v1/panes/{}/special-keys", encode_segment(&pane_id)),
+                        &serde_json::json!({ "action": "tmux_prefix_twice" }),
+                    )
+                    .await
+                    .map_err(|error| remote_mutation_error(&error))?;
+            }
+        }
+        Ok(())
     }
 
     /// Sends one allowlisted interactive tmux key to an exact pane generation
@@ -3198,7 +3224,7 @@ impl ControlPlane {
                 self.ensure_online(&machine.id)?;
                 machine
                     .post_json(
-                        &format!("/api/v1/panes/{}/special-keys", encode_segment(&pane_id)),
+                        &format!("/api/v1/panes/{}/input-keys", encode_segment(&pane_id)),
                         &serde_json::json!({
                             "action": key.wire_name(),
                             "machine": expected_machine_id,

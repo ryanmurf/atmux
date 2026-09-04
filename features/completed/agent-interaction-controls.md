@@ -9,7 +9,10 @@ Status: completed
 - [x] Actions exposes fixed Up, Down, Left, Right, and blank Enter tmux keys for interactive
   agent prompts without consuming or clearing the message draft.
 - [x] Pane-key requests bind the owning machine and immutable pane instance, revalidate at the
-  owner mutation boundary, and reject stale/reused panes with HTTP 409.
+  owner mutation boundary, and reject stale/reused panes with HTTP 409. The versioned input-key
+  route fails closed across mixed deployments instead of falling back to the legacy Ctrl+B route.
+- [x] Rapid pane-key taps drain in order through a bounded 16-action queue. A failed target drops
+  only that pane generation's remaining keys, and switching agents cannot retarget queued input.
 - [x] `atmux-web` service sessions are hidden from the inventory.
 - [x] Browser unit tests, tmux smoke tests, live browser checks, Fable review, and independent review
   passed.

@@ -1265,10 +1265,7 @@ impl Tmux {
     ///
     /// Returns an error when the pane does not exist or tmux rejects either key.
     pub fn tmux_prefix_twice(&self, pane_id: &str) -> Result<()> {
-        for key in tmux_prefix_twice_keys() {
-            Self::output(["send-keys", "-t", pane_id, key])?;
-        }
-        Ok(())
+        Self::output(tmux_prefix_twice_args(pane_id)).map(|_| ())
     }
 
     /// Reports the running harness version and current model from the owning
@@ -2085,8 +2082,8 @@ fn special_key_args(pane_id: &str, key: PaneSpecialKey) -> [&str; 4] {
     ["send-keys", "-t", pane_id, key]
 }
 
-fn tmux_prefix_twice_keys() -> &'static [&'static str] {
-    &["C-b", "C-b"]
+fn tmux_prefix_twice_args(pane_id: &str) -> [&str; 5] {
+    ["send-keys", "-t", pane_id, "C-b", "C-b"]
 }
 
 fn select_session_panes(
@@ -3836,7 +3833,16 @@ mod tests {
 
     #[test]
     fn special_prefix_action_sends_ctrl_b_twice() {
-        assert_eq!(tmux_prefix_twice_keys(), ["C-b", "C-b"]);
+        assert_eq!(
+            tmux_prefix_twice_args("%7; run-shell 'touch /tmp/pwned'"),
+            [
+                "send-keys",
+                "-t",
+                "%7; run-shell 'touch /tmp/pwned'",
+                "C-b",
+                "C-b",
+            ],
+        );
     }
 
     #[test]

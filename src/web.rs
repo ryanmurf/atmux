@@ -108,6 +108,11 @@ struct SpecialKeyRequest {
     instance_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct LegacySpecialKeyRequest {
+    action: String,
+}
+
 /// Deliberately empty: the owning node derives the Claude config root and
 /// native session id itself, never from a browser request.
 #[derive(Debug, Deserialize)]
@@ -808,7 +813,14 @@ fn routes(state: WebState) -> Router {
             post(send_image_message)
                 .layer(DefaultBodyLimit::max(MAX_ATTACHMENT_REQUEST_BODY_BYTES)),
         )
-        .route("/api/v1/panes/{id}/special-keys", post(send_special_keys))
+        // Keep the original Ctrl+B route for already-loaded old clients. All
+        // generation-bound controls use a new route so an old coordinator or
+        // owner returns 404 instead of silently ignoring their bindings.
+        .route(
+            "/api/v1/panes/{id}/special-keys",
+            post(send_legacy_special_keys),
+        )
+        .route("/api/v1/panes/{id}/input-keys", post(send_input_keys))
         .route("/api/v1/panes/{id}/interrupt", post(interrupt))
         .route("/api/v1/sessions/{id}", delete(kill))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
@@ -1165,7 +1177,25 @@ async fn send_image_message(
     Ok(Json(OkResponse { ok: true }))
 }
 
-async fn send_special_keys(
+async fn send_legacy_special_keys(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<LegacySpecialKeyRequest>,
+) -> Result<Json<OkResponse>, ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    if request.action != "tmux_prefix_twice" {
+        return Err(ApiError::bad_request("unsupported special key action"));
+    }
+    state
+        .control
+        .tmux_prefix_twice(&id)
+        .await
+        .map_err(|error| ApiError::from_control(&error))?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+async fn send_input_keys(
     State(state): State<WebState>,
     Path(id): Path<String>,
     headers: HeaderMap,
@@ -2621,7 +2651,7 @@ mod tests {
             ),
             (
                 "POST",
-                "/api/v1/panes/gpu-box~%251/special-keys",
+                "/api/v1/panes/gpu-box~%251/input-keys",
                 Some(concat!(
                     r#"{"action":"tmux_prefix_twice","machine":"gpu-box","instance_id":"pane-v1-"#,
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
@@ -2749,7 +2779,7 @@ mod tests {
             status_of(
                 &app,
                 "POST",
-                "/api/v1/panes/%254294967295/special-keys",
+                "/api/v1/panes/%254294967295/input-keys",
                 Some(&live_race_key),
             )
             .await,
@@ -3060,7 +3090,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn special_key_route_is_allowlisted() {
+    async fn generation_bound_input_key_route_is_allowlisted() {
         let control = crate::control::test_control(&[]);
         let mut session = crate::control::test_session("agent", "%4294967295", "hello");
         session.pane_identity = format!("pane-v1-{}", "b".repeat(64));
@@ -3078,7 +3108,7 @@ mod tests {
 
         let anonymous = protected_api(
             "POST",
-            "/api/v1/panes/%254294967295/special-keys",
+            "/api/v1/panes/%254294967295/input-keys",
             &valid_body,
             None,
             Some("http://localhost:7345"),
@@ -3090,7 +3120,7 @@ mod tests {
 
         let cross_origin = HttpRequest::builder()
             .method("POST")
-            .uri("/api/v1/panes/%254294967295/special-keys")
+            .uri("/api/v1/panes/%254294967295/input-keys")
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ORIGIN, "https://attacker.example")
             .body(Body::from(valid_body))
@@ -3104,7 +3134,7 @@ mod tests {
             status_of(
                 &app,
                 "POST",
-                "/api/v1/panes/%254294967295/special-keys",
+                "/api/v1/panes/%254294967295/input-keys",
                 Some(r#"{"action":"enter"}"#),
             )
             .await,
@@ -3115,7 +3145,7 @@ mod tests {
             status_of(
                 &app,
                 "POST",
-                "/api/v1/panes/%254294967295/special-keys",
+                "/api/v1/panes/%254294967295/input-keys",
                 Some(
                     &serde_json::json!({
                         "action": "anything_else",
@@ -3132,7 +3162,7 @@ mod tests {
             status_of(
                 &app,
                 "POST",
-                "/api/v1/panes/%254294967295/special-keys",
+                "/api/v1/panes/%254294967295/input-keys",
                 Some(
                     &serde_json::json!({
                         "action": "enter",
@@ -3150,7 +3180,7 @@ mod tests {
             status_of(
                 &app,
                 "POST",
-                "/api/v1/panes/%254294967295/special-keys",
+                "/api/v1/panes/%254294967295/input-keys",
                 Some(
                     &serde_json::json!({
                         "action": "down",
@@ -3168,7 +3198,7 @@ mod tests {
             status_of(
                 &app,
                 "POST",
-                "/api/v1/panes/nope/special-keys",
+                "/api/v1/panes/nope/input-keys",
                 Some(
                     &serde_json::json!({
                         "action": "tmux_prefix_twice",
@@ -3180,6 +3210,29 @@ mod tests {
             )
             .await,
             StatusCode::NOT_FOUND
+        );
+
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/nope/special-keys",
+                Some(r#"{"action":"tmux_prefix_twice"}"#),
+            )
+            .await,
+            StatusCode::NOT_FOUND,
+            "the legacy endpoint remains available only for old Ctrl+B clients",
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/nope/special-keys",
+                Some(r#"{"action":"enter"}"#),
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "the legacy endpoint must not gain generic input-key behavior",
         );
     }
 

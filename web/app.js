@@ -48,6 +48,8 @@ const MACHINE_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const PANE_SPECIAL_KEY_ACTIONS = new Set([
   "up", "down", "left", "right", "enter", "tmux_prefix_twice",
 ]);
+const MAX_QUEUED_PANE_KEYS = 16;
+const MAX_PANE_KEY_STATUSES = 64;
 const PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN = /^pane:([A-Za-z0-9_.%~-]{1,96}):(pane-v1-[a-f0-9]{64})$/;
 const FILE_READER_SIZES = new Set(["small", "medium", "large"]);
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg"]);
@@ -292,12 +294,18 @@ function paneSpecialKeyDelivery(session, action, localMachineId = "local") {
   const compositeMachine = parseCompositeId(session.id).machine;
   if (!MACHINE_ID_PATTERN.test(machine)
       || (compositeMachine && compositeMachine !== machine)) return null;
-  return {
+  return Object.freeze({
     paneId: session.id,
     machine,
     instanceId: session.instance_id,
     action,
-  };
+  });
+}
+
+function paneSpecialKeyTarget(delivery) {
+  return delivery
+    ? `${delivery.machine}\u0000${delivery.paneId}\u0000${delivery.instanceId}`
+    : null;
 }
 
 /// Returns an incarnation-safe identity for browser-local composer state.
@@ -2400,6 +2408,8 @@ function initialize() {
     optimisticComposerClears: new Map(),
     composerSending: false,
     specialKeySending: null,
+    specialKeyQueue: [],
+    specialKeyStatuses: new Map(),
     inFlightComposerText: null,
     inFlightComposerIdentity: null,
     composerRevision: 0,
@@ -4103,11 +4113,32 @@ function initialize() {
     renderClaudeResumeAction(selected, controllable);
     const resuming = Boolean(state.resumingPaneId);
     const preparingDuplicate = Boolean(state.duplicatingPaneId);
-    const sendingSpecialKey = Boolean(state.specialKeySending);
-    for (const id of ["tmux-prefix-twice", "interrupt", "kill-open", "attach", "quick-actions-open", "quick-duplicate", "quick-compact", "quick-tmux-prefix-twice", "quick-interrupt", "quick-kill-open"]) $(id).disabled = !controllable || state.composerSending || sendingSpecialKey || resuming || preparingDuplicate;
+    for (const id of ["interrupt", "kill-open", "attach", "quick-actions-open", "quick-duplicate", "quick-compact", "quick-interrupt", "quick-kill-open"]) $(id).disabled = !controllable || state.composerSending || resuming || preparingDuplicate;
+    const keyTarget = paneSpecialKeyDelivery(selected, "enter");
+    const keyTargetId = paneSpecialKeyTarget(keyTarget);
+    const queuedKeys = keyTargetId
+      ? state.specialKeyQueue.filter((item) => paneSpecialKeyTarget(item) === keyTargetId).length
+        + Number(paneSpecialKeyTarget(state.specialKeySending) === keyTargetId)
+      : 0;
+    const keyQueueFull = state.specialKeyQueue.length
+      + Number(Boolean(state.specialKeySending)) >= MAX_QUEUED_PANE_KEYS;
+    document.querySelector(".quick-pane-keypad").setAttribute(
+      "aria-busy",
+      String(state.specialKeyQueue.length > 0 || Boolean(state.specialKeySending)),
+    );
     document.querySelectorAll("[data-pane-key]").forEach((button) => {
-      button.disabled = !controllable || state.composerSending || sendingSpecialKey || resuming || preparingDuplicate;
+      button.disabled = !controllable || state.composerSending || resuming || preparingDuplicate || keyQueueFull;
     });
+    $("tmux-prefix-twice").disabled = !controllable || state.composerSending || resuming || preparingDuplicate || keyQueueFull;
+    $("quick-tmux-prefix-twice").disabled = !controllable || state.composerSending || resuming || preparingDuplicate || keyQueueFull;
+    const keyStatus = $("quick-pane-key-status");
+    if (keyQueueFull) {
+      keyStatus.textContent = `Key queue full (${MAX_QUEUED_PANE_KEYS}). Wait for a key to finish.`;
+    } else if (queuedKeys > 0) {
+      keyStatus.textContent = `${queuedKeys} key${queuedKeys === 1 ? "" : "s"} sending or queued for this agent.`;
+    } else {
+      keyStatus.textContent = state.specialKeyStatuses.get(keyTargetId) || "One key is sent per tap.";
+    }
     $("quick-duplicate").textContent = preparingDuplicate ? "Preparing duplicate…" : "Duplicate agent";
     $("message").disabled = !controllable || resuming;
     $("send").disabled = !controllable || state.composerSending || resuming
@@ -6185,47 +6216,92 @@ function initialize() {
     } catch (error) { toast(error.message); }
     finally { render(); }
   }
-  async function sendPaneSpecialKey(action, label) {
+  function queuedPaneKeyCount() {
+    return state.specialKeyQueue.length + Number(Boolean(state.specialKeySending));
+  }
+  function discardQueuedPaneKeys(delivery) {
+    const target = paneSpecialKeyTarget(delivery);
+    const before = state.specialKeyQueue.length;
+    state.specialKeyQueue = state.specialKeyQueue.filter((item) => paneSpecialKeyTarget(item) !== target);
+    return before - state.specialKeyQueue.length;
+  }
+  function setPaneKeyStatus(delivery, message) {
+    const target = paneSpecialKeyTarget(delivery);
+    state.specialKeyStatuses.delete(target);
+    state.specialKeyStatuses.set(target, message);
+    while (state.specialKeyStatuses.size > MAX_PANE_KEY_STATUSES) {
+      state.specialKeyStatuses.delete(state.specialKeyStatuses.keys().next().value);
+    }
+  }
+  function paneKeyFailureMessage(error, discarded) {
+    const suffix = discarded > 0
+      ? ` ${discarded} queued key${discarded === 1 ? " was" : "s were"} discarded for that agent.`
+      : "";
+    if ([400, 404, 422].includes(error.status)) {
+      return `Key controls and this atmux server are out of sync.${suffix} Refresh after the server updates, then try again.`;
+    }
+    if (error.status === 409) {
+      return `This agent changed before the key arrived.${suffix} Reopen the agent and try again.`;
+    }
+    if (error.status === 401 || error.status === 403) {
+      return `Key delivery was rejected by sign-in or origin checks.${suffix} Refresh or sign in again, then try again.`;
+    }
+    return `Key delivery failed: ${error.message}.${suffix} Check the agent connection, then try again.`;
+  }
+  async function drainPaneSpecialKeyQueue() {
     if (state.specialKeySending) return;
-    const delivery = paneSpecialKeyDelivery(state.sessions.get(state.selected), action);
+    while (state.specialKeyQueue.length > 0) {
+      const delivery = state.specialKeyQueue.shift();
+      state.specialKeySending = delivery;
+      render();
+      try {
+        await request(`/api/v1/panes/${encodeURIComponent(delivery.paneId)}/input-keys`, {
+          method: "POST",
+          body: JSON.stringify({
+            action: delivery.action,
+            machine: delivery.machine,
+            instance_id: delivery.instanceId,
+          }),
+        });
+        setPaneKeyStatus(delivery, `Sent ${delivery.label}.`);
+      } catch (error) {
+        const discarded = discardQueuedPaneKeys(delivery);
+        const message = paneKeyFailureMessage(error, discarded);
+        setPaneKeyStatus(delivery, message);
+        toast(message);
+      } finally {
+        state.specialKeySending = null;
+        render();
+      }
+    }
+  }
+  function sendPaneSpecialKey(action, label) {
+    const captured = paneSpecialKeyDelivery(state.sessions.get(state.selected), action);
+    const delivery = captured ? Object.freeze({ ...captured, label }) : null;
     if (!delivery) {
       toast("This agent changed or does not report a safe key-delivery target");
       return;
     }
-    state.specialKeySending = delivery;
-    const status = $("quick-pane-key-status");
-    status.textContent = `Sending ${label}…`;
-    render();
-    try {
-      await request(`/api/v1/panes/${encodeURIComponent(delivery.paneId)}/special-keys`, {
-        method: "POST",
-        body: JSON.stringify({
-          action: delivery.action,
-          machine: delivery.machine,
-          instance_id: delivery.instanceId,
-        }),
-      });
-      status.textContent = `Sent ${label}.`;
-    } catch (error) {
-      const message = error.status === 400 || error.status === 422
-        ? "Key controls and this atmux server are out of sync. Refresh after the server updates, then try again."
-        : error.message;
-      status.textContent = message;
+    if (queuedPaneKeyCount() >= MAX_QUEUED_PANE_KEYS) {
+      const message = `Key queue full (${MAX_QUEUED_PANE_KEYS}). Wait for a key to finish.`;
+      setPaneKeyStatus(delivery, message);
       toast(message);
-    } finally {
-      state.specialKeySending = null;
       render();
+      return;
     }
+    state.specialKeyQueue.push(delivery);
+    render();
+    void drainPaneSpecialKeyQueue();
   }
   document.querySelectorAll("[data-pane-key]").forEach((button) => {
     button.addEventListener("click", () => {
       if (button.disabled) return;
       const labels = { up: "Up", down: "Down", left: "Left", right: "Right", enter: "blank Enter" };
-      void sendPaneSpecialKey(button.dataset.paneKey, labels[button.dataset.paneKey] || "key");
+      sendPaneSpecialKey(button.dataset.paneKey, labels[button.dataset.paneKey] || "key");
     });
   });
   $("tmux-prefix-twice").addEventListener("click", () => {
-    void sendPaneSpecialKey("tmux_prefix_twice", "Ctrl+B twice");
+    sendPaneSpecialKey("tmux_prefix_twice", "Ctrl+B twice");
   });
   $("message").addEventListener("input", () => {
     state.composerRevision += 1;
