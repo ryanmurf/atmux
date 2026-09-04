@@ -3009,7 +3009,21 @@ mod tests {
         state.harness_mut(Harness::Codex).last_error = Some("bounded failure".to_owned());
         first.store(&state).unwrap();
         drop(first);
-        let restarted = OwnerLock::try_acquire_in(root.clone()).unwrap().unwrap();
+        // Another parallel test may have forked while the lock descriptor was
+        // open and retain the CLOEXEC copy until it reaches exec. Match the
+        // pane-lock restart test: release must become visible promptly, but
+        // it need not be visible in the same scheduling turn as close.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let restarted = loop {
+            if let Some(lock) = OwnerLock::try_acquire_in(root.clone()).unwrap() {
+                break lock;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owner maintenance lock remained busy after its owner was dropped"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
         let loaded = restarted.load().unwrap();
         assert_eq!(loaded.last_check_ms, Some(42));
         assert_eq!(
