@@ -1766,6 +1766,10 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       body: { action, machine: "tron", instance_id: expectedInstance },
     })));
     assert.equal(messageRequests.length, messagesBeforePaneKeys, "blank Enter must bypass the empty chat composer");
+    await waitFor(
+      () => cdp.evaluate("document.querySelector('.quick-pane-keypad').getAttribute('aria-busy') === 'false'"),
+      "the prior key queue did not become idle before the cap check",
+    );
 
     // The cap includes the in-flight request. Only this target's key buttons
     // disable at the cap; the rest of Quick actions remains usable.
