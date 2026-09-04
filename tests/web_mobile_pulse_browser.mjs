@@ -39,6 +39,7 @@ const specialKeyRequests = [];
 const legacySpecialKeyRequests = [];
 let nextSpecialKeyStatus = null;
 let nextSpecialKeyResponseDelayMs = 0;
+let nextSpecialKeyResponseGate = null;
 let simulateOldCoordinatorInputRoute = false;
 let nextMessageFailurePane = null;
 let messageResponseDelayMs = 0;
@@ -304,13 +305,16 @@ function mockApi(url, response, request) {
       specialKeyRequests.push({ paneId, body: JSON.parse(body) });
       const status = nextSpecialKeyStatus;
       const delayMs = nextSpecialKeyResponseDelayMs;
+      const responseGate = nextSpecialKeyResponseGate;
       nextSpecialKeyStatus = null;
       nextSpecialKeyResponseDelayMs = 0;
+      nextSpecialKeyResponseGate = null;
       const reply = () => {
         if (status) errorJson(response, status, "fixture input-key rejection");
         else json(response, {});
       };
-      if (delayMs > 0) setTimeout(reply, delayMs);
+      if (responseGate) void responseGate.then(reply);
+      else if (delayMs > 0) setTimeout(reply, delayMs);
       else reply();
     });
     return true;
@@ -793,6 +797,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
   legacySpecialKeyRequests.length = 0;
   nextSpecialKeyStatus = null;
   nextSpecialKeyResponseDelayMs = 0;
+  nextSpecialKeyResponseGate = null;
   simulateOldCoordinatorInputRoute = false;
   projectFileContents.clear();
   projectFileVersions.clear();
@@ -1764,7 +1769,8 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
 
     // The cap includes the in-flight request. Only this target's key buttons
     // disable at the cap; the rest of Quick actions remains usable.
-    nextSpecialKeyResponseDelayMs = 250;
+    let releaseCappedKey;
+    nextSpecialKeyResponseGate = new Promise((resolveGate) => { releaseCappedKey = resolveGate; });
     await cdp.evaluate(`(() => {
       const down = document.querySelector('[data-pane-key="down"]');
       for (let index = 0; index < 20; index += 1) down.click();
@@ -1782,6 +1788,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(capState.duplicateDisabled, false, JSON.stringify(capState));
     await new Promise((resolve) => setTimeout(resolve, 60));
     assert.equal(specialKeyRequests.length, 9, "a delayed key allowed concurrent queue dispatch");
+    releaseCappedKey();
     await waitFor(() => specialKeyRequests.length === 24, "the bounded queue did not drain exactly 16 taps");
     await waitFor(
       () => cdp.evaluate("!document.querySelector('[data-pane-key=\"down\"]').disabled"),
