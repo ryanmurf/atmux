@@ -556,6 +556,78 @@ fn parse_version_line(printed: &str) -> Result<Version> {
     Version::parse(version).with_context(|| format!("{printed:?} does not carry a semver version"))
 }
 
+/// Installs the staged executable without the path ever going missing.
+///
+/// A hard link keeps the old inode reachable as `<exe>.prev` while the
+/// executable name still resolves, and one rename then swaps the new file in
+/// atomically. Two renames would leave a window in which the path does not
+/// exist at all, which is exactly when a supervisor restarts. A filesystem
+/// that refuses the link falls back to that older sequence.
+fn swap_into_place(exe: &Path, previous: &Path, staged: &Path) -> Result<()> {
+    let _ = fs::remove_file(previous);
+    let linked = fs::hard_link(exe, previous).is_ok();
+    if !linked {
+        fs::rename(exe, previous).context("could not move the running atmux aside")?;
+    }
+    if let Err(error) = fs::rename(staged, exe) {
+        if linked {
+            let _ = fs::remove_file(previous);
+        } else {
+            let _ = fs::rename(previous, exe);
+        }
+        return Err(error).context("could not install the staged atmux executable");
+    }
+    sync_directory(exe)
+}
+
+/// Puts `previous` back at `exe`, keeps what was running as the new
+/// `previous`, and reports the SHA-256 of the executable being left behind.
+fn restore_previous(exe: &Path, previous: &Path, staging: &Path) -> Result<String> {
+    let _ = fs::remove_file(staging);
+    let linked = fs::hard_link(exe, staging).is_ok();
+    if !linked {
+        fs::rename(exe, staging).context("could not set the running atmux aside for a rollback")?;
+    }
+    let leaving_sha = file_sha256(staging)?;
+    if let Err(error) = fs::rename(previous, exe) {
+        if linked {
+            let _ = fs::remove_file(staging);
+        } else {
+            let _ = fs::rename(staging, exe);
+        }
+        return Err(error).context("could not restore the previous atmux executable");
+    }
+    fs::rename(staging, previous)
+        .context("could not keep the rolled-back atmux for a second attempt")?;
+    sync_directory(exe)?;
+    Ok(leaving_sha)
+}
+
+/// Persists the renames themselves, not just the bytes they moved.
+fn sync_directory(exe: &Path) -> Result<()> {
+    let Some(directory) = exe.parent() else {
+        return Ok(());
+    };
+    File::open(directory)
+        .and_then(|handle| handle.sync_all())
+        .with_context(|| format!("could not flush {}", directory.display()))
+}
+
+/// Runs one bounded filesystem step off the async runtime.
+///
+/// Hashing a quarter-gigabyte executable, flushing it, and swapping it into
+/// place are all synchronous work measured in milliseconds to seconds. On a
+/// tokio worker they would stall every other request this node is serving.
+async fn blocking<T, F>(what: &'static str, work: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .with_context(|| format!("{what} panicked"))?
+}
+
 /// SHA-256 of a file, streamed so a large executable never lands in memory.
 fn file_sha256(path: &Path) -> Result<String> {
     let mut file =
@@ -1428,7 +1500,15 @@ impl SelfUpdater {
             shared: Arc::clone(&self.shared),
         };
         let outcome = fetcher.download(&candidate.asset_url, &mut sink).await;
-        let settled = outcome.and_then(|()| sink.finish());
+        let settled = match outcome {
+            Ok(()) => {
+                blocking("flushing the staged atmux executable", move || {
+                    sink.finish()
+                })
+                .await
+            }
+            Err(error) => Err(error),
+        };
         let (digest, written) = match settled {
             Ok(settled) => settled,
             Err(error) => {
@@ -1459,10 +1539,16 @@ impl SelfUpdater {
         }
 
         lock(&self.shared).phase = Phase::Applying;
-        // Hash what is about to be set aside, so a later rollback can prove it
-        // is still the same file rather than trusting the path.
-        let replaced_sha = file_sha256(&self.environment.exe)?;
-        self.swap_into_place(&staged)?;
+        let exe = self.environment.exe.clone();
+        let previous = self.previous_path();
+        let replaced_sha = blocking("installing the staged atmux executable", move || {
+            // Hash what is about to be set aside, so a later rollback can prove
+            // it is still the same file rather than trusting the path.
+            let replaced_sha = file_sha256(&exe)?;
+            swap_into_place(&exe, &previous, &staged)?;
+            Ok(replaced_sha)
+        })
+        .await?;
         self.record_applied(&expected_version, VERSION, &replaced_sha)?;
         self.restart();
         Ok(())
@@ -1481,71 +1567,28 @@ impl SelfUpdater {
                     previous.display()
                 )
             })?;
-        if file_sha256(previous)? != recorded {
+        let target = previous.to_path_buf();
+        let actual = blocking("hashing the previous atmux executable", move || {
+            file_sha256(&target)
+        })
+        .await?;
+        if actual != recorded {
             bail!(
                 "{} is not the executable this atmux set aside; refusing to roll back into it",
                 previous.display()
             );
         }
         let restored = probe_version(previous, None, VERSION_PROBE_TIMEOUT).await?;
+        let exe = self.environment.exe.clone();
+        let target = previous.to_path_buf();
         let staging = self.staging_path("rollback");
-        let _ = fs::remove_file(&staging);
-        let linked = fs::hard_link(&self.environment.exe, &staging).is_ok();
-        if !linked {
-            fs::rename(&self.environment.exe, &staging)
-                .context("could not set the running atmux aside for a rollback")?;
-        }
-        let leaving_sha = file_sha256(&staging)?;
-        if let Err(error) = fs::rename(previous, &self.environment.exe) {
-            if linked {
-                let _ = fs::remove_file(&staging);
-            } else {
-                let _ = fs::rename(&staging, &self.environment.exe);
-            }
-            return Err(error).context("could not restore the previous atmux executable");
-        }
-        fs::rename(&staging, previous)
-            .context("could not keep the rolled-back atmux for a second attempt")?;
-        self.sync_directory()?;
+        let leaving_sha = blocking("restoring the previous atmux executable", move || {
+            restore_previous(&exe, &target, &staging)
+        })
+        .await?;
         self.record_applied(&restored.to_string(), VERSION, &leaving_sha)?;
         self.restart();
         Ok(())
-    }
-
-    /// Installs the staged executable without the path ever going missing.
-    ///
-    /// A hard link keeps the old inode reachable as `<exe>.prev` while the
-    /// executable name still resolves, and one rename then swaps the new file
-    /// in atomically. Two renames would leave a window in which the path does
-    /// not exist at all, which is exactly when a supervisor restarts. A
-    /// filesystem that refuses the link falls back to that older sequence.
-    fn swap_into_place(&self, staged: &Path) -> Result<()> {
-        let previous = self.previous_path();
-        let _ = fs::remove_file(&previous);
-        let linked = fs::hard_link(&self.environment.exe, &previous).is_ok();
-        if !linked {
-            fs::rename(&self.environment.exe, &previous)
-                .context("could not move the running atmux aside")?;
-        }
-        if let Err(error) = fs::rename(staged, &self.environment.exe) {
-            if linked {
-                let _ = fs::remove_file(&previous);
-            } else {
-                let _ = fs::rename(&previous, &self.environment.exe);
-            }
-            return Err(error).context("could not install the staged atmux executable");
-        }
-        self.sync_directory()
-    }
-
-    /// Persists the renames themselves, not just the bytes they moved.
-    fn sync_directory(&self) -> Result<()> {
-        let Some(directory) = self.environment.exe.parent() else {
-            return Ok(());
-        };
-        File::open(directory)
-            .and_then(|handle| handle.sync_all())
-            .with_context(|| format!("could not flush {}", directory.display()))
     }
 
     /// What this updater would re-execute, or `None` when it must not restart.
@@ -2461,8 +2504,8 @@ mod tests {
         )
         .unwrap();
         let before = fs::metadata(&environment.exe).unwrap().ino();
-        updater.swap_into_place(&staged).unwrap();
         let previous = directory.join("atmux.prev");
+        swap_into_place(&environment.exe, &previous, &staged).unwrap();
         assert!(previous.is_file());
         assert!(environment.exe.is_file());
         assert!(!staged.exists());
