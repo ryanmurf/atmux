@@ -117,7 +117,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          (cd dist && sha256sum atmux-* > ../SHA256SUMS)
+          # The version header binds this document to one release. A node
+          # compares it to the tag it chose, so an older release's still-valid
+          # signature cannot be replayed under a newer tag.
+          printf 'version %s\n' "${{ needs.verify.outputs.tag }}" > SHA256SUMS
+          (cd dist && sha256sum atmux-*) >> SHA256SUMS
+          cat SHA256SUMS
       - name: Sign checksums
         shell: bash
         env:
@@ -146,13 +151,20 @@ jobs:
 
   container:
     name: Publish container image
-    needs: verify
+    # Every artifact of a release ships together or not at all: an image tagged
+    # vX.Y.Z must never exist for a release whose executables failed to build
+    # or publish.
+    needs: [verify, build, publish]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # `:latest` is decided by comparing every release tag, and
+          # build-container.sh archives from history.
+          fetch-depth: 0
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -162,13 +174,24 @@ jobs:
         run: bash scripts/build-container.sh ghcr.io/ryanmurf/atmux
       - name: Tag and push image
         shell: bash
+        env:
+          TAG: ${{ needs.verify.outputs.tag }}
         run: |
           set -euo pipefail
           commit="$(git rev-parse --verify 'HEAD^{commit}')"
           source_image="ghcr.io/ryanmurf/atmux:${commit:0:12}"
-          release_image="ghcr.io/ryanmurf/atmux:${{ needs.verify.outputs.tag }}"
-          latest_image="ghcr.io/ryanmurf/atmux:latest"
+          release_image="ghcr.io/ryanmurf/atmux:$TAG"
           docker tag "$source_image" "$release_image"
-          docker tag "$source_image" "$latest_image"
           docker push "$release_image"
-          docker push "$latest_image"
+          # Re-running an old tag must not move `:latest` backward, so only the
+          # highest released version ever claims it.
+          highest="$(git tag --list 'v*' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V \
+            | tail -n 1)"
+          if [ "$highest" = "$TAG" ]; then
+            docker tag "$source_image" "ghcr.io/ryanmurf/atmux:latest"
+            docker push "ghcr.io/ryanmurf/atmux:latest"
+          else
+            echo "$TAG is not the newest release ($highest); leaving :latest alone"
+          fi
