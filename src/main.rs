@@ -212,7 +212,7 @@ async fn run_self_update(config: &Config, check: bool, apply: bool, rollback: bo
     let status = match action {
         Some(Action::Check) => updater.check(true).await.map_err(anyhow::Error::new)?,
         Some(Action::Apply) => updater.apply().await.map_err(anyhow::Error::new)?,
-        Some(Action::Rollback) => updater.rollback().await.map_err(anyhow::Error::new)?,
+        Some(Action::Rollback) => updater.rollback().map_err(anyhow::Error::new)?,
         None => updater.status(),
     };
     println!("atmux {} ({})", status.version, status.target);

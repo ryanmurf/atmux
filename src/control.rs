@@ -1028,7 +1028,7 @@ impl ControlPlane {
         let outcome = match action {
             self_update::Action::Check => self.inner.updater.check(true).await,
             self_update::Action::Apply => self.inner.updater.apply().await,
-            self_update::Action::Rollback => self.inner.updater.rollback().await,
+            self_update::Action::Rollback => self.inner.updater.rollback(),
         };
         outcome.map_err(|error| {
             if error.conflict {

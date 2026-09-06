@@ -1070,10 +1070,10 @@ impl SelfUpdater {
     ///
     /// Returns a conflict when there is nothing to roll back to, when
     /// self-update is unavailable, or when an update is already running.
-    // The preflight is synchronous, but the three verbs share one caller-facing
-    // shape so a route or the CLI can dispatch them without special cases.
-    #[allow(clippy::unused_async)]
-    pub async fn rollback(self: &Arc<Self>) -> Result<UpdateStatus, UpdateError> {
+    ///
+    /// Unlike a check or an apply this needs no network, so the preflight is
+    /// synchronous; the swap and restart still run on their own task.
+    pub fn rollback(self: &Arc<Self>) -> Result<UpdateStatus, UpdateError> {
         self.ensure_actionable()?;
         self.ensure_writable_directory()?;
         let previous = self.previous_path();
@@ -2015,7 +2015,7 @@ mod tests {
         assert_eq!(disabled.mode(), Mode::Disabled);
         assert!(disabled.check(true).await.unwrap_err().conflict);
         assert!(disabled.apply().await.unwrap_err().conflict);
-        assert!(disabled.rollback().await.unwrap_err().conflict);
+        assert!(disabled.rollback().unwrap_err().conflict);
 
         environment.container = true;
         let managed = SelfUpdater::with_environment(
@@ -2046,7 +2046,7 @@ mod tests {
     #[tokio::test]
     async fn rollback_without_a_previous_executable_is_a_conflict() {
         let Fixture { directory, updater } = fixture("norollback", false, 61);
-        assert!(updater.rollback().await.unwrap_err().conflict);
+        assert!(updater.rollback().unwrap_err().conflict);
         fs::remove_dir_all(&directory).unwrap();
     }
 
