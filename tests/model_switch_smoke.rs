@@ -3,6 +3,7 @@ use std::{
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::PathBuf,
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -150,12 +151,18 @@ fn remove_disposable_socket_file(socket: &str) {
     }
 }
 
+static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 fn start_probe() -> Probe {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let socket = format!("atmux-model-{}-{nonce}", std::process::id());
+    // Two probes started in the same instant by parallel tests collided on the
+    // clock nonce alone (macOS reports microsecond time), so a per-process
+    // sequence number makes each socket and directory name unique regardless.
+    let sequence = PROBE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    let socket = format!("atmux-model-{}-{sequence}-{nonce}", std::process::id());
     let directory = env::temp_dir().join(&socket);
     fs::create_dir(&directory).unwrap();
     let script = directory.join("fake_agent.py");
