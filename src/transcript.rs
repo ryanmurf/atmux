@@ -53,6 +53,35 @@ pub struct TranscriptMessage {
     pub tool_output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
+    /// Names the subagent that produced a `subagent` entry when the native log
+    /// carries one. Absent for operator and main-agent turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    /// Native per-request usage for the entry, so the browser can total a
+    /// collapsed run of tool calls without re-reading the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+}
+
+/// Optional per-entry attribution and usage. Grouping them keeps the record
+/// builders at their existing arity for the harnesses that publish neither.
+#[derive(Clone, Copy, Default)]
+struct EntryMeta<'a> {
+    agent_name: Option<&'a str>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+}
+
+impl EntryMeta<'_> {
+    fn usage(usage: Option<(u64, u64)>) -> Self {
+        Self {
+            agent_name: None,
+            input_tokens: usage.map(|(input, _)| input),
+            output_tokens: usage.map(|(_, output)| output),
+        }
+    }
 }
 
 fn default_message_kind() -> String {
@@ -715,34 +744,23 @@ fn parse_claude(log: &LogTail) -> (Vec<TranscriptMessage>, bool) {
         let Some(content) = value.pointer("/message/content") else {
             continue;
         };
+        // One native record is one API request, so its usage must be spent on
+        // the first entry it produces rather than repeated per content block.
+        let mut usage = claude_usage(&value);
         match role {
             Some("user") => {
-                if let Some(markdown) =
-                    claude_user_text(&value).filter(|text| !text.trim().is_empty())
-                    && !is_injected_user_context(&markdown)
-                {
-                    push_message(&mut messages, "user", markdown, id, timestamp);
-                }
-                if let Some(blocks) = content.as_array() {
-                    for (index, block) in blocks.iter().enumerate() {
-                        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
-                            continue;
-                        }
-                        let output = tool_output_text(block.get("content"));
-                        let call_id = block.get("tool_use_id").and_then(Value::as_str);
-                        attach_tool_output(
-                            &mut messages,
-                            call_id,
-                            output,
-                            derived_id(id, "tool-result", index).as_deref(),
-                            timestamp,
-                        );
-                    }
-                }
+                push_claude_user(&mut messages, &value, content, id, timestamp, usage.take());
             }
             Some("assistant") => {
                 if let Some(markdown) = content.as_str().map(str::to_owned) {
-                    push_message(&mut messages, "assistant", markdown, id, timestamp);
+                    push_message(
+                        &mut messages,
+                        "assistant",
+                        markdown,
+                        id,
+                        timestamp,
+                        EntryMeta::usage(usage.take()),
+                    );
                     continue;
                 }
                 let Some(blocks) = content.as_array() else {
@@ -764,6 +782,7 @@ fn parse_claude(log: &LogTail) -> (Vec<TranscriptMessage>, bool) {
                                     markdown,
                                     block_id.as_deref(),
                                     timestamp,
+                                    EntryMeta::usage(usage.take()),
                                 );
                             }
                         }
@@ -776,6 +795,7 @@ fn parse_claude(log: &LogTail) -> (Vec<TranscriptMessage>, bool) {
                                 tool_input_text(block.get("input")),
                                 call_id.or(fallback.as_deref()),
                                 timestamp,
+                                EntryMeta::usage(usage.take()),
                             );
                         }
                         _ => {}
@@ -798,6 +818,93 @@ fn derived_id(base: Option<&str>, kind: &str, index: usize) -> Option<String> {
     id.push_str(base);
     id.push_str(&suffix);
     Some(id)
+}
+
+/// Claude Code persists subagent and tool-generated turns with the user role.
+/// Attributing those to the operator makes an Agent tool's own prompts and
+/// reports read as "You" in the browser.
+fn push_claude_user(
+    messages: &mut Vec<TranscriptMessage>,
+    value: &Value,
+    content: &Value,
+    id: Option<&str>,
+    timestamp: Option<&str>,
+    usage: Option<(u64, u64)>,
+) {
+    let subagent = claude_tool_authored_user(value);
+    let agent_name = subagent.then(|| claude_subagent_name(value)).flatten();
+    if let Some(markdown) = claude_user_text(value).filter(|text| !text.trim().is_empty())
+        && !is_injected_user_context(&markdown)
+    {
+        push_message(
+            messages,
+            if subagent { "subagent" } else { "user" },
+            markdown,
+            id,
+            timestamp,
+            EntryMeta {
+                agent_name: agent_name.as_deref(),
+                ..EntryMeta::usage(usage)
+            },
+        );
+    }
+    let Some(blocks) = content.as_array() else {
+        return;
+    };
+    for (index, block) in blocks.iter().enumerate() {
+        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        attach_tool_output(
+            messages,
+            block.get("tool_use_id").and_then(Value::as_str),
+            tool_output_text(block.get("content")),
+            derived_id(id, "tool-result", index).as_deref(),
+            timestamp,
+        );
+    }
+}
+
+/// Claude Code writes every subagent and tool-authored turn back into the log
+/// with `message.role == "user"`. These markers are the harness's own way of
+/// separating a typed prompt from a turn a tool produced.
+fn claude_tool_authored_user(value: &Value) -> bool {
+    value.get("turnCompanion").and_then(Value::as_bool) == Some(true)
+        || value.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        || value.get("userType").and_then(Value::as_str) == Some("agent")
+        || ["sourceToolAssistantUUID", "sourceToolUseID", "taskId"]
+            .iter()
+            .any(|key| value.get(key).is_some_and(|marker| !marker.is_null()))
+}
+
+fn claude_subagent_name(value: &Value) -> Option<String> {
+    [
+        "agentName",
+        "subagentName",
+        "subagentType",
+        "attributionAgent",
+    ]
+    .iter()
+    .find_map(|key| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(|name| truncate_plain(name, MAX_TOOL_NAME_BYTES))
+    })
+}
+
+/// Native usage for one request. Cache reads and writes are still context the
+/// request paid for, so the browser sees the same input total the CLI reports.
+fn claude_usage(value: &Value) -> Option<(u64, u64)> {
+    let usage = value.pointer("/message/usage")?;
+    let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let input = field("input_tokens")
+        .saturating_add(field("cache_creation_input_tokens"))
+        .saturating_add(field("cache_read_input_tokens"));
+    let output = field("output_tokens");
+    (input > 0 || output > 0).then_some((input, output))
 }
 
 fn claude_user_text(value: &Value) -> Option<String> {
@@ -838,6 +945,7 @@ fn parse_codex(log: &LogTail) -> (Vec<TranscriptMessage>, bool) {
                     markdown,
                     value.pointer("/payload/id").and_then(Value::as_str),
                     timestamp,
+                    EntryMeta::default(),
                 );
             }
             Some("function_call" | "custom_tool_call") => {
@@ -858,6 +966,7 @@ fn parse_codex(log: &LogTail) -> (Vec<TranscriptMessage>, bool) {
                         .or_else(|| value.pointer("/payload/id"))
                         .and_then(Value::as_str),
                     timestamp,
+                    EntryMeta::default(),
                 );
             }
             Some("function_call_output" | "custom_tool_call_output") => {
@@ -900,6 +1009,7 @@ fn parse_codex(log: &LogTail) -> (Vec<TranscriptMessage>, bool) {
                 markdown,
                 None,
                 value.get("timestamp").and_then(Value::as_str),
+                EntryMeta::default(),
             );
         }
     }
@@ -1174,6 +1284,7 @@ fn push_message(
     markdown: String,
     id: Option<&str>,
     timestamp: Option<&str>,
+    meta: EntryMeta<'_>,
 ) {
     let markdown = truncate_utf8(markdown, MAX_MESSAGE_BYTES);
     let id = bounded_id(id, || format!("message-{}", messages.len()));
@@ -1189,6 +1300,9 @@ fn push_message(
         tool_input: None,
         tool_output: None,
         timestamp: timestamp.map(|value| truncate_plain(value, MAX_TIMESTAMP_BYTES)),
+        agent_name: meta.agent_name.map(ToOwned::to_owned),
+        input_tokens: meta.input_tokens,
+        output_tokens: meta.output_tokens,
     });
     cap_parse_messages(messages);
 }
@@ -1199,6 +1313,7 @@ fn push_tool(
     input: Option<String>,
     id: Option<&str>,
     timestamp: Option<&str>,
+    meta: EntryMeta<'_>,
 ) {
     let id = bounded_id(id, || format!("tool-{}", messages.len()));
     if messages.last().is_some_and(|message| message.id == id) {
@@ -1213,6 +1328,9 @@ fn push_tool(
         tool_input: input.map(|value| truncate_utf8(value, MAX_MESSAGE_BYTES)),
         tool_output: None,
         timestamp: timestamp.map(|value| truncate_plain(value, MAX_TIMESTAMP_BYTES)),
+        agent_name: meta.agent_name.map(ToOwned::to_owned),
+        input_tokens: meta.input_tokens,
+        output_tokens: meta.output_tokens,
     });
     cap_parse_messages(messages);
 }
@@ -1251,6 +1369,9 @@ fn attach_tool_output(
         tool_input: None,
         tool_output: Some(output),
         timestamp: timestamp.map(|value| truncate_plain(value, MAX_TIMESTAMP_BYTES)),
+        agent_name: None,
+        input_tokens: None,
+        output_tokens: None,
     });
     cap_parse_messages(messages);
 }
@@ -1550,6 +1671,34 @@ mod tests {
                 .contains("hide me")
         );
         assert_eq!(messages[2].tool_output.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn claude_subagent_turns_are_attributed_to_the_subagent_and_carry_request_usage() {
+        let source = concat!(
+            r#"{"type":"user","uuid":"human","message":{"role":"user","content":"do the thing"}}"#,
+            "\n",
+            r#"{"type":"user","uuid":"agent-report","turnCompanion":true,"agentName":"Explore","message":{"role":"user","content":[{"type":"text","text":"Searched the tree and found three call sites."}]}}"#,
+            "\n",
+            r#"{"type":"user","uuid":"tool-authored","sourceToolAssistantUUID":"a1","message":{"role":"user","content":"Running in the background as @scout"}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"a1","message":{"role":"assistant","usage":{"input_tokens":40,"cache_read_input_tokens":1000,"output_tokens":7},"content":[{"type":"text","text":"Summarising."},{"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"ls"}}]}}"#,
+            "\n",
+        );
+        let (messages, _) = parse_claude(&tail(source));
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            ["user", "subagent", "subagent", "assistant", "tool"]
+        );
+        assert_eq!(messages[1].agent_name.as_deref(), Some("Explore"));
+        assert_eq!(messages[2].agent_name, None);
+        // One record is one request, so only its first entry spends the usage.
+        assert_eq!(messages[3].input_tokens, Some(1_040));
+        assert_eq!(messages[3].output_tokens, Some(7));
+        assert_eq!(messages[4].input_tokens, None);
     }
 
     #[test]
@@ -1957,6 +2106,9 @@ mod tests {
                 tool_input: None,
                 tool_output: None,
                 timestamp: None,
+                agent_name: None,
+                input_tokens: None,
+                output_tokens: None,
             })
             .collect();
         let (bounded, truncated) = bound_messages(messages);
@@ -1984,6 +2136,9 @@ mod tests {
                 tool_input: None,
                 tool_output: None,
                 timestamp: Some("t".repeat(1_000)),
+                agent_name: None,
+                input_tokens: None,
+                output_tokens: None,
             })
             .collect();
         let (bounded, truncated) = bound_messages(messages);
@@ -1998,6 +2153,7 @@ mod tests {
                 "ok".to_owned(),
                 Some(&format!("id-{index}-{}", "x".repeat(MAX_ITEM_ID_BYTES + 1))),
                 Some(&"t".repeat(MAX_TIMESTAMP_BYTES + 1)),
+                EntryMeta::default(),
             );
         }
         assert!(parsed.len() <= MAX_PARSE_MESSAGES);
