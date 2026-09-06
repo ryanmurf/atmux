@@ -16,7 +16,18 @@ const MAX_FILE_REFERENCE_CHARS = 12_000;
 const MAX_FILE_REFERENCE_LINES = 200;
 const CONTENT_HASH_PATTERN = /^[a-f0-9]{64}$/;
 const LIVE_TAIL_TOLERANCE = 2;
+// Conversation cards end on fractional pixel boundaries and mobile zoom adds
+// its own rounding, so the reader counts as parked at the tail well before the
+// scroll offset matches exactly.
+const STICKY_BOTTOM_TOLERANCE = 24;
 const MAX_COLLAPSED_TOOL_RUN = 24;
+// A pair of adjacent tool cards still reads as two steps; a longer run is the
+// repetition the reader wants folded away.
+const MIN_COLLAPSED_TOOL_RUN = 3;
+// Bare URLs only: markdown links are already tokenized, and the closing set is
+// trimmed afterwards so surrounding prose never joins the address.
+const AUTOLINK_PATTERN = /https?:\/\/[^\s<>"'`]+/gi;
+const TRANSCRIPT_MESSAGE_ROLES = new Set(["user", "assistant", "subagent"]);
 const COLLAPSIBLE_COORDINATION_TOOLS = new Set([
   "followup_task", "list_agents", "send_message", "wait_agent",
 ]);
@@ -27,6 +38,24 @@ const BENIGN_COORDINATION_STATUSES = new Set([
 ]);
 const LAUNCH_DIRECTORY_STORAGE_KEY = "atmux.launch-directories";
 const FILE_READER_STORAGE_KEY = "atmux.file-reader-preferences";
+
+function readStoredValue(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    // A privacy-restricted browser may deny storage.
+    return null;
+  }
+}
+
+function writeStoredValue(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // A privacy-restricted browser may deny storage.
+  }
+}
+
 const FILE_READER_SIZES = new Set(["small", "medium", "large"]);
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg"]);
 const COMPOSITE_SEPARATOR = "~";
@@ -836,6 +865,54 @@ function safeLinkUrl(value, base = "https://atmux.invalid/") {
   } catch { return null; }
 }
 
+/// Splits plain text around bare http(s) URLs. Kept free of the DOM so the
+/// scheme check and the trailing-punctuation rule stay unit-testable, and so
+/// every rendered segment is still built as a text node or a checked anchor.
+function linkifyTokens(text) {
+  const value = String(text ?? "");
+  const tokens = [];
+  let position = 0;
+  for (const match of value.matchAll(AUTOLINK_PATTERN)) {
+    const candidate = trimmedAutolink(match[0]);
+    const url = candidate ? safeLinkUrl(candidate) : null;
+    if (!url) continue;
+    if (match.index > position) tokens.push({ type: "text", text: value.slice(position, match.index) });
+    tokens.push({ type: "link", text: candidate, url });
+    position = match.index + candidate.length;
+  }
+  if (position < value.length) tokens.push({ type: "text", text: value.slice(position) });
+  return tokens;
+}
+
+/// Prose ends sentences and wraps links in brackets; those characters belong to
+/// the writing, not the address. Closers only leave the URL when the URL itself
+/// never opened them.
+function trimmedAutolink(value) {
+  let text = String(value || "");
+  const pairs = { ")": "(", "]": "[", "}": "{" };
+  while (text) {
+    const last = text[text.length - 1];
+    if (".,;:!?'\"".includes(last)) { text = text.slice(0, -1); continue; }
+    const opener = pairs[last];
+    if (opener && text.split(last).length > text.split(opener).length) { text = text.slice(0, -1); continue; }
+    break;
+  }
+  return text;
+}
+
+function linkifyInto(parent, text) {
+  for (const token of linkifyTokens(text)) {
+    if (token.type === "text") { parent.append(document.createTextNode(token.text)); continue; }
+    const anchor = document.createElement("a");
+    anchor.textContent = token.text;
+    anchor.href = token.url;
+    anchor.target = "_blank";
+    anchor.rel = "noopener noreferrer";
+    parent.append(anchor);
+  }
+  return parent;
+}
+
 function highlightCode(text) {
   const source = String(text || "");
   const pattern = /(\/\/.*$|(?:^|\s)#.*$|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b(?:async|await|break|case|class|const|continue|def|else|enum|false|fn|for|function|if|impl|import|in|let|match|mod|new|null|pub|return|self|static|struct|throw|trait|true|try|type|use|var|while)\b|\b\d+(?:\.\d+)?\b)/gm;
@@ -1041,7 +1118,7 @@ function diffLineKind(line) {
 
 function appendInlineMarkdown(parent, text) {
   for (const token of inlineTokens(text)) {
-    if (token.type === "text") parent.append(document.createTextNode(token.text));
+    if (token.type === "text") linkifyInto(parent, token.text);
     else if (token.type === "break") parent.append(document.createElement("br"));
     else if (token.type === "code") {
       const code = document.createElement("code"); code.textContent = token.text; parent.append(code);
@@ -1069,7 +1146,12 @@ function appendInlineMarkdown(parent, text) {
 }
 
 function appendInlineToken(parent, token) {
-  if (token.type === "text") { parent.append(document.createTextNode(token.text)); return; }
+  // Never nest an autolink inside an explicit markdown link.
+  if (token.type === "text") {
+    if (parent.closest?.("a")) parent.append(document.createTextNode(token.text));
+    else linkifyInto(parent, token.text);
+    return;
+  }
   if (token.type === "break") { parent.append(document.createElement("br")); return; }
   if (token.type === "code") {
     const code = document.createElement("code"); code.textContent = token.text; parent.append(code); return;
@@ -1167,6 +1249,15 @@ function reduceTranscript(current, data) {
       error: null,
     },
   };
+}
+
+/// A Claude Code subagent writes its prompts and reports back with the user
+/// role. Labelling those "You" credits the operator with an agent's words.
+function transcriptRoleLabel(message) {
+  if (message?.role === "user") return "You";
+  if (message?.role !== "subagent") return "Agent";
+  const name = String(message?.agent_name || "").trim();
+  return name ? `Subagent · ${name}` : "Subagent";
 }
 
 function transcriptItemKind(item) {
@@ -1278,10 +1369,81 @@ function compactTranscriptItems(messages, maxRun = MAX_COLLAPSED_TOOL_RUN) {
     }
     index = end;
   }
-  return items;
+  return groupRepeatedTools(items);
+}
+
+/// A tool card is collapsed on arrival, so a long run of them is a wall of
+/// closed rows. Errors and approvals keep their own row: they are the ones a
+/// reader is scanning for.
+function collapsibleToolRun(item) {
+  return transcriptItemKind(item) === "tool"
+    && !COLLAPSIBLE_COORDINATION_TOOLS.has(normalizedToolName(item))
+    && !["error", "approval"].includes(coordinationResultSignal(item));
+}
+
+function toolDisplayName(item) {
+  const raw = String(item?.tool_name || "Tool").trim() || "Tool";
+  const segments = raw.split(/__|[./:]/).filter(Boolean);
+  return segments.length ? segments[segments.length - 1] : raw;
+}
+
+function toolRunTokens(messages) {
+  let input = 0;
+  let output = 0;
+  let known = false;
+  for (const message of messages || []) {
+    for (const [field, add] of [["input_tokens", (n) => { input += n; }], ["output_tokens", (n) => { output += n; }]]) {
+      const value = Number(message?.[field]);
+      if (Number.isFinite(value) && value > 0) { add(value); known = true; }
+    }
+  }
+  return known ? { input, output } : null;
+}
+
+function formatTokenCount(value) {
+  const count = Number.isFinite(value) && value > 0 ? value : 0;
+  if (count < 1000) return String(count);
+  const scaled = count < 1_000_000 ? count / 1000 : count / 1_000_000;
+  const unit = count < 1_000_000 ? "k" : "M";
+  return `${scaled >= 100 ? Math.round(scaled) : scaled.toFixed(1).replace(/\.0$/, "")}${unit}`;
+}
+
+function toolRunGroupSummary(group) {
+  const messages = group?.messages || [];
+  const names = new Set(messages.map(toolDisplayName));
+  const parts = [`${names.size === 1 ? [...names][0] : "Tools"} ×${messages.length}`];
+  const tokens = toolRunTokens(messages);
+  if (tokens) parts.push(`${formatTokenCount(tokens.input)} in · ${formatTokenCount(tokens.output)} out`);
+  return parts.join(" · ");
+}
+
+/// Folds the plain tool cards the coordination pass left behind. The key comes
+/// from the first entry so the reading anchor survives a redraw.
+function groupRepeatedTools(items, maxRun = MAX_COLLAPSED_TOOL_RUN) {
+  const grouped = [];
+  const boundedMax = Math.max(MIN_COLLAPSED_TOOL_RUN, Math.min(Number.isInteger(maxRun) ? maxRun : MAX_COLLAPSED_TOOL_RUN, MAX_COLLAPSED_TOOL_RUN));
+  const runnable = (entry) => entry?.kind === "item" && collapsibleToolRun(entry.message);
+  for (let index = 0; index < items.length;) {
+    if (!runnable(items[index])) { grouped.push(items[index]); index += 1; continue; }
+    let end = index;
+    while (end < items.length && runnable(items[end])) end += 1;
+    let cursor = index;
+    while (cursor < end) {
+      const size = Math.min(boundedMax, end - cursor);
+      if (size < MIN_COLLAPSED_TOOL_RUN) {
+        grouped.push(items[cursor]); cursor += 1; continue;
+      }
+      const messages = items.slice(cursor, cursor + size).map((entry) => entry.message);
+      grouped.push({ kind: "tool-run", id: `tool-run:${String(messages[0]?.id || cursor)}`, messages });
+      cursor += size;
+    }
+    index = end;
+  }
+  return grouped;
 }
 
 function coordinationGroupSummary(group) {
+  if (group?.kind === "tool-run") return toolRunGroupSummary(group);
   const calls = group?.messages?.length || 0;
   const counts = (group?.counts || []).map(({ name, count }) => `${name} ×${count}`).join(" · ");
   return `${calls} coordination calls · ${counts} · no errors`;
@@ -1378,6 +1540,19 @@ function claudeResumeState(session, capabilities, online, resumingPaneId, compos
 
 function followsLiveTail(element, tolerance = 16) {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= tolerance;
+}
+
+/// Decides how a transcript redraw treats the reader. A pane with no laid-out
+/// box — hidden view mode, unselected agent view, mobile list still showing —
+/// reports no scroll height, so its geometry says nothing and the reader's
+/// remembered intent carries over until the pane is measurable again.
+function stickyBottomState(element, following, visible, tolerance = STICKY_BOTTOM_TOLERANCE) {
+  const measurable = Boolean(visible) && element.clientHeight > 0;
+  if (!measurable) {
+    return { measurable, follow: Boolean(following), deferBottom: Boolean(following), showJump: false };
+  }
+  const follow = Boolean(following) && followsLiveTail(element, tolerance);
+  return { measurable, follow, deferBottom: false, showJump: !follow };
 }
 
 /// Captures the first visible semantic transcript item, not just a pixel
@@ -1656,6 +1831,8 @@ if (typeof module !== "undefined" && module.exports) {
     modelPickerState,
     claudeResumeState,
     followsLiveTail,
+    stickyBottomState,
+    STICKY_BOTTOM_TOLERANCE,
     sessionMachineId,
     sessionFolderLabel,
     sessionProfileLabel,
@@ -1669,6 +1846,14 @@ if (typeof module !== "undefined" && module.exports) {
     collapsibleCoordinationTool,
     compactTranscriptItems,
     coordinationGroupSummary,
+    collapsibleToolRun,
+    groupRepeatedTools,
+    toolDisplayName,
+    toolRunGroupSummary,
+    formatTokenCount,
+    linkifyTokens,
+    trimmedAutolink,
+    transcriptRoleLabel,
     diffLineKind,
     safeLinkUrl,
     sortSessions,
@@ -1693,9 +1878,9 @@ function initialize() {
   } else {
     history.replaceState(appHistoryState(initialRoute), "", pageUrl);
   }
-  const storedPulseAccount = pulseAccountId(localStorage.getItem("atmux.pulse-account"));
+  const storedPulseAccount = pulseAccountId(readStoredValue("atmux.pulse-account"));
   const storedLaunchDirectories = rememberedLaunchDirectories(
-    localStorage.getItem(LAUNCH_DIRECTORY_STORAGE_KEY),
+    readStoredValue(LAUNCH_DIRECTORY_STORAGE_KEY),
   );
   const storedFileReaderPreferences = loadFileReaderPreferences(
     () => localStorage.getItem(FILE_READER_STORAGE_KEY),
@@ -1741,6 +1926,10 @@ function initialize() {
     pendingTranscriptRender: false,
     transcriptFollowing: true,
     transcriptExpectedScrollTop: null,
+    transcriptReadingScrollTop: 0,
+    transcriptPendingBottom: true,
+    transcriptUnseen: false,
+    transcriptDrawnHash: "",
     viewMode: "conversation",
     projectView: null,
     filesRequest: 0,
@@ -1768,7 +1957,7 @@ function initialize() {
     recoveryStatus: null,
     recoveryLoading: false,
     recoveryPoll: null,
-    railCollapsed: localStorage.getItem("atmux.rail-collapsed") === "true",
+    railCollapsed: readStoredValue("atmux.rail-collapsed") === "true",
     pulseOpen: initialRoute.view === "usage",
     pulseAccount: requestedPulseAccount || storedPulseAccount,
     pulseAccounts: [],
@@ -1860,7 +2049,7 @@ function initialize() {
     toggle.setAttribute("aria-expanded", String(!state.railCollapsed));
     toggle.setAttribute("aria-label", state.railCollapsed ? "Expand agent list" : "Collapse agent list");
     toggle.title = state.railCollapsed ? "Expand agent list" : "Collapse agent list";
-    localStorage.setItem("atmux.rail-collapsed", String(state.railCollapsed));
+    writeStoredValue("atmux.rail-collapsed", String(state.railCollapsed));
   }
 
   setRailCollapsed(state.railCollapsed);
@@ -1960,6 +2149,12 @@ function initialize() {
     state.pendingTranscriptRender = false;
     state.transcriptFollowing = true;
     state.transcriptExpectedScrollTop = null;
+    // Opening or switching agents always starts pinned at the newest message.
+    state.transcriptReadingScrollTop = 0;
+    state.transcriptPendingBottom = true;
+    state.transcriptUnseen = false;
+    state.transcriptDrawnHash = "";
+    renderTranscriptJump();
     clearTimeout(state.transcriptTimer);
     clearInterval(state.transcriptPoll);
     state.transcriptTimer = null;
@@ -2089,7 +2284,7 @@ function initialize() {
       if (!value) continue;
       const section = document.createElement("section");
       const heading = document.createElement("span"); heading.textContent = label;
-      const pre = document.createElement("pre"); pre.textContent = value;
+      const pre = document.createElement("pre"); linkifyInto(pre, value);
       section.append(heading, pre); body.append(section);
     }
     if (body.childNodes.length) details.append(body);
@@ -2099,6 +2294,7 @@ function initialize() {
   function renderCoordinationGroup(group, expandedTools) {
     const details = document.createElement("details");
     details.className = "tool-card tool-call-group";
+    if (group.kind === "tool-run") details.classList.add("tool-run-group");
     details.dataset.transcriptId = group.id;
     details.open = expandedTools.has(group.id);
     const summary = document.createElement("summary");
@@ -2130,15 +2326,64 @@ function initialize() {
     return details;
   }
 
+  function conversationMeasurable() {
+    return !conversation.hidden && conversation.clientHeight > 0;
+  }
+
+  /// Landing on the newest message has to survive late layout. The agent view
+  /// is still hidden while the first transcript arrives, and markdown, code
+  /// blocks and web fonts keep growing the log after the synchronous write, so
+  /// a single scrollTop assignment used to leave the reader at the very top.
+  function scrollConversationToBottom() {
+    if (!conversationMeasurable()) {
+      state.transcriptPendingBottom = true;
+      return;
+    }
+    state.transcriptPendingBottom = false;
+    state.transcriptUnseen = false;
+    const settle = () => {
+      if (!conversationMeasurable() || !state.transcriptFollowing) return;
+      conversation.scrollTop = conversation.scrollHeight;
+      state.transcriptReadingScrollTop = conversation.scrollTop;
+      state.transcriptExpectedScrollTop = conversation.scrollTop;
+    };
+    settle();
+    requestAnimationFrame(settle);
+    renderTranscriptJump();
+  }
+
+  /// The pill only claims there is something new: a reader who scrolled up and
+  /// received nothing since is left undisturbed.
+  function renderTranscriptJump() {
+    const jump = $("conversation-jump");
+    if (!jump) return;
+    jump.hidden = !state.transcriptUnseen
+      || !conversationMeasurable()
+      || state.transcriptFollowing;
+  }
+
+  // A pane that was hidden or zero-height when the transcript rendered gains a
+  // box later; that is the moment the deferred jump to the tail can happen.
+  if (typeof ResizeObserver === "function") {
+    new ResizeObserver(() => {
+      if (state.transcriptPendingBottom) scrollConversationToBottom();
+      else renderTranscriptJump();
+    }).observe(conversation);
+  }
+
   function drawConversation() {
     if (state.transcriptPointerDown || selectionTouchesPane(conversation, window.getSelection())) {
       state.pendingTranscriptRender = true;
       return;
     }
-    const shouldFollow = state.transcriptFollowing
-      && followsLiveTail(conversation, LIVE_TAIL_TOLERANCE);
-    const readingOffset = conversation.scrollTop;
-    const readingAnchor = shouldFollow ? null : transcriptReadingAnchor(conversation);
+    const sticky = stickyBottomState(conversation, state.transcriptFollowing, !conversation.hidden);
+    const shouldFollow = sticky.follow;
+    const readingOffset = sticky.measurable
+      ? conversation.scrollTop
+      : state.transcriptReadingScrollTop;
+    const readingAnchor = shouldFollow || !sticky.measurable
+      ? null
+      : transcriptReadingAnchor(conversation);
     const expandedTools = new Set(
       [...conversation.querySelectorAll("details.tool-card[open]")]
         .map((node) => node.dataset.transcriptId)
@@ -2155,7 +2400,7 @@ function initialize() {
       state.transcript.available ? state.transcript.messages : [],
     );
     for (const item of transcriptItems) {
-      if (item.kind === "tool-group") {
+      if (item.kind === "tool-group" || item.kind === "tool-run") {
         nodes.push(renderCoordinationGroup(item, expandedTools));
         continue;
       }
@@ -2165,12 +2410,12 @@ function initialize() {
         nodes.push(renderToolCard(message, expandedTools));
         continue;
       }
-      if (message.role !== "user" && message.role !== "assistant") continue;
+      if (!TRANSCRIPT_MESSAGE_ROLES.has(message.role)) continue;
       const article = document.createElement("article");
       article.className = `message-card ${message.role}`;
       article.dataset.transcriptId = String(message.id || "");
       const label = document.createElement("header");
-      label.textContent = message.role === "user" ? "You" : "Agent";
+      label.textContent = transcriptRoleLabel(message);
       const body = document.createElement("div");
       body.className = "markdown-body";
       body.append(markdownFragment(message.markdown));
@@ -2185,16 +2430,35 @@ function initialize() {
           ? `Waiting for ${state.transcript.source} conversation messages…`
           : "No agent session log is mapped yet. Raw pane remains available.");
       nodes.push(empty);
+    } else if (state.transcript.error) {
+      // A failed refresh must never look like a quiet agent.
+      const notice = document.createElement("p");
+      notice.className = "transcript-notice";
+      notice.textContent = `Conversation log update failed: ${state.transcript.error}`;
+      nodes.unshift(notice);
     }
+    const changed = state.transcriptDrawnHash !== state.transcriptHash;
+    state.transcriptDrawnHash = state.transcriptHash;
     conversation.replaceChildren(...nodes);
     state.pendingTranscriptRender = false;
+    state.transcriptFollowing = shouldFollow;
     // Stream updates replace transcript cards wholesale. Following is an
     // explicit reader choice, not merely a position that happens to be near
-    // the tail. When reading, anchor the same transcript item in the viewport.
-    if (shouldFollow) conversation.scrollTop = conversation.scrollHeight;
-    else restoreTranscriptReadingAnchor(conversation, readingAnchor, readingOffset);
-    state.transcriptFollowing = shouldFollow;
-    state.transcriptExpectedScrollTop = conversation.scrollTop;
+    // the tail. When reading, anchor the same transcript item in the viewport
+    // and offer the jump pill rather than dragging the reader to the tail.
+    if (!sticky.measurable) {
+      state.transcriptReadingScrollTop = readingOffset;
+      state.transcriptExpectedScrollTop = null;
+      state.transcriptPendingBottom = state.transcriptPendingBottom || shouldFollow;
+    } else if (shouldFollow) {
+      scrollConversationToBottom();
+    } else {
+      restoreTranscriptReadingAnchor(conversation, readingAnchor, readingOffset);
+      state.transcriptReadingScrollTop = conversation.scrollTop;
+      state.transcriptExpectedScrollTop = conversation.scrollTop;
+      if (changed) state.transcriptUnseen = true;
+    }
+    renderTranscriptJump();
   }
 
   function flushPendingTranscriptRender() {
@@ -3013,8 +3277,14 @@ function initialize() {
     }
     const revealFiles = files && filesPanel.hidden;
     const revealGit = git && gitPanel.hidden;
+    const conversationMode = state.viewMode === "conversation";
+    const revealConversation = conversationMode && conversation.hidden;
+    if (!conversationMode && conversationMeasurable()) {
+      state.transcriptReadingScrollTop = conversation.scrollTop;
+      state.transcriptExpectedScrollTop = null;
+    }
     pane.hidden = !raw;
-    conversation.hidden = state.viewMode !== "conversation";
+    conversation.hidden = !conversationMode;
     filesPanel.hidden = !files;
     gitPanel.hidden = !git;
     // Snapshots normally arrive while Conversation is visible, when the
@@ -3028,6 +3298,17 @@ function initialize() {
       state.paneReadingScrollTop = pane.scrollTop;
       state.paneExpectedScrollTop = pane.scrollTop;
     }
+    // Conversation is hidden while Files, Git or the raw pane are open, and a
+    // hidden element reports no scroll height, so every redraw it missed left
+    // it parked at the top. Re-apply the reader's place once it is measurable.
+    if (revealConversation) {
+      if (state.transcriptFollowing) scrollConversationToBottom();
+      else if (conversationMeasurable()) {
+        conversation.scrollTop = state.transcriptReadingScrollTop;
+        state.transcriptExpectedScrollTop = conversation.scrollTop;
+      }
+    }
+    renderTranscriptJump();
     const labels = { conversation: "Conversation", raw: "Live pane", files: "Project files", git: "Git status" };
     $("pane-heading").textContent = labels[state.viewMode];
     for (const mode of ["conversation", "raw", "files", "git"]) {
@@ -3892,7 +4173,7 @@ function initialize() {
   }
 
   function rememberPulseAccount(account) {
-    localStorage.setItem("atmux.pulse-account", String(account));
+    writeStoredValue("atmux.pulse-account", String(account));
   }
 
   async function loadPulseAccounts(force = false) {
@@ -5153,14 +5434,24 @@ function initialize() {
     state.panePointerDown = true;
     state.paneFollowing = false;
   });
+  // Tapping the transcript — to expand a tool card, or to dismiss the mobile
+  // keyboard — must not silently stop the pane from following. Only a real
+  // upward gesture unpins ahead of the scroll event, and the scroll handler
+  // re-pins the moment the reader returns to the tail.
   conversation.addEventListener("pointerdown", () => {
     state.transcriptPointerDown = true;
-    state.transcriptFollowing = false;
   });
   pane.addEventListener("wheel", () => { state.paneFollowing = false; }, { passive: true });
   pane.addEventListener("touchstart", () => { state.paneFollowing = false; }, { passive: true });
-  conversation.addEventListener("wheel", () => { state.transcriptFollowing = false; }, { passive: true });
-  conversation.addEventListener("touchstart", () => { state.transcriptFollowing = false; }, { passive: true });
+  conversation.addEventListener("wheel", (event) => {
+    if (event.deltaY < 0) state.transcriptFollowing = false;
+  }, { passive: true });
+  conversation.addEventListener("touchmove", () => { state.transcriptFollowing = false; }, { passive: true });
+  $("conversation-jump").addEventListener("click", () => {
+    state.transcriptFollowing = true;
+    state.transcriptUnseen = false;
+    scrollConversationToBottom();
+  });
   pane.addEventListener("scroll", () => {
     if (pane.hidden) return;
     state.paneReadingScrollTop = pane.scrollTop;
@@ -5172,12 +5463,18 @@ function initialize() {
     state.paneFollowing = followsLiveTail(pane, LIVE_TAIL_TOLERANCE);
   }, { passive: true });
   conversation.addEventListener("scroll", () => {
+    if (conversation.hidden) return;
+    state.transcriptReadingScrollTop = conversation.scrollTop;
     if (scrollMatchesExpectedPosition(conversation, state.transcriptExpectedScrollTop)) {
       state.transcriptExpectedScrollTop = null;
       return;
     }
     state.transcriptExpectedScrollTop = null;
-    state.transcriptFollowing = followsLiveTail(conversation, LIVE_TAIL_TOLERANCE);
+    // Geometry, not gesture bookkeeping, decides pinning: reaching the tail by
+    // any means re-pins and retires the pill.
+    state.transcriptFollowing = followsLiveTail(conversation, STICKY_BOTTOM_TOLERANCE);
+    if (state.transcriptFollowing) state.transcriptUnseen = false;
+    renderTranscriptJump();
   }, { passive: true });
   const finishPanePointerSelection = () => {
     state.panePointerDown = false;
