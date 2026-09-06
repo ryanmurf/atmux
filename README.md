@@ -283,8 +283,11 @@ auto_apply = false # apply a verified newer release without an operator action
 `repository` must match `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`. `check_interval_seconds` is clamped to
 a 300-second minimum. With `auto_apply` left at `false`, atmux still finds and verifies updates in
 the background; an operator applies them from the Software card or `atmux self-update --apply`.
-`public_key` overrides the release-signing public key embedded in the binary and exists only for
-tests.
+
+`public_key` replaces the release-signing public key embedded in the binary. It exists so tests can
+drive the whole pipeline with a throwaway keypair, and a release build refuses to combine it with
+`enabled = true`: a shipped binary cannot be pointed at someone else's signing key by editing one
+configuration line.
 
 See "Releases and self-update" below for how checking, verification, and the swap itself work.
 
@@ -1030,41 +1033,56 @@ Bump `version` in `Cargo.toml` and `Cargo.lock`, and `appVersion` in
 
 - Raw executables `atmux-x86_64-unknown-linux-gnu`, `atmux-aarch64-unknown-linux-gnu`,
   `atmux-aarch64-apple-darwin`, and `atmux-x86_64-apple-darwin`.
-- `SHA256SUMS`, in `sha256sum` format, covering those four files.
+- `SHA256SUMS`: a `version vX.Y.Z` header line followed by `sha256sum`-format lines covering those
+  four files. The header binds the document to one release, so an older release's still-valid
+  signature cannot be replayed under a newer tag.
 - `SHA256SUMS.sig`: a single-line base64 encoding of the raw 64-byte Ed25519 signature over
   `SHA256SUMS`.
-- `ghcr.io/ryanmurf/atmux:vX.Y.Z` and `:latest`.
+- `ghcr.io/ryanmurf/atmux:vX.Y.Z`, and `:latest` when that tag is the highest released version, so
+  re-running an old tag never moves `latest` backward. The image job runs only after the
+  executables are published, so a release ships whole or not at all.
 
 ### How a node updates itself
 
 It asks `https://api.github.com/repos/<repository>/releases/latest` — unauthenticated, HTTPS only,
-redirects restricted to GitHub asset hosts — and accepts a release only when its tag parses as a
-non-prerelease semver greater than the running version. It downloads `SHA256SUMS` and
-`SHA256SUMS.sig`, verifies the signature against the embedded public key, then picks the checksum
-line for its own compiled target triple (`atmux --version` prints `atmux <version> (<target>)`).
+at most five redirects and only to GitHub asset hosts — and accepts a release only when its tag
+parses as a non-prerelease semver greater than the running version. It downloads `SHA256SUMS` and
+`SHA256SUMS.sig`, verifies the signature against the embedded public key, requires the document's
+`version` header to name the release it just chose, then picks the checksum line for its own
+compiled target triple.
 
-The matching executable streams to disk next to the running binary, its SHA-256 is verified, and
-the staged binary's own `--version` is run before anything moves. The verified binary is then
-swapped into place atomically, the previous one kept alongside as `<exe>.prev`, and atmux re-execs
-itself with the original argv and environment. tmux servers are a separate process, so agent
-sessions keep running across the restart.
+The matching executable streams to disk next to the running binary, is flushed to the device, and
+its SHA-256 is compared to the signed one. The staged binary is then run with `--version` and must
+print exactly `atmux <version> (<target>)` for the version that was signed — an exact match, since a
+substring test would accept `11.2.0` for a signed `1.2.0`.
+
+Only then is it installed. A hard link makes the running executable reachable as `<exe>.prev` while
+its own name still resolves, and one rename swaps the new file in, so the executable path is never
+momentarily absent. atmux then re-execs itself with the original argv and environment. tmux servers
+are a separate process, so agent sessions keep running across the restart.
 
 ### Triggering from the coordinator
 
 The machine view's Software card offers Check now, Update, and Roll back. The landing page shows an
 `↑ vA.B.C` pill and an Update all action once at least one machine has a verified update pending.
-The coordinator only triggers and observes; each node still downloads and verifies its own
-artifacts.
+Update, Update all, and Roll back all confirm first, because all three restart the node; only Check
+now acts on a single tap. The coordinator only triggers and observes; each node still downloads and
+verifies its own artifacts.
 
 ### Rollback
 
-A rollback swaps `<exe>.prev` back into place, confirms its `--version`, and re-execs — the same
-verify-then-swap path as an update. Also available as `atmux self-update --rollback`.
+A rollback checks that `<exe>.prev` is still byte-for-byte the file this node set aside — its
+SHA-256 is recorded at swap time — then confirms its `--version`, swaps it back, and re-execs.
+Without that check, anyone who could write the directory could turn a rollback into arbitrary code
+execution. Also available as `atmux self-update --rollback`.
 
 ### CLI
 
-`atmux self-update --check`, `--apply`, and `--rollback` run over SSH and use the same code paths
-as the API.
+`atmux self-update --check`, `--apply`, and `--rollback` run over SSH and use the same code paths as
+the API, with one difference: a one-shot command installs the executable but does not restart
+anything. Re-executing its own argv would make `--rollback` roll back again on every generation and
+`--apply` re-run against a binary that is already current. A running `atmux web` keeps its old
+binary until the service is restarted.
 
 ### Container and Kubernetes deployments
 
