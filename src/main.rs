@@ -11,7 +11,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 #[derive(Debug, Parser)]
-#[command(author, version, about)]
+#[command(author, version = atmux::self_update::VERSION_LINE, about)]
 struct Cli {
     /// Use a configuration file other than ~/.config/atmux/config.toml.
     #[arg(long, global = true)]
@@ -45,6 +45,21 @@ enum Commands {
     },
     /// Check tmux, configuration, folders, and launcher profiles.
     Doctor,
+    /// Inspect or install a signed atmux release for this machine.
+    ///
+    /// The same code paths the web API uses, so an operator over ssh and the
+    /// coordinator's Update button do exactly the same thing.
+    SelfUpdate {
+        /// Ask GitHub what the newest verified release is.
+        #[arg(long, conflicts_with_all = ["apply", "rollback"])]
+        check: bool,
+        /// Install the newest verified release and restart into it.
+        #[arg(long, conflicts_with_all = ["check", "rollback"])]
+        apply: bool,
+        /// Put the previously installed executable back and restart into it.
+        #[arg(long, conflicts_with_all = ["check", "apply"])]
+        rollback: bool,
+    },
     /// Run the streaming web dashboard and stateless MCP server.
     Web {
         /// Address for the HTTP server.
@@ -148,6 +163,14 @@ async fn main() -> Result<()> {
             );
         }
         Some(Commands::Doctor) => return doctor(&config_path),
+        Some(Commands::SelfUpdate {
+            check,
+            apply,
+            rollback,
+        }) => {
+            let (config, _) = Config::load(Some(&config_path))?;
+            return run_self_update(&config, check, apply, rollback).await;
+        }
         Some(Commands::Web {
             bind,
             allow_remote,
@@ -168,6 +191,91 @@ async fn main() -> Result<()> {
     let (config, config_path) = Config::load(Some(&config_path))?;
     let app = App::new(config, config_path)?;
     run(app)
+}
+
+/// Runs one bounded self-update verb and prints the resulting document.
+///
+/// With no flag this reports current state without contacting anything.
+async fn run_self_update(config: &Config, check: bool, apply: bool, rollback: bool) -> Result<()> {
+    use atmux::self_update::{Action, Environment, Phase, SelfUpdater};
+
+    // A one-shot command must never re-execute its own argv. `--rollback`
+    // would roll back again on every generation, and `--apply` would re-run
+    // against a binary that is already current and exit non-zero. This installs
+    // the file and leaves restarting the service to the operator or systemd.
+    let updater = SelfUpdater::with_environment(
+        &config.self_update,
+        Environment::production()?.without_restart(),
+    )?;
+    let action = if apply {
+        Some(Action::Apply)
+    } else if rollback {
+        Some(Action::Rollback)
+    } else if check {
+        Some(Action::Check)
+    } else {
+        None
+    };
+    let status = match action {
+        Some(Action::Check) => updater.check(true).await.map_err(anyhow::Error::new)?,
+        Some(Action::Apply) => updater.apply().await.map_err(anyhow::Error::new)?,
+        Some(Action::Rollback) => updater.rollback().map_err(anyhow::Error::new)?,
+        None => updater.status(),
+    };
+    print_self_update_status(&status);
+    if !matches!(action, Some(Action::Apply | Action::Rollback)) {
+        return Ok(());
+    }
+    // The pipeline finishes on its own task; report what it settled on rather
+    // than leaving an operator watching a silent terminal.
+    println!("working   installing; a running atmux service keeps its old binary until restarted");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let settled = updater.status();
+        match settled.state {
+            Phase::Failed => {
+                anyhow::bail!(
+                    "{}",
+                    settled
+                        .last_error
+                        .unwrap_or_else(|| "the update failed".to_owned())
+                );
+            }
+            Phase::Restarting => {
+                print_self_update_status(&settled);
+                println!("done      restart atmux to run the installed executable");
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("the update did not finish within its time bound")
+}
+
+fn print_self_update_status(status: &atmux::self_update::UpdateStatus) {
+    println!("atmux {} ({})", status.version, status.target);
+    println!("mode      {:?}", status.mode);
+    println!("state     {:?}", status.state);
+    match &status.latest {
+        Some(latest) => println!(
+            "latest    {} ({}){}",
+            latest.version,
+            latest.tag,
+            if latest.verified {
+                " · signature verified"
+            } else {
+                " · UNVERIFIED"
+            }
+        ),
+        None => println!("latest    nothing newer for this target"),
+    }
+    if let Some(previous) = &status.previous {
+        println!("previous  {} at {}", previous.version, previous.path);
+    }
+    if let Some(error) = &status.last_error {
+        println!("error     {error}");
+    }
 }
 
 fn doctor(config_path: &std::path::Path) -> Result<()> {

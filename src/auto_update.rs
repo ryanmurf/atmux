@@ -1789,7 +1789,7 @@ fn digest_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn secure_owner_directory(path: &Path) -> Result<()> {
+pub(crate) fn secure_owner_directory(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     reject_secure_owner_directory(path)

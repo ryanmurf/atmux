@@ -611,6 +611,142 @@ function isMachineControllable(machine) {
   return !machine || machine.online !== false;
 }
 
+/// Poll cadence for the fleet update roster. A machine that is mid-update is
+/// the only thing worth watching closely; everything else is background news.
+const UPDATE_POLL_ACTIVE_MS = 5000;
+const UPDATE_POLL_IDLE_MS = 60000;
+/// Node states that mean work is under way on that machine right now.
+const UPDATE_BUSY_STATES = new Set([
+  "checking", "downloading", "verifying", "applying", "restarting",
+]);
+
+function machineUpdateInFlight(entry) {
+  return UPDATE_BUSY_STATES.has(entry?.update?.state);
+}
+
+/// How long to wait before reading the fleet roster again.
+function fleetUpdatePollDelay(entries) {
+  const roster = Array.isArray(entries) ? entries : [];
+  return roster.some(machineUpdateInFlight) ? UPDATE_POLL_ACTIVE_MS : UPDATE_POLL_IDLE_MS;
+}
+
+/// A machine may install a release only when it owns its own executable and
+/// the node itself reported a verified newer one. An unverified release is
+/// never offered, however new it claims to be.
+function machineCanUpdate(entry) {
+  const update = entry?.update;
+  return Boolean(update
+    && update.mode === "self"
+    && update.latest?.verified
+    && !machineUpdateInFlight(entry));
+}
+
+function machineCanRollback(entry) {
+  const update = entry?.update;
+  return Boolean(update && update.mode === "self" && update.previous && !machineUpdateInFlight(entry));
+}
+
+function machineCanCheck(entry) {
+  return Boolean(entry?.update?.mode === "self" && !machineUpdateInFlight(entry));
+}
+
+/// The compact landing-page marker, empty when there is nothing to install.
+function machineUpdatePill(entry) {
+  return machineCanUpdate(entry) ? `\u2191 v${entry.update.latest.version}` : "";
+}
+
+function updatableMachines(entries) {
+  return (Array.isArray(entries) ? entries : []).filter(machineCanUpdate);
+}
+
+/// The one thing an operator needs to know before pressing Update.
+function updateRestartWarning(labels) {
+  const names = (Array.isArray(labels) ? labels : [labels]).filter(Boolean);
+  const subject = names.length ? names.join(", ") : "this machine";
+  return `atmux restarts on ${subject}; agent sessions keep running in tmux.`;
+}
+
+/// What the confirmation says for one verb.
+///
+/// Rolling back restarts the node exactly as installing does, so it is
+/// confirmed the same way rather than firing on a single tap.
+function updateConfirmCopy(action, labels) {
+  const names = (Array.isArray(labels) ? labels : [labels]).filter(Boolean);
+  const subject = names.length === 1 ? names[0] : `${names.length} machines`;
+  const note = updateRestartWarning(names);
+  return action === "rollback"
+    ? {
+      title: "Roll back atmux?",
+      target: `Restore the previously installed atmux on ${subject}.`,
+      note,
+      confirm: "Roll back",
+    }
+    : {
+      title: "Install the new atmux?",
+      target: `Install the newest verified atmux on ${subject}.`,
+      note,
+      confirm: "Update",
+    };
+}
+
+function updateProgressLabel(progress) {
+  if (!progress || !Number.isFinite(progress.downloaded)) return "";
+  const done = formatBytes(progress.downloaded);
+  return Number.isFinite(progress.total) && progress.total > 0
+    ? `${done} of ${formatBytes(progress.total)}`
+    : done;
+}
+
+const UPDATE_STATE_LABELS = {
+  checking: "Checking for a new release\u2026",
+  downloading: "Downloading\u2026",
+  verifying: "Verifying the signature and checksum\u2026",
+  applying: "Installing\u2026",
+  restarting: "Restarting into the new version\u2026",
+  failed: "The last update attempt failed",
+};
+
+/// Everything the Software card shows, as text the renderer only has to place.
+///
+/// The node decides what it can do; this only reads the document it published,
+/// so a coordinator can never offer an action the owner would refuse.
+function softwareCardModel(entry, now = Date.now()) {
+  const update = entry?.update || null;
+  if (!update) {
+    return {
+      version: "Software state unavailable",
+      latest: entry?.error || "This machine did not report its software state.",
+      state: "",
+      error: null,
+      canCheck: false,
+      canUpdate: false,
+      canRollback: false,
+    };
+  }
+  let latest;
+  if (update.mode === "managed_externally") latest = "Managed by container image";
+  else if (update.mode === "disabled") latest = "Self-update disabled on this machine";
+  else if (update.latest) {
+    const published = formatRelativeTime(Date.parse(update.latest.published_at), now);
+    latest = [
+      `v${update.latest.version} available`,
+      update.latest.verified ? "verified" : "unverified",
+      published ? `published ${published}` : "",
+    ].filter(Boolean).join(" \u00b7 ");
+  } else latest = "Up to date";
+  const stateLabel = UPDATE_STATE_LABELS[update.state] || "";
+  const progress = update.state === "downloading" ? updateProgressLabel(update.progress) : "";
+  return {
+    version: `atmux v${update.version} \u00b7 ${update.target}`,
+    latest,
+    state: [stateLabel, progress].filter(Boolean).join(" "),
+    error: update.last_error || entry?.error || null,
+    canCheck: machineCanCheck(entry),
+    canUpdate: machineCanUpdate(entry),
+    canRollback: machineCanRollback(entry),
+  };
+}
+
 function contentToLines(content) {
   return typeof content === "string" && content.length > 0 ? content.split("\n") : [];
 }
@@ -2404,7 +2540,18 @@ if (typeof module !== "undefined" && module.exports) {
     memoryLimitChoices,
     parseMemoryLimitSelection,
     formatRelativeTime,
+    fleetUpdatePollDelay,
+    updateConfirmCopy,
     groupSessionsByMachine,
+    machineCanCheck,
+    machineCanRollback,
+    machineCanUpdate,
+    machineUpdateInFlight,
+    machineUpdatePill,
+    softwareCardModel,
+    updatableMachines,
+    updateProgressLabel,
+    updateRestartWarning,
     harnessesForProfiles,
     isMachineControllable,
     isManualDirectory,
@@ -2667,6 +2814,13 @@ function initialize() {
     recoveryStatus: null,
     recoveryLoading: false,
     recoveryPoll: null,
+    /// Machine id -> the node's own update document, as the coordinator read it.
+    fleetUpdates: new Map(),
+    fleetUpdatePoll: null,
+    /// Machines with a verb in flight from this browser, so its buttons stay
+    /// disabled until the node answers.
+    updateBusy: new Set(),
+    pendingUpdate: null,
     railCollapsed: readLocalStorage("atmux.rail-collapsed") === "true",
     pulseOpen: initialRoute.view === "usage",
     pulseAccount: requestedPulseAccount || storedPulseAccount,
@@ -4423,6 +4577,7 @@ function initialize() {
     const sessions = presented.sessions;
     renderCounts(sessions);
     renderRecoveryControl();
+    renderUpdateAll();
     renderAttachments();
 
     const query = state.filter.toLowerCase();
@@ -4599,10 +4754,12 @@ function initialize() {
     const dot = textSpan("", "machine-dot");
     dot.setAttribute("aria-hidden", "true");
     const label = textSpan("", "machine-label");
+    const pill = textSpan("", "machine-update-pill");
+    pill.hidden = true;
     const status = textSpan("", "machine-status");
-    header.append(dot, label, status);
+    header.append(dot, label, pill, status);
     li.append(header);
-    return { li, header, dot, label, status, machineId: machine.id };
+    return { li, header, dot, label, pill, status, machineId: machine.id };
   }
 
   function updateMachineNode(node, machine) {
@@ -4610,6 +4767,10 @@ function initialize() {
     node.header.className = `machine-header ${online ? "online" : "offline"}${state.selectedMachine === machine.id ? " selected" : ""}`;
     node.dot.textContent = online ? "◉" : "○";
     node.label.textContent = machine.label || machine.id;
+    const pill = machineUpdatePill(state.fleetUpdates.get(machine.id));
+    node.pill.textContent = pill;
+    node.pill.hidden = !pill;
+    node.pill.title = pill ? "A verified atmux update is ready for this machine" : "";
     node.status.textContent = machineStatusLabel(machine, Date.now());
     node.li.setAttribute(
       "aria-label",
@@ -4700,6 +4861,67 @@ function initialize() {
       metricListCard("Temperatures", temperatureLines(metrics.temperatures)),
     ];
     $("machine-metrics").replaceChildren(...cards);
+    renderMachineSoftware(machine);
+  }
+
+  /// The machine view's Software card.
+  ///
+  /// Every enabled action comes from the owning node's own document, so this
+  /// never offers an operator a button the node would refuse.
+  function renderMachineSoftware(machine) {
+    const card = $("machine-software");
+    const entry = state.fleetUpdates.get(machine.id) || null;
+    const model = softwareCardModel(entry, Date.now());
+    const busy = state.updateBusy.has(machine.id);
+    const heading = document.createElement("h2");
+    heading.textContent = "Software";
+    const children = [heading, textSpan(model.version, "software-version"),
+      textSpan(model.latest, "software-latest")];
+    if (model.state) {
+      const line = textSpan(model.state, "software-state");
+      line.setAttribute("role", "status");
+      children.push(line);
+    }
+    if (model.error) {
+      const line = textSpan(model.error, "software-error");
+      line.setAttribute("role", "status");
+      children.push(line);
+    }
+    const actions = document.createElement("div");
+    actions.className = "software-actions";
+    actions.append(
+      softwareButton(machine, "check", "Check now", model.canCheck && !busy),
+      softwareButton(machine, "apply", "Update", model.canUpdate && !busy),
+      softwareButton(machine, "rollback", "Roll back", model.canRollback && !busy),
+    );
+    children.push(actions);
+    card.replaceChildren(...children);
+  }
+
+  function softwareButton(machine, action, label, enabled) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = action === "apply" ? "primary" : "subtle";
+    button.textContent = label;
+    button.disabled = !enabled;
+    button.dataset.updateAction = action;
+    button.dataset.machineId = machine.id;
+    button.addEventListener("click", () => {
+      // Both restarting verbs are confirmed; only a read-only check is not.
+      if (action === "check") void runMachineUpdate(machine.id, action);
+      else openUpdateConfirm([machine.id], action);
+    });
+    return button;
+  }
+
+  /// The one landing-page action, shown only when something can be installed.
+  function renderUpdateAll() {
+    const button = $("update-all-open");
+    const targets = updatableMachines([...state.fleetUpdates.values()]);
+    button.hidden = targets.length === 0;
+    button.textContent = `\u2191 Update all (${targets.length})`;
+    button.disabled = state.updateBusy.size > 0;
+    button.dataset.updateCount = String(targets.length);
   }
 
   function metricCard(title, value, sub) {
@@ -6015,6 +6237,109 @@ function initialize() {
       renderRecoveryControl();
     }
   }
+  function stopFleetUpdatePolling() {
+    if (state.fleetUpdatePoll !== null) clearTimeout(state.fleetUpdatePoll);
+    state.fleetUpdatePoll = null;
+  }
+
+  /// Reads every machine's update document.
+  ///
+  /// One coordinator request covers the whole fleet, so the cadence is the
+  /// fleet's, not one request per machine per tick.
+  async function refreshFleetUpdates() {
+    stopFleetUpdatePolling();
+    let entries = [];
+    try {
+      entries = await request("/api/v1/fleet/updates");
+    } catch {
+      // A coordinator that cannot answer leaves the last roster in place; the
+      // Software card already shows whatever each node last reported.
+      scheduleFleetUpdates();
+      return;
+    }
+    state.fleetUpdates = new Map(
+      (Array.isArray(entries) ? entries : []).map((entry) => [entry.id, entry]),
+    );
+    scheduleFleetUpdates();
+    render();
+  }
+
+  function scheduleFleetUpdates() {
+    stopFleetUpdatePolling();
+    if (document.hidden) return;
+    const delay = fleetUpdatePollDelay([...state.fleetUpdates.values()]);
+    state.fleetUpdatePoll = setTimeout(() => { void refreshFleetUpdates(); }, delay);
+  }
+
+  /// Sends one fixed verb to one machine and repaints from the answer.
+  async function runMachineUpdate(machineId, action) {
+    if (state.updateBusy.has(machineId)) return false;
+    state.updateBusy.add(machineId);
+    render();
+    try {
+      const status = await request(
+        `/api/v1/machines/${encodeURIComponent(machineId)}/update/${action}`,
+        { method: "POST", body: JSON.stringify({}) },
+      );
+      const existing = state.fleetUpdates.get(machineId);
+      state.fleetUpdates.set(machineId, {
+        id: machineId,
+        label: existing?.label || machineId,
+        online: true,
+        update: status,
+        error: null,
+      });
+      return true;
+    } catch (error) {
+      toast(error.message);
+      return false;
+    } finally {
+      state.updateBusy.delete(machineId);
+      scheduleFleetUpdates();
+      render();
+    }
+  }
+
+  function machineLabelFor(machineId) {
+    return state.fleetUpdates.get(machineId)?.label
+      || state.machines.find((machine) => machine.id === machineId)?.label
+      || machineId;
+  }
+
+  /// Nothing that restarts a node happens without an explicit confirmation
+  /// naming the machines it will restart.
+  function openUpdateConfirm(machineIds, action) {
+    if (!machineIds.length) return;
+    state.pendingUpdate = { action, machines: machineIds };
+    const copy = updateConfirmCopy(action, machineIds.map(machineLabelFor));
+    $("update-dialog-title").textContent = copy.title;
+    $("update-dialog-target").textContent = copy.target;
+    $("update-dialog-note").textContent = copy.note;
+    $("update-confirm").textContent = copy.confirm;
+    const dialog = $("update-dialog");
+    if (!dialog.open) dialog.showModal();
+  }
+
+  $("update-dialog").addEventListener("close", () => { state.pendingUpdate = null; });
+  $("update-all-open").addEventListener("click", () => {
+    openUpdateConfirm(
+      updatableMachines([...state.fleetUpdates.values()]).map((entry) => entry.id),
+      "apply",
+    );
+  });
+  $("update-confirm").addEventListener("click", async () => {
+    const pending = state.pendingUpdate;
+    $("update-dialog").close();
+    if (!pending?.machines.length) return;
+    const results = await Promise.all(
+      pending.machines.map((id) => runMachineUpdate(id, pending.action)),
+    );
+    const started = results.filter(Boolean).length;
+    if (!started) return;
+    toast(pending.action === "rollback"
+      ? `Rolling back ${started} machine${started === 1 ? "" : "s"}`
+      : `Updating ${started} machine${started === 1 ? "" : "s"}`);
+  });
   $("recovery-open").addEventListener("click", () => { void refreshRecoveryStatus(true); });
   $("recovery-confirm").addEventListener("click", async () => {
     if (state.recoveryLoading || state.recoveryStatus?.phase === "running") return;
@@ -8017,6 +8342,7 @@ function initialize() {
       stopPulseRefresh();
       stopPulseEvents();
       stopRecoveryPolling();
+      stopFleetUpdatePolling();
     } else {
       connectOverview();
       connectPane(false);
@@ -8024,6 +8350,7 @@ function initialize() {
         void loadPulseAccounts(true);
       }
       if (state.recoveryStatus?.phase === "running") void refreshRecoveryStatus(false);
+      void refreshFleetUpdates();
     }
   });
   window.addEventListener("storage", (event) => {
@@ -8052,6 +8379,7 @@ function initialize() {
 
   render();
   connectOverview();
+  void refreshFleetUpdates();
   if (state.selected) connectPane();
   if (state.pulseOpen) void loadPulseAccounts();
 }

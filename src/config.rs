@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 pub use crate::auto_update::MaintenanceConfig;
 use crate::machine::{LOCAL_MACHINE_ID, NodeUrl, validate_machine_id, validate_machine_label};
 use crate::project;
+pub use crate::self_update::SelfUpdateConfig;
 
 pub const DEFAULT_CONFIG: &str = r#"# atmux configuration
 
@@ -97,6 +98,14 @@ enabled = false
 interval_minutes = 30
 update_timeout_seconds = 180
 relaunch_limit = 4
+
+# Signed self-update from GitHub Releases. Each node verifies and installs its
+# own artifact; a coordinator only triggers and observes. Disabled by default.
+[self_update]
+enabled = false
+repository = "ryanmurf/atmux"
+check_interval_seconds = 3600
+auto_apply = false
 
 # This machine's federated identity. With no [[machines]] below, atmux emits
 # bare tmux pane ids exactly as it always has, so leaving [node] out changes
@@ -196,6 +205,8 @@ pub struct Config {
     pub agent_resources: AgentResourcesConfig,
     #[serde(default)]
     pub maintenance: MaintenanceConfig,
+    #[serde(default)]
+    pub self_update: SelfUpdateConfig,
     #[serde(default)]
     pub node: NodeConfig,
     #[serde(default)]
@@ -524,6 +535,10 @@ impl Config {
             .maintenance
             .validate()
             .with_context(|| format!("invalid maintenance configuration in {}", path.display()))?;
+        config
+            .self_update
+            .validate()
+            .with_context(|| format!("invalid self-update configuration in {}", path.display()))?;
         #[cfg(feature = "pulse")]
         config
             .pulse

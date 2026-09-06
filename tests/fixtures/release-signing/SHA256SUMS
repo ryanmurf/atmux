@@ -1,0 +1,5 @@
+version v0.2.0
+9cdb938d217596a3c4009ce71fc3452c2bd741df996fb87fc26f71abd4a2678d  atmux-x86_64-unknown-linux-gnu
+b47a9bd94a4ae329e033384fb5ba2c8e289efab36fe0ff31c94656d1763ea072  atmux-aarch64-unknown-linux-gnu
+4f9b925614a7d136df6da00000250f6e39c2e65bdf6c38f73114e3fa21baa326  atmux-aarch64-apple-darwin
+bbc25185bf0edfdc2eda0a69426417744aae7a732c5ac0736b302d7ff40c1e72  atmux-x86_64-apple-darwin

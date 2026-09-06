@@ -40,6 +40,7 @@ use crate::{
     project::{self, ProjectPreferences},
     recovery::{RecoveryRunner, RecoveryStartError, RecoveryStatus},
     remote::{self, RemoteMachine, encode_segment},
+    self_update::{self, SelfUpdater, UpdateStatus},
     status::{AgentKind, AgentStatus},
     summary, systemd_scope,
     tmux::{
@@ -99,6 +100,23 @@ impl fmt::Display for ControlError {
 }
 
 impl std::error::Error for ControlError {}
+
+/// How long one node has to answer a fleet update read before its entry
+/// reports a timeout instead of holding up every other machine.
+const FLEET_UPDATE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The owner-scoped read every node exposes for its own executable.
+const UPDATE_STATUS_PATH: &str = "/api/v1/update";
+
+/// One machine's self-update state as seen by a coordinator.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FleetUpdate {
+    pub id: String,
+    pub label: String,
+    pub online: bool,
+    /// Absent when the machine could not be read; `error` says why.
+    pub update: Option<UpdateStatus>,
+    pub error: Option<String>,
+}
 
 /// Classifies any control-plane failure.
 ///
@@ -770,6 +788,9 @@ struct Inner {
     /// Owner-local, fixed-command restart recovery. Remote coordinators proxy
     /// to this runner; they never receive a script path or command line.
     recovery: RecoveryRunner,
+    /// Owner-local signed self-update. A coordinator forwards a fixed verb to
+    /// the owning node; it never hands a node a version, URL, or path.
+    updater: Arc<SelfUpdater>,
     /// Unit-test controls use synthetic pane records. If a regression crosses
     /// the Claude-resume validation boundary, stop at this in-memory seam
     /// rather than consulting the developer's default tmux server.
@@ -883,6 +904,7 @@ impl ControlPlane {
         let bare_local_ids = machines.is_empty() && !config.discovery.enabled;
         let configured_machine_ids = machines.keys().cloned().collect();
         let recovery = RecoveryRunner::production(&config.node.id);
+        let updater = SelfUpdater::production(&config.self_update)?;
         let control = Self {
             inner: Arc::new(Inner {
                 local_id: config.node.id.clone(),
@@ -909,6 +931,7 @@ impl ControlPlane {
                 revisions,
                 refresh_now: Notify::new(),
                 recovery,
+                updater,
                 #[cfg(test)]
                 deny_local_claude_resume: false,
                 #[cfg(test)]
@@ -923,6 +946,7 @@ impl ControlPlane {
             control.spawn_auto_compact();
             control.spawn_maintenance();
         }
+        control.inner.updater.spawn_background();
         for machine in control.remote_machines() {
             control.start_watcher(machine);
         }
@@ -986,6 +1010,165 @@ impl ControlPlane {
     #[must_use]
     pub fn local_id(&self) -> &str {
         &self.inner.local_id
+    }
+
+    /// This node's own signed self-update document.
+    #[must_use]
+    pub fn update_status(&self) -> UpdateStatus {
+        self.inner.updater.status()
+    }
+
+    /// Runs one fixed update verb against this node's own executable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the verb does not apply to this node right now,
+    /// and an internal error when the updater itself failed.
+    pub async fn local_update_action(&self, action: self_update::Action) -> Result<UpdateStatus> {
+        let outcome = match action {
+            self_update::Action::Check => self.inner.updater.check(true).await,
+            self_update::Action::Apply => self.inner.updater.apply().await,
+            self_update::Action::Rollback => self.inner.updater.rollback(),
+        };
+        outcome.map_err(|error| {
+            if error.conflict {
+                conflict(error.to_string())
+            } else {
+                internal(&anyhow::Error::new(error))
+            }
+        })
+    }
+
+    /// Reads the update document from the machine that owns that executable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the machine is unknown, offline, or rejects the
+    /// owner-scoped read.
+    pub async fn machine_update_status(&self, machine: &str) -> Result<UpdateStatus> {
+        if machine == self.inner.local_id {
+            return Ok(self.update_status());
+        }
+        let remote = self.remote_machine(machine)?;
+        self.ensure_online(&remote.id)?;
+        remote
+            .get_json(UPDATE_STATUS_PATH)
+            .await
+            .map_err(|error| upstream(&error))
+    }
+
+    /// Forwards one fixed update verb to the machine that owns the executable.
+    ///
+    /// The forwarded path is chosen from a closed set of literals, so no part
+    /// of a request can steer a coordinator at a URL of its choosing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the machine is unknown, offline, or refuses the
+    /// verb.
+    pub async fn machine_update_action(
+        &self,
+        machine: &str,
+        action: self_update::Action,
+    ) -> Result<UpdateStatus> {
+        if machine == self.inner.local_id {
+            return self.local_update_action(action).await;
+        }
+        let remote = self.remote_machine(machine)?;
+        self.ensure_online(&remote.id)?;
+        let path = match action {
+            self_update::Action::Check => "/api/v1/update/check",
+            self_update::Action::Apply => "/api/v1/update/apply",
+            self_update::Action::Rollback => "/api/v1/update/rollback",
+        };
+        remote
+            .post_json_response(path, &serde_json::json!({}))
+            .await
+            .map_err(|error| remote_mutation_error(&error))
+    }
+
+    /// Every machine's update document, read concurrently.
+    ///
+    /// One slow or broken node bounds its own entry instead of the whole
+    /// answer: a per-node timeout turns into that entry's `error`.
+    pub async fn fleet_updates(&self) -> Vec<FleetUpdate> {
+        let local_id = self.inner.local_id.clone();
+        let local_status = self.update_status();
+        let local_label = self.inner.local_label.clone();
+        let mut summaries = self.machines();
+        if !summaries.iter().any(|machine| machine.id == local_id) {
+            summaries.insert(
+                0,
+                MachineSummary {
+                    id: local_id.clone(),
+                    label: local_label,
+                    kind: MachineKind::Local,
+                    online: true,
+                    sessions: 0,
+                    health: None,
+                    last_seen_ms: None,
+                    address: None,
+                    metrics: MachineMetrics::default(),
+                },
+            );
+        }
+        let mut tasks = Vec::with_capacity(summaries.len());
+        for machine in summaries {
+            if machine.id == local_id {
+                tasks.push(tokio::spawn(std::future::ready(FleetUpdate {
+                    id: machine.id,
+                    label: machine.label,
+                    online: true,
+                    update: Some(local_status.clone()),
+                    error: None,
+                })));
+                continue;
+            }
+            let remote = self.remote_machine(&machine.id).ok();
+            tasks.push(tokio::spawn(async move {
+                let Some(remote) = remote.filter(|_| machine.online) else {
+                    return FleetUpdate {
+                        error: Some(
+                            machine
+                                .health
+                                .clone()
+                                .unwrap_or_else(|| "machine is offline".to_owned()),
+                        ),
+                        id: machine.id,
+                        label: machine.label,
+                        online: machine.online,
+                        update: None,
+                    };
+                };
+                let read = tokio::time::timeout(
+                    FLEET_UPDATE_TIMEOUT,
+                    remote.get_json::<UpdateStatus>(UPDATE_STATUS_PATH),
+                )
+                .await;
+                let (update, error) = match read {
+                    Ok(Ok(update)) => (Some(update), None),
+                    Ok(Err(error)) => (None, Some(format!("{error:#}"))),
+                    Err(_) => (
+                        None,
+                        Some("timed out reading this machine's update state".to_owned()),
+                    ),
+                };
+                FleetUpdate {
+                    id: machine.id,
+                    label: machine.label,
+                    online: true,
+                    update,
+                    error,
+                }
+            }));
+        }
+        let mut entries = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            if let Ok(entry) = task.await {
+                entries.push(entry);
+            }
+        }
+        entries
     }
 
     pub(crate) fn remote_machines(&self) -> Vec<Arc<RemoteMachine>> {
@@ -5282,6 +5465,17 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
             revisions,
             refresh_now: Notify::new(),
             recovery: RecoveryRunner::production(&local_id),
+            updater: SelfUpdater::with_environment(
+                &crate::self_update::SelfUpdateConfig::default(),
+                self_update::Environment {
+                    exe: std::path::PathBuf::from("/nonexistent/atmux"),
+                    state_dir: std::path::PathBuf::from("/nonexistent/state"),
+                    launch: self_update::Launch::capture(),
+                    container: false,
+                    restart: false,
+                },
+            )
+            .expect("the default self-update policy must be valid"),
             deny_local_claude_resume: true,
             local_claude_resume_attempts: AtomicU64::new(0),
             test_message_live_instances: Mutex::new(HashMap::new()),

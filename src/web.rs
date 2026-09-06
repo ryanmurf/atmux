@@ -27,14 +27,15 @@ use crate::{
     config::Config,
     control::{
         CloneLaunchRepositoryRequest, ControlPlane, CreateLaunchDirectoryRequest, ErrorKind,
-        LaunchDirectoryActionResult, LaunchDirectoryListing, LaunchRequest, ModelSwitchRequest,
-        Overview, PaneModels, PaneOutput, ResumableLaunchSessions, error_kind, overview_patch,
-        pane_patch,
+        FleetUpdate, LaunchDirectoryActionResult, LaunchDirectoryListing, LaunchRequest,
+        ModelSwitchRequest, Overview, PaneModels, PaneOutput, ResumableLaunchSessions, error_kind,
+        overview_patch, pane_patch,
     },
     discovery,
     machine::{MachineSummary, Secret, resolve_token},
     mcp,
     recovery::RecoveryStatus,
+    self_update::{self, UpdateStatus},
     tmux::PaneSpecialKey,
     transcript::Transcript,
     workspace::{FileWriteRequest, FilesResponse, GitResponse, MAX_FILE_WRITE_REQUEST_BYTES},
@@ -114,6 +115,12 @@ struct SpecialKeyRequest {
 struct LegacySpecialKeyRequest {
     action: String,
 }
+
+/// Deliberately empty: the owning node decides which release it installs and
+/// never learns a version, URL, or path from the caller.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateActionRequest {}
 
 /// Deliberately empty: the owning node derives the Claude config root and
 /// native session id itself, never from a browser request.
@@ -782,6 +789,17 @@ fn routes(state: WebState) -> Router {
             "/api/v1/machines/{id}/quick-resume",
             get(quick_resume_status).post(start_quick_resume),
         )
+        // Owner-scoped view of this node's own executable.
+        .route("/api/v1/update", get(update_status))
+        .route("/api/v1/update/check", post(update_check))
+        .route("/api/v1/update/apply", post(update_apply))
+        .route("/api/v1/update/rollback", post(update_rollback))
+        // Coordinator aggregation and forwarding.
+        .route("/api/v1/fleet/updates", get(fleet_updates))
+        .route(
+            "/api/v1/machines/{id}/update/{action}",
+            post(machine_update),
+        )
         .route("/api/v1/sessions", get(sessions).post(launch))
         .route("/api/v1/memory-launches/v1", post(launch_with_memory))
         .route("/api/v1/events", get(overview_events))
@@ -1156,6 +1174,78 @@ async fn start_quick_resume(
     state
         .control
         .start_recovery(&id)
+        .await
+        .map(|status| (StatusCode::ACCEPTED, Json(status)))
+        .map_err(|error| ApiError::from_control(&error))
+}
+
+/// Reads this node's own update document.
+///
+/// Every API caller already presents this node's token; the document adds a
+/// version, a target triple, and a public release tag, and never a path
+/// beyond the one the node itself keeps for a rollback.
+async fn update_status(State(state): State<WebState>) -> Json<UpdateStatus> {
+    Json(state.control.update_status())
+}
+
+async fn update_check(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<UpdateStatus>), ApiError> {
+    run_local_update(&state, &headers, self_update::Action::Check).await
+}
+
+async fn update_apply(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<UpdateStatus>), ApiError> {
+    run_local_update(&state, &headers, self_update::Action::Apply).await
+}
+
+async fn update_rollback(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<UpdateStatus>), ApiError> {
+    run_local_update(&state, &headers, self_update::Action::Rollback).await
+}
+
+async fn run_local_update(
+    state: &WebState,
+    headers: &HeaderMap,
+    action: self_update::Action,
+) -> Result<(StatusCode, Json<UpdateStatus>), ApiError> {
+    ensure_origin(headers, &state.allowed_origins)?;
+    state
+        .control
+        .local_update_action(action)
+        .await
+        .map(|status| (StatusCode::ACCEPTED, Json(status)))
+        .map_err(|error| ApiError::from_control(&error))
+}
+
+/// Every machine's update state, for the coordinator dashboard.
+async fn fleet_updates(State(state): State<WebState>) -> Json<Vec<FleetUpdate>> {
+    Json(state.control.fleet_updates().await)
+}
+
+/// Forwards one fixed update verb to the machine that owns the executable.
+///
+/// The action must be one of three literals and the machine must already be in
+/// this coordinator's machine list, so neither segment can become a URL.
+async fn machine_update(
+    State(state): State<WebState>,
+    Path((id, action)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(_request): Json<UpdateActionRequest>,
+) -> Result<(StatusCode, Json<UpdateStatus>), ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    let action = self_update::Action::parse(&action).ok_or_else(|| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "update action must be check, apply, or rollback".to_owned(),
+    })?;
+    state
+        .control
+        .machine_update_action(&id, action)
         .await
         .map(|status| (StatusCode::ACCEPTED, Json(status)))
         .map_err(|error| ApiError::from_control(&error))
@@ -2481,6 +2571,181 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    #[tokio::test]
+    async fn update_routes_are_owner_scoped_authenticated_and_no_store() {
+        let control = crate::control::test_control(&[]);
+        let (app, _shutdown) = authenticated_real_app(control);
+
+        let anonymous = protected_api("GET", "/api/v1/update", "", None, None);
+        assert_eq!(
+            app.clone().oneshot(anonymous).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let read = protected_api(
+            "GET",
+            "/api/v1/update",
+            "",
+            Some("quick-resume-test-token"),
+            None,
+        );
+        let response = app.clone().oneshot(read).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["version"], crate::self_update::VERSION);
+        assert_eq!(payload["target"], crate::self_update::TARGET);
+        // `test_control` leaves the default policy in place, which is off.
+        assert_eq!(payload["mode"], "disabled");
+        assert_eq!(payload["enabled"], false);
+
+        for path in [
+            "/api/v1/update/check",
+            "/api/v1/update/apply",
+            "/api/v1/update/rollback",
+        ] {
+            let anonymous = protected_api("POST", path, "{}", None, Some("http://localhost:7345"));
+            assert_eq!(
+                app.clone().oneshot(anonymous).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must require the node token"
+            );
+            let cross_origin = protected_api(
+                "POST",
+                path,
+                "{}",
+                Some("quick-resume-test-token"),
+                Some("https://attacker.example"),
+            );
+            assert_eq!(
+                app.clone().oneshot(cross_origin).await.unwrap().status(),
+                StatusCode::FORBIDDEN,
+                "{path} must reject a foreign origin"
+            );
+            let same_origin = protected_api(
+                "POST",
+                path,
+                "{}",
+                Some("quick-resume-test-token"),
+                Some("http://localhost:7345"),
+            );
+            // Self-update is disabled on this node, so every verb fails closed
+            // after authentication and origin checks instead of touching disk.
+            assert_eq!(
+                app.clone().oneshot(same_origin).await.unwrap().status(),
+                StatusCode::CONFLICT,
+                "{path} must refuse while self-update is disabled"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn machine_update_forwarding_only_accepts_known_machines_and_verbs() {
+        let control = crate::control::test_control(&["gpu-box"]);
+        let (app, _shutdown) = authenticated_real_app(control);
+        let request = |uri: &str| {
+            protected_api(
+                "POST",
+                uri,
+                "{}",
+                Some("quick-resume-test-token"),
+                Some("http://localhost:7345"),
+            )
+        };
+
+        // An action outside the fixed vocabulary never becomes a forwarded path.
+        for action in ["restart", "..%2F..%2Fetc", "Apply", ""] {
+            let uri = format!("/api/v1/machines/gpu-box/update/{action}");
+            let status = app.clone().oneshot(request(&uri)).await.unwrap().status();
+            assert!(
+                matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND),
+                "action {action} produced {status}"
+            );
+        }
+
+        assert_eq!(
+            app.clone()
+                .oneshot(request("/api/v1/machines/ghost/update/check"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        // The configured remote is offline, which proves the coordinator never
+        // ran the owner-scoped verb locally on its behalf.
+        assert_eq!(
+            app.clone()
+                .oneshot(request("/api/v1/machines/gpu-box/update/apply"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request("/api/v1/machines/local/update/rollback"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let cross_origin = protected_api(
+            "POST",
+            "/api/v1/machines/local/update/check",
+            "{}",
+            Some("quick-resume-test-token"),
+            Some("https://attacker.example"),
+        );
+        assert_eq!(
+            app.oneshot(cross_origin).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn fleet_updates_reports_one_entry_per_machine() {
+        let control = crate::control::test_control(&["gpu-box"]);
+        let (app, _shutdown) = authenticated_real_app(control);
+        let read = protected_api(
+            "GET",
+            "/api/v1/fleet/updates",
+            "",
+            Some("quick-resume-test-token"),
+            None,
+        );
+        let response = app.oneshot(read).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let entries: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(entries.len(), 2);
+        let local = entries
+            .iter()
+            .find(|entry| entry["id"] == "local")
+            .expect("the local machine is always reported");
+        assert_eq!(local["update"]["target"], crate::self_update::TARGET);
+        assert!(local["error"].is_null());
+        let remote = entries
+            .iter()
+            .find(|entry| entry["id"] == "gpu-box")
+            .expect("every configured machine is reported");
+        // An unreachable node bounds its own entry instead of the whole answer.
+        assert_eq!(remote["online"], false);
+        assert!(remote["update"].is_null());
+        assert!(remote["error"].is_string());
     }
 
     #[tokio::test]

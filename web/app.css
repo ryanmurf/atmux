@@ -288,6 +288,8 @@ dialog::backdrop { background: #000a; }
 .machine-header.online .machine-dot { color: #4ec9a5; }
 .machine-header.offline .machine-dot, .machine-header.offline .machine-status { color: #e0975f; }
 .machine-header.offline .machine-label { color: var(--muted); }
+.machine-header .machine-update-pill { flex: none; padding: 1px 5px; border-radius: 999px; background: #12303a; color: var(--cyan); font-size: 10px; font-weight: 700; letter-spacing: .02em; text-transform: none; white-space: nowrap; }
+.rail-update-all { width: 100%; min-height: 34px; margin-bottom: 6px; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .agent-offline { margin: 0; padding: 8px 11px; border-radius: 7px; background: #3a2a18; color: #f0c48a; font-size: 13px; }
 .dialog-note { margin: 0; color: #e0975f; font-size: 12px; }
 .launch-directory-control { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
@@ -322,6 +324,14 @@ dialog::backdrop { background: #000a; }
 .launch-summary-toggle { min-height: 32px; display: flex; align-items: center; gap: 9px; color: var(--text); font-size: 13px; }
 .launch-summary-toggle input { width: 18px; height: 18px; margin: 0; flex: none; }
 .machine-view { height: 100%; overflow: auto; padding: 16px; }
+.software-card { min-width: 0; display: grid; gap: 6px; margin-top: 18px; padding: 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.software-card h2 { margin: 0 0 4px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .07em; }
+.software-version { font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
+.software-latest { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.software-state { color: var(--cyan); font-size: 12px; overflow-wrap: anywhere; }
+.software-error { color: #f0c48a; font-size: 12px; overflow-wrap: anywhere; }
+.software-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.software-actions button { min-height: 36px; }
 .metrics-grid { min-width: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 22px; }
 .metric-card { min-width: 0; min-height: 112px; padding: 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
 .metric-card h2 { margin: 0 0 12px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .07em; }
