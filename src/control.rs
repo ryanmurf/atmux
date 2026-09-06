@@ -31,7 +31,10 @@ use crate::{
     auto_compact::{self, Decision as AutoCompactDecision},
     auto_update::{self, Harness as UpdateHarness, PendingMarker},
     config::{AgentProfile, Config, ProfileMode},
-    machine::{MachineKind, MachineSummary, composite_id, now_ms, split_composite},
+    launch_directory,
+    machine::{
+        MachineKind, MachineSummary, composite_id, now_ms, split_composite, validate_machine_id,
+    },
     metrics::{HardwareSampler, MachineMetrics},
     old_sessions::{self, DiscoveryLimits, ResumeCandidate},
     project::{self, ProjectPreferences},
@@ -39,7 +42,10 @@ use crate::{
     remote::{self, RemoteMachine, encode_segment},
     status::{AgentKind, AgentStatus},
     systemd_scope,
-    tmux::{RESERVED_SERVICE_SESSION, Session, Tmux, UnsupportedModelControl, known_models},
+    tmux::{
+        PaneSpecialKey, RESERVED_SERVICE_SESSION, Session, Tmux, UnsupportedModelControl,
+        known_models, valid_pane_identity,
+    },
     transcript::Transcript,
     workspace::{FileWriteRequest, FilesResponse, GitResponse, WorkspaceErrorKind},
 };
@@ -130,11 +136,18 @@ fn upstream(error: &anyhow::Error) -> anyhow::Error {
     ControlError::new(ErrorKind::Upstream, format!("{error:#}")).into()
 }
 
-fn remote_workspace_error(error: &anyhow::Error) -> anyhow::Error {
+/// Preserves safe owner-side mutation classifications without reflecting the
+/// owner's response body through a coordinator.
+fn remote_mutation_error(error: &anyhow::Error) -> anyhow::Error {
     match remote::rejected_status(error) {
-        Some(400) => bad_request(error.to_string()),
-        Some(404) => not_found(error.to_string()),
-        Some(409) => conflict(error.to_string()),
+        Some(400) => bad_request("owning machine rejected the mutation as invalid"),
+        Some(404) => not_found("owning machine no longer has the requested resource"),
+        Some(409) => conflict("owning machine reports that the target changed"),
+        Some(status) => ControlError::new(
+            ErrorKind::Upstream,
+            format!("owning machine rejected the mutation with HTTP {status}"),
+        )
+        .into(),
         _ => upstream(error),
     }
 }
@@ -155,6 +168,16 @@ fn workspace_error(error: &crate::workspace::WorkspaceError) -> anyhow::Error {
     }
 }
 
+fn launch_directory_error(error: &launch_directory::ActionError) -> anyhow::Error {
+    match error.kind() {
+        launch_directory::ErrorKind::Invalid => bad_request(error.to_string()),
+        launch_directory::ErrorKind::Conflict => conflict(error.to_string()),
+        launch_directory::ErrorKind::Internal => {
+            ControlError::new(ErrorKind::Internal, error.to_string()).into()
+        }
+    }
+}
+
 const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_BROWSE_PATH_BYTES: usize = 4_096;
@@ -168,6 +191,11 @@ const REMOTE_FETCH_LINES: usize = 2_000;
 pub struct SessionSummary {
     /// Stable composite identity: `machine~pane`.
     pub id: String,
+    /// Opaque owner-issued pane generation used to scope browser-local state.
+    ///
+    /// Unlike a tmux pane id, this changes when a deleted pane id is reused.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instance_id: String,
     /// Machine that owns this session.
     #[serde(default)]
     pub machine: String,
@@ -202,6 +230,7 @@ impl SessionSummary {
     fn from_local(machine: &str, id: String, session: &Session) -> Self {
         Self {
             id,
+            instance_id: session.pane_identity.clone(),
             machine: machine.to_owned(),
             name: session.name.clone(),
             pane_id: session.pane_id.clone(),
@@ -332,6 +361,24 @@ pub struct ProfileModeOption {
     pub service_tier: Option<String>,
 }
 
+/// Owner-advertised, server-enforced memory choices for one machine.
+///
+/// The browser treats this as display data only. Every requested byte value is
+/// resolved again by the owning node against its current configuration and
+/// host/cgroup ceiling immediately before launch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentMemoryLaunchOptions {
+    pub supported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_max_bytes: Option<u64>,
+    #[serde(default)]
+    pub presets_bytes: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 /// Launch inputs accepted by one machine.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MachineLaunchOptions {
@@ -343,6 +390,9 @@ pub struct MachineLaunchOptions {
     /// Saved project-local defaults keyed by their absolute launch directory.
     #[serde(default)]
     pub project_preferences: BTreeMap<String, ProjectPreferences>,
+    /// Per-launch cgroup limit capability reported by this exact owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<AgentMemoryLaunchOptions>,
     /// Why a machine currently offers no launch inputs.
     pub note: Option<String>,
 }
@@ -356,6 +406,10 @@ pub struct LaunchOptions {
     /// Saved project-local defaults keyed by their absolute launch directory.
     #[serde(default)]
     pub project_preferences: BTreeMap<String, ProjectPreferences>,
+    /// This machine's memory capability. Retained beside `machines` for old
+    /// single-owner clients and omitted by older nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<AgentMemoryLaunchOptions>,
     /// Per-machine launch inputs, this machine first.
     #[serde(default)]
     pub machines: Vec<MachineLaunchOptions>,
@@ -378,6 +432,10 @@ pub struct LaunchRequest {
     /// provider session id and configuration path never cross the API.
     #[serde(default)]
     pub resume_session_id: Option<String>,
+    /// Optional exact byte cap. Absence selects the owner's configured
+    /// default; presence is never trusted without owner-side revalidation.
+    #[serde(default)]
+    pub memory_max_bytes: Option<u64>,
 }
 
 /// One saved native conversation safe to display in Quick Launch.
@@ -414,6 +472,35 @@ pub struct LaunchDirectoryListing {
     pub parent: Option<String>,
     pub directories: Vec<BrowseDirectory>,
     pub truncated: bool,
+}
+
+/// Creates one child folder in the currently displayed launch directory.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateLaunchDirectoryRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    pub directory: String,
+    pub name: String,
+}
+
+/// Clones one repository into a new child of the displayed launch directory.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CloneLaunchRepositoryRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    pub directory: String,
+    pub repository: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+}
+
+/// A successful folder mutation and the refreshed parent listing.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct LaunchDirectoryActionResult {
+    pub directory: BrowseDirectory,
+    pub listing: LaunchDirectoryListing,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -501,6 +588,7 @@ impl std::error::Error for ResumeRejected {}
 enum Target {
     Local {
         pane_id: String,
+        instance_id: String,
         name: String,
         agent: AgentKind,
         resume_lease: Option<String>,
@@ -508,6 +596,7 @@ enum Target {
     Remote {
         machine: Arc<RemoteMachine>,
         pane_id: String,
+        instance_id: String,
         name: String,
     },
 }
@@ -650,6 +739,9 @@ struct Inner {
     deny_local_claude_resume: bool,
     #[cfg(test)]
     local_claude_resume_attempts: AtomicU64,
+    /// Synthetic live pane generations for owner-local message race tests.
+    #[cfg(test)]
+    test_message_live_instances: Mutex<HashMap<String, Option<String>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -783,6 +875,8 @@ impl ControlPlane {
                 deny_local_claude_resume: false,
                 #[cfg(test)]
                 local_claude_resume_attempts: AtomicU64::new(0),
+                #[cfg(test)]
+                test_message_live_instances: Mutex::new(HashMap::new()),
             }),
         };
         if !control.inner.config.node.coordinator_only {
@@ -1549,8 +1643,9 @@ impl ControlPlane {
                         // is temporarily unavailable, retain the plan so a
                         // later maintenance pass can retry without ever
                         // launching an unbounded replacement.
-                        let scope = match systemd_scope::prepare(
+                        let scope = match systemd_scope::prepare_override(
                             &self.inner.config.agent_resources,
+                            fresh.as_ref().and_then(|session| session.memory_max_bytes),
                             &pane_id,
                         ) {
                             Ok(scope) => scope,
@@ -1886,6 +1981,7 @@ impl ControlPlane {
                 machine,
                 pane_id,
                 name,
+                ..
             } => self
                 .remote_pane_output(&machine, &pane_id, &name, known_hash, max_lines)
                 .await
@@ -2068,7 +2164,7 @@ impl ControlPlane {
                 let response: FilesResponse = machine
                     .put_json_response(&route, &request)
                     .await
-                    .map_err(|error| remote_workspace_error(&error))?;
+                    .map_err(|error| remote_mutation_error(&error))?;
                 Ok(Some(
                     response.with_pane_id(composite_id(&machine.id, &pane_id)),
                 ))
@@ -2313,6 +2409,43 @@ impl ControlPlane {
         lock
     }
 
+    #[cfg(not(test))]
+    #[allow(clippy::unused_self)] // Test builds consult the owner-live race seam below.
+    fn validate_live_message_instance(&self, pane_id: &str, expected: Option<&str>) -> Result<()> {
+        validate_live_pane_instance(pane_id, expected)
+    }
+
+    #[cfg(test)]
+    fn validate_live_message_instance(&self, pane_id: &str, expected: Option<&str>) -> Result<()> {
+        if let Some(live) = self
+            .inner
+            .test_message_live_instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(pane_id)
+            .cloned()
+        {
+            return live.map_or_else(
+                || Err(conflict("agent pane disappeared before message delivery")),
+                |instance| validate_expected_pane_instance(expected, &instance),
+            );
+        }
+        validate_live_pane_instance(pane_id, expected)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_message_live_instance(
+        &self,
+        pane_id: &str,
+        instance_id: Option<String>,
+    ) {
+        self.inner
+            .test_message_live_instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(pane_id.to_owned(), instance_id);
+    }
+
     fn cached_output(&self, composite: &str, expected_hash: &str) -> Option<CachedOutput> {
         self.inner
             .outputs
@@ -2364,6 +2497,13 @@ impl ControlPlane {
             .map(|path| path.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         let project_preferences = project_preferences(&directory_paths);
+        let memory = if self.inner.config.node.coordinator_only {
+            None
+        } else {
+            Some(agent_memory_launch_options(
+                &self.inner.config.agent_resources,
+            ))
+        };
         let profiles = if self.inner.config.node.coordinator_only {
             Vec::new()
         } else {
@@ -2389,6 +2529,7 @@ impl ControlPlane {
                 directories: directories.clone(),
                 profiles: profiles.clone(),
                 project_preferences: project_preferences.clone(),
+                memory: memory.clone(),
                 note: None,
             });
         }
@@ -2412,6 +2553,7 @@ impl ControlPlane {
                     .as_ref()
                     .map(|options| options.project_preferences.clone())
                     .unwrap_or_default(),
+                memory: options.as_ref().and_then(|options| options.memory.clone()),
                 note: remote.and_then(|remote| {
                     remote
                         .launch_note
@@ -2424,6 +2566,7 @@ impl ControlPlane {
             directories,
             profiles,
             project_preferences,
+            memory,
             machines,
         }
     }
@@ -2464,6 +2607,90 @@ impl ControlPlane {
         })
         .await
         .map_err(|error| internal(&error.into()))?
+    }
+
+    /// Creates one new folder on the selected machine and refreshes its
+    /// bounded parent listing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown/offline machine, an outside-root
+    /// parent, a non-component name, an existing target, or a filesystem
+    /// failure on the owner.
+    pub async fn create_launch_directory(
+        &self,
+        request: CreateLaunchDirectoryRequest,
+    ) -> Result<LaunchDirectoryActionResult> {
+        let target = request.machine.as_deref().unwrap_or(&self.inner.local_id);
+        if target != self.inner.local_id {
+            let remote = self.remote_machine(target)?;
+            self.ensure_online(&remote.id)?;
+            let forwarded = CreateLaunchDirectoryRequest {
+                machine: None,
+                ..request
+            };
+            return remote
+                .post_json_response("/api/v1/launch-directories/folders", &forwarded)
+                .await
+                .map_err(|error| remote_mutation_error(&error));
+        }
+
+        self.ensure_local_owner_enabled()?;
+        let config = self.inner.config.clone();
+        let machine = self.inner.local_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let created =
+                launch_directory::create_folder(&config, &request.directory, &request.name)
+                    .map_err(|error| launch_directory_error(&error))?;
+            launch_directory_action_result(&config, machine, &request.directory, &created)
+        })
+        .await
+        .map_err(|error| internal(&anyhow::Error::new(error).context("folder creation panicked")))?
+    }
+
+    /// Clones one repository into a new child folder on the selected machine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown/offline machine, unsafe repository or
+    /// destination input, an existing target, or a failed owner-side clone.
+    pub async fn clone_launch_repository(
+        &self,
+        request: CloneLaunchRepositoryRequest,
+    ) -> Result<LaunchDirectoryActionResult> {
+        let target = request.machine.as_deref().unwrap_or(&self.inner.local_id);
+        if target != self.inner.local_id {
+            let remote = self.remote_machine(target)?;
+            self.ensure_online(&remote.id)?;
+            let forwarded = CloneLaunchRepositoryRequest {
+                machine: None,
+                ..request
+            };
+            return remote
+                .post_json_response_with_timeout(
+                    "/api/v1/launch-directories/clone",
+                    &forwarded,
+                    Duration::from_secs(10 * 60 + 30),
+                )
+                .await
+                .map_err(|error| remote_mutation_error(&error));
+        }
+
+        self.ensure_local_owner_enabled()?;
+        let config = self.inner.config.clone();
+        let machine = self.inner.local_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let created = launch_directory::clone_repository(
+                &config,
+                &request.directory,
+                &request.repository,
+                request.destination.as_deref(),
+            )
+            .map_err(|error| launch_directory_error(&error))?;
+            launch_directory_action_result(&config, machine, &request.directory, &created)
+        })
+        .await
+        .map_err(|error| internal(&anyhow::Error::new(error).context("git clone task panicked")))?
     }
 
     /// Lists bounded native conversations for one exact launch selection.
@@ -2553,18 +2780,50 @@ impl ControlPlane {
     ///
     /// Returns an error when the agent is unknown or tmux rejects the input.
     pub async fn send_text(&self, id: &str, text: String, submit: bool) -> Result<()> {
+        self.send_text_for_instance(id, text, submit, None).await
+    }
+
+    /// Sends text only while the owner still reports the caller's pane generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the pane was deleted or reincarnated before the
+    /// owner-local tmux mutation boundary.
+    pub async fn send_text_for_instance(
+        &self,
+        id: &str,
+        text: String,
+        submit: bool,
+        expected_instance_id: Option<String>,
+    ) -> Result<()> {
         match self.resolve(id)? {
-            Target::Local { pane_id, .. } => {
+            Target::Local {
+                pane_id,
+                instance_id,
+                ..
+            } => {
+                validate_expected_pane_instance(expected_instance_id.as_deref(), &instance_id)?;
                 let prompt_lock = self.prompt_lock(&pane_id);
-                local_tmux(
+                let expected_instance_id = expected_instance_id.clone();
+                let live_control = self.clone();
+                local_message_mutation(
                     tokio::task::spawn_blocking(move || {
                         let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
                         let mut guard = prompt_lock
                             .state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        live_control.validate_live_message_instance(
+                            &pane_id,
+                            expected_instance_id.as_deref(),
+                        )?;
                         begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
-                        Tmux.send_text(&pane_id, &text, submit)?;
+                        Tmux::send_text_checked(&pane_id, &text, submit, || {
+                            live_control.validate_live_message_instance(
+                                &pane_id,
+                                expected_instance_id.as_deref(),
+                            )
+                        })?;
                         Ok(())
                     })
                     .await,
@@ -2572,16 +2831,24 @@ impl ControlPlane {
                 self.inner.refresh_now.notify_one();
             }
             Target::Remote {
-                machine, pane_id, ..
+                machine,
+                pane_id,
+                instance_id,
+                ..
             } => {
+                validate_expected_pane_instance(expected_instance_id.as_deref(), &instance_id)?;
                 self.ensure_online(&machine.id)?;
+                let mut request = serde_json::json!({ "text": text, "submit": submit });
+                if let Some(instance_id) = expected_instance_id {
+                    request["instance_id"] = serde_json::Value::String(instance_id);
+                }
                 machine
                     .post_json(
                         &format!("/api/v1/panes/{}/messages", encode_segment(&pane_id)),
-                        &serde_json::json!({ "text": text, "submit": submit }),
+                        &request,
                     )
                     .await
-                    .map_err(|error| upstream(&error))?;
+                    .map_err(|error| remote_mutation_error(&error))?;
             }
         }
         Ok(())
@@ -2741,10 +3008,14 @@ impl ControlPlane {
                             )
                             .into());
                         }
-                        let scope = systemd_scope::prepare(&resources, &pane_id)?;
-                        begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
                         let (session, resume, claude_program) =
                             fresh_claude_resume_target(&pane_id, &status, capture_lines)?;
+                        let scope = systemd_scope::prepare_override(
+                            &resources,
+                            session.memory_max_bytes,
+                            &pane_id,
+                        )?;
+                        begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
                         Tmux::resume_claude(
                             &pane_id,
                             &session.path,
@@ -2783,8 +3054,15 @@ impl ControlPlane {
     /// Returns an error for malformed images, an unknown/offline pane, or a
     /// storage/tmux failure on the owning node.
     pub async fn send_image_message(&self, id: &str, request: ImageMessageRequest) -> Result<()> {
+        let expected_instance_id = request.instance_id.clone();
         match self.resolve(id)? {
-            Target::Local { pane_id, agent, .. } => {
+            Target::Local {
+                pane_id,
+                instance_id,
+                agent,
+                ..
+            } => {
+                validate_expected_pane_instance(expected_instance_id.as_deref(), &instance_id)?;
                 if let Err(error) = attachment::validate_request(&request) {
                     return if error.kind() == DeliveryErrorKind::Invalid {
                         Err(bad_request(error.to_string()))
@@ -2793,28 +3071,35 @@ impl ControlPlane {
                     };
                 }
                 let prompt_lock = self.prompt_lock(&pane_id);
-                let delivered = tokio::task::spawn_blocking(move || -> Result<_> {
-                    let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
-                    let mut guard = prompt_lock
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
-                    Ok(attachment::deliver(
-                        &pane_id,
-                        request,
-                        agent == AgentKind::Claude,
-                    ))
-                })
-                .await
-                .map_err(|error| {
-                    internal(&anyhow::Error::new(error).context("an attachment task panicked"))
-                })?
-                .map_err(|error| internal(&error))?;
+                let expected_instance_id = expected_instance_id.clone();
+                let live_control = self.clone();
+                let delivered = local_message_mutation(
+                    tokio::task::spawn_blocking(move || -> Result<_> {
+                        let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
+                        let mut guard = prompt_lock
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        live_control.validate_live_message_instance(
+                            &pane_id,
+                            expected_instance_id.as_deref(),
+                        )?;
+                        begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
+                        Ok(attachment::deliver(
+                            &pane_id,
+                            request,
+                            agent == AgentKind::Claude,
+                        ))
+                    })
+                    .await,
+                )?;
                 match delivered {
                     Ok(()) => {}
                     Err(error) if error.kind() == DeliveryErrorKind::Invalid => {
                         return Err(bad_request(error.to_string()));
+                    }
+                    Err(error) if error.kind() == DeliveryErrorKind::Conflict => {
+                        return Err(conflict(error.to_string()));
                     }
                     Err(error) => {
                         return Err(internal(
@@ -2826,8 +3111,12 @@ impl ControlPlane {
                 self.inner.refresh_now.notify_one();
             }
             Target::Remote {
-                machine, pane_id, ..
+                machine,
+                pane_id,
+                instance_id,
+                ..
             } => {
+                validate_expected_pane_instance(expected_instance_id.as_deref(), &instance_id)?;
                 self.ensure_online(&machine.id)?;
                 machine
                     .post_json(
@@ -2835,13 +3124,17 @@ impl ControlPlane {
                         &request,
                     )
                     .await
-                    .map_err(|error| upstream(&error))?;
+                    .map_err(|error| remote_mutation_error(&error))?;
             }
         }
         Ok(())
     }
 
-    /// Sends the fixed `Ctrl+B`, `Ctrl+B` sequence to one agent pane.
+    /// Sends the legacy fixed `Ctrl+B`, `Ctrl+B` sequence to one agent pane.
+    ///
+    /// This compatibility path intentionally has no browser-supplied pane
+    /// generation. New clients must call [`Self::send_special_key_for_instance`]
+    /// through the generation-bound `/input-keys` route instead.
     ///
     /// # Errors
     ///
@@ -2876,7 +3169,76 @@ impl ControlPlane {
                         &serde_json::json!({ "action": "tmux_prefix_twice" }),
                     )
                     .await
-                    .map_err(|error| upstream(&error))?;
+                    .map_err(|error| remote_mutation_error(&error))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Sends one allowlisted interactive tmux key to an exact pane generation
+    /// on its expected owning machine.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the machine, pane generation, or live pane
+    /// changes before delivery. Offline/upstream and tmux failures retain
+    /// their normal control-plane classifications.
+    pub async fn send_special_key_for_instance(
+        &self,
+        id: &str,
+        key: PaneSpecialKey,
+        expected_machine_id: String,
+        expected_instance_id: String,
+    ) -> Result<()> {
+        match self.resolve(id)? {
+            Target::Local {
+                pane_id,
+                instance_id,
+                ..
+            } => {
+                validate_expected_pane_machine(&expected_machine_id, &self.inner.local_id)?;
+                validate_expected_pane_instance(Some(&expected_instance_id), &instance_id)?;
+                let prompt_lock = self.prompt_lock(&pane_id);
+                let live_control = self.clone();
+                local_message_mutation(
+                    tokio::task::spawn_blocking(move || {
+                        let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
+                        let mut guard = prompt_lock
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        live_control.validate_live_message_instance(
+                            &pane_id,
+                            Some(&expected_instance_id),
+                        )?;
+                        begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
+                        Tmux.send_special_key(&pane_id, key)?;
+                        Ok(())
+                    })
+                    .await,
+                )?;
+                self.inner.refresh_now.notify_one();
+            }
+            Target::Remote {
+                machine,
+                pane_id,
+                instance_id,
+                ..
+            } => {
+                validate_expected_pane_machine(&expected_machine_id, &machine.id)?;
+                validate_expected_pane_instance(Some(&expected_instance_id), &instance_id)?;
+                self.ensure_online(&machine.id)?;
+                machine
+                    .post_json(
+                        &format!("/api/v1/panes/{}/input-keys", encode_segment(&pane_id)),
+                        &serde_json::json!({
+                            "action": key.wire_name(),
+                            "machine": expected_machine_id,
+                            "instance_id": expected_instance_id,
+                        }),
+                    )
+                    .await
+                    .map_err(|error| remote_mutation_error(&error))?;
             }
         }
         Ok(())
@@ -2979,29 +3341,23 @@ impl ControlPlane {
         if target != self.inner.local_id {
             let machine = self.remote_machine(target)?;
             self.ensure_online(&machine.id)?;
+            if let Some(requested) = request.memory_max_bytes {
+                self.ensure_remote_memory_request_advertised(&machine.id, requested)?;
+            }
             // The node validates its own directory and profile allowlists; this
             // coordinator never forwards a caller-supplied URL or machine hop.
             let forwarded = LaunchRequest {
                 machine: None,
                 ..request
             };
+            let launch_path = remote_launch_path(&forwarded);
             return machine
-                .post_json("/api/v1/sessions", &forwarded)
+                .post_json(launch_path, &forwarded)
                 .await
                 .map_err(|error| upstream(&error));
         }
         self.ensure_local_owner_enabled()?;
-        if self
-            .read_state()
-            .sessions
-            .iter()
-            .any(|session| session.name == request.name)
-        {
-            return Err(conflict(format!(
-                "a tmux session named {} already exists",
-                request.name
-            )));
-        }
+        self.ensure_launch_name_available(&request.name)?;
         let directory = self
             .inner
             .config
@@ -3014,6 +3370,11 @@ impl ControlPlane {
             })?;
         let profile = profile_by_id(&self.inner.config, &request.profile_id)?;
         let mode = select_launch_mode(&profile, request.mode_id.as_deref())?;
+        let requested_memory_max_bytes = request.memory_max_bytes;
+        validate_launch_memory(
+            &self.inner.config.agent_resources,
+            requested_memory_max_bytes,
+        )?;
         let resume = self
             .revalidate_resume_candidate(
                 request.resume_session_id.as_deref(),
@@ -3035,7 +3396,11 @@ impl ControlPlane {
         let launched = local_tmux(
             tokio::task::spawn_blocking(move || {
                 let launched = (|| {
-                    let scope = systemd_scope::prepare(&resources, &name)?;
+                    let scope = systemd_scope::prepare_override(
+                        &resources,
+                        requested_memory_max_bytes,
+                        &name,
+                    )?;
                     match (resume.as_ref(), launch_lease.as_deref()) {
                         (Some(candidate), Some(lease)) => Tmux::launch_resumed(
                             &name,
@@ -3068,6 +3433,50 @@ impl ControlPlane {
         launched?;
         self.inner.refresh_now.notify_one();
         Ok(())
+    }
+
+    fn ensure_launch_name_available(&self, name: &str) -> Result<()> {
+        if self
+            .read_state()
+            .sessions
+            .iter()
+            .any(|session| session.name == name)
+        {
+            return Err(conflict(format!(
+                "a tmux session named {name} already exists"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Prevents a new coordinator from sending an override to an older owner
+    /// which would deserialize the additive field as unknown and silently
+    /// launch with its default (or no cap). This cached capability is only a
+    /// compatibility gate; the owner repeats current policy and host checks.
+    fn ensure_remote_memory_request_advertised(&self, machine: &str, requested: u64) -> Result<()> {
+        let state = self.read_state();
+        let advertised = state
+            .remotes
+            .get(machine)
+            .and_then(|remote| remote.launch.as_ref())
+            .and_then(|options| options.memory.as_ref())
+            .filter(|memory| memory.supported);
+        let Some(memory) = advertised else {
+            return Err(bad_request(format!(
+                "machine {machine} has not advertised per-agent memory override support; update that owner or use its Default limit"
+            )));
+        };
+        let resources = crate::config::AgentResourcesConfig {
+            memory_max_bytes: memory.default_bytes,
+            memory_override_max_bytes: memory.override_max_bytes,
+        };
+        systemd_scope::resolve_memory_max(&resources, Some(requested))
+            .map(|_| ())
+            .map_err(|error| {
+                bad_request(format!(
+                    "machine {machine} did not advertise that memory limit: {error}"
+                ))
+            })
     }
 
     async fn revalidate_resume_candidate(
@@ -3266,6 +3675,7 @@ impl ControlPlane {
         {
             matches.push(Target::Local {
                 pane_id: session.pane_id.clone(),
+                instance_id: session.pane_identity.clone(),
                 name: session.name.clone(),
                 agent: session.agent,
                 resume_lease: session.resume_lease.clone(),
@@ -3286,6 +3696,7 @@ impl ControlPlane {
                 matches.push(Target::Remote {
                     machine: Arc::clone(&machine),
                     pane_id: session.pane_id.clone(),
+                    instance_id: session.instance_id.clone(),
                     name: session.name.clone(),
                 });
             }
@@ -3418,6 +3829,18 @@ fn browse_directory(path: &Path) -> Option<BrowseDirectory> {
         .unwrap_or(&path)
         .to_owned();
     Some(BrowseDirectory { path, name })
+}
+
+fn launch_directory_action_result(
+    config: &Config,
+    machine: String,
+    parent: &str,
+    created: &Path,
+) -> Result<LaunchDirectoryActionResult> {
+    let directory = browse_directory(created)
+        .ok_or_else(|| internal(&anyhow::anyhow!("created directory path is not UTF-8")))?;
+    let listing = browse_configured_directories(config, machine, Some(parent))?;
+    Ok(LaunchDirectoryActionResult { directory, listing })
 }
 
 fn model_capabilities(
@@ -3603,6 +4026,40 @@ fn begin_pane_mutation(
     Ok(())
 }
 
+fn validate_expected_pane_instance(expected: Option<&str>, actual: &str) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if !valid_pane_identity(expected) {
+        return Err(bad_request("invalid pane instance id"));
+    }
+    if expected != actual {
+        return Err(conflict(
+            "agent pane restarted before the message could be delivered",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_expected_pane_machine(expected: &str, actual: &str) -> Result<()> {
+    validate_machine_id(expected).map_err(|_| bad_request("invalid pane machine id"))?;
+    if expected != actual {
+        return Err(conflict(
+            "agent owning machine changed before the key could be delivered",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_live_pane_instance(pane_id: &str, expected: Option<&str>) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let live = Tmux::live_pane_identity(pane_id)?
+        .ok_or_else(|| conflict("agent pane disappeared before message delivery"))?;
+    validate_expected_pane_instance(Some(expected), &live.pane_identity)
+}
+
 fn mark_gate_mutated(gate: &PaneMutationGate, state: &mut PaneMutationState) {
     state.generation = state.generation.wrapping_add(1);
     gate.generation.store(state.generation, Ordering::Release);
@@ -3702,6 +4159,21 @@ fn local_tmux(joined: std::result::Result<Result<()>, tokio::task::JoinError>) -
     }
 }
 
+/// Classifies a blocking message mutation while preserving an intentional
+/// caller-visible conflict from its owner-local generation checks.
+fn local_message_mutation<T>(
+    joined: std::result::Result<Result<T>, tokio::task::JoinError>,
+) -> Result<T> {
+    match joined {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) if error_kind(&error) != ErrorKind::Internal => Err(error),
+        Ok(Err(error)) => Err(internal(&error)),
+        Err(error) => Err(internal(
+            &anyhow::Error::new(error).context("a message mutation task panicked"),
+        )),
+    }
+}
+
 fn local_model_switch(
     joined: std::result::Result<Result<()>, tokio::task::JoinError>,
 ) -> Result<()> {
@@ -3786,6 +4258,7 @@ fn observable_sessions_equal(previous: &[Session], current: &[Session]) -> bool 
 fn observable_session_equal(left: &Session, right: &Session) -> bool {
     left.name == right.name
         && left.pane_id == right.pane_id
+        && left.pane_identity == right.pane_identity
         && left.status == right.status
         && left.agent == right.agent
         && left.attached == right.attached
@@ -3817,6 +4290,7 @@ fn observable_summaries_equal(previous: &[SessionSummary], current: &[SessionSum
 
 fn observable_summary_equal(left: &SessionSummary, right: &SessionSummary) -> bool {
     left.id == right.id
+        && left.instance_id == right.instance_id
         && left.machine == right.machine
         && left.name == right.name
         && left.pane_id == right.pane_id
@@ -3983,6 +4457,77 @@ fn profile_by_id(config: &Config, id: &str) -> Result<AgentProfile> {
         .get(index)
         .cloned()
         .ok_or_else(|| bad_request("profile no longer exists"))
+}
+
+fn validate_launch_memory(
+    resources: &crate::config::AgentResourcesConfig,
+    requested_memory_max_bytes: Option<u64>,
+) -> Result<()> {
+    systemd_scope::resolve_memory_max(resources, requested_memory_max_bytes)
+        .map(|_| ())
+        .map_err(|error| bad_request(error.to_string()))
+}
+
+/// Never sends an additive memory field to the legacy launch route. An owner
+/// downgraded after capability discovery could otherwise ignore that field and
+/// still launch. Old owners do not implement the versioned route, so a stale
+/// capability fails before launch and there is deliberately no fallback.
+fn remote_launch_path(request: &LaunchRequest) -> &'static str {
+    if request.memory_max_bytes.is_some() {
+        "/api/v1/memory-launches/v1"
+    } else {
+        "/api/v1/sessions"
+    }
+}
+
+fn agent_memory_launch_options(
+    resources: &crate::config::AgentResourcesConfig,
+) -> AgentMemoryLaunchOptions {
+    let default_bytes = resources.memory_max_bytes;
+    let (override_max_bytes, override_check_failed) =
+        match systemd_scope::advertised_override_ceiling(resources) {
+            Ok(ceiling) => (ceiling, false),
+            Err(_) => (None, resources.memory_override_max_bytes.is_some()),
+        };
+    let supported = cfg!(target_os = "linux") && default_bytes.is_some();
+    let mut presets = BTreeSet::new();
+    if let Some(ceiling) = override_max_bytes {
+        for gib in [2_u64, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128] {
+            let bytes = gib.saturating_mul(systemd_scope::GIBIBYTE);
+            if bytes <= ceiling {
+                presets.insert(bytes);
+            }
+        }
+        if let Some(default) = default_bytes
+            && default <= ceiling
+        {
+            presets.insert(default);
+        }
+    }
+    let note = if !cfg!(target_os = "linux") {
+        Some(
+            "Per-agent memory limits require Linux and apply on the next launch or relaunch."
+                .to_owned(),
+        )
+    } else if override_check_failed {
+        Some("Per-launch memory overrides are unavailable because the effective host/cgroup ceiling could not be verified.".to_owned())
+    } else if default_bytes.is_none() {
+        Some("Per-agent memory limits are not enabled on this machine.".to_owned())
+    } else if override_max_bytes.is_none() {
+        Some(
+            "This machine enforces its default cap; per-launch overrides are not enabled."
+                .to_owned(),
+        )
+    } else {
+        Some("Changes apply on the next launch or relaunch; running cgroups are never mutated in place.".to_owned())
+    };
+    AgentMemoryLaunchOptions {
+        supported,
+        default_bytes,
+        override_max_bytes,
+        presets_bytes: presets.into_iter().collect(),
+        note,
+    }
 }
 
 fn opaque_resume_id(
@@ -4305,6 +4850,7 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
             recovery: RecoveryRunner::production(&local_id),
             deny_local_claude_resume: true,
             local_claude_resume_attempts: AtomicU64::new(0),
+            test_message_live_instances: Mutex::new(HashMap::new()),
         }),
     }
 }
@@ -4354,6 +4900,7 @@ mod tests {
     fn summary(id: &str, status: &str) -> SessionSummary {
         SessionSummary {
             id: composite_id(LOCAL_MACHINE_ID, id),
+            instance_id: String::new(),
             machine: LOCAL_MACHINE_ID.to_owned(),
             name: format!("session-{id}"),
             pane_id: id.to_owned(),
@@ -4458,13 +5005,20 @@ mod tests {
             "atmux-tmux-spawn-1-2-0123456789abcdef.scope"
         );
         assert_eq!(json["memory_max_bytes"], 34_359_738_368_u64);
+        assert_eq!(json["instance_id"], format!("pane-v1-{}", "a".repeat(64)));
 
         let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("instance_id");
         legacy.as_object_mut().unwrap().remove("systemd_scope");
         legacy.as_object_mut().unwrap().remove("memory_max_bytes");
         let decoded: SessionSummary = serde_json::from_value(legacy).unwrap();
         assert_eq!(decoded.systemd_scope, None);
         assert_eq!(decoded.memory_max_bytes, None);
+        assert!(decoded.instance_id.is_empty());
+
+        let mut replacement = managed.clone();
+        replacement.pane_identity = format!("pane-v1-{}", "b".repeat(64));
+        assert!(!observable_session_equal(&managed, &replacement));
     }
 
     fn local_control() -> ControlPlane {
@@ -4530,6 +5084,7 @@ mod tests {
     fn remote_summary(machine: &str, pane: &str, name: &str, hash: &str) -> SessionSummary {
         SessionSummary {
             id: composite_id(machine, pane),
+            instance_id: format!("pane-v1-{}", "a".repeat(64)),
             machine: machine.to_owned(),
             name: name.to_owned(),
             pane_id: pane.to_owned(),
@@ -4634,6 +5189,20 @@ mod tests {
         let nested_listing =
             browse_configured_directories(&config, "tron".to_owned(), child.to_str()).unwrap();
         assert_eq!(nested_listing.parent.as_deref(), canonical_root.to_str());
+
+        config.general.favorite_dirs = vec![child.clone()];
+        let overlapping_root =
+            browse_configured_directories(&config, "tron".to_owned(), child.to_str()).unwrap();
+        assert_eq!(
+            overlapping_root.parent.as_deref(),
+            canonical_root.to_str(),
+            "a nested configured root must still navigate up when an outer root allows it"
+        );
+        config.general.project_roots = vec![child.clone()];
+        config.general.favorite_dirs.clear();
+        let actual_root =
+            browse_configured_directories(&config, "tron".to_owned(), child.to_str()).unwrap();
+        assert_eq!(actual_root.parent, None);
 
         let error = browse_configured_directories(&config, "tron".to_owned(), outside.to_str())
             .unwrap_err();
@@ -5140,6 +5709,7 @@ mod tests {
                     modes: Vec::new(),
                 }],
                 project_preferences: BTreeMap::new(),
+                memory: None,
                 machines: Vec::new(),
             },
         );
@@ -5148,6 +5718,73 @@ mod tests {
         assert_eq!(options.machines[1].directories, ["/srv/models"]);
         assert_eq!(options.machines[1].profiles[0].harness, "claude");
         assert!(options.machines[1].note.is_none());
+    }
+
+    #[test]
+    fn launch_memory_options_are_owner_scoped_and_legacy_payloads_stay_valid() {
+        let mut config = Config::default();
+        config.agent_resources.memory_max_bytes = Some(16 * systemd_scope::GIBIBYTE);
+        config.agent_resources.memory_override_max_bytes = Some(24 * systemd_scope::GIBIBYTE);
+        let control = super::test_control_with_config(&[], config);
+        let options = control.launch_options();
+        let memory = options.memory.as_ref().unwrap();
+        assert_eq!(memory.default_bytes, Some(16 * systemd_scope::GIBIBYTE));
+        if let Some(ceiling) = memory.override_max_bytes {
+            assert!(ceiling <= 24 * systemd_scope::GIBIBYTE);
+            assert!(memory.presets_bytes.iter().all(|preset| *preset <= ceiling));
+        } else {
+            assert!(memory.presets_bytes.is_empty());
+            assert!(memory.note.as_deref().is_some_and(|note| !note.is_empty()));
+        }
+
+        let legacy: LaunchRequest = serde_json::from_value(serde_json::json!({
+            "name": "legacy",
+            "directory": "/tmp",
+            "profile_id": "profile-0"
+        }))
+        .unwrap();
+        assert_eq!(legacy.memory_max_bytes, None);
+
+        let mut legacy_options = serde_json::to_value(&options).unwrap();
+        legacy_options.as_object_mut().unwrap().remove("memory");
+        for machine in legacy_options["machines"].as_array_mut().unwrap() {
+            machine.as_object_mut().unwrap().remove("memory");
+        }
+        let decoded: LaunchOptions = serde_json::from_value(legacy_options).unwrap();
+        assert!(decoded.memory.is_none());
+        assert!(
+            decoded
+                .machines
+                .iter()
+                .all(|machine| machine.memory.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_rejects_a_spoofed_memory_override_before_tmux_or_systemd() {
+        let mut config = Config::default();
+        config.general.project_roots = vec![PathBuf::from("/tmp")];
+        config.agent_resources.memory_max_bytes = Some(16 * systemd_scope::GIBIBYTE);
+        config.agent_resources.memory_override_max_bytes = Some(24 * systemd_scope::GIBIBYTE);
+        let control = super::test_control_with_config(&[], config);
+        for (index, requested) in [0, u64::MAX, 25 * systemd_scope::GIBIBYTE]
+            .into_iter()
+            .enumerate()
+        {
+            let error = control
+                .launch(LaunchRequest {
+                    name: format!("malicious-memory-{index}"),
+                    directory: "/tmp".to_owned(),
+                    profile_id: "profile-0".to_owned(),
+                    mode_id: None,
+                    machine: None,
+                    resume_session_id: None,
+                    memory_max_bytes: Some(requested),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error_kind(&error), ErrorKind::BadRequest);
+        }
     }
 
     #[tokio::test]
@@ -5184,6 +5821,7 @@ mod tests {
                 mode_id: None,
                 machine: None,
                 resume_session_id: None,
+                memory_max_bytes: None,
             })
             .await
             .unwrap_err()
@@ -5249,6 +5887,7 @@ mod tests {
                     mode_id: None,
                     machine: Some("gpu-box".to_owned()),
                     resume_session_id: None,
+                    memory_max_bytes: None,
                 })
                 .await
                 .is_err()
@@ -5262,6 +5901,7 @@ mod tests {
                 mode_id: None,
                 machine: Some("ghost".to_owned()),
                 resume_session_id: None,
+                memory_max_bytes: None,
             })
             .await
             .unwrap_err()
@@ -5375,6 +6015,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_pane_reincarnation_advances_revision_and_notifies_subscribers() {
+        let control = control_with_machines(&["gpu-box"]);
+        let mut original = remote_summary("gpu-box", "%4", "trainer", "aaaa");
+        original.instance_id = format!("pane-v1-{}", "a".repeat(64));
+        control.apply_machine_sessions("gpu-box", vec![original.clone()], None);
+        let prior_revision = control.machine_revision("gpu-box").unwrap();
+        let mut updates = control.subscribe();
+
+        let mut replacement = original;
+        replacement.instance_id = format!("pane-v1-{}", "b".repeat(64));
+        control.apply_machine_sessions("gpu-box", vec![replacement.clone()], None);
+
+        tokio::time::timeout(Duration::from_secs(1), updates.changed())
+            .await
+            .expect("pane reincarnation must wake federation observers")
+            .expect("revision sender must remain live");
+        assert!(control.machine_revision("gpu-box").unwrap() > prior_revision);
+        assert_eq!(
+            control.machine_overview("gpu-box").unwrap().sessions[0].instance_id,
+            replacement.instance_id
+        );
+    }
+
+    #[test]
+    fn expected_pane_instances_fail_closed_on_malformed_or_recycled_generations() {
+        let current = format!("pane-v1-{}", "a".repeat(64));
+        assert!(validate_expected_pane_instance(None, &current).is_ok());
+        assert!(validate_expected_pane_instance(Some(&current), &current).is_ok());
+
+        let recycled =
+            validate_expected_pane_instance(Some(&format!("pane-v1-{}", "b".repeat(64))), &current)
+                .unwrap_err();
+        assert_eq!(error_kind(&recycled), ErrorKind::Conflict);
+        let malformed = validate_expected_pane_instance(Some("%7"), &current).unwrap_err();
+        assert_eq!(error_kind(&malformed), ErrorKind::BadRequest);
+    }
+
+    #[test]
+    fn message_task_preserves_generation_conflicts_but_not_raw_tmux_failures() {
+        let changed = local_message_mutation::<()>(Ok(Err(conflict("pane changed"))))
+            .expect_err("a changed pane must fail");
+        assert_eq!(error_kind(&changed), ErrorKind::Conflict);
+
+        let tmux = local_message_mutation::<()>(Ok(Err(anyhow::anyhow!("tmux paste failed"))))
+            .expect_err("a tmux failure must fail");
+        assert_eq!(error_kind(&tmux), ErrorKind::Internal);
+    }
+
+    #[tokio::test]
     async fn failures_are_classified_for_transport_agnostic_reporting() {
         let control = control_with_machines(&["gpu-box"]);
         control.apply_refresh(vec![session("local work")]);
@@ -5426,6 +6115,7 @@ mod tests {
                         mode_id: None,
                         machine: None,
                         resume_session_id: None,
+                        memory_max_bytes: None,
                     })
                     .await
                     .unwrap_err()
@@ -5442,6 +6132,7 @@ mod tests {
                         mode_id: None,
                         machine: None,
                         resume_session_id: None,
+                        memory_max_bytes: None,
                     })
                     .await
                     .unwrap_err()
@@ -5570,6 +6261,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: vec![
                 ProfileMode {
                     id: "sonnet".to_owned(),
@@ -5624,6 +6316,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: vec![ProfileMode {
                 id: "pinned".to_owned(),
                 label: None,
@@ -5756,6 +6449,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: Vec::new(),
         };
         let launcher = Path::new("/owner/.local/share/claude/versions/2.1.0");
@@ -5798,6 +6492,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: vec![
                 ProfileMode {
                     id: "terra".to_owned(),
@@ -5889,6 +6584,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: Vec::new(),
         };
 

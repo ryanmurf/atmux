@@ -34,6 +34,12 @@ enum Commands {
     /// Internal fail-closed bridge for fixed recovery scripts.
     #[command(hide = true)]
     ScopedExec {
+        /// Owner-policy-validated cap for a fixed recovery roster entry.
+        #[arg(long, conflicts_with = "recovery_service_memory_max_bytes")]
+        memory_max_bytes: Option<u64>,
+        /// Owner-policy-validated cap above every worker for a recovered service.
+        #[arg(long, conflicts_with = "memory_max_bytes")]
+        recovery_service_memory_max_bytes: Option<u64>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -129,8 +135,17 @@ async fn main() -> Result<()> {
             println!("{}", config_path.display());
             return Ok(());
         }
-        Some(Commands::ScopedExec { command }) => {
-            return Tmux::scoped_exec(&config_path, command);
+        Some(Commands::ScopedExec {
+            memory_max_bytes,
+            recovery_service_memory_max_bytes,
+            command,
+        }) => {
+            return Tmux::scoped_exec(
+                &config_path,
+                memory_max_bytes,
+                recovery_service_memory_max_bytes,
+                command,
+            );
         }
         Some(Commands::Doctor) => return doctor(&config_path),
         Some(Commands::Web {
@@ -165,6 +180,10 @@ fn doctor(config_path: &std::path::Path) -> Result<()> {
             "✓ MemoryMax  {memory_max_bytes} bytes (systemd user-scope probe passed and was collected)"
         ),
         None => println!("- MemoryMax  disabled for agent scopes"),
+    }
+    if let Some(configured) = config.agent_resources.memory_override_max_bytes {
+        let effective = Tmux::check_agent_memory_override_ceiling(&config.agent_resources)?;
+        println!("{}", memory_override_doctor_line(configured, effective));
     }
     let folders = config.directories();
     println!("✓ folders    {} discovered", folders.len());
@@ -203,6 +222,20 @@ fn doctor(config_path: &std::path::Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn memory_override_doctor_line(configured: u64, effective: Option<u64>) -> String {
+    match effective {
+        Some(effective) if effective < configured => format!(
+            "✓ override   effective whole-GiB ceiling {effective} bytes (configured policy {configured}; host/cgroup clamped; revalidated each launch)"
+        ),
+        Some(effective) => format!(
+            "✓ override   effective whole-GiB ceiling {effective} bytes (configured policy; revalidated each launch)"
+        ),
+        None => format!(
+            "- override   unavailable: no whole-GiB cap fits below the effective host/cgroup ceiling (configured policy {configured})"
+        ),
+    }
 }
 
 #[cfg(feature = "pulse")]
@@ -502,6 +535,8 @@ mod cli_tests {
             "--config",
             "/tmp/atmux.toml",
             "scoped-exec",
+            "--memory-max-bytes",
+            "17179869184",
             "--",
             "/usr/bin/printf",
             "$FOO",
@@ -511,9 +546,16 @@ mod cli_tests {
             "--not-an-atmux-option",
         ])
         .unwrap();
-        let Some(Commands::ScopedExec { command }) = cli.command else {
+        let Some(Commands::ScopedExec {
+            memory_max_bytes,
+            recovery_service_memory_max_bytes,
+            command,
+        }) = cli.command
+        else {
             panic!("expected scoped-exec");
         };
+        assert_eq!(memory_max_bytes, Some(17_179_869_184));
+        assert_eq!(recovery_service_memory_max_bytes, None);
         assert_eq!(
             command,
             [
@@ -524,6 +566,60 @@ mod cli_tests {
                 "quoted value",
                 "--not-an-atmux-option",
             ]
+        );
+    }
+
+    #[test]
+    fn scoped_exec_without_an_override_keeps_the_configured_default() {
+        let cli = Cli::try_parse_from(["atmux", "scoped-exec", "--", "/bin/true"]).unwrap();
+        let Some(Commands::ScopedExec {
+            memory_max_bytes,
+            recovery_service_memory_max_bytes,
+            command,
+        }) = cli.command
+        else {
+            panic!("expected scoped-exec");
+        };
+        assert_eq!(memory_max_bytes, None);
+        assert_eq!(recovery_service_memory_max_bytes, None);
+        assert_eq!(command, ["/bin/true"]);
+    }
+
+    #[test]
+    fn scoped_exec_recovery_service_cap_is_distinct_from_worker_overrides() {
+        let cli = Cli::try_parse_from([
+            "atmux",
+            "scoped-exec",
+            "--recovery-service-memory-max-bytes",
+            "60129542144",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        let Some(Commands::ScopedExec {
+            memory_max_bytes,
+            recovery_service_memory_max_bytes,
+            command,
+        }) = cli.command
+        else {
+            panic!("expected scoped-exec");
+        };
+        assert_eq!(memory_max_bytes, None);
+        assert_eq!(recovery_service_memory_max_bytes, Some(60_129_542_144));
+        assert_eq!(command, ["/bin/true"]);
+
+        assert!(
+            Cli::try_parse_from([
+                "atmux",
+                "scoped-exec",
+                "--memory-max-bytes",
+                "12884901888",
+                "--recovery-service-memory-max-bytes",
+                "60129542144",
+                "--",
+                "/bin/true",
+            ])
+            .is_err()
         );
     }
 
@@ -563,6 +659,22 @@ impl Drop for TerminalSession {
 #[cfg(all(test, feature = "pulse"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_distinguishes_effective_and_configured_override_ceilings() {
+        let clamped = memory_override_doctor_line(24, Some(16));
+        assert!(clamped.contains("effective whole-GiB ceiling 16"));
+        assert!(clamped.contains("configured policy 24"));
+        assert!(clamped.contains("host/cgroup clamped"));
+
+        let exact = memory_override_doctor_line(24, Some(24));
+        assert!(exact.contains("effective whole-GiB ceiling 24"));
+        assert!(!exact.contains("host/cgroup clamped"));
+
+        let unavailable = memory_override_doctor_line(24, None);
+        assert!(unavailable.contains("unavailable"));
+        assert!(unavailable.contains("configured policy 24"));
+    }
 
     #[test]
     fn pulse_cli_requires_explicit_account_and_preserves_one_shot_flags() {

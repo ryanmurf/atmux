@@ -34,6 +34,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Replace the separate project finder with one typedown that filters as characters are entered | `completed/project-and-profile-launching.md` | Completed |
 | Allow a validated folder to be entered manually even when it is not in discovery results | `completed/project-and-profile-launching.md` | Completed |
 | Browse to an undiscovered launch folder and remember it per machine | `launch-folder-browser.md` | Implemented and live-tested; review pending |
+| Navigate up, create folders, and clone repositories from the selected machine's folder browser | `launch-folder-browser.md` | Implemented and locally tested; review pending |
 | Treat folders containing Claude or Codex agent-instruction files as projects | `completed/project-and-profile-launching.md` | Completed |
 | Descend through non-git grouping folders such as `nes-spring` and `nes-experimental` | `completed/project-and-profile-launching.md` | Completed |
 | Update the proposed session name when a project is selected | `completed/project-and-profile-launching.md` | Completed |
@@ -71,6 +72,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Support old/unlabeled Claude CLI storage and profile directories such as `~/.claude-max` | `completed/claude-codex-transcripts.md` | Completed |
 | Render agent output as safe native Markdown with links and highlighted, expandable code blocks | `completed/claude-codex-transcripts.md` | Completed |
 | Show compact, expandable Claude and Codex tool calls and results | `completed/claude-codex-transcripts.md` | Completed |
+| Hide Human messages or Internal activity independently while Agent prose stays visible | `completed/conversation-visibility-filters.md` | Completed |
 | Make agent boxes and the overall web view denser and more streamlined | `completed/claude-codex-transcripts.md` | Completed |
 | Put a nearby trash-can action beside each session in the left navigation | `completed/left-rail-session-controls.md` | Completed |
 | Collapse and restore the left navigation | `completed/left-rail-session-controls.md` | Completed |

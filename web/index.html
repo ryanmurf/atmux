@@ -108,6 +108,9 @@
               <button id="files-view" class="view-button" type="button" role="tab" aria-selected="false" aria-controls="files-panel" tabindex="-1">Files</button>
               <button id="git-view" class="view-button" type="button" role="tab" aria-selected="false" aria-controls="git-panel" tabindex="-1">Git</button>
             </div>
+            <button id="conversation-filters-open" class="subtle conversation-filters-open" type="button" aria-haspopup="dialog" aria-controls="conversation-filters-dialog" aria-expanded="false">
+              <span>Show</span><span id="conversation-filters-indicator" class="conversation-filters-indicator">All</span>
+            </button>
             <span id="stream-state">Connecting…</span>
           </div>
           <div id="conversation" class="conversation" role="tabpanel" aria-live="polite" aria-labelledby="conversation-view" tabindex="0" title="Start typing to message this agent"></div>
@@ -157,13 +160,26 @@
       <label id="launch-harness-row">Agent<select id="launch-harness" required></select></label>
       <label id="launch-profile-row">Profile<select id="launch-profile" required></select></label>
       <label id="launch-mode-row">Mode<select id="launch-mode"></select></label>
+      <div id="launch-memory-group" class="launch-memory-group">
+        <label id="launch-memory-row">Memory limit<select id="launch-memory"></select></label>
+        <label id="launch-memory-custom-row" hidden>Custom GiB<input id="launch-memory-custom" type="number" inputmode="decimal" min="1" step="1"></label>
+        <p id="launch-memory-note" class="dialog-note"></p>
+      </div>
       <div class="launch-project-field"><label for="launch-directory">Project</label>
-        <span class="launch-directory-control"><input id="launch-directory" type="search" list="launch-directory-options" placeholder="Filter projects or type an absolute folder" autocomplete="off" required><button id="launch-browse" type="button">Browse</button></span>
-        <datalist id="launch-directory-options"></datalist>
+        <span class="launch-directory-control"><input id="launch-directory" type="search" role="combobox" aria-autocomplete="list" aria-controls="launch-directory-suggestions" aria-expanded="false" placeholder="Filter projects or type an absolute folder" autocomplete="off" required><button id="launch-browse" type="button">Browse</button></span>
+        <div id="launch-directory-suggestions" class="launch-directory-suggestions" role="listbox" aria-label="Matching projects" hidden></div>
       </div>
       <section id="launch-browser" class="launch-browser" aria-label="Project folder browser" hidden>
         <div class="launch-browser-head"><strong id="launch-browser-path">Project roots</strong><button id="launch-browser-close" class="icon-button" type="button" aria-label="Close folder browser">×</button></div>
-        <div class="launch-browser-actions"><button id="launch-browser-up" class="subtle" type="button">Up</button><button id="launch-browser-use" class="primary" type="button">Use this folder</button></div>
+        <div class="launch-browser-actions"><button id="launch-browser-up" class="subtle" type="button">Up</button><button id="launch-browser-use" class="primary" type="button">Use folder</button><button id="launch-browser-new" class="subtle" type="button" aria-expanded="false">New folder</button><button id="launch-browser-clone" class="subtle" type="button" aria-expanded="false">Clone repo</button></div>
+        <div id="launch-browser-operation" class="launch-browser-operation" role="group" aria-labelledby="launch-browser-operation-title" hidden>
+          <strong id="launch-browser-operation-title"></strong>
+          <label id="launch-browser-new-row" for="launch-browser-new-name">Folder name<input id="launch-browser-new-name" maxlength="240" autocomplete="off"></label>
+          <label id="launch-browser-repository-row" for="launch-browser-repository">Repository URL<input id="launch-browser-repository" maxlength="4096" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+          <label id="launch-browser-destination-row" for="launch-browser-destination">Destination folder <span>(optional)</span><input id="launch-browser-destination" maxlength="240" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+          <div class="launch-browser-operation-actions"><button id="launch-browser-operation-cancel" class="subtle" type="button">Cancel</button><button id="launch-browser-operation-confirm" class="primary" type="button"></button></div>
+          <p id="launch-browser-operation-note" class="dialog-note" role="status" aria-live="polite"></p>
+        </div>
         <div id="launch-browser-list" class="launch-browser-list" role="list"></div>
         <p id="launch-browser-note" class="dialog-note" hidden></p>
       </section>
@@ -211,6 +227,17 @@
         <select id="quick-agent-model" aria-describedby="quick-model-status"></select>
         <p id="quick-model-status" class="dialog-note" role="status"></p>
       </div>
+      <fieldset class="quick-pane-keys">
+        <legend>Agent keys</legend>
+        <div class="quick-pane-keypad" role="group" aria-label="Send interactive keys to this agent">
+          <button class="subtle quick-pane-key quick-pane-key-up" type="button" data-pane-key="up" aria-label="Send Up arrow" title="Send Up arrow">↑</button>
+          <button class="subtle quick-pane-key quick-pane-key-left" type="button" data-pane-key="left" aria-label="Send Left arrow" title="Send Left arrow">←</button>
+          <button class="subtle quick-pane-key quick-pane-key-down" type="button" data-pane-key="down" aria-label="Send Down arrow" title="Send Down arrow">↓</button>
+          <button class="subtle quick-pane-key quick-pane-key-right" type="button" data-pane-key="right" aria-label="Send Right arrow" title="Send Right arrow">→</button>
+          <button class="subtle quick-pane-key quick-pane-key-enter" type="button" data-pane-key="enter" aria-label="Send blank Enter" title="Submit the current Claude prompt without adding text">Enter ↵</button>
+        </div>
+        <p id="quick-pane-key-status" class="dialog-note" role="status" aria-live="polite">One key is sent per tap.</p>
+      </fieldset>
       <div class="quick-actions-grid">
         <button id="quick-duplicate" class="subtle" type="button">Duplicate agent</button>
         <button id="quick-resume" class="subtle" type="button" hidden>Relaunch &amp; resume</button>
@@ -220,6 +247,19 @@
         <button id="quick-kill-open" class="danger" type="button">Kill agent</button>
       </div>
       <p id="quick-resume-note" class="dialog-note" role="status" hidden></p>
+    </form>
+  </dialog>
+
+  <dialog id="conversation-filters-dialog" aria-labelledby="conversation-filters-title" aria-describedby="conversation-filters-note">
+    <form method="dialog" class="dialog-form conversation-filters-form">
+      <div class="dialog-head"><h2 id="conversation-filters-title">Conversation visibility</h2><button class="icon-button" type="submit" aria-label="Close">×</button></div>
+      <p id="conversation-filters-note">Agent messages always stay visible.</p>
+      <div class="conversation-filter-options" role="group" aria-label="Message types to show">
+        <label><input type="checkbox" checked disabled> <span>Agent messages</span><small>Always shown</small></label>
+        <label for="conversation-show-human"><input id="conversation-show-human" type="checkbox" checked> <span>Human messages</span><small>Your prompts and follow-ups</small></label>
+        <label for="conversation-show-internal"><input id="conversation-show-internal" type="checkbox" checked> <span>Internal activity</span><small>Tools, status, and coordination</small></label>
+      </div>
+      <div class="dialog-actions"><button id="conversation-filters-reset" class="subtle" type="button">Show all</button><button class="primary" type="submit">Done</button></div>
     </form>
   </dialog>
 

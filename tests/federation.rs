@@ -17,10 +17,13 @@ use std::{
 use atmux::{
     attachment::{EncodedImage, ImageMessageRequest},
     config::{Config, MachineConfig},
-    control::{ControlPlane, ErrorKind, LaunchRequest, error_kind},
+    control::{
+        CloneLaunchRepositoryRequest, ControlPlane, CreateLaunchDirectoryRequest, ErrorKind,
+        LaunchRequest, error_kind,
+    },
     machine::MachineKind,
     remote::RemoteMachine,
-    tmux::Tmux,
+    tmux::{PaneSpecialKey, Tmux},
     workspace::{FileWriteRequest, FilesResponse, GitResponse},
 };
 
@@ -79,9 +82,15 @@ struct Recorder {
     hosts: Vec<Option<String>>,
     paths: Vec<String>,
     bodies: Vec<String>,
+    /// Whether this fixture represents a new owner which explicitly
+    /// advertises and validates per-launch memory overrides.
+    advertise_memory: bool,
     /// Latency injected into pane reads, so a test can hold several callers
     /// inside one fetch window at the same time.
     pane_latency: Duration,
+    /// Simulates an owner discovering that a coordinator-cached pane
+    /// generation was replaced after the command was forwarded.
+    reject_generation_mutations: bool,
 }
 
 type Shared = Arc<Mutex<Recorder>>;
@@ -108,8 +117,10 @@ fn record_locked(recorder: &mut Recorder, headers: &HeaderMap, path: &str, body:
 }
 
 fn session(pane: &str, name: &str, status: &str, hash: &str) -> Value {
+    let instance = if pane == "%7" { 'a' } else { 'b' };
     json!({
         "id": format!("local~{pane}"),
+        "instance_id": format!("pane-v1-{}", instance.to_string().repeat(64)),
         "machine": "local",
         "name": name,
         "pane_id": pane,
@@ -124,6 +135,13 @@ fn session(pane: &str, name: &str, status: &str, hash: &str) -> Value {
         "window_index": 0,
         "pane_index": 0,
         "content_hash": hash,
+    })
+}
+
+fn fixture_accepts_trainer_instance(body: &str) -> bool {
+    serde_json::from_str::<Value>(body).is_ok_and(|value| {
+        value.get("instance_id").and_then(Value::as_str)
+            == Some(format!("pane-v1-{}", "a".repeat(64)).as_str())
     })
 }
 
@@ -336,12 +354,26 @@ async fn messages(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    record(
-        &state,
-        &headers,
-        &format!("/api/v1/panes/{id}/messages"),
-        &body,
-    );
+    let reject = {
+        let mut recorder = state.lock().unwrap();
+        record_locked(
+            &mut recorder,
+            &headers,
+            &format!("/api/v1/panes/{id}/messages"),
+            &body,
+        );
+        recorder.reject_generation_mutations
+    };
+    if reject && fixture_accepts_trainer_instance(&body) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "owner-only-generation-detail" })),
+        )
+            .into_response();
+    }
+    if reject {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -351,16 +383,56 @@ async fn image_messages(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    record(
-        &state,
-        &headers,
-        &format!("/api/v1/panes/{id}/image-messages"),
-        &body,
-    );
+    let reject = {
+        let mut recorder = state.lock().unwrap();
+        record_locked(
+            &mut recorder,
+            &headers,
+            &format!("/api/v1/panes/{id}/image-messages"),
+            &body,
+        );
+        recorder.reject_generation_mutations
+    };
+    if reject && fixture_accepts_trainer_instance(&body) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "owner-only-generation-detail" })),
+        )
+            .into_response();
+    }
+    if reject {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     Json(json!({ "ok": true })).into_response()
 }
 
-async fn special_keys(
+async fn input_keys(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let reject = {
+        let mut recorder = state.lock().unwrap();
+        record_locked(
+            &mut recorder,
+            &headers,
+            &format!("/api/v1/panes/{id}/input-keys"),
+            &body,
+        );
+        recorder.reject_generation_mutations
+    };
+    if reject && fixture_accepts_trainer_instance(&body) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "owner-only-generation-detail" })),
+        )
+            .into_response();
+    }
+    Json(json!({ "ok": true })).into_response()
+}
+
+async fn legacy_special_keys(
     State(state): State<Shared>,
     Path(id): Path<String>,
     headers: HeaderMap,
@@ -459,14 +531,36 @@ async fn launch(State(state): State<Shared>, headers: HeaderMap, body: String) -
     (StatusCode::CREATED, Json(json!({ "ok": true }))).into_response()
 }
 
+async fn launch_with_memory(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if !state.lock().unwrap().advertise_memory {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    record(&state, &headers, "/api/v1/memory-launches/v1", &body);
+    (StatusCode::CREATED, Json(json!({ "ok": true }))).into_response()
+}
+
 async fn launch_options(State(state): State<Shared>, headers: HeaderMap) -> Response {
     record(&state, &headers, "/api/v1/launch-options", "");
-    Json(json!({
+    let advertise_memory = state.lock().unwrap().advertise_memory;
+    let mut payload = json!({
         "directories": ["/srv/models"],
         "profiles": [{ "id": "profile-0", "name": "Default", "harness": "claude" }],
         "machines": [],
-    }))
-    .into_response()
+    });
+    if advertise_memory {
+        payload["memory"] = json!({
+            "supported": true,
+            "default_bytes": 17_179_869_184_u64,
+            "override_max_bytes": 25_769_803_776_u64,
+            "presets_bytes": [8_589_934_592_u64, 17_179_869_184_u64, 25_769_803_776_u64],
+            "note": "fixture capability"
+        });
+    }
+    Json(payload).into_response()
 }
 
 async fn launch_directories(
@@ -487,19 +581,68 @@ async fn launch_directories(
     .into_response()
 }
 
+async fn launch_directory_action(
+    State(state): State<Shared>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    record(&state, &headers, &uri.to_string(), &body);
+    let value: Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let parent = value
+        .get("directory")
+        .and_then(Value::as_str)
+        .unwrap_or("/srv/models");
+    let name = value
+        .get("name")
+        .or_else(|| value.get("destination"))
+        .and_then(Value::as_str)
+        .unwrap_or("cloned-repo");
+    Json(json!({
+        "directory": { "path": format!("{parent}/{name}"), "name": name },
+        "listing": {
+            "machine": "gpu-box",
+            "current": parent,
+            "parent": "/srv",
+            "directories": [{ "path": format!("{parent}/{name}"), "name": name }],
+            "truncated": false,
+        },
+    }))
+    .into_response()
+}
+
 async fn start_node() -> (SocketAddr, Shared) {
-    let recorder: Shared = Arc::new(Mutex::new(Recorder::default()));
+    start_node_with_memory(false).await
+}
+
+async fn start_node_with_memory(advertise_memory: bool) -> (SocketAddr, Shared) {
+    let recorder: Shared = Arc::new(Mutex::new(Recorder {
+        advertise_memory,
+        ..Recorder::default()
+    }));
     let app = Router::new()
         .route("/api/v1/events", get(events))
         .route("/api/v1/launch-options", get(launch_options))
         .route("/api/v1/launch-directories", get(launch_directories))
+        .route(
+            "/api/v1/launch-directories/folders",
+            post(launch_directory_action),
+        )
+        .route(
+            "/api/v1/launch-directories/clone",
+            post(launch_directory_action),
+        )
         .route("/api/v1/panes/{id}", get(pane))
         .route("/api/v1/panes/{id}/transcript", get(transcript))
         .route("/api/v1/panes/{id}/files", get(files).put(write_file))
         .route("/api/v1/panes/{id}/git", get(git_view))
         .route("/api/v1/panes/{id}/messages", post(messages))
         .route("/api/v1/panes/{id}/image-messages", post(image_messages))
-        .route("/api/v1/panes/{id}/special-keys", post(special_keys))
+        .route("/api/v1/panes/{id}/special-keys", post(legacy_special_keys))
+        .route("/api/v1/panes/{id}/input-keys", post(input_keys))
         .route("/api/v1/panes/{id}/interrupt", post(interrupt))
         .route("/api/v1/panes/{id}/resume", post(resume))
         .route(
@@ -507,7 +650,24 @@ async fn start_node() -> (SocketAddr, Shared) {
             get(recovery_status).post(start_recovery),
         )
         .route("/api/v1/sessions", post(launch))
+        .route("/api/v1/memory-launches/v1", post(launch_with_memory))
         .route("/api/v1/sessions/{id}", delete(kill))
+        .with_state(Arc::clone(&recorder));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (address, recorder)
+}
+
+async fn start_legacy_input_node() -> (SocketAddr, Shared) {
+    let recorder: Shared = Arc::new(Mutex::new(Recorder::default()));
+    let app = Router::new()
+        .route("/api/v1/events", get(events))
+        // This intentionally models the prior owner: it would execute the
+        // unbound Ctrl+B command here, but knows nothing about /input-keys.
+        .route("/api/v1/panes/{id}/special-keys", post(legacy_special_keys))
         .with_state(Arc::clone(&recorder));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -587,6 +747,57 @@ async fn an_unauthenticated_machine_sends_no_authorization_header() {
     let _: atmux::control::LaunchOptions =
         machine.get_json("/api/v1/launch-options").await.unwrap();
     assert_eq!(recorder.lock().unwrap().authorizations, [None]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn generation_bound_keys_fail_closed_against_a_legacy_owner() {
+    if !tmux_available("generation_bound_keys_fail_closed_against_a_legacy_owner") {
+        return;
+    }
+    let (address, recorder) = start_legacy_input_node().await;
+    let control = ControlPlane::start(federated_config(address))
+        .await
+        .unwrap();
+    assert!(wait_for_session(&control, "gpu-box~%7").await);
+    let error = control
+        .send_special_key_for_instance(
+            "gpu-box~%7",
+            PaneSpecialKey::TmuxPrefixTwice,
+            "gpu-box".to_owned(),
+            format!("pane-v1-{}", "a".repeat(64)),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_kind(&error), ErrorKind::NotFound, "{error:#}");
+
+    {
+        let seen = recorder.lock().unwrap();
+        assert!(
+            !seen
+                .paths
+                .iter()
+                .any(|path| path.ends_with("/special-keys")),
+            "a new coordinator must never fall back to the legacy unbound route: {:#?}",
+            seen.paths,
+        );
+        assert!(
+            seen.bodies.iter().all(String::is_empty),
+            "the legacy mutation handler must receive no key body: {:#?}",
+            seen.bodies,
+        );
+    }
+
+    control.tmux_prefix_twice("gpu-box~%7").await.unwrap();
+    let seen = recorder.lock().unwrap();
+    assert!(
+        seen.paths
+            .iter()
+            .any(|path| path == "/api/v1/panes/%7/special-keys"),
+        "only the explicit legacy control may use the old owner route",
+    );
+    assert!(seen.bodies.iter().any(|body| {
+        serde_json::from_str::<Value>(body).ok() == Some(json!({ "action": "tmux_prefix_twice" }))
+    }));
 }
 
 #[tokio::test]
@@ -797,6 +1008,204 @@ async fn wait_for_online(control: &ControlPlane, machine: &str) -> bool {
     false
 }
 
+async fn wait_for_memory_capability(control: &ControlPlane, machine: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if control
+            .launch_options()
+            .machines
+            .iter()
+            .find(|candidate| candidate.id == machine)
+            .and_then(|candidate| candidate.memory.as_ref())
+            .is_some_and(|memory| memory.supported)
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_version_owner_never_receives_an_unadvertised_memory_override() {
+    if !tmux_available("mixed_version_owner_never_receives_an_unadvertised_memory_override") {
+        return;
+    }
+    let (address, recorder) = start_node().await;
+    let control = ControlPlane::start(federated_config(address))
+        .await
+        .unwrap();
+    assert!(wait_for_online(&control, "gpu-box").await);
+    let before = recorder
+        .lock()
+        .unwrap()
+        .paths
+        .iter()
+        .filter(|path| path.as_str() == "/api/v1/sessions")
+        .count();
+
+    for (index, requested) in [0, u64::MAX, 8 * 1024 * 1024 * 1024]
+        .into_iter()
+        .enumerate()
+    {
+        let error = control
+            .launch(LaunchRequest {
+                name: format!("old-owner-memory-{index}"),
+                directory: "/srv/models".to_owned(),
+                profile_id: "profile-0".to_owned(),
+                mode_id: None,
+                machine: Some("gpu-box".to_owned()),
+                resume_session_id: None,
+                memory_max_bytes: Some(requested),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error_kind(&error), ErrorKind::BadRequest);
+        assert!(error.to_string().contains("has not advertised"));
+    }
+    let seen = recorder.lock().unwrap();
+    assert_eq!(
+        seen.paths
+            .iter()
+            .filter(|path| path.as_str() == "/api/v1/sessions")
+            .count(),
+        before,
+        "an older owner must never receive or silently ignore an override"
+    );
+    assert!(
+        seen.bodies
+            .iter()
+            .all(|body| !body.contains("old-owner-memory"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn capable_owner_receives_valid_memory_but_coordinator_rejects_advertised_bounds() {
+    if !tmux_available(
+        "capable_owner_receives_valid_memory_but_coordinator_rejects_advertised_bounds",
+    ) {
+        return;
+    }
+    let (address, recorder) = start_node_with_memory(true).await;
+    let control = ControlPlane::start(federated_config(address))
+        .await
+        .unwrap();
+    assert!(wait_for_online(&control, "gpu-box").await);
+    assert!(wait_for_memory_capability(&control, "gpu-box").await);
+
+    let custom = 20 * 1024 * 1024 * 1024;
+    control
+        .launch(LaunchRequest {
+            name: "new-owner-memory".to_owned(),
+            directory: "/srv/models".to_owned(),
+            profile_id: "profile-0".to_owned(),
+            mode_id: None,
+            machine: Some("gpu-box".to_owned()),
+            resume_session_id: None,
+            memory_max_bytes: Some(custom),
+        })
+        .await
+        .unwrap();
+
+    let successful_posts = recorder
+        .lock()
+        .unwrap()
+        .paths
+        .iter()
+        .filter(|path| path.as_str() == "/api/v1/memory-launches/v1")
+        .count();
+    for (index, requested) in [0, u64::MAX, 25 * 1024 * 1024 * 1024]
+        .into_iter()
+        .enumerate()
+    {
+        let error = control
+            .launch(LaunchRequest {
+                name: format!("new-owner-invalid-{index}"),
+                directory: "/srv/models".to_owned(),
+                profile_id: "profile-0".to_owned(),
+                mode_id: None,
+                machine: Some("gpu-box".to_owned()),
+                resume_session_id: None,
+                memory_max_bytes: Some(requested),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error_kind(&error), ErrorKind::BadRequest);
+    }
+    let seen = recorder.lock().unwrap();
+    assert_eq!(
+        seen.paths
+            .iter()
+            .filter(|path| path.as_str() == "/api/v1/memory-launches/v1")
+            .count(),
+        successful_posts
+    );
+    assert!(
+        seen.paths
+            .iter()
+            .all(|path| path.as_str() != "/api/v1/sessions"),
+        "an explicit limit must never use the legacy launch route"
+    );
+    let forwarded = seen
+        .bodies
+        .iter()
+        .find(|body| body.contains("new-owner-memory"))
+        .map(|body| serde_json::from_str::<Value>(body).unwrap())
+        .unwrap();
+    assert_eq!(forwarded["memory_max_bytes"], custom);
+    assert_eq!(forwarded["machine"], Value::Null);
+    assert!(
+        seen.bodies
+            .iter()
+            .all(|body| !body.contains("new-owner-invalid"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_capability_cannot_launch_after_an_owner_downgrade() {
+    if !tmux_available("stale_capability_cannot_launch_after_an_owner_downgrade") {
+        return;
+    }
+    let (address, recorder) = start_node_with_memory(true).await;
+    let control = ControlPlane::start(federated_config(address))
+        .await
+        .unwrap();
+    assert!(wait_for_online(&control, "gpu-box").await);
+    assert!(wait_for_memory_capability(&control, "gpu-box").await);
+
+    // Simulate a rolling downgrade behind the same address while the
+    // coordinator still has the newer owner's launch options cached. The old
+    // owner retains only the legacy route and would ignore an additive field.
+    recorder.lock().unwrap().advertise_memory = false;
+    let error = control
+        .launch(LaunchRequest {
+            name: "downgraded-owner-memory".to_owned(),
+            directory: "/srv/models".to_owned(),
+            profile_id: "profile-0".to_owned(),
+            mode_id: None,
+            machine: Some("gpu-box".to_owned()),
+            resume_session_id: None,
+            memory_max_bytes: Some(20 * 1024 * 1024 * 1024),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error_kind(&error), ErrorKind::Upstream);
+
+    let seen = recorder.lock().unwrap();
+    assert!(
+        seen.paths
+            .iter()
+            .all(|path| path.as_str() != "/api/v1/sessions"),
+        "a stale capability must never fall back to the legacy launch route"
+    );
+    assert!(
+        seen.bodies
+            .iter()
+            .all(|body| !body.contains("downgraded-owner-memory")),
+        "the downgraded owner must not launch the request"
+    );
+}
+
 async fn assert_remote_directory_browsing(control: &ControlPlane, recorder: &Shared) {
     let listing = control
         .browse_launch_directories(Some("gpu-box"), Some("/srv/models with space"))
@@ -809,6 +1218,57 @@ async fn assert_remote_directory_browsing(control: &ControlPlane, recorder: &Sha
             path == "/api/v1/launch-directories?path=%2Fsrv%2Fmodels%20with%20space"
         })
     );
+}
+
+async fn assert_remote_directory_actions(control: &ControlPlane, recorder: &Shared) {
+    let created = control
+        .create_launch_directory(CreateLaunchDirectoryRequest {
+            machine: Some("gpu-box".to_owned()),
+            directory: "/srv/models with space".to_owned(),
+            name: "new project".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.listing.machine, "gpu-box");
+    assert_eq!(created.directory.path, "/srv/models with space/new project");
+
+    let cloned = control
+        .clone_launch_repository(CloneLaunchRepositoryRequest {
+            machine: Some("gpu-box".to_owned()),
+            directory: "/srv/models with space".to_owned(),
+            repository: "git@example.test:team/repo.git".to_owned(),
+            destination: Some("repo copy".to_owned()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(cloned.directory.path, "/srv/models with space/repo copy");
+
+    let seen = recorder.lock().unwrap();
+    for path in [
+        "/api/v1/launch-directories/folders",
+        "/api/v1/launch-directories/clone",
+    ] {
+        assert!(
+            seen.paths.iter().any(|seen| seen == path),
+            "{:#?}",
+            seen.paths
+        );
+    }
+    assert!(seen.bodies.iter().any(|body| {
+        serde_json::from_str::<Value>(body).is_ok_and(|value| {
+            value.get("machine").is_none()
+                && value.get("directory").and_then(Value::as_str) == Some("/srv/models with space")
+                && value.get("name").and_then(Value::as_str) == Some("new project")
+        })
+    }));
+    assert!(seen.bodies.iter().any(|body| {
+        serde_json::from_str::<Value>(body).is_ok_and(|value| {
+            value.get("machine").is_none()
+                && value.get("repository").and_then(Value::as_str)
+                    == Some("git@example.test:team/repo.git")
+                && value.get("destination").and_then(Value::as_str) == Some("repo copy")
+        })
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1042,6 +1502,7 @@ async fn a_coordinator_groups_routes_and_survives_an_offline_machine() {
     );
 
     assert_remote_directory_browsing(&control, &recorder).await;
+    assert_remote_directory_actions(&control, &recorder).await;
 
     route_commands_to_the_owning_machine(&control, &recorder).await;
 }
@@ -1049,8 +1510,14 @@ async fn a_coordinator_groups_routes_and_survives_an_offline_machine() {
 /// exact wire form the node received.
 #[allow(clippy::too_many_lines)]
 async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: &Shared) {
+    let trainer_instance = format!("pane-v1-{}", "a".repeat(64));
     control
-        .send_text("gpu-box~%7", "resume training".to_owned(), true)
+        .send_text_for_instance(
+            "gpu-box~%7",
+            "resume training".to_owned(),
+            true,
+            Some(trainer_instance.clone()),
+        )
         .await
         .unwrap();
     control
@@ -1062,11 +1529,69 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
                     media_type: "image/png".to_owned(),
                     data: "iVBORw0KGgo=".to_owned(),
                 }],
+                instance_id: Some(trainer_instance.clone()),
             },
         )
         .await
         .unwrap();
-    control.tmux_prefix_twice("gpu-box~%7").await.unwrap();
+    let sent_before_mismatch = recorder.lock().unwrap().bodies.len();
+    let error = control
+        .send_text_for_instance(
+            "gpu-box~%7",
+            "must not cross generations".to_owned(),
+            true,
+            Some(format!("pane-v1-{}", "f".repeat(64))),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_kind(&error), ErrorKind::Conflict);
+    assert_eq!(recorder.lock().unwrap().bodies.len(), sent_before_mismatch);
+    for key in [
+        PaneSpecialKey::Up,
+        PaneSpecialKey::Down,
+        PaneSpecialKey::Left,
+        PaneSpecialKey::Right,
+        PaneSpecialKey::Enter,
+        PaneSpecialKey::TmuxPrefixTwice,
+    ] {
+        control
+            .send_special_key_for_instance(
+                "gpu-box~%7",
+                key,
+                "gpu-box".to_owned(),
+                trainer_instance.clone(),
+            )
+            .await
+            .unwrap();
+    }
+    let sent_before_key_mismatch = recorder.lock().unwrap().bodies.len();
+    for error in [
+        control
+            .send_special_key_for_instance(
+                "gpu-box~%8",
+                PaneSpecialKey::Enter,
+                "gpu-box".to_owned(),
+                trainer_instance.clone(),
+            )
+            .await
+            .unwrap_err(),
+        control
+            .send_special_key_for_instance(
+                "gpu-box~%7",
+                PaneSpecialKey::Down,
+                "midnight".to_owned(),
+                trainer_instance.clone(),
+            )
+            .await
+            .unwrap_err(),
+    ] {
+        assert_eq!(error_kind(&error), ErrorKind::Conflict);
+    }
+    assert_eq!(
+        recorder.lock().unwrap().bodies.len(),
+        sent_before_key_mismatch,
+        "mismatched machine or generation must not cross federation",
+    );
     control.interrupt("gpu-box~%7").await.unwrap();
     control.resume_current_claude("gpu-box~%7").await.unwrap();
     control.kill("gpu-box~%8").await.unwrap();
@@ -1078,6 +1603,7 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
             mode_id: None,
             machine: Some("gpu-box".to_owned()),
             resume_session_id: None,
+            memory_max_bytes: None,
         })
         .await
         .unwrap();
@@ -1096,7 +1622,14 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
     assert!(
         seen.paths
             .iter()
-            .any(|path| path == "/api/v1/panes/%7/special-keys")
+            .any(|path| path == "/api/v1/panes/%7/input-keys")
+    );
+    assert!(
+        !seen
+            .paths
+            .iter()
+            .any(|path| path == "/api/v1/panes/%7/special-keys"),
+        "generation-bound controls must never use the legacy route",
     );
     assert!(
         seen.paths
@@ -1117,6 +1650,7 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
     let sent: Value = serde_json::from_str(sent).unwrap();
     assert_eq!(sent["text"], "resume training");
     assert_eq!(sent["submit"], true);
+    assert_eq!(sent["instance_id"], trainer_instance);
     let image_message: Value = seen
         .bodies
         .iter()
@@ -1125,6 +1659,7 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
         .expect("image message body");
     assert_eq!(image_message["images"][0]["media_type"], "image/png");
     assert_eq!(image_message["images"][0]["data"], "iVBORw0KGgo=");
+    assert_eq!(image_message["instance_id"], trainer_instance);
     let special_keys: Value = seen
         .bodies
         .iter()
@@ -1132,6 +1667,18 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
         .map(|body| serde_json::from_str(body).unwrap())
         .expect("special key body");
     assert_eq!(special_keys["action"], "tmux_prefix_twice");
+    assert_eq!(special_keys["machine"], "gpu-box");
+    assert_eq!(special_keys["instance_id"], trainer_instance);
+    for action in ["up", "down", "left", "right", "enter"] {
+        assert!(seen.bodies.iter().any(|body| {
+            serde_json::from_str::<Value>(body).is_ok_and(|value| {
+                value.get("action").and_then(Value::as_str) == Some(action)
+                    && value.get("machine").and_then(Value::as_str) == Some("gpu-box")
+                    && value.get("instance_id").and_then(Value::as_str)
+                        == Some(trainer_instance.as_str())
+            })
+        }));
+    }
     let resume: Value = seen
         .bodies
         .iter()
@@ -1238,6 +1785,7 @@ async fn one_unreachable_machine_never_breaks_local_or_healthy_machines() {
                 mode_id: None,
                 machine: Some("dead".to_owned()),
                 resume_session_id: None,
+                memory_max_bytes: None,
             })
             .await
             .is_err()
@@ -1440,4 +1988,114 @@ async fn the_http_surface_reports_an_upstream_rejection_as_a_gateway_failure() {
         StatusCode::NOT_FOUND,
         "a pane no machine reports is simply missing"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn owner_generation_conflicts_remain_conflicts_through_a_coordinator() {
+    if !tmux_available("owner_generation_conflicts_remain_conflicts_through_a_coordinator") {
+        return;
+    }
+    let (address, recorder) = start_node().await;
+    let control = ControlPlane::start(federated_config(address))
+        .await
+        .unwrap();
+    assert!(wait_for_session(&control, "gpu-box~%7").await);
+    recorder.lock().unwrap().reject_generation_mutations = true;
+    let instance_id = format!("pane-v1-{}", "a".repeat(64));
+
+    let direct = control
+        .send_text_for_instance(
+            "gpu-box~%7",
+            "direct conflict".to_owned(),
+            true,
+            Some(instance_id.clone()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_kind(&direct), ErrorKind::Conflict);
+    assert!(
+        !direct.to_string().contains("owner-only-generation-detail"),
+        "owner response detail escaped through the coordinator: {direct:#}"
+    );
+    let key_conflict = control
+        .send_special_key_for_instance(
+            "gpu-box~%7",
+            PaneSpecialKey::Enter,
+            "gpu-box".to_owned(),
+            instance_id.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_kind(&key_conflict), ErrorKind::Conflict);
+    assert!(
+        !key_conflict
+            .to_string()
+            .contains("owner-only-generation-detail"),
+        "owner response detail escaped through special-key federation: {key_conflict:#}"
+    );
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let app = atmux::web::api_router(control, Vec::new(), shutdown_rx);
+    let cases = [
+        (
+            "/api/v1/panes/gpu-box~%257/messages",
+            json!({
+                "text": "HTTP text conflict",
+                "submit": true,
+                "instance_id": instance_id,
+            }),
+        ),
+        (
+            "/api/v1/panes/gpu-box~%257/image-messages",
+            json!({
+                "text": "HTTP image conflict",
+                "images": [{ "media_type": "image/png", "data": "iVBORw0KGgo=" }],
+                "instance_id": instance_id,
+            }),
+        ),
+        (
+            "/api/v1/panes/gpu-box~%257/input-keys",
+            json!({
+                "action": "enter",
+                "machine": "gpu-box",
+                "instance_id": instance_id,
+            }),
+        ),
+    ];
+    for (uri, body) in cases {
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{uri}");
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            !body
+                .windows("owner-only-generation-detail".len())
+                .any(|window| window == b"owner-only-generation-detail"),
+            "owner response detail escaped through {uri}"
+        );
+    }
+
+    let seen = recorder.lock().unwrap();
+    let rejected = seen
+        .bodies
+        .iter()
+        .filter_map(|body| serde_json::from_str::<Value>(body).ok())
+        .filter(|body| {
+            body.get("instance_id").and_then(Value::as_str) == Some(instance_id.as_str())
+        })
+        .count();
+    assert!(rejected >= 5, "forwarded bodies: {:#?}", seen.bodies);
 }

@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 helper_fixture="$repo_root/tests/fixtures/resume_tron_transactional_helpers.sh"
-canonical_script=/home/ryan/resume-tron.sh
+canonical_script=${ATMUX_TRON_CANONICAL_SCRIPT:-/home/ryan/resume-tron.sh}
 test_root=$(mktemp -d)
 socket_name="atmux-test-resume-${BASHPID}-${RANDOM}"
 export TMUX_TMPDIR="$test_root/tmux-tmp"
@@ -108,7 +108,24 @@ tmux() {
   local argument
   local send_status
   local wait_attempt
+  local index
+  local worker_prefix='exec /home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec -- '
+  local service_prefix='exec /home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec --recovery-service-memory-max-bytes 60129542144 -- '
+  local -a forwarded
   shift
+  forwarded=("$@")
+  # Exercise the exact production helper while keeping every launched command
+  # inside this disposable socket rather than entering a real systemd scope.
+  if [ "$operation" = send-keys ]; then
+    for index in "${!forwarded[@]}"; do
+      if [[ ${forwarded[$index]} == "$service_prefix"* ]]; then
+        forwarded[$index]="exec ${forwarded[$index]#"$service_prefix"}"
+      elif [[ ${forwarded[$index]} == "$worker_prefix"* ]]; then
+        forwarded[$index]="exec ${forwarded[$index]#"$worker_prefix"}"
+      fi
+    done
+    set -- "${forwarded[@]}"
+  fi
   for argument in "$@"; do
     if [ "$previous" = -t ] || [ "$previous" = -s ]; then
       target=$argument

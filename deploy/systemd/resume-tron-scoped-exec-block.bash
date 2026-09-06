@@ -9,12 +9,16 @@
 # into which this replacement block is inserted.
 # shellcheck disable=SC2154
 send() {
+  local scoped_exec_command='/home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec'
   [ "$unit_state" = created ] || return 0
+  if [ "$unit_session" = atmux-web ]; then
+    scoped_exec_command+=' --recovery-service-memory-max-bytes 60129542144'
+  fi
   if [ "$unit_session" != "$1" ]; then
     fail_unit "launch target mismatch"
   elif ! session_belongs_to_unit; then
     fail_unit "launch ownership"
-  elif ! tmux send-keys -t "$created_session_id" "exec /home/ryan/.local/bin/atmux --config /home/ryan/.config/atmux/config.toml scoped-exec -- $2" Enter; then
+  elif ! tmux send-keys -t "$created_session_id" "exec $scoped_exec_command -- $2" Enter; then
     fail_unit "launch input"
   fi
 }

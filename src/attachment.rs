@@ -49,11 +49,15 @@ pub struct ImageMessageRequest {
     #[serde(default)]
     pub text: String,
     pub images: Vec<EncodedImage>,
+    /// Optional owner-issued pane generation for fail-closed web dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeliveryErrorKind {
     Invalid,
+    Conflict,
     Internal,
 }
 
@@ -80,6 +84,13 @@ impl DeliveryError {
         Self {
             kind: DeliveryErrorKind::Internal,
             source: error,
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            kind: DeliveryErrorKind::Conflict,
+            source: anyhow!(message.into()),
         }
     }
 }
@@ -138,6 +149,7 @@ pub fn deliver(
     request: ImageMessageRequest,
     wait_for_native_image: bool,
 ) -> Result<(), DeliveryError> {
+    let expected_instance_id = request.instance_id.clone();
     let (text, images) = validate(request)?;
     let root = attachment_root().map_err(DeliveryError::internal)?;
     let staged = stage(&root, &text, &images).map_err(DeliveryError::internal)?;
@@ -150,7 +162,18 @@ pub fn deliver(
         .then(|| Tmux.capture(pane_id, 40).ok())
         .flatten()
         .map(|content| native_image_marker_count(&content));
-    Tmux.send_text(pane_id, &staged.message, false)
+    let mut target_error = None;
+    let paste = Tmux::send_text_checked(pane_id, &staged.message, false, || {
+        if let Err(error) = validate_delivery_target(pane_id, expected_instance_id.as_deref()) {
+            target_error = Some(error);
+            return Err(anyhow!("image delivery target changed"));
+        }
+        Ok(())
+    });
+    if let Some(error) = target_error {
+        return Err(error);
+    }
+    paste
         .context("failed to paste the image message into tmux")
         .map_err(DeliveryError::internal)?;
     if wait_for_native_image {
@@ -158,10 +181,32 @@ pub fn deliver(
     } else {
         std::thread::sleep(IMAGE_PASTE_SETTLE_DELAY);
     }
+    validate_delivery_target(pane_id, expected_instance_id.as_deref())?;
     Tmux.submit(pane_id)
         .context("failed to submit the image message to tmux")
         .map_err(DeliveryError::internal)?;
     staged.retain();
+    Ok(())
+}
+
+fn validate_delivery_target(
+    pane_id: &str,
+    expected_instance_id: Option<&str>,
+) -> Result<(), DeliveryError> {
+    let Some(expected) = expected_instance_id else {
+        return Ok(());
+    };
+    let live = Tmux::live_pane_identity(pane_id).map_err(DeliveryError::internal)?;
+    let Some(live) = live else {
+        return Err(DeliveryError::conflict(
+            "agent pane disappeared during image delivery",
+        ));
+    };
+    if live.pane_identity != expected {
+        return Err(DeliveryError::conflict(
+            "agent pane restarted during image delivery",
+        ));
+    }
     Ok(())
 }
 
@@ -529,6 +574,7 @@ mod tests {
         ImageMessageRequest {
             text: "review this".to_owned(),
             images,
+            instance_id: None,
         }
     }
 
