@@ -266,6 +266,28 @@ relaunch over a duplicate. The plan survives atmux restart and a newer atmux
 user mutation invalidates it via the durable sequence. The old raw tmux start
 command is never replayed.
 
+### Self-update
+
+Each node can check for, verify, and apply its own signed releases from GitHub. It is opt-in and
+defaults to doing nothing:
+
+```toml
+[self_update]
+enabled = false # opt in explicitly on each node
+repository = "ryanmurf/atmux" # GitHub owner/name
+check_interval_seconds = 3600 # background check cadence; minimum 300
+auto_apply = false # apply a verified newer release without an operator action
+# public_key = "base64..." # overrides the embedded signing key; tests only
+```
+
+`repository` must match `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`. `check_interval_seconds` is clamped to
+a 300-second minimum. With `auto_apply` left at `false`, atmux still finds and verifies updates in
+the background; an operator applies them from the Software card or `atmux self-update --apply`.
+`public_key` overrides the release-signing public key embedded in the binary and exists only for
+tests.
+
+See "Releases and self-update" below for how checking, verification, and the swap itself work.
+
 ### Native Pulse management (implementation active)
 
 When Pulse serving is configured, the dashboard exposes one explicit account at a time. Its
@@ -995,6 +1017,71 @@ explicit authorization; Pulse deployment verification must leave its current sta
 must not add a new route or an authentication bypass.
 The final Pulse merge status and outstanding native/review gates are tracked in
 [features/claude-pulse-rust-merge.md](features/claude-pulse-rust-merge.md).
+
+## Releases and self-update
+
+### Cutting a release
+
+Bump `version` in `Cargo.toml` and `Cargo.lock`, and `appVersion` in
+`deploy/helm/atmux-web/Chart.yaml`, then commit. Tag `vX.Y.Z` and push the tag.
+`.github/workflows/release.yml` refuses to publish when the tag does not equal the Cargo version.
+
+### What the workflow publishes
+
+- Raw executables `atmux-x86_64-unknown-linux-gnu`, `atmux-aarch64-unknown-linux-gnu`,
+  `atmux-aarch64-apple-darwin`, and `atmux-x86_64-apple-darwin`.
+- `SHA256SUMS`, in `sha256sum` format, covering those four files.
+- `SHA256SUMS.sig`: a single-line base64 encoding of the raw 64-byte Ed25519 signature over
+  `SHA256SUMS`.
+- `ghcr.io/ryanmurf/atmux:vX.Y.Z` and `:latest`.
+
+### How a node updates itself
+
+It asks `https://api.github.com/repos/<repository>/releases/latest` — unauthenticated, HTTPS only,
+redirects restricted to GitHub asset hosts — and accepts a release only when its tag parses as a
+non-prerelease semver greater than the running version. It downloads `SHA256SUMS` and
+`SHA256SUMS.sig`, verifies the signature against the embedded public key, then picks the checksum
+line for its own compiled target triple (`atmux --version` prints `atmux <version> (<target>)`).
+
+The matching executable streams to disk next to the running binary, its SHA-256 is verified, and
+the staged binary's own `--version` is run before anything moves. The verified binary is then
+swapped into place atomically, the previous one kept alongside as `<exe>.prev`, and atmux re-execs
+itself with the original argv and environment. tmux servers are a separate process, so agent
+sessions keep running across the restart.
+
+### Triggering from the coordinator
+
+The machine view's Software card offers Check now, Update, and Roll back. The landing page shows an
+`↑ vA.B.C` pill and an Update all action once at least one machine has a verified update pending.
+The coordinator only triggers and observes; each node still downloads and verifies its own
+artifacts.
+
+### Rollback
+
+A rollback swaps `<exe>.prev` back into place, confirms its `--version`, and re-execs — the same
+verify-then-swap path as an update. Also available as `atmux self-update --rollback`.
+
+### CLI
+
+`atmux self-update --check`, `--apply`, and `--rollback` run over SSH and use the same code paths
+as the API.
+
+### Container and Kubernetes deployments
+
+The public coordinator runs from a container image in microk8s. A node that sees `/.dockerenv` or
+`KUBERNETES_SERVICE_HOST` reports mode `managed_externally` and refuses to self-update. Roll it
+forward by pinning `server.image` in `deploy/helm/atmux-web` to the new build and upgrading the
+release.
+
+### Signing key
+
+The embedded public key is a base64-encoded raw 32-byte Ed25519 key:
+`hvFQRGa4xvRCKeazrWPnihuxkl3+Lsr3hM4GYZ+KyRQ=`. The private key lives only in the GitHub Actions
+secret `ATMUX_RELEASE_SIGNING_KEY` (PEM, generated 2026-09-06), with a local copy at
+`~/.config/atmux/release-signing.key` on tron. Rotating it means generating a new keypair, changing
+the embedded constant, shipping a release built with the new constant, and signing every later
+release with the new key — old binaries reject artifacts signed by the new key, so a rotation
+requires one manual upgrade.
 
 ## Development
 
