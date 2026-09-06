@@ -2281,6 +2281,30 @@ test("machineStatusLabel reports counts when online and last-seen when offline",
   assert.equal(machineStatusLabel(null, now), "");
 });
 
+test("machineStatusLabel notes an active phone-home tunnel only for a connected remote machine", () => {
+  const now = 1_700_000_000_000;
+  assert.equal(
+    machineStatusLabel(machine("midnight", "Midnight", true, { sessions: 1, tunnel: true }), now),
+    "1 agent · via tunnel",
+  );
+  // A remote machine reached through its configured address, not a tunnel.
+  assert.equal(
+    machineStatusLabel(machine("midnight", "Midnight", true, { sessions: 1, tunnel: false }), now),
+    "1 agent",
+  );
+  // tunnel:true is contractually only sent for a live connection, but an
+  // offline machine must never be reported as tunnelled regardless.
+  assert.equal(
+    machineStatusLabel(machine("mini", "Mini", false, { tunnel: true, health: "connecting" }), now),
+    "Offline · connecting",
+  );
+  // The coordinator's own machine has no tunnel concept.
+  assert.equal(
+    machineStatusLabel(machine("local", "This machine", true, { sessions: 0, tunnel: true }), now),
+    "0 agents",
+  );
+});
+
 test("GPU formatting exposes every available bounded device counter without inventing zeros", () => {
   const gpu = {
     id: "0000:03:00.0",

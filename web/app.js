@@ -600,7 +600,10 @@ function machineStatusLabel(machine, now) {
   if (!machine) return "";
   const count = `${machine.sessions ?? 0} agent${(machine.sessions ?? 0) === 1 ? "" : "s"}`;
   if (machine.online) {
-    return machine.health ? `${count} · ${machine.health}` : count;
+    // The coordinator's own machine has no tunnel concept, and an offline
+    // machine (below) is never mid-tunnel by definition.
+    const tunnel = machine.tunnel && machine.kind !== "local" ? "via tunnel" : null;
+    return [count, machine.health, tunnel].filter(Boolean).join(" · ");
   }
   const seen = formatRelativeTime(machine.last_seen_ms, now);
   const detail = machine.health ? ` · ${machine.health}` : "";
@@ -4844,9 +4847,13 @@ function initialize() {
   function renderMachineDetail(machine) {
     $("machine-name").textContent = machine.label || machine.id;
     const status = machine.online ? "Online" : "Offline";
+    // A tunnelled machine may still have a configured address (reachable both
+    // ways); only say "no direct address" when the tunnel is its only path.
+    const addressLine = machine.address || (machine.tunnel ? "no direct address" : null);
     $("machine-meta").textContent = [
       status,
-      machine.address,
+      machine.tunnel ? "via tunnel" : null,
+      addressLine,
       `${machine.sessions ?? 0} agent${(machine.sessions ?? 0) === 1 ? "" : "s"}`,
     ].filter(Boolean).join(" · ");
     const offline = $("machine-offline");

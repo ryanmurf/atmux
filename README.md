@@ -634,6 +634,101 @@ rather than merging into a gap.
 - **Session names containing `~`.** On a coordinator with configured machines, a session named like
   `machine~pane` is read as a composite reference. The launcher rejects `~` in new names.
 
+## Phone-home tunnel
+
+A coordinator normally dials each `[[machines]]` `url` directly. A laptop that spends most of its
+time away from home has no reachable address, but it does have outbound HTTPS. The phone-home
+tunnel inverts the direction: the node dials the coordinator and holds the connection open, and the
+coordinator drives the node back down that same connection. Every federated call path — the event
+stream, launches, pane reads, fleet updates, update actions — works unchanged over it.
+
+The node sends `GET /api/v1/tunnel/{machine-id}` with `Upgrade: atmux-tunnel`, `Connection:
+Upgrade`, and its own federation bearer token. The coordinator answers `101 Switching Protocols`,
+and the node then runs an HTTP/2 **server** over the upgraded stream, serving the same API it would
+serve on its own listener; the coordinator holds the HTTP/2 client end and multiplexes every
+request onto it. Both ends send HTTP/2 PING keepalives (20s interval, 10s timeout) so an idle proxy
+does not silently drop the connection and a sleeping laptop is detected quickly. The node
+reconnects with exponential backoff plus jitter; the last connection for a machine id wins, and the
+coordinator aborts the previous one.
+
+Enable it on the node with a new `[coordinator]` table:
+
+```toml
+[node]
+id = "midnight"                 # must be explicit; this is the machine id the coordinator knows
+
+[coordinator]
+enabled = true
+url = "https://atmux.murphytek.com"
+token_file = "~/.config/atmux/lan.token"   # or token_env = "ATMUX_NODE_TOKEN"
+```
+
+`enabled` defaults to `false`; the tunnel is opt-in. Exactly one of `token_file` / `token_env` is
+required, and it is the same secret the coordinator already holds for this machine — no new
+credential material. `url` must be `https://`; a loopback `http://` URL is accepted only so tests
+and local development work. `[node].id` must be set explicitly, not left at the default `local`,
+because it is the machine id the coordinator matches against `[[machines]]`.
+
+On the coordinator, `[[machines]]` gains `tunnel`:
+
+```toml
+[[machines]]
+id = "midnight"
+label = "Midnight"
+tunnel = true
+token_file = "/etc/atmux/federation-tokens/midnight.token"
+```
+
+`url` is now optional, but only when `tunnel = true`; a machine with neither is a configuration
+error. A machine may set both `tunnel = true` and a `url` — the coordinator then prefers the live
+tunnel and falls back to the direct address when no tunnel is connected, so one configuration works
+both at home and away.
+
+`deploy/helm/atmux-web` exposes the tunnel as a second gateway port (`server.tunnel.enabled`,
+default port `server.tunnel.port`, default `8081`), off by default and serving only
+`/api/v1/tunnel`. It is deliberately not behind OAuth2 Proxy/Keycloak SSO, and the gateway does not
+inject the proxy token onto it, unlike the web gateway above. The Ingress routes `/api/v1/tunnel`
+(Prefix) to that port with long proxy read/send timeouts, and forwards `Upgrade`/`Connection`.
+
+### Security
+
+- The tunnel route accepts only the named machine's own federation token, compared in constant
+  time. The web proxy token is rejected, the coordinator's own node token is rejected, and another
+  machine's token is rejected.
+- `allow_unauthenticated_loopback` does not apply to the tunnel route.
+- A machine id that is not configured, or is configured without `tunnel = true`, gets `404` with no
+  credential comparison at all. Machine ids are not secret — they appear in configuration, in the
+  dashboard, and in LAN discovery records — so a clear 404 is what makes a wrong id diagnosable.
+- Requests arriving on the node through the tunnel get a synthetic non-loopback peer address, so
+  the node's own loopback development exemption can never apply to them; they still have to present
+  the node's token.
+- The node validates the coordinator's TLS certificate against the bundled Mozilla root program
+  (webpki roots) and pins ALPN to `http/1.1` for the upgrade.
+- Tokens are never logged. The node prints one line on connect and one on disconnect, with the
+  machine id and the reason.
+
+### Troubleshooting
+
+- **Anything other than `101` is a hard failure and is retried.** A `200` with an HTML body almost
+  always means a proxy on the path stripped the `Upgrade`/`Connection` hop-by-hop headers, or the
+  request reached the SSO'd port instead of the tunnel port. Check the ingress path and that the
+  gateway forwards `Upgrade`/`Connection`.
+- **`401`**: wrong token file, or the coordinator has a different token on file for this machine.
+- **`404`**: the machine id is not in the coordinator's `[[machines]]`, or that entry is missing
+  `tunnel = true`.
+- **`403`**: the coordinator rejected the `Host` header.
+- **ALPN.** If a TLS-terminating hop negotiates `h2` end-to-end, the HTTP/1.1 `Upgrade` never
+  happens. The node pins ALPN to `http/1.1`; a proxy that forces h2 to the origin will break the
+  handshake.
+- **Idle timeouts.** The connection is mostly idle. Proxy read/send timeouts must be long (the
+  chart sets 3600s on the Ingress and 86400s inside the gateway); the HTTP/2 PING keepalive is what
+  keeps intermediaries from treating it as dead.
+- **Laptop sleep/wake and network change.** The connection dies and is re-dialed with backoff; the
+  machine briefly shows offline in the dashboard, then reconnects.
+
+The dashboard shows `via tunnel` on a machine reached this way, and says when a machine has no
+direct address.
+
 ## Stateless MCP server
 
 `atmux web` also serves MCP at <http://127.0.0.1:7345/mcp>. It implements the stateless

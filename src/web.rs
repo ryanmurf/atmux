@@ -374,7 +374,14 @@ pub async fn serve(
         .discovery_token
         .map(|token| discovery::start(&config, bind, control.clone(), token))
         .transpose()?;
-    let hosts: Arc<[String]> = allowed_hosts(bind, extra_hosts).into();
+    let mut host_values = allowed_hosts(bind, extra_hosts);
+    if config.coordinator.enabled {
+        // A tunneled request names the reserved authority instead of a real
+        // address, and the Host check runs on every request including those.
+        host_values.push(crate::tunnel::TUNNEL_AUTHORITY.to_owned());
+    }
+    let hosts: Arc<[String]> = host_values.into();
+    let tunnels = control.tunnels();
     let origins: Arc<[String]> = allowed_origins(bind, binding.tls.is_some(), extra_origins).into();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let state = WebState {
@@ -414,14 +421,39 @@ pub async fn serve(
         )),
         None => app,
     };
+    let app = match crate::tunnel::TunnelAcceptor::from_config(&config, tunnels)? {
+        Some(acceptor) => app.merge(crate::tunnel::router(acceptor)),
+        None => app,
+    };
     let app = app
         .nest_service("/mcp", mcp_service)
         .layer(middleware::from_fn_with_state(
             policy,
             enforce_request_policy,
         ));
+    // The tunnel serves this node's own app, request policy and all. Building
+    // it here — after the policy layer — is what makes "the tunnel grants
+    // nothing the listener would not" a structural property rather than a
+    // promise.
+    let phone_home = config
+        .coordinator
+        .enabled
+        .then(|| {
+            crate::tunnel::PhoneHome::new(&config.coordinator, &config.node.id, app.clone())
+                .context("failed to prepare the [coordinator] tunnel")
+        })
+        .transpose()?
+        .map(crate::tunnel::PhoneHome::spawn);
+    let _phone_home = phone_home.map(TaskGuard);
 
     print_listeners(&binding.listeners);
+    if config.coordinator.enabled {
+        println!(
+            "atmux tun  dialing out to {} as {}",
+            config.coordinator.url.as_deref().unwrap_or_default(),
+            config.node.id
+        );
+    }
     println!("atmux MCP  endpoint(s) above (stateless MCP 2026-07-28)");
     if machine_count > 0 {
         println!("atmux fed  aggregating {machine_count} remote machine(s)");
@@ -436,6 +468,16 @@ pub async fn serve(
         pulse_runtime,
     )
     .await
+}
+
+/// Stops a background task when the server it belongs to is torn down.
+#[derive(Debug)]
+struct TaskGuard(tokio::task::AbortHandle);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 async fn serve_with_lifecycle(
@@ -888,19 +930,38 @@ async fn shutdown_signal(shutdown: watch::Sender<bool>) {
     shutdown.send_replace(true);
 }
 
+/// The machine named by a tunnel-upgrade request, if the path is exactly one.
+///
+/// The shape is checked rather than the prefix alone so nothing below
+/// `/api/v1/tunnel/` — and nothing that merely starts with those bytes — can
+/// inherit the route's exemption from the shared token list.
+fn tunnel_upgrade_machine(path: &str) -> Option<&str> {
+    let machine = path.strip_prefix(crate::tunnel::TUNNEL_PATH_PREFIX)?;
+    (!machine.is_empty() && !machine.contains('/')).then_some(machine)
+}
+
 async fn enforce_request_policy(
     State(policy): State<RequestPolicy>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request,
     next: Next,
 ) -> Response {
-    if let Err(error) = ensure_host(request.headers(), &policy.allowed_hosts) {
+    if let Err(error) = ensure_request_host(&request, &policy.allowed_hosts) {
         return error.into_response();
     }
-    let sensitive =
-        request.uri().path().starts_with("/api/") || request.uri().path().starts_with("/mcp");
+    let path = request.uri().path();
+    let sensitive = path.starts_with("/api/") || path.starts_with("/mcp");
+    // The tunnel route is the one `/api/` path this layer must not guard. Its
+    // caller is a node presenting *its own* federation token, which this
+    // coordinator does not hold in `policy.tokens`; and the tokens it does
+    // hold — its own node token and, crucially, the web proxy token every
+    // single-sign-on'd browser request carries — must never open a tunnel.
+    // `tunnel::TunnelAcceptor::authorize` is the only authority for this path,
+    // and it accepts exactly one secret per machine.
+    let delegated = tunnel_upgrade_machine(path).is_some();
     let development_loopback = peer.ip().is_loopback() && policy.allow_unauthenticated_loopback;
     if sensitive
+        && !delegated
         && !development_loopback
         && let Err(error) = ensure_node_token(request.headers(), &policy.tokens, peer)
     {
@@ -1609,7 +1670,7 @@ fn ensure_node_token(
 ///
 /// RFC 9110 defines the authentication scheme as case-insensitive, so clients
 /// and proxies that send `bearer` or `BEARER` are accepted.
-fn bearer_credential(value: &str) -> Option<&str> {
+pub(crate) fn bearer_credential(value: &str) -> Option<&str> {
     let (scheme, credential) = value.split_once(' ')?;
     scheme
         .eq_ignore_ascii_case("bearer")
@@ -1622,7 +1683,7 @@ fn bearer_credential(value: &str) -> Option<&str> {
 /// length. Unequal lengths are rejected immediately, which reveals nothing an
 /// attacker cannot already learn: the configured token's length is fixed, and a
 /// guess of the wrong length is wrong regardless.
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
     }
@@ -1634,12 +1695,42 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
+#[cfg(test)]
 fn ensure_host(headers: &HeaderMap, allowed: &[String]) -> Result<(), ApiError> {
     let host = headers
         .get(header::HOST)
         .ok_or_else(|| ApiError::bad_request("missing Host header"))?
         .to_str()
         .map_err(|_| ApiError::bad_request("invalid Host header"))?;
+    ensure_host_value(host, allowed)
+}
+
+/// Validates the authority of one request against the allow-list.
+///
+/// `Host` is authoritative whenever it is present, which is every HTTP/1.1
+/// request. HTTP/2 has no `Host` header at all — the authority arrives in
+/// `:authority`, which hyper folds into the request URI — so the URI is the
+/// fallback rather than an alternative: a request that carries both is judged
+/// on its `Host`, exactly as before.
+fn ensure_request_host(request: &Request, allowed: &[String]) -> Result<(), ApiError> {
+    match request.headers().get(header::HOST) {
+        Some(host) => ensure_host_value(
+            host.to_str()
+                .map_err(|_| ApiError::bad_request("invalid Host header"))?,
+            allowed,
+        ),
+        None => ensure_host_value(
+            request
+                .uri()
+                .authority()
+                .ok_or_else(|| ApiError::bad_request("missing Host header"))?
+                .as_str(),
+            allowed,
+        ),
+    }
+}
+
+fn ensure_host_value(host: &str, allowed: &[String]) -> Result<(), ApiError> {
     if allowed
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(host))
@@ -1964,6 +2055,153 @@ mod tests {
             .unwrap();
         assert_eq!(accepted.status(), StatusCode::OK);
         assert_eq!(accepted.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[test]
+    fn only_an_exact_tunnel_path_is_delegated_to_the_tunnel_credential() {
+        assert_eq!(
+            tunnel_upgrade_machine("/api/v1/tunnel/midnight"),
+            Some("midnight")
+        );
+        // Nothing else may inherit the exemption from the shared token list.
+        assert_eq!(tunnel_upgrade_machine("/api/v1/tunnel/"), None);
+        assert_eq!(tunnel_upgrade_machine("/api/v1/tunnel"), None);
+        assert_eq!(tunnel_upgrade_machine("/api/v1/tunnels/midnight"), None);
+        assert_eq!(tunnel_upgrade_machine("/api/v1/tunnel/a/b"), None);
+        assert_eq!(tunnel_upgrade_machine("/api/v1/tunnel/../sessions"), None);
+        assert_eq!(tunnel_upgrade_machine("/api/v1/sessions"), None);
+    }
+
+    /// The route is owner-scoped in the strictest sense atmux has: it accepts
+    /// exactly one secret, and the credential every other `/api/` path accepts
+    /// is refused.
+    #[tokio::test]
+    async fn tunnel_route_is_owner_scoped_to_one_machines_federation_token() {
+        let acceptor = crate::tunnel::TunnelAcceptor::new(
+            crate::tunnel::TunnelRegistry::new(),
+            [
+                ("midnight".to_owned(), Secret::new("midnight-token")),
+                ("tron".to_owned(), Secret::new("tron-token")),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        // The coordinator's own policy layer sits above the route exactly as
+        // it does in `serve`, so this exercises the delegation too.
+        let policy = RequestPolicy {
+            allowed_hosts: vec!["localhost:7345".to_owned()].into(),
+            tokens: vec![
+                Secret::new("coordinator-node-token"),
+                Secret::new("web-proxy-token"),
+            ]
+            .into(),
+            // Even the development escape hatch must not open a tunnel.
+            allow_unauthenticated_loopback: true,
+        };
+        let app = crate::tunnel::router(acceptor).layer(middleware::from_fn_with_state(
+            policy,
+            enforce_request_policy,
+        ));
+        let request = |machine: &str, token: Option<&str>| {
+            let mut builder = HttpRequest::builder()
+                .uri(format!("/api/v1/tunnel/{machine}"))
+                .header(header::HOST, "localhost:7345")
+                .header(header::CONNECTION, "upgrade")
+                .header(header::UPGRADE, crate::tunnel::UPGRADE_PROTOCOL)
+                .extension(ConnectInfo("127.0.0.1:5000".parse::<SocketAddr>().unwrap()));
+            if let Some(token) = token {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+        let status = async |machine: &str, token: Option<&str>| {
+            app.clone()
+                .oneshot(request(machine, token))
+                .await
+                .unwrap()
+                .status()
+        };
+
+        // The gateway injects this token on every single-sign-on'd browser
+        // request. If it opened a tunnel, any authenticated browser could
+        // impersonate a machine.
+        assert_eq!(
+            status("midnight", Some("web-proxy-token")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status("midnight", Some("coordinator-node-token")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status("midnight", Some("tron-token")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // A loopback caller with the development exemption still needs it.
+        assert_eq!(status("midnight", None).await, StatusCode::UNAUTHORIZED);
+        // An id that is not configured for a tunnel never reaches a compare.
+        assert_eq!(
+            status("laptop", Some("midnight-token")).await,
+            StatusCode::NOT_FOUND
+        );
+
+        let accepted = app
+            .clone()
+            .oneshot(request("midnight", Some("midnight-token")))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(accepted.headers()[header::UPGRADE], "atmux-tunnel");
+
+        // The Host allow-list still applies to this path.
+        let wrong_host = HttpRequest::builder()
+            .uri("/api/v1/tunnel/midnight")
+            .header(header::HOST, "attacker.example:7345")
+            .header(header::CONNECTION, "upgrade")
+            .header(header::UPGRADE, crate::tunnel::UPGRADE_PROTOCOL)
+            .header(header::AUTHORIZATION, "Bearer midnight-token")
+            .extension(ConnectInfo("127.0.0.1:5000".parse::<SocketAddr>().unwrap()))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(wrong_host).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn an_http2_request_is_judged_on_its_uri_authority() {
+        // HTTP/2 carries no Host header at all, so the authority in the URI is
+        // the only host information a tunneled request has.
+        let app = probe_app(Some(Secret::new("node-token")));
+        let request = |uri: &str| {
+            HttpRequest::builder()
+                .uri(uri)
+                .header(header::AUTHORIZATION, "Bearer node-token")
+                .extension(ConnectInfo("192.0.2.1:0".parse::<SocketAddr>().unwrap()))
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request("http://localhost:7345/api/probe"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request("http://attacker.example:7345/api/probe"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            app.oneshot(request("/api/probe")).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]

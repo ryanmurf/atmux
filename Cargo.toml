@@ -34,8 +34,8 @@ futures-core = "0.3.32"
 fs2 = "0.4.3"
 getrandom = "0.3.4"
 http-body-util = "0.1.4"
-hyper = { version = "1.11.0", features = ["client", "http1"] }
-hyper-util = { version = "0.1.20", features = ["tokio"] }
+hyper = { version = "1.11.0", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1.20", features = ["service", "tokio"] }
 if-addrs = "0.15.0"
 jiff = { version = "0.2.35", optional = true }
 mdns-sd = "0.20.3"

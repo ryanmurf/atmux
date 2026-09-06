@@ -587,6 +587,7 @@ mod tests {
             last_seen_ms: None,
             address: (kind == MachineKind::Remote).then(|| format!("{id}:7345")),
             metrics: crate::metrics::MachineMetrics::default(),
+            tunnel: false,
         };
         Overview {
             revision: 9,

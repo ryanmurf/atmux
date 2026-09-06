@@ -764,6 +764,10 @@ struct Inner {
     /// Configured and dynamically discovered remotes, keyed by stable machine
     /// id. Explicit configuration always wins over a discovery advertisement.
     machines: RwLock<BTreeMap<String, Arc<RemoteMachine>>>,
+    /// Phone-home tunnels this coordinator is currently holding open. Shared
+    /// with every `RemoteMachine`, so a machine that dials in is reachable the
+    /// moment its tunnel lands.
+    tunnels: crate::tunnel::TunnelRegistry,
     configured_machine_ids: BTreeSet<String>,
     watchers: std::sync::Mutex<BTreeMap<String, AbortHandle>>,
     state: RwLock<State>,
@@ -879,12 +883,14 @@ impl ControlPlane {
         config.validate_federation()?;
         config.validate_auto_compact()?;
         config.maintenance.validate()?;
+        let tunnels = crate::tunnel::TunnelRegistry::new();
         let mut machines = BTreeMap::new();
         for machine in &config.machines {
-            let machine = Arc::new(match &config.node.tls {
-                Some(tls) => RemoteMachine::from_config_with_tls(machine, tls)?,
-                None => RemoteMachine::from_config(machine)?,
-            });
+            let machine = Arc::new(RemoteMachine::from_config_with_transport(
+                machine,
+                config.node.tls.as_ref(),
+                Some(tunnels.clone()),
+            )?);
             machines.insert(machine.id.clone(), machine);
         }
         let remotes = machines
@@ -911,6 +917,7 @@ impl ControlPlane {
                 local_label: config.node_label(),
                 bare_local_ids,
                 machines: RwLock::new(machines),
+                tunnels,
                 configured_machine_ids,
                 watchers: std::sync::Mutex::new(BTreeMap::new()),
                 config,
@@ -1108,6 +1115,7 @@ impl ControlPlane {
                     health: None,
                     last_seen_ms: None,
                     address: None,
+                    tunnel: false,
                     metrics: MachineMetrics::default(),
                 },
             );
@@ -1169,6 +1177,12 @@ impl ControlPlane {
             }
         }
         entries
+    }
+
+    /// The registry every phone-home tunnel registers itself in.
+    #[must_use]
+    pub fn tunnels(&self) -> crate::tunnel::TunnelRegistry {
+        self.inner.tunnels.clone()
     }
 
     pub(crate) fn remote_machines(&self) -> Vec<Arc<RemoteMachine>> {
@@ -2118,6 +2132,7 @@ impl ControlPlane {
                 health: state.health.clone(),
                 last_seen_ms: None,
                 address: None,
+                tunnel: false,
                 metrics: state.metrics.clone(),
             });
         }
@@ -2134,7 +2149,8 @@ impl ControlPlane {
                 sessions: mirrored.len(),
                 health: remote.and_then(|remote| remote.health.clone()),
                 last_seen_ms: remote.and_then(|remote| remote.last_seen_ms),
-                address: Some(machine.address()),
+                address: machine.address(),
+                tunnel: machine.tunnel_online(),
                 metrics: remote
                     .map_or_else(MachineMetrics::default, |remote| remote.metrics.clone()),
             });
@@ -5429,9 +5445,10 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
                 RemoteMachine::from_config(&crate::config::MachineConfig {
                     id: (*id).to_owned(),
                     label: Some(format!("{id} label")),
-                    url: format!("http://{id}.invalid:7345"),
+                    url: Some(format!("http://{id}.invalid:7345")),
                     token_env: None,
                     token_file: None,
+                    tunnel: false,
                 })
                 .unwrap(),
             );
@@ -5447,6 +5464,7 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
             bare_local_ids: handles.is_empty(),
             configured_machine_ids: handles.keys().cloned().collect(),
             machines: RwLock::new(handles),
+            tunnels: crate::tunnel::TunnelRegistry::new(),
             watchers: std::sync::Mutex::new(BTreeMap::new()),
             state: RwLock::new(State {
                 revision: 0,
@@ -6845,9 +6863,10 @@ mod tests {
         let machine = RemoteMachine::from_config(&crate::config::MachineConfig {
             id: "gpu-box".to_owned(),
             label: Some("GPU box".to_owned()),
-            url: "http://192.168.1.8:7345".to_owned(),
+            url: Some("http://192.168.1.8:7345".to_owned()),
             token_env: None,
             token_file: None,
+            tunnel: false,
         })
         .unwrap();
         control.upsert_discovered_machine(machine);

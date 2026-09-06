@@ -38,6 +38,7 @@ use crate::{
     config::{MachineConfig, TlsConfig},
     control::{ControlPlane, LaunchOptions, Overview, OverviewPatch, SessionSummary},
     machine::{MachineKind, MachineSummary, NodeUrl, Secret, composite_id, resolve_token},
+    tunnel::{TUNNEL_AUTHORITY, TunnelRegistry, TunnelSender},
 };
 
 const USER_AGENT: &str = concat!("atmux/", env!("CARGO_PKG_VERSION"));
@@ -57,12 +58,17 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 pub struct RemoteMachine {
     pub id: String,
     pub label: String,
-    pub url: NodeUrl,
+    /// Address this coordinator dials. `None` for a machine that only ever
+    /// dials in, which has no address a coordinator could reach.
+    pub url: Option<NodeUrl>,
     token: Option<Secret>,
     /// Present only for certificate-validating HTTPS federation. Keeping the
     /// legacy manual HTTP transport confined to loopback makes existing local
     /// test harnesses work while production configurations are TLS-only.
     tls_client: Option<TlsConnector>,
+    /// Present when this machine may dial in. A live tunnel is always
+    /// preferred over `url`, so one configuration works at home and away.
+    tunnel: Option<TunnelRegistry>,
     connect_timeout: Duration,
     request_timeout: Duration,
 }
@@ -76,9 +82,59 @@ impl std::fmt::Debug for RemoteMachine {
             .field("url", &self.url)
             .field("token", &self.token)
             .field("tls", &self.tls_client.is_some())
+            .field("tunnel", &self.tunnel.is_some())
             .field("connect_timeout", &self.connect_timeout)
             .field("request_timeout", &self.request_timeout)
             .finish()
+    }
+}
+
+/// Which transport one request will actually use.
+///
+/// The tunnel arm carries no address: HTTP/2 has no `Host` header, so the
+/// authority must travel in the request URI, and there is no real host at the
+/// other end of the stream to name.
+#[derive(Clone, Debug)]
+enum Endpoint {
+    Direct(NodeUrl),
+    Tunnel,
+}
+
+impl Endpoint {
+    fn authority(&self) -> String {
+        match self {
+            Self::Direct(url) => url.authority(),
+            Self::Tunnel => TUNNEL_AUTHORITY.to_owned(),
+        }
+    }
+
+    fn request_target(&self, path: &str) -> String {
+        match self {
+            Self::Direct(url) => url.request_target(path),
+            Self::Tunnel => crate::tunnel::tunnel_request_target(path),
+        }
+    }
+}
+
+/// One transport's request half. Both arms answer the same question, so every
+/// call path above `connect` is identical over a dialed socket and a tunnel.
+enum Sender {
+    Direct(hyper::client::conn::http1::SendRequest<Full<Bytes>>),
+    Tunnel(Box<TunnelSender>),
+}
+
+impl Sender {
+    async fn send_request(
+        &mut self,
+        request: Request<Full<Bytes>>,
+    ) -> hyper::Result<hyper::Response<Incoming>> {
+        match self {
+            Self::Direct(sender) => sender.send_request(request).await,
+            Self::Tunnel(sender) => {
+                sender.ready().await?;
+                sender.send_request(request).await
+            }
+        }
     }
 }
 
@@ -89,22 +145,7 @@ impl RemoteMachine {
     ///
     /// Returns an error for an invalid URL or an unreadable credential.
     pub fn from_config(machine: &MachineConfig) -> Result<Self> {
-        let url = NodeUrl::parse(&machine.url)
-            .with_context(|| format!("invalid url for machine {}", machine.id))?;
-        let token = resolve_token(
-            &machine.id,
-            machine.token_env.as_deref(),
-            machine.token_file.as_deref(),
-        )?;
-        Ok(Self {
-            id: machine.id.clone(),
-            label: machine.label.clone().unwrap_or_else(|| machine.id.clone()),
-            url,
-            token,
-            tls_client: None,
-            connect_timeout: CONNECT_TIMEOUT,
-            request_timeout: REQUEST_TIMEOUT,
-        })
+        Self::from_config_with_transport(machine, None, None)
     }
 
     /// Builds a configured HTTPS remote whose server certificate and client
@@ -115,15 +156,64 @@ impl RemoteMachine {
     /// Returns an error when the machine URL is not HTTPS or TLS material is
     /// unreadable or invalid.
     pub fn from_config_with_tls(machine: &MachineConfig, tls: &TlsConfig) -> Result<Self> {
-        let mut remote = Self::from_config(machine)?;
-        if !remote.url.is_https() {
+        Self::from_config_with_transport(machine, Some(tls), None)
+    }
+
+    /// Builds a remote that may be reached over a dialed address, over an
+    /// inbound tunnel, or over either.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid URL, an unreadable credential, a
+    /// plaintext HTTPS-required address, or a machine that would end up with no
+    /// transport at all.
+    pub fn from_config_with_transport(
+        machine: &MachineConfig,
+        tls: Option<&TlsConfig>,
+        tunnel: Option<TunnelRegistry>,
+    ) -> Result<Self> {
+        let url = machine
+            .url
+            .as_deref()
+            .map(|url| {
+                NodeUrl::parse(url)
+                    .with_context(|| format!("invalid url for machine {}", machine.id))
+            })
+            .transpose()?;
+        let tunnel = tunnel.filter(|_| machine.tunnel);
+        if url.is_none() && tunnel.is_none() {
             bail!(
-                "machine {} uses plaintext HTTP; remote federation requires HTTPS",
-                remote.id
+                "machine {} has neither a url nor an inbound tunnel; it could never be reached",
+                machine.id
             );
         }
-        remote.tls_client = Some(crate::tls::client(tls)?);
-        Ok(remote)
+        let token = resolve_token(
+            &machine.id,
+            machine.token_env.as_deref(),
+            machine.token_file.as_deref(),
+        )?;
+        let tls_client = match (tls, &url) {
+            (Some(tls), Some(url)) => {
+                if !url.is_https() {
+                    bail!(
+                        "machine {} uses plaintext HTTP; remote federation requires HTTPS",
+                        machine.id
+                    );
+                }
+                Some(crate::tls::client(tls)?)
+            }
+            _ => None,
+        };
+        Ok(Self {
+            id: machine.id.clone(),
+            label: machine.label.clone().unwrap_or_else(|| machine.id.clone()),
+            url,
+            token,
+            tls_client,
+            tunnel,
+            connect_timeout: CONNECT_TIMEOUT,
+            request_timeout: REQUEST_TIMEOUT,
+        })
     }
 
     /// Builds a mutually authenticated HTTPS remote from a validated DNS-SD
@@ -147,9 +237,10 @@ impl RemoteMachine {
         Ok(Self {
             id,
             label,
-            url,
+            url: Some(url),
             token,
             tls_client: Some(crate::tls::client(tls)?),
+            tunnel: None,
             connect_timeout: CONNECT_TIMEOUT,
             request_timeout: REQUEST_TIMEOUT,
         })
@@ -166,9 +257,31 @@ impl RemoteMachine {
         self
     }
 
+    /// Credential-free `host:port` this coordinator would dial, when one is
+    /// configured. `None` means the machine only ever dials in.
     #[must_use]
-    pub fn address(&self) -> String {
-        self.url.authority()
+    pub fn address(&self) -> Option<String> {
+        self.url.as_ref().map(NodeUrl::authority)
+    }
+
+    /// Whether a live phone-home tunnel is carrying this machine right now.
+    #[must_use]
+    pub fn tunnel_online(&self) -> bool {
+        self.tunnel
+            .as_ref()
+            .is_some_and(|registry| registry.is_connected(&self.id))
+    }
+
+    /// Waits until this machine's tunnel state changes, or forever for a
+    /// machine that never dials in.
+    ///
+    /// A machine that is only reachable through a tunnel would otherwise sit
+    /// out the full reconnect backoff after its node comes back.
+    async fn tunnel_changed(&self) {
+        match &self.tunnel {
+            Some(registry) => registry.changed().await,
+            None => std::future::pending().await,
+        }
     }
 
     #[must_use]
@@ -280,9 +393,9 @@ impl RemoteMachine {
         // timeout, a refusal, or a rejected status can never leave a detached
         // task holding the socket open. Ownership moves into the returned
         // stream only once the stream itself exists.
-        let (mut sender, guard) = self.connect().await?;
+        let (mut sender, guard, endpoint) = self.connect().await?;
         let request = self
-            .build(Method::GET, path)
+            .build(Method::GET, path, &endpoint)
             .header(header::ACCEPT, "text/event-stream")
             .body(Full::new(Bytes::new()))
             .context("failed to build a federated stream request")?;
@@ -311,9 +424,9 @@ impl RemoteMachine {
         body: Option<Vec<u8>>,
         timeout: Duration,
     ) -> Result<Bytes> {
-        let (mut sender, _guard) = self.connect().await?;
+        let (mut sender, _guard, endpoint) = self.connect().await?;
         let mut builder = self
-            .build(method, path)
+            .build(method, path, &endpoint)
             .header(header::ACCEPT, "application/json");
         if body.is_some() {
             builder = builder.header(header::CONTENT_TYPE, "application/json");
@@ -345,11 +458,19 @@ impl RemoteMachine {
         Ok(collected)
     }
 
-    fn build(&self, method: Method, path: &str) -> hyper::http::request::Builder {
+    fn build(
+        &self,
+        method: Method,
+        path: &str,
+        endpoint: &Endpoint,
+    ) -> hyper::http::request::Builder {
         let mut builder = Request::builder()
             .method(method)
-            .uri(self.url.request_target(path))
-            .header(header::HOST, self.url.authority())
+            .uri(endpoint.request_target(path))
+            // HTTP/2 carries the authority in `:authority` rather than a
+            // header, but the node validates `Host` on every request, so both
+            // transports present the same authority the same way.
+            .header(header::HOST, endpoint.authority())
             .header(header::USER_AGENT, USER_AGENT);
         if let Some(token) = &self.token {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {}", token.expose()));
@@ -357,10 +478,31 @@ impl RemoteMachine {
         builder
     }
 
-    async fn connect(&self) -> Result<(SendRequest, ConnectionGuard)> {
-        let target = (self.url.host().to_owned(), self.url.port());
+    /// Chooses a transport for one request.
+    ///
+    /// A live tunnel always wins: a machine that dials in is by definition the
+    /// one that knows it is reachable, and its address may be stale or
+    /// unroutable from here.
+    async fn connect(&self) -> Result<(Sender, ConnectionGuard, Endpoint)> {
+        if let Some(registry) = &self.tunnel
+            && let Some(sender) = registry.sender(&self.id)
+        {
+            // The tunnel's connection driver is owned by the registry, so this
+            // guard has nothing of its own to abort.
+            return Ok((
+                Sender::Tunnel(Box::new(sender)),
+                ConnectionGuard(None),
+                Endpoint::Tunnel,
+            ));
+        }
+        let url = self.url.as_ref().with_context(|| {
+            format!(
+                "machine {} has no live tunnel and no address to dial",
+                self.id
+            )
+        })?;
         let stream =
-            tokio::time::timeout(self.connect_timeout, connect_target(&target.0, target.1))
+            tokio::time::timeout(self.connect_timeout, connect_target(url.host(), url.port()))
                 .await
                 .with_context(|| {
                     format!(
@@ -368,19 +510,19 @@ impl RemoteMachine {
                         self.id, self.connect_timeout
                     )
                 })?
-                .with_context(|| format!("machine {} is unreachable at {}", self.id, self.url))?;
+                .with_context(|| format!("machine {} is unreachable at {url}", self.id))?;
         stream
             .set_nodelay()
             .context("failed to configure the federated socket")?;
+        let endpoint = Endpoint::Direct(url.clone());
         if let Some(tls) = &self.tls_client {
-            let server_name =
-                ServerName::try_from(self.url.host().to_owned()).with_context(|| {
-                    format!(
-                        "machine {} has an invalid TLS server name {}",
-                        self.id,
-                        self.url.host()
-                    )
-                })?;
+            let server_name = ServerName::try_from(url.host().to_owned()).with_context(|| {
+                format!(
+                    "machine {} has an invalid TLS server name {}",
+                    self.id,
+                    url.host()
+                )
+            })?;
             let stream =
                 tokio::time::timeout(self.connect_timeout, tls.connect(server_name, stream))
                     .await
@@ -392,7 +534,11 @@ impl RemoteMachine {
             let driver = tokio::spawn(async move {
                 let _ = connection.await;
             });
-            return Ok((sender, ConnectionGuard(driver)));
+            return Ok((
+                Sender::Direct(sender),
+                ConnectionGuard(Some(driver)),
+                endpoint,
+            ));
         }
         let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
@@ -400,7 +546,11 @@ impl RemoteMachine {
         let driver = tokio::spawn(async move {
             let _ = connection.await;
         });
-        Ok((sender, ConnectionGuard(driver)))
+        Ok((
+            Sender::Direct(sender),
+            ConnectionGuard(Some(driver)),
+            endpoint,
+        ))
     }
 }
 
@@ -636,19 +786,21 @@ fn routed_source(target: SocketAddr) -> Option<IpAddr> {
     Some(socket.local_addr().ok()?.ip())
 }
 
-type SendRequest = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
-
 /// Owns a spawned hyper connection driver and aborts it on drop.
 ///
 /// Every path that creates a connection holds one of these, so an error before
 /// the response is fully owned can never detach the driver task or leak its
-/// socket.
+/// socket. A tunneled request borrows a shared, registry-owned connection and
+/// therefore holds an empty guard: dropping one request must not tear down the
+/// multiplexed connection every other request is using.
 #[derive(Debug)]
-struct ConnectionGuard(JoinHandle<()>);
+struct ConnectionGuard(Option<JoinHandle<()>>);
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(driver) = &self.0 {
+            driver.abort();
+        }
     }
 }
 
@@ -819,6 +971,31 @@ pub fn backoff_delay(failures: u32) -> Duration {
     const MAX_MS: u64 = 30_000;
     let shift = failures.saturating_sub(1).min(16);
     Duration::from_millis((BASE_MS.saturating_mul(1_u64 << shift)).min(MAX_MS))
+}
+
+/// Spreads a reconnect delay over `[base / 2, base]`.
+///
+/// The deterministic backoff alone synchronizes every node that lost the same
+/// coordinator: they all sleep the identical interval and retry together, which
+/// is exactly the thundering herd a restarting coordinator can least afford.
+/// Jittering downward keeps the documented ceiling intact — the delay never
+/// grows past `backoff_delay` — while breaking the lockstep.
+///
+/// `rand` is a Pulse-only optional dependency, so the entropy comes from
+/// `getrandom`; a platform that cannot produce randomness falls back to the
+/// deterministic delay rather than failing to reconnect.
+#[must_use]
+pub fn jittered(base: Duration) -> Duration {
+    let millis = base.as_millis();
+    let half = u64::try_from(millis / 2).unwrap_or(u64::MAX);
+    if half == 0 {
+        return base;
+    }
+    let mut bytes = [0_u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        return base;
+    }
+    Duration::from_millis(half + u64::from_le_bytes(bytes) % half.saturating_add(1))
 }
 
 /// Consecutive-failure counter behind the reconnect backoff.
@@ -1002,7 +1179,15 @@ pub fn spawn_watcher(
             // from inside it, the moment a valid snapshot arrives.
             let error = watch_once(&control, &machine, &mut reconnect).await;
             control.mark_machine_offline(&machine.id, &format!("{error:#}"));
-            tokio::time::sleep(reconnect.record_failure()).await;
+            let delay = jittered(reconnect.record_failure());
+            // A machine that dials in has nothing to retry until it does, and
+            // everything to retry the moment it has. Waiting out the full
+            // backoff after its tunnel lands would leave it offline for up to
+            // half a minute for no reason.
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = machine.tunnel_changed() => {}
+            }
         }
     })
     .abort_handle()
@@ -1141,6 +1326,7 @@ mod tests {
             health: None,
             last_seen_ms: None,
             address: None,
+            tunnel: false,
             metrics: crate::metrics::MachineMetrics::default(),
         }
     }
@@ -1206,6 +1392,34 @@ mod tests {
             previous = delay;
         }
         assert_eq!(backoff_delay(u32::MAX), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn jitter_stays_inside_half_the_backoff_and_actually_varies() {
+        let mut seen = std::collections::BTreeSet::new();
+        for failures in 1..24_u32 {
+            let base = backoff_delay(failures);
+            for _ in 0..64 {
+                let delay = jittered(base);
+                assert!(
+                    delay >= base / 2,
+                    "jitter must not collapse {base:?} to nothing, got {delay:?}"
+                );
+                assert!(
+                    delay <= base,
+                    "jitter must never exceed the documented ceiling {base:?}, got {delay:?}"
+                );
+                seen.insert(delay.as_millis());
+            }
+        }
+        assert!(
+            seen.len() > 24,
+            "jitter must actually spread reconnects, saw {} distinct delays",
+            seen.len()
+        );
+        // A delay too small to halve has nothing to spread.
+        assert_eq!(jittered(Duration::from_millis(1)), Duration::from_millis(1));
+        assert_eq!(jittered(Duration::ZERO), Duration::ZERO);
     }
 
     #[test]

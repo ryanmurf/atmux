@@ -140,6 +140,15 @@ auto_apply = false
 # token_env = "ATMUX_LAN_TOKEN"
 # token_file = "~/.config/atmux/lan.token"
 
+# Dial out to a coordinator and stay controllable through that connection. This
+# is for a machine that has outbound HTTPS but no address a coordinator could
+# reach, such as a laptop away from home. The credential is the same federation
+# token the coordinator already holds for this machine; nothing new is granted.
+# [coordinator]
+# enabled = true
+# url = "https://atmux.example.com"
+# token_file = "~/.config/atmux/lan.token"
+
 # Optional credential accepted only for a trusted web reverse proxy. Keep this
 # distinct from [node]'s LAN federation token.
 # [web]
@@ -189,6 +198,14 @@ receive = false
 # label = "GPU box"
 # url = "https://gpu-box.tail1234.ts.net:7345"
 # token_env = "ATMUX_GPU_BOX_TOKEN"
+#
+# A machine that dials in instead. `url` may be omitted entirely when `tunnel`
+# is set; keep both to prefer the live tunnel and fall back to the address.
+# [[machines]]
+# id = "midnight"
+# label = "Midnight"
+# tunnel = true
+# token_file = "~/.config/atmux/midnight.token"
 "#;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -212,6 +229,8 @@ pub struct Config {
     #[serde(default)]
     pub discovery: DiscoveryConfig,
     #[serde(default)]
+    pub coordinator: CoordinatorConfig,
+    #[serde(default)]
     pub web: WebConfig,
     #[cfg(feature = "pulse")]
     #[serde(default)]
@@ -230,6 +249,21 @@ pub struct Config {
 #[serde(default)]
 pub struct DiscoveryConfig {
     pub enabled: bool,
+    pub token_env: Option<String>,
+    pub token_file: Option<PathBuf>,
+}
+
+/// Opt-in outbound tunnel to a coordinator this node cannot be dialed from.
+///
+/// The node dials the coordinator and then serves its own API back down the
+/// same connection. The credential is the federation token the coordinator
+/// already holds for this machine, so enabling this grants a coordinator
+/// nothing it could not already do over a reachable address.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CoordinatorConfig {
+    pub enabled: bool,
+    pub url: Option<String>,
     pub token_env: Option<String>,
     pub token_file: Option<PathBuf>,
 }
@@ -285,15 +319,23 @@ pub struct TlsConfig {
 }
 
 /// One trusted remote node. Credentials are referenced, never inlined.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MachineConfig {
     pub id: String,
     pub label: Option<String>,
-    pub url: String,
+    /// Address this coordinator dials. Optional only for a machine that dials
+    /// in instead; a machine with neither an address nor `tunnel` is rejected
+    /// rather than silently unreachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     #[serde(default)]
     pub token_env: Option<String>,
     #[serde(default)]
     pub token_file: Option<PathBuf>,
+    /// Accept an inbound phone-home tunnel from this machine. A live tunnel is
+    /// always preferred over `url`, so one entry works both at home and away.
+    #[serde(default)]
+    pub tunnel: bool,
 }
 
 impl Default for Config {
@@ -572,8 +614,17 @@ impl Config {
                     machine.id
                 );
             }
-            NodeUrl::parse(&machine.url)
-                .with_context(|| format!("invalid url for machine {}", machine.id))?;
+            match &machine.url {
+                Some(url) => {
+                    NodeUrl::parse(url)
+                        .with_context(|| format!("invalid url for machine {}", machine.id))?;
+                }
+                None if machine.tunnel => {}
+                None => bail!(
+                    "machine {} has no url; set one, or set tunnel = true so it dials in",
+                    machine.id
+                ),
+            }
         }
         if self.discovery.enabled {
             if self.node.id == LOCAL_MACHINE_ID {
@@ -604,7 +655,12 @@ impl Config {
             let urls = self
                 .machines
                 .iter()
-                .map(|machine| NodeUrl::parse(&machine.url).map(|url| (&machine.id, url)))
+                .filter_map(|machine| {
+                    machine
+                        .url
+                        .as_ref()
+                        .map(|url| NodeUrl::parse(url).map(|url| (&machine.id, url)))
+                })
                 .collect::<Result<Vec<_>>>()?;
             if let Some((id, _)) = urls
                 .iter()
@@ -622,6 +678,47 @@ impl Config {
         }
         if self.web.proxy_token_env.is_some() && self.web.proxy_token_file.is_some() {
             bail!("[web] sets both proxy_token_env and proxy_token_file; choose one");
+        }
+        self.validate_coordinator()
+    }
+
+    /// Rejects an outbound-tunnel configuration that could not authenticate or
+    /// could not be matched to a machine entry on the coordinator.
+    fn validate_coordinator(&self) -> Result<()> {
+        if !self.coordinator.enabled {
+            // A disabled block is inert, but a half-written one is a trap: the
+            // operator believes the node dials out and it silently does not.
+            if self.coordinator.url.is_some()
+                || self.coordinator.token_env.is_some()
+                || self.coordinator.token_file.is_some()
+            {
+                bail!("[coordinator] is configured but enabled = false; set enabled = true");
+            }
+            return Ok(());
+        }
+        if self.node.id == LOCAL_MACHINE_ID {
+            bail!(
+                "[coordinator] requires an explicit [node] id; it is the machine id the coordinator matches"
+            );
+        }
+        if self.coordinator.token_env.is_some() && self.coordinator.token_file.is_some() {
+            bail!("[coordinator] sets both token_env and token_file; choose one");
+        }
+        if self.coordinator.token_env.is_none() && self.coordinator.token_file.is_none() {
+            bail!(
+                "[coordinator] requires token_env or token_file; the tunnel is authenticated with this machine's federation token"
+            );
+        }
+        let url = self
+            .coordinator
+            .url
+            .as_deref()
+            .context("[coordinator] requires a url")?;
+        let url = NodeUrl::parse(url).context("invalid [coordinator] url")?;
+        if !url.is_https() && !url.is_loopback() {
+            bail!(
+                "[coordinator] url must be https://; the node's federation token travels over it"
+            );
         }
         Ok(())
     }
@@ -916,7 +1013,9 @@ impl Config {
         }
         for machine in &mut self.machines {
             machine.id = machine.id.trim().to_owned();
-            machine.url = machine.url.trim().to_owned();
+            if let Some(url) = &mut machine.url {
+                *url = url.trim().to_owned();
+            }
             if let Some(path) = &mut machine.token_file {
                 *path = expand_tilde(path);
             }
@@ -2807,6 +2906,171 @@ token_file = "/run/secrets/mini"
         let rendered = toml::to_string(&config).unwrap();
         assert!(!rendered.contains("Authorization"));
         assert!(rendered.contains("token_env"));
+    }
+
+    #[test]
+    fn a_machine_may_omit_its_url_only_when_it_dials_in() {
+        let dial_in: Config = toml::from_str(
+            r#"
+[[machines]]
+id = "midnight"
+tunnel = true
+token_file = "/run/secrets/midnight"
+"#,
+        )
+        .unwrap();
+        dial_in.validate_federation().unwrap();
+        assert!(dial_in.machines[0].url.is_none());
+        assert!(dial_in.machines[0].tunnel);
+
+        // Both is the point of the feature: prefer the tunnel, fall back home.
+        let both: Config = toml::from_str(
+            r#"
+[node]
+id = "hub"
+
+[node.tls]
+cert_file = "/run/atmux/node.crt"
+key_file = "/run/atmux/node.key"
+ca_file = "/run/atmux/ca.crt"
+
+[[machines]]
+id = "midnight"
+tunnel = true
+url = "https://192.168.0.9:7345"
+token_file = "/run/secrets/midnight"
+"#,
+        )
+        .unwrap();
+        both.validate_federation().unwrap();
+
+        // Neither is unreachable, and silence would be worse than an error.
+        let neither: Config = toml::from_str(
+            r#"
+[[machines]]
+id = "midnight"
+token_file = "/run/secrets/midnight"
+"#,
+        )
+        .unwrap();
+        let error = neither.validate_federation().unwrap_err().to_string();
+        assert!(error.contains("tunnel = true"), "{error}");
+
+        // An omitted url must not be serialized back as an empty string.
+        let rendered = toml::to_string(&dial_in).unwrap();
+        assert!(!rendered.contains("url ="), "{rendered}");
+        assert!(rendered.contains("tunnel = true"), "{rendered}");
+    }
+
+    #[test]
+    fn dialing_out_requires_an_identity_a_credential_and_https() {
+        let complete: Config = toml::from_str(
+            r#"
+[node]
+id = "midnight"
+
+[coordinator]
+enabled = true
+url = "https://atmux.example.com"
+token_file = "/run/secrets/midnight"
+"#,
+        )
+        .unwrap();
+        complete.validate_federation().unwrap();
+
+        // The coordinator matches on the node id, so the default is ambiguous.
+        let default_id: Config = toml::from_str(
+            r#"
+[coordinator]
+enabled = true
+url = "https://atmux.example.com"
+token_file = "/run/secrets/midnight"
+"#,
+        )
+        .unwrap();
+        assert!(
+            default_id
+                .validate_federation()
+                .unwrap_err()
+                .to_string()
+                .contains("explicit [node] id")
+        );
+
+        for (fragment, expected) in [
+            (
+                r#"
+[node]
+id = "midnight"
+
+[coordinator]
+enabled = true
+url = "https://atmux.example.com"
+"#,
+                "token_env or token_file",
+            ),
+            (
+                r#"
+[node]
+id = "midnight"
+
+[coordinator]
+enabled = true
+url = "https://atmux.example.com"
+token_env = "A"
+token_file = "/run/secrets/midnight"
+"#,
+                "choose one",
+            ),
+            (
+                r#"
+[node]
+id = "midnight"
+
+[coordinator]
+enabled = true
+token_file = "/run/secrets/midnight"
+"#,
+                "url",
+            ),
+            (
+                r#"
+[node]
+id = "midnight"
+
+[coordinator]
+enabled = true
+url = "http://atmux.example.com"
+token_file = "/run/secrets/midnight"
+"#,
+                "https",
+            ),
+            (
+                r#"
+[coordinator]
+url = "https://atmux.example.com"
+"#,
+                "enabled = true",
+            ),
+        ] {
+            let config: Config = toml::from_str(fragment).unwrap();
+            let error = config.validate_federation().unwrap_err().to_string();
+            assert!(error.contains(expected), "{expected} not in {error}");
+        }
+
+        // A loopback fixture stays usable for local development and tests.
+        let loopback: Config = toml::from_str(
+            r#"
+[node]
+id = "midnight"
+
+[coordinator]
+enabled = true
+url = "http://127.0.0.1:7345"
+token_file = "/run/secrets/midnight"
+"#,
+        )
+        .unwrap();
+        loopback.validate_federation().unwrap();
     }
 
     #[test]

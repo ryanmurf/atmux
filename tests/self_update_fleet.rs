@@ -129,9 +129,10 @@ fn coordinator_config(address: SocketAddr) -> Config {
     config.machines = vec![MachineConfig {
         id: "gpu-box".to_owned(),
         label: Some("GPU box".to_owned()),
-        url: format!("http://{address}"),
+        url: Some(format!("http://{address}")),
         token_env: None,
         token_file: None,
+        tunnel: false,
     }];
     config
 }
