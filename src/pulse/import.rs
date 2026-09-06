@@ -23,8 +23,9 @@ use crate::pulse::{
     error::{PulseError, PulseErrorKind, PulseResult},
     store::{
         AlertEventInput, ImportBatch, ImportProvenance, ImportedAlertEvent,
-        ImportedAlertSubscription, ImportedRow, MAX_IMPORT_BATCH_ROWS, PricingRule, Store,
-        StoredTokenTotals, TokenReconciliationKey,
+        ImportedAlertSubscription, ImportedRow, MAX_IMPORT_BATCH_ROWS,
+        MAX_IMPORT_RECONCILIATION_KEYS, PricingRule, Store, StoredTokenTotals,
+        TokenReconciliationKey,
     },
 };
 
@@ -632,13 +633,17 @@ async fn reconcile_tokens(
             profile: profile.clone(),
             day: day.clone(),
         })
-        .collect();
-    let mut target = store
-        .token_totals_by_keys(plan.target_account_id, keys)
-        .await?
-        .into_iter()
-        .map(|(key, totals)| ((key.profile, key.day), token_totals_from_store(totals)))
-        .collect::<BTreeMap<_, _>>();
+        .collect::<Vec<_>>();
+    let mut target = BTreeMap::new();
+    for chunk in keys.chunks(MAX_IMPORT_RECONCILIATION_KEYS) {
+        target.extend(
+            store
+                .token_totals_by_keys(plan.target_account_id, chunk.to_vec())
+                .await?
+                .into_iter()
+                .map(|(key, totals)| ((key.profile, key.day), token_totals_from_store(totals))),
+        );
+    }
     let rows = source
         .into_iter()
         .map(|((profile, day), source)| {

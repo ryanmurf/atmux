@@ -2947,13 +2947,15 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       ],
     };
     await waitFor(
-      () => cdp.evaluate("document.querySelectorAll('#conversation .tool-call-group').length === 4"),
+      () => cdp.evaluate("document.querySelectorAll('#conversation .tool-call-group:not(.tool-run-group)').length === 4"),
       "internal tool runs did not collapse on mobile",
       5_000,
     );
     const compactTools = await cdp.evaluate(`(() => {
       const conversation = document.getElementById('conversation');
-      const groups = [...conversation.querySelectorAll('.tool-call-group')];
+      // Folded runs of ordinary tool cards are a separate row type; these
+      // assertions are about the internal exec/coordination groups.
+      const groups = [...conversation.querySelectorAll('.tool-call-group:not(.tool-run-group)')];
       const first = groups[0];
       const bounds = conversation.getBoundingClientRect();
       conversation.scrollTop += first.getBoundingClientRect().top - bounds.top - 18;
@@ -2982,7 +2984,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
         ]
           .every((id) => {
             const node = conversation.querySelector('[data-transcript-id="' + id + '"]');
-            return Boolean(node) && !node.closest('.tool-call-group');
+            return Boolean(node) && !node.closest('.tool-call-group:not(.tool-run-group)');
           }),
         fileReaderPreferences: localStorage.getItem('atmux.file-reader-preferences'),
         markupInjected: Boolean(conversation.querySelector('img, script')),
@@ -3016,7 +3018,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
 
     const expandedExec = await cdp.evaluate(`(() => {
       const conversation = document.getElementById('conversation');
-      const group = [...conversation.querySelectorAll('.tool-call-group')]
+      const group = [...conversation.querySelectorAll('.tool-call-group:not(.tool-run-group)')]
         .find((node) => node.querySelector(':scope > summary').textContent === 'exec ×4');
       const summary = group.querySelector(':scope > summary');
       summary.click();
@@ -3042,7 +3044,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     // the new Conversation generation.
     const staleExpansionSetup = await cdp.evaluate(`(() => {
       const conversation = document.getElementById('conversation');
-      const group = conversation.querySelector('.tool-call-group');
+      const group = conversation.querySelector('.tool-call-group:not(.tool-run-group)');
       group.dataset.oldGeneration = 'true';
       const original = window.requestAnimationFrame;
       window.__staleToolExpansionCallbacks = [];
@@ -3062,7 +3064,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       base_revision: 999, revision: 1_000, start_line: 0, delete_lines: 0, lines: [],
     })}\n\n`);
     await waitFor(
-      () => cdp.evaluate("document.getElementById('stream-state').textContent === 'Live' && document.querySelectorAll('#conversation .tool-call-group:not([data-old-generation])').length === 4"),
+      () => cdp.evaluate("document.getElementById('stream-state').textContent === 'Live' && document.querySelectorAll('#conversation .tool-call-group:not(.tool-run-group):not([data-old-generation])').length === 4"),
       "same-pane reconnect did not replace the old tool group generation",
       5_000,
     );
@@ -3078,7 +3080,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
         before,
         after: conversation.scrollTop,
         oldConnected: Boolean(document.querySelector('[data-old-generation]')),
-        groupCount: document.querySelectorAll('#conversation .tool-call-group').length,
+        groupCount: document.querySelectorAll('#conversation .tool-call-group:not(.tool-run-group)').length,
       };
     })()`);
     assert.equal(staleExpansionResult.oldConnected, false, JSON.stringify(staleExpansionResult));
@@ -3152,7 +3154,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       return {
         humans: conversation.querySelectorAll('[data-transcript-visibility="human"]').length,
         agents: conversation.querySelectorAll('[data-transcript-visibility="agent"]').length,
-        groups: conversation.querySelectorAll('.tool-call-group').length,
+        groups: conversation.querySelectorAll('.tool-call-group:not(.tool-run-group)').length,
         targetOffset: target.getBoundingClientRect().top - bounds.top,
         indicator: document.getElementById('conversation-filters-indicator').textContent,
         active: document.getElementById('conversation-filters-open').classList.contains('active'),
@@ -3300,7 +3302,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     );
     const groupClearedOnPaneChange = await cdp.evaluate(`(() => {
       document.querySelector('.session-button[data-session-id="midnight~%5"]').click();
-      return !document.querySelector('#conversation .tool-call-group');
+      return !document.querySelector('#conversation .tool-call-group:not(.tool-run-group)');
     })()`);
     assert.equal(groupClearedOnPaneChange, true, "pane A tool group remained visible under pane B");
     await waitFor(
@@ -3412,7 +3414,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       const bounds = conversation.getBoundingClientRect();
       return {
         offset: singleton.getBoundingClientRect().top - bounds.top,
-        singletonOutsideGroup: !singleton.closest('.tool-call-group'),
+        singletonOutsideGroup: !singleton.closest('.tool-call-group:not(.tool-run-group)'),
         humanRestored: conversation.textContent.includes('Human boundary between exec calls'),
         splitGroupMembers: JSON.parse(
           conversation.querySelector('[data-transcript-id="tool-group:anchor-exec-2"]')

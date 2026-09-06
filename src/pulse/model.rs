@@ -13,11 +13,11 @@ use super::{
 const MAX_PROFILE_NAME_BYTES: usize = 128;
 const MAX_MACHINE_NAME_BYTES: usize = 255;
 const MAX_SESSION_ID_BYTES: usize = 512;
-const MAX_MODEL_NAME_BYTES: usize = 256;
+pub(crate) const MAX_MODEL_NAME_BYTES: usize = 256;
 pub const MIN_PROFILE_POLL_MINUTES: u32 = 5;
 pub const MAX_PROFILE_POLL_MINUTES: u32 = 7 * 24 * 60;
 
-fn validate_text(kind: &str, value: &str, max_bytes: usize) -> PulseResult<()> {
+pub(crate) fn validate_text(kind: &str, value: &str, max_bytes: usize) -> PulseResult<()> {
     if value.is_empty() {
         return Err(PulseError::invalid_input(format!("{kind} cannot be empty")));
     }

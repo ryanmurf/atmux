@@ -51,6 +51,8 @@ const {
   memoryLimitChoices,
   parseMemoryLimitSelection,
   followsLiveTail,
+  stickyBottomState,
+  STICKY_BOTTOM_TOLERANCE,
   formatUptime,
   formatRelativeTime,
   groupSessionsByMachine,
@@ -151,9 +153,18 @@ const {
   execResultClass,
   toolResultSignal,
   collapsibleCoordinationTool,
+  collapsibleToolRun,
   internalToolGroupKey,
   compactTranscriptItems,
+  coordinationGroupSummary,
   toolGroupSummary,
+  groupRepeatedTools,
+  toolDisplayName,
+  toolRunGroupSummary,
+  formatTokenCount,
+  linkifyTokens,
+  trimmedAutolink,
+  transcriptRoleLabel,
   diffLineKind,
   utf8ByteLength,
   validateImageSelection,
@@ -261,7 +272,7 @@ test("live tail following requires the reader to remain at the actual tail", () 
 test("streaming redraws use semantic transcript anchors and explicit reader intent", () => {
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
   const css = readFileSync(new URL("./app.css", import.meta.url), "utf8");
-  assert.match(source, /const shouldFollow = state\.transcriptFollowing\s*&& followsLiveTail\(conversation, LIVE_TAIL_TOLERANCE\)/s);
+  assert.match(source, /const sticky = stickyBottomState\(conversation, state\.transcriptFollowing, !conversation\.hidden\);\s*const shouldFollow = sticky\.follow;/s);
   assert.match(source, /article\.dataset\.transcriptId = String\(message\.id \|\| ""\)/);
   assert.match(source, /restoreTranscriptReadingAnchor\(conversation, readingAnchor, readingOffset\)/);
   assert.match(source, /details\.dataset\.transcriptMembers = JSON\.stringify/);
@@ -282,6 +293,48 @@ test("streaming redraws use semantic transcript anchors and explicit reader inte
   assert.match(source, /if \(pane\.hidden\) return;\s*state\.paneReadingScrollTop = pane\.scrollTop;/s);
   assert.match(css, /#pane \{[^}]*height: 100%;[^}]*min-height: 0;[^}]*max-height: 100%;[^}]*overflow: auto;[^}]*overscroll-behavior: contain;[^}]*overflow-anchor: none;/s);
   assert.match(css, /\.conversation \{[^}]*overscroll-behavior: contain;/s);
+  assert.match(source, /const revealConversation = conversationMode && conversation\.hidden/);
+  assert.match(source, /if \(revealConversation\) \{\s*if \(state\.transcriptFollowing\) scrollConversationToBottom\(\);/s);
+  assert.match(source, /state\.transcriptFollowing = followsLiveTail\(conversation, STICKY_BOTTOM_TOLERANCE\)/);
+  assert.match(css, /\.terminal-shell \{ position: relative;/);
+  assert.match(css, /\.conversation-jump \{[^}]*position: absolute;/s);
+});
+
+test("sticky bottom keeps reader intent while the transcript has no measurable box", () => {
+  const hidden = { scrollHeight: 0, scrollTop: 0, clientHeight: 0 };
+  assert.deepEqual(
+    stickyBottomState(hidden, true, false),
+    { measurable: false, follow: true, deferBottom: true, showJump: false },
+  );
+  // A laid-out element inside a hidden ancestor still reports no height, so the
+  // pane must defer its jump to the tail instead of silently landing at the top.
+  assert.deepEqual(
+    stickyBottomState(hidden, true, true),
+    { measurable: false, follow: true, deferBottom: true, showJump: false },
+  );
+  assert.deepEqual(
+    stickyBottomState(hidden, false, false),
+    { measurable: false, follow: false, deferBottom: false, showJump: false },
+  );
+});
+
+test("sticky bottom pins within tolerance and offers the jump pill above it", () => {
+  const parked = { scrollHeight: 2_000, scrollTop: 1_580, clientHeight: 400 };
+  assert.deepEqual(
+    stickyBottomState(parked, true, true),
+    { measurable: true, follow: true, deferBottom: false, showJump: false },
+  );
+  assert.equal(STICKY_BOTTOM_TOLERANCE, 24);
+  const reading = { scrollHeight: 2_000, scrollTop: 1_000, clientHeight: 400 };
+  assert.deepEqual(
+    stickyBottomState(reading, true, true),
+    { measurable: true, follow: false, deferBottom: false, showJump: true },
+  );
+  // Reader intent alone never drags a scrolled-back reader to the tail.
+  assert.deepEqual(
+    stickyBottomState(parked, false, true),
+    { measurable: true, follow: false, deferBottom: false, showJump: true },
+  );
 });
 
 test("tool-group anchor membership is bounded and malformed hints fail closed", () => {
@@ -672,8 +725,13 @@ test("meaningful non-exec tools never collapse even when repeated", () => {
     tool_output: index === 1 ? "ok" : "completed",
   })));
   assert.ok(calls.every((item) => internalToolGroupKey(item) === null));
+  // Internal grouping still declines them, so they never become an `exec ×N`
+  // row; the reader-facing fold of an uninterrupted run keeps every call, in
+  // order, one disclosure away.
+  const compacted = compactTranscriptItems(calls);
+  assert.deepEqual(compacted.map((item) => item.kind), ["tool-run"]);
   assert.deepEqual(
-    compactTranscriptItems(calls).map((item) => item.message.id),
+    compacted.flatMap((item) => item.messages.map((message) => message.id)),
     calls.map((item) => item.id),
   );
 });
@@ -731,6 +789,72 @@ test("coordination groups are bounded at 24 and preserve every call in exact ord
   assert.ok(groups.every((group) => group.messages.length >= 2 && group.messages.length <= 24));
 });
 
+test("repeated default-collapsed tool calls fold into one keyed row with summed usage", () => {
+  const tool = (id, name, extra = {}) => ({ id, kind: "tool", role: "tool", tool_name: name, ...extra });
+  const messages = [
+    { id: "human", role: "user", markdown: "Please look around" },
+    tool("bash-1", "Bash", { tool_output: "ok", input_tokens: 12_000, output_tokens: 600 }),
+    tool("bash-2", "Bash", { tool_output: "ok", input_tokens: 300, output_tokens: 500 }),
+    tool("bash-3", "Bash", { tool_output: "ok" }),
+    tool("bash-4", "Bash", { tool_output: "Error: command not found" }),
+    tool("read-1", "Read", { tool_output: "contents" }),
+    tool("edit-1", "mcp__files__Edit", { tool_output: "written" }),
+    tool("grep-1", "Grep", { tool_output: "match" }),
+  ];
+  const items = compactTranscriptItems(messages);
+  assert.deepEqual(items.map((item) => item.kind), ["item", "tool-run", "item", "tool-run"]);
+  // The key comes from the first entry so the reading anchor survives a redraw.
+  assert.equal(items[1].id, "tool-run:bash-1");
+  assert.deepEqual(items[1].messages.map((item) => item.id), ["bash-1", "bash-2", "bash-3"]);
+  assert.equal(items[2].message.id, "bash-4", "an error result keeps its own row");
+  assert.equal(toolRunGroupSummary(items[1]), "Bash ×3 · 12.3k in · 1.1k out");
+  assert.equal(coordinationGroupSummary(items[1]), toolRunGroupSummary(items[1]));
+  assert.equal(toolRunGroupSummary(items[3]), "Tools ×3");
+  assert.equal(toolDisplayName(messages[6]), "Edit");
+  assert.deepEqual([1, 999, 1_000, 12_345, 1_500_000].map(formatTokenCount), ["1", "999", "1k", "12.3k", "1.5M"]);
+  assert.equal(collapsibleToolRun({ role: "assistant", markdown: "prose" }), false);
+  assert.deepEqual(groupRepeatedTools([]), []);
+});
+
+test("bare URLs linkify as checked anchors without swallowing surrounding prose", () => {
+  assert.deepEqual(linkifyTokens("see https://atmux.dev/docs, then stop"), [
+    { type: "text", text: "see " },
+    { type: "link", text: "https://atmux.dev/docs", url: "https://atmux.dev/docs" },
+    { type: "text", text: ", then stop" },
+  ]);
+  assert.deepEqual(linkifyTokens("(https://atmux.dev/a_(b))")[1], {
+    type: "link", text: "https://atmux.dev/a_(b)", url: "https://atmux.dev/a_(b)",
+  });
+  assert.equal(trimmedAutolink("https://atmux.dev/x)."), "https://atmux.dev/x");
+  assert.deepEqual(linkifyTokens("javascript:alert(1) and file:///etc/passwd"), [
+    { type: "text", text: "javascript:alert(1) and file:///etc/passwd" },
+  ]);
+  assert.deepEqual(linkifyTokens("<img src=x onerror=alert(1)>"), [
+    { type: "text", text: "<img src=x onerror=alert(1)>" },
+  ]);
+  assert.deepEqual(linkifyTokens(""), []);
+  const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  const linkify = source.slice(source.indexOf("function linkifyInto"), source.indexOf("function highlightCode"));
+  assert.match(linkify, /document\.createTextNode\(token\.text\)/);
+  assert.match(linkify, /anchor\.rel = "noopener noreferrer"/);
+  assert.match(linkify, /anchor\.target = "_blank"/);
+  assert.doesNotMatch(linkify, /innerHTML/);
+});
+
+test("subagent turns are labelled as the subagent and never as the operator", () => {
+  assert.equal(transcriptRoleLabel({ role: "user" }), "You");
+  assert.equal(transcriptRoleLabel({ role: "assistant" }), "Agent");
+  assert.equal(transcriptRoleLabel({ role: "subagent" }), "Subagent");
+  assert.equal(transcriptRoleLabel({ role: "subagent", agent_name: "Explore" }), "Subagent · Explore");
+  const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  const css = readFileSync(new URL("./app.css", import.meta.url), "utf8");
+  // Subagent prose shares the Internal visibility bucket, so it stays hideable
+  // while keeping its own attribution and card styling.
+  assert.equal(transcriptVisibilityKind({ role: "subagent", markdown: "report" }), "internal");
+  assert.match(source, /label\.textContent = transcriptRoleLabel\(message\)/);
+  assert.match(css, /\.message-card\.subagent/);
+});
+
 test("tool summaries normalize namespaces and expose per-tool counts", () => {
   const messages = [
     { id: "a", kind: "tool", tool_name: "functions.collaboration.wait_agent" },
@@ -747,9 +871,9 @@ test("coordination compaction stays inside Conversation and uses text-only DOM r
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
   const renderer = source.slice(source.indexOf("function renderToolCard"), source.indexOf("function flushPendingTranscriptRender"));
   assert.match(renderer, /compactTranscriptItems\(/);
-  assert.match(renderer, /summary\.textContent = toolGroupSummary\(group\)/);
+  assert.match(renderer, /summary\.textContent = coordinationGroupSummary\(group\)/);
   assert.match(renderer, /\$\{summary\.textContent\}; \$\{group\.messages\.length\} calls and results/);
-  assert.match(renderer, /pre\.textContent = value/);
+  assert.match(renderer, /linkifyInto\(pre, value\)/);
   assert.match(renderer, /state\.transcriptRequest === transcriptGeneration/);
   assert.match(renderer, /details\.isConnected/);
   assert.match(renderer, /details\.closest\("#conversation"\) === conversation/);
@@ -1299,7 +1423,7 @@ test("conversation items distinguish compact tool calls from chat messages", () 
   assert.equal(transcriptItemKind({ role: "tool" }), "tool");
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
   assert.match(source, /details\.className = "tool-card"/);
-  assert.match(source, /pre\.textContent = value/);
+  assert.match(source, /linkifyInto\(pre, value\)/);
   assert.doesNotMatch(source, /tool_(?:input|output).*innerHTML/);
 });
 

@@ -2875,45 +2875,51 @@ impl ControlPlane {
                         .map(|session| (session.content.clone(), session.profile.clone()))
                         .ok_or_else(|| not_found(format!("no agent session matches {id}")))?
                 };
-                let observation = Tmux.model_observation(&pane_id, agent, &content);
-                let capabilities = model_capabilities(
-                    self.local_identity(&pane_id),
-                    agent,
-                    &profile_name,
-                    observation,
-                    &self.inner.config.profiles,
-                );
-                let choice = capabilities
-                    .models
-                    .iter()
-                    .find(|choice| choice.id == request.mode_id)
-                    .ok_or_else(|| {
-                        bad_request(format!(
-                            "mode {} is not reported by this pane's owning machine",
-                            request.mode_id
-                        ))
-                    })?;
-                if !choice.switchable {
-                    return Err(conflict(format!(
-                        "mode {} is available only when launching a new {} session",
-                        request.mode_id, capabilities.harness
-                    )));
-                }
-                let version =
-                    capabilities.version.ok_or_else(|| {
-                        conflict(capabilities.note.unwrap_or_else(|| {
-                            "the running CLI version is not observable".to_owned()
-                        }))
-                    })?;
-                let mode = profile_for_session(&self.inner.config.profiles, agent, &profile_name)
-                    .and_then(|profile| {
-                        profile.modes.iter().find(|mode| mode.id == request.mode_id)
-                    })
-                    .cloned()
-                    .ok_or_else(|| bad_request("the pane profile no longer defines that mode"))?;
                 let prompt_lock = self.prompt_lock(&pane_id);
+                let identity = self.local_identity(&pane_id);
+                let inner = Arc::clone(&self.inner);
+                let mode_id = request.mode_id.clone();
                 local_model_switch(
                     tokio::task::spawn_blocking(move || {
+                        // Observing the pane runs several tmux subprocesses, so
+                        // it stays on this blocking thread ahead of the gate.
+                        let observation = Tmux.model_observation(&pane_id, agent, &content);
+                        let capabilities = model_capabilities(
+                            identity,
+                            agent,
+                            &profile_name,
+                            observation,
+                            &inner.config.profiles,
+                        );
+                        let choice = capabilities
+                            .models
+                            .iter()
+                            .find(|choice| choice.id == mode_id)
+                            .ok_or_else(|| {
+                                bad_request(format!(
+                                    "mode {mode_id} is not reported by this pane's owning machine"
+                                ))
+                            })?;
+                        if !choice.switchable {
+                            return Err(conflict(format!(
+                                "mode {mode_id} is available only when launching a new {} session",
+                                capabilities.harness
+                            )));
+                        }
+                        let version = capabilities.version.ok_or_else(|| {
+                            conflict(capabilities.note.unwrap_or_else(|| {
+                                "the running CLI version is not observable".to_owned()
+                            }))
+                        })?;
+                        let mode =
+                            profile_for_session(&inner.config.profiles, agent, &profile_name)
+                                .and_then(|profile| {
+                                    profile.modes.iter().find(|mode| mode.id == mode_id)
+                                })
+                                .cloned()
+                                .ok_or_else(|| {
+                                    bad_request("the pane profile no longer defines that mode")
+                                })?;
                         let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
                         let mut guard = prompt_lock
                             .state
@@ -3395,7 +3401,6 @@ impl ControlPlane {
                         requested_memory_max_bytes,
                         &name,
                     )?;
-                    project::remember_launch(&directory, &name, &profile)?;
                     match (resume.as_ref(), launch_lease.as_deref()) {
                         (Some(candidate), Some(lease)) => Tmux::launch_resumed(
                             &name,
@@ -3419,7 +3424,9 @@ impl ControlPlane {
                 {
                     guard.activate();
                 }
-                launched
+                // A launch that never happened must not overwrite the project's
+                // recorded launch preference.
+                launched.and_then(|()| project::remember_launch(&directory, &name, &profile))
             })
             .await,
         );
@@ -4179,6 +4186,9 @@ fn local_model_switch(
         {
             Err(conflict(format!("{error:#}")))
         }
+        // The pre-flight capability checks now run on the blocking thread, so
+        // their already-classified rejections keep their caller-facing status.
+        Ok(Err(error)) if !matches!(error_kind(&error), ErrorKind::Internal) => Err(error),
         Ok(Err(error)) => Err(internal(&error)),
         Err(error) => Err(internal(
             &anyhow::Error::new(error).context("a model switch task panicked"),
@@ -6320,7 +6330,7 @@ mod tests {
             AgentKind::Codex,
             "Pinned",
             crate::tmux::ModelObservation {
-                version: Some("0.999.0".to_owned()),
+                version: Some("0.99.0".to_owned()),
                 current: Some("gpt-5.4".to_owned()),
                 effort: None,
                 mode: None,

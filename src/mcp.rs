@@ -298,7 +298,13 @@ impl AtmuxMcp {
         description = "List per-machine project directories, agent profiles, and bounded memory choices accepted by agent_launch. Offline machines report a note instead of inputs."
     )]
     async fn agents_launch_options(&self) -> Result<String, String> {
-        serde_json::to_string(&self.control.launch_options()).map_err(|error| error.to_string())
+        // Building the options walks project roots and reads `.atmux.toml`, so
+        // it must not run on the async runtime thread.
+        let control = self.control.clone();
+        let options = tokio::task::spawn_blocking(move || control.launch_options())
+            .await
+            .map_err(|error| error.to_string())?;
+        serde_json::to_string(&options).map_err(|error| error.to_string())
     }
 
     #[tool(

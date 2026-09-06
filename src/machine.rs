@@ -272,6 +272,9 @@ fn parse_authority(authority: &str, secure: bool) -> Result<(String, u16, bool)>
         {
             bail!("machine url has an invalid IPv6 literal");
         }
+        if !tail.is_empty() && !tail.starts_with(':') {
+            bail!("machine url has trailing characters after the IPv6 literal");
+        }
         let port = parse_port(tail.strip_prefix(':'), secure)?;
         return Ok((host.to_ascii_lowercase(), port, true));
     }

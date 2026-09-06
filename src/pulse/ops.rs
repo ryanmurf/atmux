@@ -1260,6 +1260,7 @@ async fn append_profile_report_rows(
             scope.account_id,
             Some(profile.name.clone()),
             scope.token_since.clone(),
+            None,
             assembly.remaining,
         )
         .await?;

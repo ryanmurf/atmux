@@ -526,13 +526,62 @@ impl StoreReporterCoordinator {
                 self.destination_key.clone(),
             )
             .await?;
-        self.report_usage_pages(account_id, &mut state, cancellation, &mut outcome)
+        self.drain_reporter_pending(account_id, &mut state, cancellation, &mut outcome)
             .await?;
+        if !outcome.cancelled {
+            self.report_usage_pages(account_id, &mut state, cancellation, &mut outcome)
+                .await?;
+        }
         if !outcome.cancelled {
             self.report_token_pages(account_id, &mut state, cancellation, &mut outcome)
                 .await?;
         }
         Ok(outcome)
+    }
+
+    /// Sends and commits every already durable outbox page before either stream
+    /// prepares a new one, so no kind's page is stranded by a cursor advance.
+    async fn drain_reporter_pending(
+        &self,
+        account_id: AccountId,
+        state: &mut ReporterCursorState,
+        cancellation: &mut watch::Receiver<bool>,
+        outcome: &mut ReporterOutcome,
+    ) -> PulseResult<()> {
+        for kind in [ReporterStreamKind::Usage, ReporterStreamKind::Token] {
+            let Some(pending) = self
+                .store
+                .load_reporter_pending(
+                    account_id,
+                    self.machine.clone(),
+                    self.destination_key.clone(),
+                    kind,
+                )
+                .await?
+            else {
+                continue;
+            };
+            ensure_pending_expected(&pending, state)?;
+            let sent = self
+                .reporter
+                .report_pending_page(&pending, cancellation)
+                .await?;
+            add_outcome(outcome, sent);
+            if sent.cancelled {
+                break;
+            }
+            *state = self
+                .store
+                .commit_reporter_pending(
+                    account_id,
+                    self.machine.clone(),
+                    self.destination_key.clone(),
+                    kind,
+                    pending.id,
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     async fn assemble_metadata(&self, account_id: AccountId) -> PulseResult<PushBatch> {

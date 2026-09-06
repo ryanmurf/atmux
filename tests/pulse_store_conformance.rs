@@ -469,6 +469,88 @@ fn reporter_usage_pending_draft(
     }
 }
 
+fn reporter_token_pending_draft(
+    account: AccountId,
+    machine: MachineName,
+    expected: ReporterCursorState,
+    next: ReporterCursorState,
+    grain: TokenGrain,
+) -> ReporterPendingDraft {
+    let request_id = "push-store-conformance-token".to_owned();
+    let body = PushEnvelope {
+        version: PUSH_VERSION,
+        request_id: request_id.clone(),
+        reporter_version: REPORTER_VERSION.to_owned(),
+        account_id: Some(account),
+        machine: Some(machine),
+        batch: PushBatch {
+            token_grains: vec![grain],
+            ..PushBatch::default()
+        },
+    }
+    .encode()
+    .expect("encode reporter token outbox page");
+    ReporterPendingDraft {
+        kind: ReporterStreamKind::Token,
+        expected,
+        next,
+        chunks: vec![ReporterPendingChunk {
+            request_id,
+            body,
+            rows: 1,
+        }],
+    }
+}
+
+/// A durable page of one stream must block the other stream from preparing,
+/// so no page is stranded behind a cursor the other stream already advanced.
+async fn reject_other_kind_reporter_outbox(
+    store: &dyn Store,
+    account: AccountId,
+    destination: &str,
+    expected: ReporterCursorState,
+) {
+    let grains = store
+        .local_reporter_token_page(account, machine_name("midnight"), None, 500)
+        .await
+        .expect("load outbox tokens");
+    let mut token_next = expected.clone();
+    token_next.token_after =
+        Some(ReporterTokenPosition::from_grain(&grains[0]).expect("token position"));
+    let blocked = reporter_token_pending_draft(
+        account,
+        machine_name("midnight"),
+        expected,
+        token_next,
+        grains[0].clone(),
+    );
+    assert_eq!(
+        store
+            .prepare_reporter_pending(
+                account,
+                machine_name("midnight"),
+                destination.to_owned(),
+                blocked,
+            )
+            .await
+            .expect_err("a pending page of another kind must block preparation")
+            .kind(),
+        PulseErrorKind::Conflict
+    );
+    assert_eq!(
+        store
+            .load_reporter_pending(
+                account,
+                machine_name("midnight"),
+                destination.to_owned(),
+                ReporterStreamKind::Token,
+            )
+            .await
+            .expect("reload blocked token outbox"),
+        None
+    );
+}
+
 async fn roundtrip_reporter_outbox(
     store: &dyn Store,
     account: AccountId,
@@ -500,7 +582,7 @@ async fn roundtrip_reporter_outbox(
     let draft = reporter_usage_pending_draft(
         account,
         machine_name("midnight"),
-        expected,
+        expected.clone(),
         next.clone(),
         page[0].snapshot.clone(),
     );
@@ -525,6 +607,7 @@ async fn roundtrip_reporter_outbox(
             .expect("reload reporter outbox"),
         Some(pending.clone())
     );
+    reject_other_kind_reporter_outbox(store, account, destination, expected).await;
     let stored = store
         .commit_reporter_pending(
             account,
@@ -675,7 +758,7 @@ async fn token_backfill_pages_are_atomic_resumable_and_generation_scoped() {
     assert_eq!(
         database
             .store
-            .list_token_grains(account, Some(profile.clone()), None, 10)
+            .list_token_grains(account, Some(profile.clone()), None, None, 10)
             .await
             .expect("tokens after stale page")
             .len(),
@@ -731,7 +814,7 @@ async fn token_backfill_pages_are_atomic_resumable_and_generation_scoped() {
     assert_eq!(
         database
             .store
-            .list_token_grains(account, Some(profile.clone()), None, 10)
+            .list_token_grains(account, Some(profile.clone()), None, None, 10)
             .await
             .expect("completed token rows")
             .len(),
@@ -2309,6 +2392,7 @@ async fn context_and_token_upserts_are_idempotent_freshness_aware_and_scoped() {
             one,
             Some(profile_name("claude")),
             Some("2026-08-01".to_owned()),
+            None,
             10,
         )
         .await
@@ -2318,7 +2402,38 @@ async fn context_and_token_upserts_are_idempotent_freshness_aware_and_scoped() {
     assert!(
         database
             .store
-            .list_token_grains(two, None, None, 10)
+            .list_token_grains(
+                one,
+                Some(profile_name("claude")),
+                Some("2026-08-01".to_owned()),
+                Some("2026-08-07".to_owned()),
+                10,
+            )
+            .await
+            .expect("bounded tokens")
+            .is_empty(),
+        "grains after through_day must be excluded"
+    );
+    assert_eq!(
+        database
+            .store
+            .list_token_grains(
+                one,
+                Some(profile_name("claude")),
+                Some("2026-08-01".to_owned()),
+                Some("2026-08-08".to_owned()),
+                10,
+            )
+            .await
+            .expect("inclusive tokens")
+            .len(),
+        1,
+        "through_day is inclusive"
+    );
+    assert!(
+        database
+            .store
+            .list_token_grains(two, None, None, None, 10)
             .await
             .expect("other tokens")
             .is_empty()
@@ -3132,7 +3247,7 @@ async fn ingest_caps_allow_at_cap_updates_and_rollback_the_whole_batch() {
     assert_eq!(
         database
             .store
-            .list_token_grains(account, None, None, 10)
+            .list_token_grains(account, None, None, None, 10)
             .await
             .expect("tokens")[0]
             .tokens_in,

@@ -256,7 +256,7 @@ fn profile_config_directory(profile: &AgentProfile, harness: ResumeHarness) -> R
         }
         return Ok(canonical);
     }
-    if profile.command != harness.as_str() {
+    if profile.command != harness.as_str() && !resolved_default_command(profile, harness) {
         bail!("saved-session discovery requires an explicit profile session store");
     }
     let home = env::var_os("HOME")
@@ -264,6 +264,15 @@ fn profile_config_directory(profile: &AgentProfile, harness: ResumeHarness) -> R
         .filter(|path| path.is_absolute())
         .ok_or_else(|| anyhow::anyhow!("agent session store is unavailable"))?;
     Ok(home.join(fallback))
+}
+
+/// Config load rewrites a bare `claude`/`codex` command to the discovered
+/// launcher, so the bare-command check above would otherwise never match a
+/// loaded default profile. Only that exact substitution is accepted here; a
+/// wrapper or unrelated path still requires an explicit store binding.
+fn resolved_default_command(profile: &AgentProfile, harness: ResumeHarness) -> bool {
+    crate::config::discovered_default_command(harness.as_str())
+        .is_some_and(|command| command == Path::new(&profile.command))
 }
 
 fn discover_claude(

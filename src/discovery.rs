@@ -146,25 +146,34 @@ fn reconcile(
     // A node id must be unique on the LAN. If a stale or hostile duplicate is
     // announced, choose deterministically so one multicast packet cannot make
     // the coordinator flap between endpoints.
-    let mut wanted = BTreeMap::<String, DiscoveredNode>::new();
-    for (node, _) in services.values() {
+    let mut wanted = BTreeMap::<String, (DiscoveredNode, Instant)>::new();
+    for (node, seen) in services.values() {
         wanted
             .entry(node.id.clone())
             .and_modify(|current| {
-                if node.fullname < current.fullname {
-                    *current = node.clone();
+                if node.fullname < current.0.fullname {
+                    *current = (node.clone(), *seen);
                 }
             })
-            .or_insert_with(|| node.clone());
+            .or_insert_with(|| (node.clone(), *seen));
     }
-    while wanted.len() > MAX_DISCOVERED_MACHINES {
-        wanted.pop_last();
+    // Trim by staleness, never by id order: an unauthenticated announcement
+    // that sorts low must not evict a machine that is still answering.
+    if wanted.len() > MAX_DISCOVERED_MACHINES {
+        let mut by_recency = wanted
+            .iter()
+            .map(|(id, (_, seen))| (*seen, id.clone()))
+            .collect::<Vec<_>>();
+        by_recency.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        for (_, id) in by_recency.into_iter().skip(MAX_DISCOVERED_MACHINES) {
+            wanted.remove(&id);
+        }
     }
     let wanted_ids = wanted.keys().cloned().collect::<BTreeSet<_>>();
     for id in active.difference(&wanted_ids).cloned().collect::<Vec<_>>() {
         control.remove_discovered_machine(&id);
     }
-    for node in wanted.values() {
+    for (node, _) in wanted.values() {
         if let Ok(machine) = RemoteMachine::from_discovery(
             node.id.clone(),
             node.label.clone(),
@@ -184,13 +193,16 @@ fn remember_service(
     node: DiscoveredNode,
     now: Instant,
 ) {
-    services.insert(node.fullname.clone(), (node, now));
-    while services.len() > MAX_DISCOVERED_SERVICES {
-        let Some(fullname) = services.keys().max().cloned() else {
-            break;
-        };
-        services.remove(&fullname);
+    if !services.contains_key(&node.fullname) {
+        expire_services(services, now);
+        // A full table is a flood of announcements. Refuse the new name
+        // instead of evicting a machine that is still being seen; expiry
+        // reopens capacity once an advertisement stops arriving.
+        if services.len() >= MAX_DISCOVERED_SERVICES {
+            return;
+        }
     }
+    services.insert(node.fullname.clone(), (node, now));
 }
 
 fn expire_services(services: &mut HashMap<String, (DiscoveredNode, Instant)>, now: Instant) {
@@ -292,6 +304,41 @@ mod tests {
         assert_eq!(instance_name("workstation"), instance_name("workstation"));
         assert_ne!(instance_name("workstation"), instance_name("gpu-box"));
         assert!(instance_name(&"a".repeat(32)).len() <= 30);
+    }
+
+    #[test]
+    fn a_full_service_table_refuses_a_new_announcement() {
+        let now = Instant::now();
+        let mut services = HashMap::new();
+        for index in 0..MAX_DISCOVERED_SERVICES {
+            remember_service(
+                &mut services,
+                DiscoveredNode {
+                    fullname: format!("atmux-{index:03}.{SERVICE_TYPE}"),
+                    id: format!("node-{index:03}"),
+                    label: format!("Node {index}"),
+                    address: Ipv4Addr::new(192, 168, 1, 8),
+                    port: 7345,
+                },
+                now,
+            );
+        }
+        // A name sorting below every live entry used to evict one of them.
+        let hostile = format!("atmux-000-flood.{SERVICE_TYPE}");
+        remember_service(
+            &mut services,
+            DiscoveredNode {
+                fullname: hostile.clone(),
+                id: "node-flood".to_owned(),
+                label: "Flood".to_owned(),
+                address: Ipv4Addr::new(192, 168, 1, 9),
+                port: 7345,
+            },
+            now,
+        );
+        assert_eq!(services.len(), MAX_DISCOVERED_SERVICES);
+        assert!(!services.contains_key(&hostile));
+        assert!(services.contains_key(&format!("atmux-063.{SERVICE_TYPE}")));
     }
 
     #[test]

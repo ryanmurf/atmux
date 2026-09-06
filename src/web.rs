@@ -366,7 +366,7 @@ pub async fn serve(
         .map(|token| discovery::start(&config, bind, control.clone(), token))
         .transpose()?;
     let hosts: Arc<[String]> = allowed_hosts(bind, extra_hosts).into();
-    let origins: Arc<[String]> = allowed_origins(bind, extra_origins).into();
+    let origins: Arc<[String]> = allowed_origins(bind, binding.tls.is_some(), extra_origins).into();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let state = WebState {
         control: control.clone(),
@@ -941,8 +941,18 @@ async fn sessions(State(state): State<WebState>) -> Json<Overview> {
     Json(state.control.overview())
 }
 
-async fn launch_options(State(state): State<WebState>) -> impl IntoResponse {
-    Json(state.control.launch_options())
+async fn launch_options(State(state): State<WebState>) -> Response {
+    // Building the options walks project roots and reads `.atmux.toml`, so it
+    // must not run on the async runtime thread.
+    let control = state.control.clone();
+    match tokio::task::spawn_blocking(move || control.launch_options()).await {
+        Ok(options) => Json(options).into_response(),
+        Err(_) => ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "the launch option lookup panicked".to_owned(),
+        }
+        .into_response(),
+    }
 }
 
 async fn launch_directories(
@@ -1577,23 +1587,55 @@ fn allowed_hosts(bind: SocketAddr, extra: Vec<String>) -> Vec<String> {
     values
 }
 
-fn allowed_origins(bind: SocketAddr, extra: Vec<String>) -> Vec<String> {
+/// Mirrors `listener_addresses`: the loopback listener always answers plain
+/// HTTP, while every network-reachable listener of a TLS bind answers HTTPS.
+fn allowed_origins(bind: SocketAddr, tls: bool, extra: Vec<String>) -> Vec<String> {
     let port = bind.port();
+    let scheme = if tls { "https" } else { "http" };
     let mut values = match bind.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => vec![
             format!("http://127.0.0.1:{port}"),
             format!("http://localhost:{port}"),
         ],
-        IpAddr::V6(ip) if ip.is_unspecified() => vec![format!("http://localhost:{port}")],
-        IpAddr::V6(ip) => vec![
+        IpAddr::V6(ip) if ip.is_unspecified() => vec![
+            format!("http://[::1]:{port}"),
+            format!("http://localhost:{port}"),
+        ],
+        IpAddr::V6(ip) if ip.is_loopback() => vec![
             format!("http://[{ip}]:{port}"),
             format!("http://localhost:{port}"),
         ],
-        IpAddr::V4(ip) => vec![
+        IpAddr::V6(ip) => vec![
+            format!("{scheme}://[{ip}]:{port}"),
+            format!("http://[::1]:{port}"),
+            format!("http://localhost:{port}"),
+        ],
+        IpAddr::V4(ip) if ip.is_loopback() => vec![
             format!("http://{ip}:{port}"),
             format!("http://localhost:{port}"),
         ],
+        IpAddr::V4(ip) => vec![
+            format!("{scheme}://{ip}:{port}"),
+            format!("http://127.0.0.1:{port}"),
+            format!("http://localhost:{port}"),
+        ],
     };
+    if bind.ip().is_unspecified() {
+        for interface in if_addrs::get_if_addrs().unwrap_or_default() {
+            let ip = interface.ip();
+            if ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_ipv4() != bind.ip().is_ipv4()
+            {
+                continue;
+            }
+            values.push(match ip {
+                IpAddr::V4(ip) => format!("{scheme}://{ip}:{port}"),
+                IpAddr::V6(ip) => format!("{scheme}://[{ip}]:{port}"),
+            });
+        }
+    }
     extend_unique(&mut values, extra);
     values
 }
@@ -1677,12 +1719,49 @@ mod tests {
     fn explicit_remote_host_and_origin_are_allowlisted() {
         let bind = "0.0.0.0:7345".parse().unwrap();
         let hosts = allowed_hosts(bind, vec!["tron.example.ts.net:7345".to_owned()]);
-        let origins = allowed_origins(bind, vec!["https://tron.example.ts.net:7345".to_owned()]);
+        let origins = allowed_origins(
+            bind,
+            true,
+            vec!["https://tron.example.ts.net:7345".to_owned()],
+        );
         assert!(hosts.iter().any(|host| host == "tron.example.ts.net:7345"));
         assert!(
             origins
                 .iter()
                 .any(|origin| origin == "https://tron.example.ts.net:7345")
+        );
+    }
+
+    #[test]
+    fn origins_follow_each_listener_scheme_and_loopback_form() {
+        let v6 = allowed_origins("[::]:7345".parse().unwrap(), true, Vec::new());
+        assert!(v6.iter().any(|origin| origin == "http://[::1]:7345"));
+        assert!(v6.iter().any(|origin| origin == "http://localhost:7345"));
+
+        let remote = allowed_origins("192.0.2.19:7345".parse().unwrap(), true, Vec::new());
+        assert!(
+            remote
+                .iter()
+                .any(|origin| origin == "https://192.0.2.19:7345")
+        );
+        assert!(
+            remote
+                .iter()
+                .any(|origin| origin == "http://127.0.0.1:7345")
+        );
+        assert!(
+            !remote
+                .iter()
+                .any(|origin| origin == "http://192.0.2.19:7345")
+        );
+
+        let local = allowed_origins("127.0.0.1:7345".parse().unwrap(), false, Vec::new());
+        assert_eq!(
+            local,
+            vec![
+                "http://127.0.0.1:7345".to_owned(),
+                "http://localhost:7345".to_owned()
+            ]
         );
     }
 

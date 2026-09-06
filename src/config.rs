@@ -912,11 +912,8 @@ impl Config {
 
     fn discover_profiles(&mut self) {
         let home = env::var_os("HOME").map(PathBuf::from);
-        let codex = find_program(
-            "codex",
-            &home.as_deref().map_or_else(Vec::new, codex_candidates),
-        );
-        let claude = current_claude_program();
+        let codex = discovered_default_command("codex");
+        let claude = discovered_default_command("claude");
         self.discover_profiles_from(home.as_deref(), codex.as_deref(), claude.as_deref());
     }
 
@@ -1072,6 +1069,23 @@ impl Config {
             .filter_map(|root| root.canonicalize().ok())
             .any(|root| requested == root || requested.starts_with(&root))
             .then_some(requested)
+    }
+}
+
+/// The stable launcher `resolve_configured_default_command` substitutes for a
+/// bare `claude`/`codex` command, so callers that only see the rewritten
+/// command can still recognize a resolved default profile.
+pub(crate) fn discovered_default_command(harness: &str) -> Option<PathBuf> {
+    match harness {
+        "codex" => {
+            let home = env::var_os("HOME").map(PathBuf::from);
+            find_program(
+                "codex",
+                &home.as_deref().map_or_else(Vec::new, codex_candidates),
+            )
+        }
+        "claude" => current_claude_program(),
+        _ => None,
     }
 }
 
@@ -1459,11 +1473,7 @@ fn normalize_profile_environment(env: &mut BTreeMap<String, String>) {
 }
 
 fn find_program(command: &str, candidates: &[PathBuf]) -> Option<PathBuf> {
-    program_on_path(command).or_else(|| {
-        candidates
-            .iter()
-            .find_map(|path| canonical_executable(path))
-    })
+    program_on_path(command).or_else(|| candidates.iter().find_map(|path| stable_executable(path)))
 }
 
 /// Resolves Claude for general profile discovery.
@@ -1501,13 +1511,13 @@ fn resolve_claude_program(path: Option<&OsStr>, home: Option<&Path>) -> Option<P
     path.and_then(|paths| {
         env::split_paths(paths)
             .map(|directory| directory.join("claude"))
-            .find_map(|candidate| canonical_executable(&candidate))
+            .find_map(|candidate| stable_executable(&candidate))
     })
     .or_else(|| {
         home.and_then(|home| {
             claude_candidates(home)
                 .iter()
-                .find_map(|candidate| canonical_executable(candidate))
+                .find_map(|candidate| stable_executable(candidate))
         })
     })
 }
@@ -1593,13 +1603,20 @@ fn program_on_path(command: &str) -> Option<PathBuf> {
     env::var_os("PATH").and_then(|paths| {
         env::split_paths(&paths)
             .map(|directory| directory.join(command))
-            .find_map(|path| canonical_executable(&path))
+            .find_map(|path| stable_executable(&path))
     })
 }
 
-fn canonical_executable(path: &Path) -> Option<PathBuf> {
-    let path = path.canonicalize().ok()?;
-    (path.is_absolute() && is_executable(&path)).then_some(path)
+/// Validates a launcher candidate through canonicalization but keeps the stable
+/// path the caller found.
+///
+/// The native installers keep `~/.local/bin/<harness>` pointing at the current
+/// version-specific binary. Storing the canonical target would freeze a profile
+/// on the version present at config load, so a later CLI update would launch the
+/// old binary and no longer match the updated launcher during relaunch binding.
+fn stable_executable(path: &Path) -> Option<PathBuf> {
+    let resolved = path.canonicalize().ok()?;
+    (path.is_absolute() && is_executable(&resolved)).then(|| path.to_path_buf())
 }
 
 fn codex_candidates(home: &Path) -> Vec<PathBuf> {
@@ -2013,6 +2030,39 @@ memory_override_max_bytes = 25769803776
         assert_eq!(codex.args, ["--profile", "work"]);
         assert_eq!(codex.env["CODEX_HOME"], "/tmp/codex");
         assert_eq!(custom.command, "/opt/custom/codex");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn discovery_keeps_the_launcher_symlink_a_cli_update_repoints() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("atmux-launcher-symlink-{nonce}"));
+        let versions = root.join("versions");
+        fs::create_dir_all(&versions).unwrap();
+        let launcher = root.join("claude");
+        for version in ["1.0.0", "2.0.0"] {
+            let binary = versions.join(version);
+            fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::os::unix::fs::symlink(versions.join("1.0.0"), &launcher).unwrap();
+
+        // The launcher path is retained, so re-pointing the symlink during a CLI
+        // update keeps every stored profile command bound to the new binary.
+        assert_eq!(stable_executable(&launcher), Some(launcher.clone()));
+        fs::remove_file(&launcher).unwrap();
+        std::os::unix::fs::symlink(versions.join("2.0.0"), &launcher).unwrap();
+        assert_eq!(
+            launcher.canonicalize().unwrap(),
+            versions.join("2.0.0").canonicalize().unwrap()
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

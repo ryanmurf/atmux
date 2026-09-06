@@ -771,7 +771,8 @@ fn sql_error(error: rusqlite::Error) -> PulseError {
         }
         _ => PulseErrorKind::Storage,
     };
-    PulseError::new(kind, format!("Pulse SQLite operation failed: {error}"))
+    eprintln!("pulse sqlite error: {error}");
+    PulseError::new(kind, "Pulse SQLite operation failed")
 }
 
 #[cfg(test)]
@@ -1693,6 +1694,7 @@ impl Store for SqliteStore {
         account_id: AccountId,
         profile: Option<ProfileName>,
         since_day: Option<String>,
+        through_day: Option<String>,
         limit: usize,
     ) -> StoreFuture<Vec<TokenGrain>> {
         self.run(move |connection| {
@@ -1702,25 +1704,37 @@ impl Store for SqliteStore {
                     PulseError::invalid_input(format!("invalid since_day: {error}"))
                 })?;
             }
+            if let Some(day) = &through_day {
+                jiff::civil::Date::from_str(day).map_err(|error| {
+                    PulseError::invalid_input(format!("invalid through_day: {error}"))
+                })?;
+            }
             let since_day = since_day.unwrap_or_else(|| "0000-01-01".to_owned());
+            let through_day = through_day.unwrap_or_else(|| "9999-12-31".to_owned());
             let mut sql = String::from(
                 "SELECT account_id, profile, machine, session_id, model, settings_hash, \
                  settings_json, day, tokens_in, tokens_out, cache_write_5m, cache_write_1h, \
                  cache_read, source_json FROM token_usage \
-                 WHERE account_id = ?1 AND day >= ?2",
+                 WHERE account_id = ?1 AND day >= ?2 AND day <= ?3",
             );
             if profile.is_some() {
                 sql.push_str(
-                    " AND profile = ?3 ORDER BY day DESC, profile, machine, session_id LIMIT ?4",
+                    " AND profile = ?4 ORDER BY day DESC, profile, machine, session_id LIMIT ?5",
                 );
             } else {
-                sql.push_str(" ORDER BY day DESC, profile, machine, session_id LIMIT ?3");
+                sql.push_str(" ORDER BY day DESC, profile, machine, session_id LIMIT ?4");
             }
             let mut statement = connection.prepare(&sql).map_err(sql_error)?;
             let rows = if let Some(profile) = profile {
                 statement
                     .query_map(
-                        params![account_id.get(), since_day, profile.as_str(), limit],
+                        params![
+                            account_id.get(),
+                            since_day,
+                            through_day,
+                            profile.as_str(),
+                            limit
+                        ],
                         raw_token,
                     )
                     .map_err(sql_error)?
@@ -1728,7 +1742,10 @@ impl Store for SqliteStore {
                     .map_err(sql_error)?
             } else {
                 statement
-                    .query_map(params![account_id.get(), since_day, limit], raw_token)
+                    .query_map(
+                        params![account_id.get(), since_day, through_day, limit],
+                        raw_token,
+                    )
                     .map_err(sql_error)?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(sql_error)?
@@ -1879,9 +1896,10 @@ impl Store for SqliteStore {
                     ],
                 )
                 .map_err(sql_error)?;
-            let id = connection
+            let (id, stored_created_at) = connection
                 .query_row(
-                    "SELECT id FROM alert_subscriptions WHERE account_id = ?1 AND profile = ?2 \
+                    "SELECT id, created_at_ms FROM alert_subscriptions \
+                     WHERE account_id = ?1 AND profile = ?2 \
                      AND alert_type_json = ?3 AND threshold_key = ?4",
                     params![
                         subscription.account_id.get(),
@@ -1889,13 +1907,13 @@ impl Store for SqliteStore {
                         encode(&subscription.alert_type)?,
                         threshold_key
                     ],
-                    |row| row.get(0),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .map_err(sql_error)?;
             Ok(StoredAlertSubscription {
                 id,
                 subscription,
-                created_at,
+                created_at: instant(stored_created_at)?,
             })
         })
     }
@@ -2906,6 +2924,27 @@ impl Store for SqliteStore {
             )? {
                 transaction.commit().map_err(sql_error)?;
                 return Ok(existing);
+            }
+            let blocked = transaction
+                .query_row(
+                    "SELECT 1 FROM reporter_pending_pages WHERE account_id=?1 AND machine=?2 \
+                     AND destination_key=?3 AND kind<>?4",
+                    params![
+                        account_id.get(),
+                        local_machine.as_str(),
+                        destination_key,
+                        draft.kind.as_str()
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(sql_error)?
+                .is_some();
+            if blocked {
+                return Err(PulseError::new(
+                    PulseErrorKind::Conflict,
+                    "Pulse reporter outbox still holds another stream's page",
+                ));
             }
             let current = transaction
                 .query_row(

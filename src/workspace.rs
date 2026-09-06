@@ -1117,7 +1117,8 @@ async fn git_inner(
         })
         .transpose()?;
     let root = project_root(&pane_cwd, &allowed_roots)?;
-    let Some(repo) = repository_root(&root) else {
+    // `project_root` already clamped the search to the allowed launch root.
+    let Some(repo) = repository_root(&root, &root) else {
         if requested.is_some() {
             return Err(WorkspaceError::not_found(
                 "Git is not available for this project",
@@ -1594,7 +1595,15 @@ fn project_root(pane_cwd: &Path, allowed_roots: &[PathBuf]) -> WorkspaceResult<P
             "pane project is outside configured launch roots",
         ));
     }
-    let root = repository_root(&cwd).unwrap_or_else(|| cwd.clone());
+    // Stop the repository search at the launch root that admitted this pane.
+    // An ancestor `.git` above it (dotfiles checked out in $HOME) would
+    // otherwise resolve every project outside the configured roots.
+    let boundary = allowed
+        .iter()
+        .max_by_key(|root| root.components().count())
+        .cloned()
+        .unwrap_or_else(|| cwd.clone());
+    let root = repository_root(&cwd, &boundary).unwrap_or_else(|| cwd.clone());
     if !allowed
         .iter()
         .any(|allowed| root == **allowed || root.starts_with(allowed))
@@ -1606,13 +1615,17 @@ fn project_root(pane_cwd: &Path, allowed_roots: &[PathBuf]) -> WorkspaceResult<P
     Ok(root)
 }
 
-fn repository_root(start: &Path) -> Option<PathBuf> {
-    start.ancestors().find_map(|candidate| {
-        let marker = candidate.join(".git");
-        let metadata = fs::symlink_metadata(marker).ok()?;
-        (!metadata.file_type().is_symlink() && (metadata.is_dir() || metadata.is_file()))
-            .then(|| candidate.to_path_buf())
-    })
+/// Finds the repository root at or below `boundary`, which is never climbed past.
+fn repository_root(start: &Path, boundary: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .take_while(|candidate| candidate.starts_with(boundary))
+        .find_map(|candidate| {
+            let marker = candidate.join(".git");
+            let metadata = fs::symlink_metadata(marker).ok()?;
+            (!metadata.file_type().is_symlink() && (metadata.is_dir() || metadata.is_file()))
+                .then(|| candidate.to_path_buf())
+        })
 }
 
 fn validate_relative_path(value: &str, allow_empty: bool) -> WorkspaceResult<PathBuf> {
@@ -1898,6 +1911,29 @@ mod tests {
 
         let raw_mode = checked_raw_mode(0o100_644).unwrap();
         assert!(FileType::from_raw_mode(raw_mode).is_file());
+    }
+
+    #[test]
+    fn repository_search_stops_at_the_allowed_launch_root() {
+        let base = fixture("ancestor-git");
+        fs::create_dir(base.join(".git")).unwrap();
+        let allowed = base.join("projects");
+        let project = allowed.join("app/src");
+        fs::create_dir_all(&project).unwrap();
+        let canonical = allowed.canonicalize().unwrap();
+
+        // The `.git` above the launch root must not push the project out of it.
+        assert_eq!(
+            project_root(&project, std::slice::from_ref(&allowed)).unwrap(),
+            canonical.join("app/src")
+        );
+
+        fs::create_dir(allowed.join("app/.git")).unwrap();
+        assert_eq!(
+            project_root(&project, std::slice::from_ref(&allowed)).unwrap(),
+            canonical.join("app")
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

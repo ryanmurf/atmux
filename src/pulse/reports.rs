@@ -173,6 +173,7 @@ pub async fn token_report(
             request.account_id,
             request.profile.clone(),
             Some(request.range.since_day.clone()),
+            Some(request.range.through_day.clone()),
             MAX_REPORT_ROWS + 1,
         )
         .await?;

@@ -46,7 +46,7 @@ pub type FederationFuture<T> = Pin<Box<dyn Future<Output = PulseResult<T>> + Sen
 /// Server-issued, bounded cursor. Its contents are intentionally not part of
 /// the federation contract.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct OpaqueCursor(String);
 
 impl OpaqueCursor {
@@ -73,6 +73,20 @@ impl OpaqueCursor {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl TryFrom<String> for OpaqueCursor {
+    type Error = PulseError;
+
+    fn try_from(value: String) -> PulseResult<Self> {
+        Self::new(value)
+    }
+}
+
+impl From<OpaqueCursor> for String {
+    fn from(value: OpaqueCursor) -> Self {
+        value.0
     }
 }
 

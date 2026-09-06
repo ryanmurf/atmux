@@ -574,7 +574,7 @@ async fn token_jobs_reserve_their_store_revision_before_scanning() {
     assert_eq!(report.succeeded, 1);
     assert_eq!(report.failed, 0);
     let stored = store
-        .list_token_grains(profile.account_id, Some(profile.name), None, 10)
+        .list_token_grains(profile.account_id, Some(profile.name), None, None, 10)
         .await
         .expect("stored tokens");
     assert_eq!(stored.len(), 1);

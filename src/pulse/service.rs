@@ -350,13 +350,22 @@ impl PulseSink for StoreSink {
                 let subscriptions = store.list_alert_subscriptions(snapshot.account_id).await?;
                 let candidates = evaluate_usage_alerts(&snapshot, &subscriptions)?;
                 let triggered = record_due_alerts(store.as_ref(), candidates).await?;
-                let _ = schedule_rate_limit_resume(
+                // A rejected resume (pending cap or horizon) must not abandon
+                // alerts already recorded for this persisted snapshot.
+                if let Err(error) = schedule_rate_limit_resume(
                     store.as_ref(),
                     &snapshot,
                     snapshot.polled_at,
                     ResetResumeLimits::default(),
                 )
-                .await?;
+                .await
+                {
+                    eprintln!(
+                        "atmux Pulse: rate-limit resume not scheduled for profile={}: {}",
+                        snapshot.profile,
+                        error.message()
+                    );
+                }
                 let _ = deliver_triggered_alerts(notifications.as_ref(), &triggered).await;
                 Ok(())
             }
