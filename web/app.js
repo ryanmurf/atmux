@@ -1499,11 +1499,17 @@ function sessionDeletePath(id) {
 function modelPickerState(session, capabilities, online, switchingPaneId, composerSending = false) {
   const recognized = session?.agent === "claude" || session?.agent === "codex";
   const matches = capabilities?.pane_id === session?.id;
-  const models = matches && Array.isArray(capabilities.models) ? capabilities.models : [];
+  const models = matches && Array.isArray(capabilities.model_options) ? capabilities.model_options : [];
+  const efforts = matches && Array.isArray(capabilities.effort_options) ? capabilities.effort_options : [];
   const current = matches && typeof capabilities.current === "string" ? capabilities.current : "";
   const effort = matches && typeof capabilities.effort === "string" ? capabilities.effort : "";
   const currentMode = matches && typeof capabilities.current_mode === "string" ? capabilities.current_mode : "";
+  const fastSupported = matches && capabilities.fast_supported === true;
+  const fast = matches && typeof capabilities.fast === "boolean" ? capabilities.fast : null;
   const busy = Boolean(switchingPaneId);
+  // Model, effort, and fast are applied one at a time, so each control is
+  // enabled on its own evidence and a shared in-flight switch blocks them all.
+  const blocked = !online || busy || composerSending;
   return {
     visible: recognized,
     loading: recognized && !matches,
@@ -1511,13 +1517,28 @@ function modelPickerState(session, capabilities, online, switchingPaneId, compos
     effort,
     currentMode,
     models,
-    disabled: !online || busy || composerSending || !models.some((model) => model.switchable),
+    efforts,
+    fast,
+    fastSupported,
+    disabled: blocked || !models.some((model) => model.switchable),
+    effortDisabled: blocked || !efforts.some((choice) => choice.switchable),
+    fastDisabled: blocked || !fastSupported,
     status: !recognized ? ""
       : !online ? "Machine offline"
         : busy ? (switchingPaneId === session?.id ? "Switching…" : "Another model switch is in progress")
           : !matches ? "Checking models…"
-            : capabilities.note || (current ? `Current: ${[current, effort].filter(Boolean).join(" · ")}` : "Current model unavailable"),
+            : capabilities.note || (current ? `Current: ${[current, effort, fast ? "fast" : ""].filter(Boolean).join(" · ")}` : "Current model unavailable"),
   };
+}
+
+/// The choices one picker offers, with the running value shown first and
+/// unselectable when this profile does not configure it.
+function pickerOptions(choices, current) {
+  const options = [...choices];
+  if (current && !options.some((choice) => choice.id === current)) {
+    options.unshift({ id: "", label: `${current} (current; not configured)`, switchable: false });
+  }
+  return options;
 }
 
 function claudeResumeState(session, capabilities, online, resumingPaneId, composerSending = false) {
@@ -1829,6 +1850,7 @@ if (typeof module !== "undefined" && module.exports) {
     reduceTranscript,
     sessionDeletePath,
     modelPickerState,
+    pickerOptions,
     claudeResumeState,
     followsLiveTail,
     stickyBottomState,
@@ -2227,6 +2249,8 @@ function initialize() {
         harness: state.sessions.get(paneId)?.agent || "agent",
         current: null,
         models: [],
+        model_options: [],
+        effort_options: [],
         note: error.message,
       };
     }
@@ -3653,27 +3677,36 @@ function initialize() {
     control.hidden = !view.visible;
     quickControl.hidden = !view.visible;
     if (!view.visible) return;
-    const options = [...view.models];
-    if (view.current && !view.currentMode) {
-      options.unshift({ id: "", label: `${view.current} (current; no configured mode)`, switchable: false });
-    }
-    const signature = JSON.stringify(options);
-    for (const [selectId, statusId] of [["agent-model", "model-status"], ["quick-agent-model", "quick-model-status"]]) {
-      const select = $(selectId);
+    const models = pickerOptions(view.models, view.current);
+    const efforts = pickerOptions(view.efforts, view.effort);
+    for (const [modelId, effortId, fastId, statusId] of [
+      ["agent-model", "agent-effort", "agent-fast", "model-status"],
+      ["quick-agent-model", "quick-agent-effort", "quick-agent-fast", "quick-model-status"],
+    ]) {
+      syncPickerSelect($(modelId), models, view.current, view.disabled, "No switchable models");
+      syncPickerSelect($(effortId), efforts, view.effort, view.effortDisabled, "No switchable effort levels");
+      const fast = $(fastId);
+      fast.checked = view.fast === true;
+      fast.disabled = view.fastDisabled;
+      fast.closest("label").hidden = !view.fastSupported;
       const status = $(statusId);
-      if (select.dataset.models !== signature) {
-        select.replaceChildren(...(options.length
-          ? options.map((model) => option(model.id, model.label, !model.switchable))
-          : [option("", "No switchable models", true)]));
-        select.dataset.models = signature;
-      }
-      if (view.currentMode && options.some((model) => model.id === view.currentMode)) {
-        select.value = view.currentMode;
-      }
-      select.disabled = view.disabled;
       status.textContent = view.status;
       status.title = view.status;
     }
+  }
+
+  /// Rebuilds one picker only when its choices changed, so a live refresh never
+  /// drops the open dropdown or the selection under the pointer.
+  function syncPickerSelect(select, options, selected, disabled, empty) {
+    const signature = JSON.stringify(options);
+    if (select.dataset.models !== signature) {
+      select.replaceChildren(...(options.length
+        ? options.map((choice) => option(choice.id, choice.label, !choice.switchable))
+        : [option("", empty, true)]));
+      select.dataset.models = signature;
+    }
+    if (selected && options.some((choice) => choice.id === selected)) select.value = selected;
+    select.disabled = disabled;
   }
 
   function renderClaudeResumeAction(session, controllable) {
@@ -5281,23 +5314,20 @@ function initialize() {
     event.target.value = "";
   });
   $("attachment-clear").addEventListener("click", clearAttachments);
-  async function switchAgentModel(modeId) {
+  /// Sends one control's change on its own. The request names only that
+  /// control, so the harness keeps the model, effort, or fast mode it omits.
+  async function switchAgentModel(change, label, warning = "") {
     const paneId = state.selected;
     const sessionName = state.sessions.get(paneId)?.name || paneId;
-    if (!paneId || !modeId || state.modelSwitchingPaneId) return;
-    if (state.paneModels?.pane_id === paneId && state.paneModels.current_mode === modeId) return;
+    if (!paneId || state.modelSwitchingPaneId) return;
     state.modelSwitchingPaneId = paneId;
     render();
     try {
       await request(`/api/v1/panes/${encodeURIComponent(paneId)}/model`, {
         method: "POST",
-        body: JSON.stringify({ mode_id: modeId }),
+        body: JSON.stringify(change),
       });
-      const choice = state.paneModels?.models?.find((item) => item.id === modeId);
-      const warning = state.sessions.get(paneId)?.agent === "claude" && choice?.effort
-        ? " Claude saves this effort as the profile default."
-        : "";
-      toast(`Switched ${sessionName} to ${choice?.label || modeId}.${warning}`);
+      toast(`Switched ${sessionName} to ${label}.${warning}`);
     } catch (error) {
       toast(error.message);
     } finally {
@@ -5306,8 +5336,27 @@ function initialize() {
       render();
     }
   }
-  $("agent-model").addEventListener("change", (event) => { void switchAgentModel(event.currentTarget.value); });
-  $("quick-agent-model").addEventListener("change", (event) => { void switchAgentModel(event.currentTarget.value); });
+  function switchAgentModelChoice(model) {
+    if (!model || state.paneModels?.current === model) return;
+    void switchAgentModel({ model }, model);
+  }
+  function switchAgentEffort(effort) {
+    if (!effort || state.paneModels?.effort === effort) return;
+    const warning = state.sessions.get(state.selected)?.agent === "claude"
+      ? " Claude saves this effort as the profile default."
+      : "";
+    void switchAgentModel({ effort }, `${effort} effort`, warning);
+  }
+  function switchAgentFast(fast) {
+    if (state.paneModels?.fast === fast) return;
+    void switchAgentModel({ fast }, fast ? "fast mode on" : "fast mode off");
+  }
+  $("agent-model").addEventListener("change", (event) => { switchAgentModelChoice(event.currentTarget.value); });
+  $("quick-agent-model").addEventListener("change", (event) => { switchAgentModelChoice(event.currentTarget.value); });
+  $("agent-effort").addEventListener("change", (event) => { switchAgentEffort(event.currentTarget.value); });
+  $("quick-agent-effort").addEventListener("change", (event) => { switchAgentEffort(event.currentTarget.value); });
+  $("agent-fast").addEventListener("change", (event) => { switchAgentFast(event.currentTarget.checked); });
+  $("quick-agent-fast").addEventListener("change", (event) => { switchAgentFast(event.currentTarget.checked); });
   $("quick-actions-open").addEventListener("click", () => {
     const dialog = $("quick-actions-dialog");
     if (!dialog.open) {

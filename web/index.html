@@ -86,6 +86,9 @@
             <div id="model-control" class="model-control" hidden>
               <label for="agent-model">Model</label>
               <select id="agent-model" aria-describedby="model-status"></select>
+              <label for="agent-effort">Effort</label>
+              <select id="agent-effort" aria-describedby="model-status"></select>
+              <label class="model-fast"><input id="agent-fast" type="checkbox" aria-describedby="model-status"> Fast</label>
               <span id="model-status" role="status"></span>
             </div>
           </div>
@@ -171,6 +174,10 @@
         <label for="launch-session">Conversation<select id="launch-session"></select></label>
         <p id="launch-sessions-note" class="dialog-note" role="status"></p>
       </section>
+      <section id="launch-summary" class="launch-summary" aria-label="Resume from summary" hidden>
+        <label class="launch-summary-toggle"><input id="launch-summary-resume" type="checkbox"><span>Resume from summary</span></label>
+        <p id="launch-summary-note" class="dialog-note" role="status">The chosen profile summarizes the previous conversation, then starts the duplicate with it.</p>
+      </section>
       <label>Session name<input id="launch-name" required maxlength="100" pattern="[A-Za-z0-9_-]+"></label>
       <p id="launch-note" class="dialog-note" hidden></p>
       <div class="dialog-actions"><button type="button" class="subtle dialog-cancel">Cancel</button><button class="primary" type="submit">Launch</button></div>
@@ -207,8 +214,11 @@
     <form method="dialog" class="dialog-form quick-actions-form">
       <div class="dialog-head"><h2 id="quick-actions-title">Quick actions</h2><button class="icon-button" type="submit" aria-label="Close">×</button></div>
       <div id="quick-model-control" class="quick-model-control" hidden>
-        <label for="quick-agent-model">Model &amp; effort</label>
+        <label for="quick-agent-model">Model</label>
         <select id="quick-agent-model" aria-describedby="quick-model-status"></select>
+        <label for="quick-agent-effort">Reasoning effort</label>
+        <select id="quick-agent-effort" aria-describedby="quick-model-status"></select>
+        <label class="model-fast"><input id="quick-agent-fast" type="checkbox" aria-describedby="quick-model-status"> Fast mode</label>
         <p id="quick-model-status" class="dialog-note" role="status"></p>
       </div>
       <div class="quick-actions-grid">

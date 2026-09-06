@@ -56,6 +56,7 @@ const {
   machineStatusLabel,
   claudeResumeState,
   modelPickerState,
+  pickerOptions,
   markdownBlocks,
   messageFitsByteLimit,
   moveMessageHistory,
@@ -1815,10 +1816,12 @@ test("model picker reports current, unsupported, offline, and in-flight states",
   const capabilities = {
     pane_id: claude.id,
     current: "sonnet",
-    models: [
+    model_options: [
       { id: "sonnet", label: "Sonnet", switchable: true },
       { id: "claude-opus-4-1", label: "Pinned", switchable: false },
     ],
+    effort_options: [],
+    fast_supported: false,
     note: null,
   };
   assert.deepEqual(modelPickerState(claude, capabilities, true, null), {
@@ -1827,19 +1830,75 @@ test("model picker reports current, unsupported, offline, and in-flight states",
     current: "sonnet",
     effort: "",
     currentMode: "",
-    models: capabilities.models,
+    models: capabilities.model_options,
+    efforts: [],
+    fast: null,
+    fastSupported: false,
     disabled: false,
+    effortDisabled: true,
+    fastDisabled: true,
     status: "Current: sonnet",
   });
   assert.equal(modelPickerState(claude, capabilities, false, null).status, "Machine offline");
   assert.equal(modelPickerState(claude, capabilities, true, claude.id).status, "Switching…");
   assert.equal(modelPickerState(claude, null, true, null).status, "Checking models…");
 
-  const unsupported = { ...capabilities, models: [], note: "codex 0.999 has an unsupported picker" };
+  const unsupported = { ...capabilities, model_options: [], note: "codex 0.999 has an unsupported picker" };
   const view = modelPickerState({ id: claude.id, agent: "codex" }, unsupported, true, null);
   assert.equal(view.disabled, true);
   assert.match(view.status, /unsupported/);
   assert.equal(modelPickerState({ id: "%9", agent: "shell" }, null, true, null).visible, false);
+});
+
+test("model, effort, and fast are independent controls with their own gates", () => {
+  const codex = { id: "midnight~%5", agent: "codex" };
+  const capabilities = {
+    pane_id: codex.id,
+    current: "gpt-5.6-sol",
+    effort: "xhigh",
+    fast: true,
+    fast_supported: true,
+    model_options: [{ id: "gpt-5.6-sol", label: "GPT-5.6 Sol", switchable: true }],
+    effort_options: [
+      { id: "xhigh", label: "Extra high", switchable: true },
+      { id: "max", label: "max", switchable: false },
+    ],
+    note: null,
+  };
+  const view = modelPickerState(codex, capabilities, true, null);
+  assert.equal(view.disabled, false);
+  assert.equal(view.effortDisabled, false);
+  assert.equal(view.fastDisabled, false);
+  assert.equal(view.fast, true);
+  assert.equal(view.status, "Current: gpt-5.6-sol · xhigh · fast");
+
+  // An older CLI reports no effort rows and no fast toggle, so only the model
+  // picker stays live.
+  const older = modelPickerState(codex, { ...capabilities, effort_options: [], fast_supported: false, fast: null }, true, null);
+  assert.equal(older.disabled, false);
+  assert.equal(older.effortDisabled, true);
+  assert.equal(older.fastDisabled, true);
+  assert.equal(older.fastSupported, false);
+
+  // A switch already in flight freezes every control, not just the one used.
+  const busy = modelPickerState(codex, capabilities, true, codex.id);
+  assert.deepEqual(
+    [busy.disabled, busy.effortDisabled, busy.fastDisabled],
+    [true, true, true],
+  );
+});
+
+test("pickerOptions surfaces an unconfigured running value without offering it", () => {
+  const configured = [{ id: "high", label: "High", switchable: true }];
+  assert.deepEqual(pickerOptions(configured, "high"), configured);
+  assert.deepEqual(pickerOptions(configured, "medium"), [
+    { id: "", label: "medium (current; not configured)", switchable: false },
+    ...configured,
+  ]);
+  assert.deepEqual(pickerOptions(configured, ""), configured);
+  assert.deepEqual(pickerOptions([], "gpt-5.6-sol"), [
+    { id: "", label: "gpt-5.6-sol (current; not configured)", switchable: false },
+  ]);
 });
 
 test("Claude resume action is capability-gated and protects active work", () => {
@@ -1868,7 +1927,7 @@ test("Claude resume action is capability-gated and protects active work", () => 
   assert.equal(claudeResumeState({ id: "%8", agent: "codex" }, ready, true, null).visible, false);
 });
 
-test("model switch captures the pane id before awaiting and routes only a profile mode id", () => {
+test("model switch captures the pane id before awaiting and routes one control at a time", () => {
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
   const handler = source.slice(
     source.indexOf("async function switchAgentModel"),
@@ -1876,10 +1935,16 @@ test("model switch captures the pane id before awaiting and routes only a profil
   );
   assert.match(handler, /const paneId = state\.selected;/);
   assert.match(handler, /encodeURIComponent\(paneId\).*\/model/s);
-  assert.match(handler, /JSON\.stringify\(\{ mode_id: modeId \}\)/);
+  assert.match(handler, /JSON\.stringify\(change\)/);
   assert.doesNotMatch(handler, /state\.selected.*\/model/);
+  // Each control posts only its own field so the harness keeps the rest.
+  assert.match(handler, /switchAgentModel\(\{ model \}, model\)/);
+  assert.match(handler, /switchAgentModel\(\{ effort \}, `\$\{effort\} effort`, warning\)/);
+  assert.match(handler, /switchAgentModel\(\{ fast \}, fast \? "fast mode on" : "fast mode off"\)/);
   assert.match(source, /modelPickerState\([\s\S]*state\.modelSwitchingPaneId/);
-  assert.match(source, /\$\("quick-agent-model"\)\.addEventListener\("change"/);
+  for (const control of ["quick-agent-model", "quick-agent-effort", "quick-agent-fast"]) {
+    assert.match(source, new RegExp(`\\$\\("${control}"\\)\\.addEventListener\\("change"`));
+  }
 });
 
 test("Claude resume uses a confirmation and never sends browser-supplied session data", () => {

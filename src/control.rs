@@ -39,7 +39,10 @@ use crate::{
     remote::{self, RemoteMachine, encode_segment},
     status::{AgentKind, AgentStatus},
     systemd_scope,
-    tmux::{RESERVED_SERVICE_SESSION, Session, Tmux, UnsupportedModelControl, known_models},
+    tmux::{
+        RESERVED_SERVICE_SESSION, Session, Tmux, UnsupportedModelControl, fast_toggle_verified,
+        known_efforts, known_models,
+    },
     transcript::Transcript,
     workspace::{FileWriteRequest, FilesResponse, GitResponse, WorkspaceErrorKind},
 };
@@ -269,8 +272,22 @@ pub struct PaneModels {
     /// can prove one. The display model remains in `current` for clarity.
     #[serde(default)]
     pub current_mode: Option<String>,
+    /// Whether the harness's session-scoped fast mode is on, when observable.
+    #[serde(default)]
+    pub fast: Option<bool>,
     pub version: Option<String>,
     pub models: Vec<PaneModelOption>,
+    /// The distinct models this profile allows, selectable on their own.
+    #[serde(default)]
+    pub model_options: Vec<PaneModelOption>,
+    /// The distinct reasoning levels this profile allows, selectable on their
+    /// own. Empty when the installed harness has no verified effort control.
+    #[serde(default)]
+    pub effort_options: Vec<PaneModelOption>,
+    /// Whether this pane's harness version exposes a fast-mode toggle atmux can
+    /// drive without touching the model or reasoning level.
+    #[serde(default)]
+    pub fast_supported: bool,
     pub note: Option<String>,
     /// Whether the owning node can safely restart this exact Claude pane with
     /// its current launcher and native saved conversation. The configuration
@@ -282,11 +299,24 @@ pub struct PaneModels {
     pub resume_note: Option<String>,
 }
 
-/// Data-only model switch request. The id must match an owner-reported,
+/// Data-only model switch request. Every id must match an owner-reported,
 /// switchable choice and is never interpreted as a command.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+///
+/// `mode_id` applies one configured profile mode as a unit and stays the
+/// compatible shape older clients send. The remaining fields apply the model,
+/// the reasoning level, and fast mode independently, leaving the controls the
+/// request omits exactly as the running harness has them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
 pub struct ModelSwitchRequest {
-    pub mode_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1656,19 +1686,14 @@ impl ControlPlane {
             profile_for_session(&self.inner.config.profiles, session.agent, &session.profile)?
                 .clone();
         let observation = Tmux.model_observation(&session.pane_id, session.agent, &session.content);
-        let mode_id = observation.mode?;
-        let mode = profile
-            .modes
-            .iter()
-            .find(|mode| mode.id == mode_id)?
-            .clone();
         let service_tier = Tmux::cli_update_service_tier(&session.pane_id).ok()?;
-        if observation.current.as_deref() != Some(mode.model.as_str())
-            || observation.effort != mode.effort
-            || service_tier != mode.service_tier
-        {
-            return None;
-        }
+        // A model/effort/fast switch applied on its own leaves no configured
+        // mode recorded, so the pane's own recorded controls stand in for one.
+        let recorded = match observation.mode {
+            Some(_) => None,
+            None => Tmux::recorded_pane_mode(&session.pane_id).ok()?,
+        };
+        let mode = preflight_mode(&profile, &observation, recorded, service_tier.as_deref())?;
         let target = crate::transcript::native_resume_target(session)?;
         Some((profile, mode, target))
     }
@@ -2587,19 +2612,18 @@ impl ControlPlane {
         Ok(())
     }
 
-    /// Switches one running agent to an owner-reported model through the
-    /// harness's fixed native control path.
+    /// Switches one running agent's model, reasoning effort, or fast mode to
+    /// owner-reported choices through the harness's fixed native control path.
+    ///
+    /// Each control the request names is applied on its own, so changing one
+    /// never resets the others.
     ///
     /// # Errors
     ///
-    /// Returns an error for a malformed/unavailable model, an unknown/offline
+    /// Returns an error for a malformed/unavailable choice, an unknown/offline
     /// pane, an unsupported CLI picker, or a failed tmux operation.
     pub async fn switch_model(&self, id: &str, request: ModelSwitchRequest) -> Result<()> {
-        if !valid_profile_mode_id(&request.mode_id) {
-            return Err(bad_request(
-                "mode ids must be 1-80 ASCII letters, digits, dashes, or underscores",
-            ));
-        }
+        validate_model_switch(&request)?;
         match self.resolve(id)? {
             Target::Local { pane_id, agent, .. } => {
                 let (content, profile_name) = {
@@ -2611,7 +2635,7 @@ impl ControlPlane {
                 let prompt_lock = self.prompt_lock(&pane_id);
                 let identity = self.local_identity(&pane_id);
                 let inner = Arc::clone(&self.inner);
-                let mode_id = request.mode_id.clone();
+                let switch = request.clone();
                 local_model_switch(
                     tokio::task::spawn_blocking(move || {
                         // Observing the pane runs several tmux subprocesses, so
@@ -2624,42 +2648,56 @@ impl ControlPlane {
                             observation,
                             &inner.config.profiles,
                         );
-                        let choice = capabilities
-                            .models
-                            .iter()
-                            .find(|choice| choice.id == mode_id)
-                            .ok_or_else(|| {
-                                bad_request(format!(
-                                    "mode {mode_id} is not reported by this pane's owning machine"
-                                ))
-                            })?;
-                        if !choice.switchable {
-                            return Err(conflict(format!(
-                                "mode {mode_id} is available only when launching a new {} session",
-                                capabilities.harness
-                            )));
-                        }
-                        let version = capabilities.version.ok_or_else(|| {
-                            conflict(capabilities.note.unwrap_or_else(|| {
-                                "the running CLI version is not observable".to_owned()
-                            }))
-                        })?;
-                        let mode =
-                            profile_for_session(&inner.config.profiles, agent, &profile_name)
-                                .and_then(|profile| {
-                                    profile.modes.iter().find(|mode| mode.id == mode_id)
-                                })
-                                .cloned()
-                                .ok_or_else(|| {
-                                    bad_request("the pane profile no longer defines that mode")
-                                })?;
+                        let version = authorize_model_switch(capabilities, &switch)?;
+                        let mode = switch
+                            .mode_id
+                            .as_deref()
+                            .map(|mode_id| {
+                                profile_for_session(&inner.config.profiles, agent, &profile_name)
+                                    .and_then(|profile| {
+                                        profile.modes.iter().find(|mode| mode.id == mode_id)
+                                    })
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        bad_request("the pane profile no longer defines that mode")
+                                    })
+                            })
+                            .transpose()?;
                         let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
                         let mut guard = prompt_lock
                             .state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
-                        Tmux.switch_model(&pane_id, agent, &version, &mode)?;
+                        // Each control is driven separately so an omitted one
+                        // keeps whatever the running harness already has.
+                        if let Some(mode) = &mode {
+                            Tmux.switch_model(&pane_id, agent, &version, mode)?;
+                        }
+                        if let Some(model) = switch.model.as_deref() {
+                            Tmux.switch_model_choice(&pane_id, agent, &version, model)?;
+                        }
+                        if let Some(effort) = switch.effort.as_deref() {
+                            Tmux.switch_effort(&pane_id, agent, &version, effort)?;
+                        }
+                        if let Some(fast) = switch.fast {
+                            Tmux.switch_fast(&pane_id, agent, &version, fast)?;
+                        }
+                        // Each split switch clears the recorded mode, so the
+                        // pane's resulting controls are matched back against
+                        // the configured modes. Without this a pane that lands
+                        // on a configured mode piecewise would stay unnamed and
+                        // CLI-update maintenance would skip it forever.
+                        if switch.model.is_some()
+                            || switch.effort.is_some()
+                            || switch.fast.is_some()
+                        {
+                            let modes =
+                                profile_for_session(&inner.config.profiles, agent, &profile_name)
+                                    .map(|profile| profile.modes.clone())
+                                    .unwrap_or_default();
+                            Tmux::reconcile_recorded_mode(&pane_id, &modes)?;
+                        }
                         Ok(())
                     })
                     .await,
@@ -3446,6 +3484,16 @@ fn model_capabilities(
                 .collect()
         })
         .unwrap_or_default();
+    let known_efforts = observation
+        .version
+        .as_deref()
+        .map_or(&[][..], |version| known_efforts(agent, version));
+    let model_options = distinct_options(profile, known, |mode| Some(mode.model.as_str()));
+    let effort_options = distinct_options(profile, known_efforts, |mode| mode.effort.as_deref());
+    let fast_supported = observation
+        .version
+        .as_deref()
+        .is_some_and(|version| fast_toggle_verified(agent, version));
     let current_mode = observation
         .mode
         .filter(|mode_id| {
@@ -3502,8 +3550,12 @@ fn model_capabilities(
         current: observation.current,
         effort: observation.effort,
         current_mode,
+        fast: observation.fast,
         version: observation.version,
         models,
+        model_options,
+        effort_options,
+        fast_supported,
         note,
         resume_available: false,
         resume_note: None,
@@ -3624,6 +3676,31 @@ fn profile_for_session<'a>(
     })
 }
 
+/// The exact mode a pane is running, taken from the configured mode it still
+/// records or, once a split model/effort/fast switch cleared that, from the
+/// controls the pane recorded for itself. Either candidate must still match
+/// what the pane visibly runs, and a pane that records neither fails closed so
+/// maintenance never relaunches it with a mode it was not using.
+fn preflight_mode(
+    profile: &AgentProfile,
+    observation: &crate::tmux::ModelObservation,
+    recorded: Option<ProfileMode>,
+    service_tier: Option<&str>,
+) -> Option<ProfileMode> {
+    let mode = match observation.mode.as_deref() {
+        Some(mode_id) => profile
+            .modes
+            .iter()
+            .find(|mode| mode.id == mode_id)?
+            .clone(),
+        None => recorded?,
+    };
+    (observation.current.as_deref() == Some(mode.model.as_str())
+        && observation.effort == mode.effort
+        && service_tier == mode.service_tier.as_deref())
+    .then_some(mode)
+}
+
 const fn update_agent(harness: UpdateHarness) -> AgentKind {
     match harness {
         UpdateHarness::Claude => AgentKind::Claude,
@@ -3647,6 +3724,117 @@ fn profile_bound_to_native(
     profile.harness.eq_ignore_ascii_case(harness.name())
         && (profile.command == harness.name()
             || Path::new(&profile.command).canonicalize().ok().as_deref() == Some(launcher))
+}
+
+/// Rejects a switch request whose ids are not data-only or that names no
+/// control at all, before any pane is resolved.
+fn validate_model_switch(request: &ModelSwitchRequest) -> Result<()> {
+    let opaque_id = |value: &Option<String>| {
+        value
+            .as_deref()
+            .is_some_and(|value| !valid_profile_mode_id(value))
+    };
+    if opaque_id(&request.mode_id) || opaque_id(&request.effort) {
+        return Err(bad_request(
+            "mode and effort ids must be 1-80 ASCII letters, digits, dashes, or underscores",
+        ));
+    }
+    if request
+        .model
+        .as_deref()
+        .is_some_and(|model| !crate::tmux::valid_model_id(model))
+    {
+        return Err(bad_request(
+            "model ids must be 1-80 ASCII letters, digits, dots, dashes, underscores, or colons",
+        ));
+    }
+    if request.mode_id.is_none()
+        && request.model.is_none()
+        && request.effort.is_none()
+        && request.fast.is_none()
+    {
+        return Err(bad_request(
+            "a model switch must name a mode, model, effort, or fast state",
+        ));
+    }
+    Ok(())
+}
+
+/// Checks every requested control against the pane's own owner-reported
+/// capabilities and returns the running harness version to drive them with.
+fn authorize_model_switch(
+    capabilities: PaneModels,
+    request: &ModelSwitchRequest,
+) -> Result<String> {
+    let harness = capabilities.harness;
+    if let Some(mode_id) = request.mode_id.as_deref() {
+        require_switchable(&capabilities.models, mode_id, "mode", &harness)?;
+    }
+    if let Some(model) = request.model.as_deref() {
+        require_switchable(&capabilities.model_options, model, "model", &harness)?;
+    }
+    if let Some(effort) = request.effort.as_deref() {
+        require_switchable(&capabilities.effort_options, effort, "effort", &harness)?;
+    }
+    if request.fast.is_some() && !capabilities.fast_supported {
+        return Err(conflict(format!(
+            "this {harness} version has no fast mode atmux can switch"
+        )));
+    }
+    capabilities.version.ok_or_else(|| {
+        conflict(
+            capabilities
+                .note
+                .unwrap_or_else(|| "the running CLI version is not observable".to_owned()),
+        )
+    })
+}
+
+/// Rejects a requested control value the pane's owning machine did not report
+/// as switchable, so a browser value never escapes the owner's allowlist.
+fn require_switchable(
+    options: &[PaneModelOption],
+    id: &str,
+    control: &str,
+    harness: &str,
+) -> Result<()> {
+    let choice = options
+        .iter()
+        .find(|choice| choice.id == id)
+        .ok_or_else(|| {
+            bad_request(format!(
+                "{control} {id} is not reported by this pane's owning machine"
+            ))
+        })?;
+    if !choice.switchable {
+        return Err(conflict(format!(
+            "{control} {id} is available only when launching a new {harness} session"
+        )));
+    }
+    Ok(())
+}
+
+/// One control's distinct owner-configured values, in configuration order and
+/// switchable only where the installed harness has a verified row for them.
+fn distinct_options(
+    profile: Option<&AgentProfile>,
+    known: &[crate::tmux::KnownModel],
+    value: impl Fn(&ProfileMode) -> Option<&str>,
+) -> Vec<PaneModelOption> {
+    let mut options: Vec<PaneModelOption> = Vec::new();
+    for mode in profile.map_or(&[][..], |profile| profile.modes.as_slice()) {
+        let Some(id) = value(mode) else { continue };
+        if options.iter().any(|option| option.id == id) {
+            continue;
+        }
+        let verified = known.iter().find(|candidate| candidate.id == id);
+        options.push(PaneModelOption {
+            id: id.to_owned(),
+            label: verified.map_or_else(|| id.to_owned(), |known| known.label.to_owned()),
+            switchable: verified.is_some(),
+        });
+    }
+    options
 }
 
 fn mode_switchable(
@@ -5595,6 +5783,7 @@ mod tests {
                 version: Some("2.1.226".to_owned()),
                 current: Some("sonnet".to_owned()),
                 effort: None,
+                fast: None,
                 mode: None,
             },
             &profiles,
@@ -5613,6 +5802,158 @@ mod tests {
             })
         );
         assert!(models.note.is_none());
+    }
+
+    #[test]
+    fn model_effort_and_fast_are_reported_as_independent_owner_scoped_controls() {
+        let profiles = vec![AgentProfile {
+            name: "Pinned".to_owned(),
+            harness: "codex".to_owned(),
+            command: "codex".to_owned(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            inherit_discovered: false,
+            modes: vec![
+                ProfileMode {
+                    id: "sol-xhigh".to_owned(),
+                    label: None,
+                    model: "gpt-5.6-sol".to_owned(),
+                    effort: Some("xhigh".to_owned()),
+                    service_tier: None,
+                },
+                ProfileMode {
+                    id: "sol-high".to_owned(),
+                    label: None,
+                    model: "gpt-5.6-sol".to_owned(),
+                    effort: Some("high".to_owned()),
+                    service_tier: None,
+                },
+                ProfileMode {
+                    id: "terra-max".to_owned(),
+                    label: None,
+                    model: "gpt-5.6-terra".to_owned(),
+                    effort: Some("max".to_owned()),
+                    service_tier: None,
+                },
+            ],
+        }];
+        let models = model_capabilities(
+            "%3".to_owned(),
+            AgentKind::Codex,
+            "Pinned",
+            crate::tmux::ModelObservation {
+                version: Some("0.153.4".to_owned()),
+                current: Some("gpt-5.6-sol".to_owned()),
+                effort: Some("xhigh".to_owned()),
+                fast: Some(true),
+                mode: None,
+            },
+            &profiles,
+        );
+        // Each model and effort appears once, never as a combined row.
+        assert_eq!(
+            models
+                .model_options
+                .iter()
+                .map(|option| (option.id.as_str(), option.switchable))
+                .collect::<Vec<_>>(),
+            [("gpt-5.6-sol", true), ("gpt-5.6-terra", true)]
+        );
+        assert_eq!(
+            models
+                .effort_options
+                .iter()
+                .map(|option| (option.id.as_str(), option.switchable))
+                .collect::<Vec<_>>(),
+            [("xhigh", true), ("high", true), ("max", false)]
+        );
+        assert!(models.fast_supported);
+        assert_eq!(models.fast, Some(true));
+        assert_eq!(models.current_mode.as_deref(), Some("sol-xhigh"));
+
+        let older = model_capabilities(
+            "%4".to_owned(),
+            AgentKind::Codex,
+            "Pinned",
+            crate::tmux::ModelObservation {
+                version: Some("0.147.0".to_owned()),
+                current: Some("gpt-5.6-sol".to_owned()),
+                effort: None,
+                fast: None,
+                mode: None,
+            },
+            &profiles,
+        );
+        assert!(!older.fast_supported);
+        assert!(older.effort_options.iter().any(|option| option.switchable));
+    }
+
+    #[test]
+    fn split_switched_panes_still_preflight_for_a_cli_update_relaunch() {
+        let mode = ProfileMode {
+            id: "sol-xhigh".to_owned(),
+            label: None,
+            model: "gpt-5.6-sol".to_owned(),
+            effort: Some("xhigh".to_owned()),
+            service_tier: None,
+        };
+        let profile = AgentProfile {
+            name: "Codex".to_owned(),
+            harness: "codex".to_owned(),
+            command: "codex".to_owned(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            inherit_discovered: false,
+            modes: vec![mode.clone()],
+        };
+        let running = |model: &str, effort: &str, recorded_mode: Option<&str>| {
+            crate::tmux::ModelObservation {
+                version: Some("0.153.4".to_owned()),
+                current: Some(model.to_owned()),
+                effort: Some(effort.to_owned()),
+                fast: None,
+                mode: recorded_mode.map(str::to_owned),
+            }
+        };
+        // A pane still on its configured mode preflights as before.
+        assert_eq!(
+            preflight_mode(
+                &profile,
+                &running("gpt-5.6-sol", "xhigh", Some("sol-xhigh")),
+                None,
+                None
+            ),
+            Some(mode)
+        );
+
+        // A split model switch clears the recorded mode, and the pane's own
+        // recorded controls carry the relaunch instead of failing closed.
+        let observation = running("gpt-5.6-terra", "high", None);
+        let recorded = ProfileMode {
+            id: "recorded:gpt-5.6-terra".to_owned(),
+            label: None,
+            model: "gpt-5.6-terra".to_owned(),
+            effort: Some("high".to_owned()),
+            service_tier: None,
+        };
+        assert_eq!(
+            preflight_mode(&profile, &observation, Some(recorded.clone()), None),
+            Some(recorded.clone())
+        );
+
+        // Nothing usable recorded still fails closed, as does a recording the
+        // running pane contradicts.
+        assert!(preflight_mode(&profile, &observation, None, None).is_none());
+        assert!(
+            preflight_mode(
+                &profile,
+                &running("gpt-5.6-luna", "high", None),
+                Some(recorded.clone()),
+                None
+            )
+            .is_none()
+        );
+        assert!(preflight_mode(&profile, &observation, Some(recorded), Some("fast")).is_none());
     }
 
     #[test]
@@ -5640,6 +5981,7 @@ mod tests {
                 version: Some("0.99.0".to_owned()),
                 current: Some("gpt-5.4".to_owned()),
                 effort: None,
+                fast: None,
                 mode: None,
             },
             &profiles,
