@@ -30,6 +30,7 @@ const {
   duplicateSourceMatches,
   duplicateSourceSnapshot,
   duplicateSessionName,
+  duplicateSummaryState,
   filterDirectories,
   followsLiveTail,
   stickyBottomState,
@@ -1422,6 +1423,45 @@ test("duplicate dialog fails closed across live model, stale request, and resume
   assert.match(source, /if \(state\.launchFlow === "duplicate"\) \{\s*clearLaunchSessions\(\);\s*return;/s);
   assert.match(source, /resume_session_id: duplicateFlow \? null : \(\$\("launch-session"\)\.value \|\| null\)/);
   assert.match(source, /launch-dialog"\)\.addEventListener\("close"[\s\S]*invalidateLaunchDialog\(false\)/);
+});
+
+test("resume from summary is offered only for a duplicate of a readable, visible local pane", () => {
+  const claude = { id: "midnight~%5", machine: "midnight", pane_id: "%5", agent: "claude" };
+  const limited = ["Claude usage limit reached. Your limit will reset at 4pm."];
+  assert.deepEqual(
+    duplicateSummaryState(claude, limited, claude.id, "midnight"),
+    { available: true, checked: true },
+  );
+  // A quiet pane still offers the handover; it just does not assume it.
+  assert.deepEqual(
+    duplicateSummaryState(claude, ["> ready"], claude.id, "midnight"),
+    { available: true, checked: false },
+  );
+  // Another pane's visible output must never pre-check this duplicate.
+  assert.deepEqual(
+    duplicateSummaryState(claude, limited, "midnight~%9", "midnight"),
+    { available: true, checked: false },
+  );
+  // A federated pane cannot be summarized within one launch request.
+  assert.deepEqual(
+    duplicateSummaryState(claude, limited, claude.id, "home"),
+    { available: false, checked: false },
+  );
+  assert.deepEqual(
+    duplicateSummaryState({ ...claude, agent: "other" }, limited, claude.id, "midnight"),
+    { available: false, checked: false },
+  );
+  assert.deepEqual(duplicateSummaryState(null, limited, null), { available: false, checked: false });
+  assert.equal(
+    duplicateSummaryState({ ...claude, agent: "codex" }, ["error: rate limit exceeded"], claude.id, "midnight").checked,
+    true,
+  );
+
+  const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  assert.match(source, /summarize_pane_id: duplicateFlow && \$\("launch-summary-resume"\)\.checked/);
+  assert.match(source, /state\.launchSummarySourceId = view\.available \? String\(sourceSession\.pane_id \|\| ""\) : null/);
+  assert.match(source, /if \(body\.summarize_pane_id\) button\.textContent = "Summarizing previous session…"/);
+  assert.match(source, /launch-machine"\)\.addEventListener\("change", \(\) => \{\s*\/\/[\s\S]*applyDuplicateSummary\(null\)/);
 });
 
 test("session labels prioritize the folder and suppress an unhelpful Default profile", () => {

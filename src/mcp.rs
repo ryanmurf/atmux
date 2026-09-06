@@ -763,12 +763,19 @@ mod tests {
         )
         .unwrap();
         assert!(request.machine.is_none());
+        assert!(request.summarize_pane_id.is_none());
 
         let targeted: LaunchRequest = serde_json::from_str(
             r#"{"name":"review","directory":"/tmp","profile_id":"profile-0","machine":"gpu-box"}"#,
         )
         .unwrap();
         assert_eq!(targeted.machine.as_deref(), Some("gpu-box"));
+
+        let duplicate: LaunchRequest = serde_json::from_str(
+            r#"{"name":"review-copy","directory":"/tmp","profile_id":"profile-1","summarize_pane_id":"%7"}"#,
+        )
+        .unwrap();
+        assert_eq!(duplicate.summarize_pane_id.as_deref(), Some("%7"));
     }
 
     #[test]

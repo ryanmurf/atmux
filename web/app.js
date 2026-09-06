@@ -660,6 +660,37 @@ function duplicateSourceMatches(snapshot, session) {
     && String(session.profile || "") === snapshot.profile;
 }
 
+/// Phrases the Claude and Codex CLIs print once an account has no usage left.
+/// They are hints for a checkbox default only; the launch itself never depends
+/// on terminal text.
+const USAGE_LIMIT_MARKERS = [
+  "usage limit reached",
+  "you've reached your usage limit",
+  "5-hour limit reached",
+  "weekly limit reached",
+  "out of usage",
+  "quota exceeded",
+  "rate limit",
+];
+
+/// Decides how the duplicate dialog offers "Resume from summary".
+///
+/// Only a Claude or Codex pane keeps a readable conversation, and only the
+/// machine that owns the pane can run the summary within one launch request,
+/// so a federated pane is not offered one. The box is pre-checked when the
+/// visible pane says that account ran out of usage, which is exactly when
+/// swapping credential profiles matters.
+function duplicateSummaryState(session, paneLines = [], paneSessionId = null, localMachineId = "local") {
+  const harness = String(session?.agent || "").toLowerCase();
+  if (!session || !["claude", "codex"].includes(harness)) return { available: false, checked: false };
+  if (sessionMachineId(session, localMachineId) !== localMachineId) {
+    return { available: false, checked: false };
+  }
+  const visible = paneSessionId === session.id && Array.isArray(paneLines) ? paneLines : [];
+  const text = visible.slice(-40).join("\n").toLowerCase();
+  return { available: true, checked: USAGE_LIMIT_MARKERS.some((marker) => text.includes(marker)) };
+}
+
 /// Classifies an overview event against the revision this client holds.
 ///
 /// A snapshot is authoritative and always applies. A patch applies only when it
@@ -1780,6 +1811,7 @@ if (typeof module !== "undefined" && module.exports) {
     duplicateSourceMatches,
     duplicateSourceSnapshot,
     duplicateSessionName,
+    duplicateSummaryState,
     filterDirectories,
     formatRelativeTime,
     groupSessionsByMachine,
@@ -1931,6 +1963,7 @@ function initialize() {
     launchBrowseGeneration: 0,
     launchDialogGeneration: 0,
     launchFlow: null,
+    launchSummarySourceId: null,
     launchSessionsGeneration: 0,
     launchSessionsKey: "",
     paneError: null,
@@ -3431,6 +3464,9 @@ function initialize() {
   function invalidateLaunchDialog(close = true) {
     state.launchDialogGeneration += 1;
     state.launchFlow = null;
+    state.launchSummarySourceId = null;
+    $("launch-summary").hidden = true;
+    $("launch-summary-resume").checked = false;
     clearLaunchSessions();
     const dialog = $("launch-dialog");
     if (close && dialog.open) {
@@ -5797,6 +5833,7 @@ function initialize() {
     if (existingDialog.open) invalidateLaunchDialog();
     const generation = ++state.launchDialogGeneration;
     state.launchFlow = null;
+    state.launchSummarySourceId = null;
     const capabilitiesRequest = duplicateSession
       ? request(`/api/v1/panes/${encodeURIComponent(duplicateSession.id)}/models`)
       : Promise.resolve(null);
@@ -5856,6 +5893,7 @@ function initialize() {
       );
       applyDuplicateLaunchSelection(selection);
     }
+    applyDuplicateSummary(sourceSnapshot ? sourceSession : null);
     if (generation !== state.launchDialogGeneration) return false;
     $("launch-dialog-title").textContent = sourceSnapshot ? "Duplicate agent" : "Launch agent";
     $("launch-form").querySelector("button[type=submit]").textContent = sourceSnapshot
@@ -5941,6 +5979,17 @@ function initialize() {
     updateLaunchAvailability(machine);
   }
 
+  /// Offers the summarized handover only for a duplicate of a readable agent.
+  /// The profile selector above stays untouched, so the same dialog swaps the
+  /// credential profile and carries the previous conversation forward.
+  function applyDuplicateSummary(sourceSession) {
+    const local = state.machines.find((machine) => machine.kind === "local")?.id || "local";
+    const view = duplicateSummaryState(sourceSession, state.paneLines, state.selected, local);
+    state.launchSummarySourceId = view.available ? String(sourceSession.pane_id || "") : null;
+    $("launch-summary").hidden = !view.available;
+    $("launch-summary-resume").checked = view.available && view.checked;
+  }
+
   function applyProjectPreferences(selected, directory, forceName) {
     const preferences = projectPreference(selected, directory);
     renderLaunchHarnesses(selected, preferences);
@@ -6023,7 +6072,12 @@ function initialize() {
     note.hidden = !message;
   }
 
-  $("launch-machine").addEventListener("change", applyLaunchMachine);
+  $("launch-machine").addEventListener("change", () => {
+    // The summary source is a pane on the machine the duplicate came from.
+    // Retarget the launch and that pane is no longer the right conversation.
+    applyDuplicateSummary(null);
+    applyLaunchMachine();
+  });
   $("launch-directory").addEventListener("input", () => renderLaunchDirectories());
   $("launch-directory").addEventListener("change", () => renderLaunchDirectories());
   $("launch-harness").addEventListener("change", () => {
@@ -6231,6 +6285,9 @@ function initialize() {
       mode_id: $("launch-mode").value || null,
       machine: $("launch-machine").value || null,
       resume_session_id: duplicateFlow ? null : ($("launch-session").value || null),
+      summarize_pane_id: duplicateFlow && $("launch-summary-resume").checked
+        ? (state.launchSummarySourceId || null)
+        : null,
     };
     if (body.resume_session_id) {
       const machine = currentLaunchMachine();
@@ -6250,16 +6307,22 @@ function initialize() {
       }));
       if (!confirmed) return;
     }
+    const label = button.textContent;
     button.disabled = true;
+    // Summarizing runs the chosen profile's CLI before tmux is touched, so the
+    // request stays open for as long as that turn takes.
+    if (body.summarize_pane_id) button.textContent = "Summarizing previous session…";
     try {
       await request("/api/v1/sessions", { method: "POST", body: JSON.stringify(body) });
       persistLaunchDirectory(body.machine || currentLaunchMachine().id, body.directory);
       state.pendingSelectionName = { name: body.name, machine: body.machine };
       reconcileSelection();
       invalidateLaunchDialog();
-      toast(`Launched ${body.name}${body.machine ? ` on ${body.machine}` : ""}`);
+      toast(body.summarize_pane_id
+        ? `Launched ${body.name} with a summary of the previous session`
+        : `Launched ${body.name}${body.machine ? ` on ${body.machine}` : ""}`);
     } catch (error) { toast(error.message); }
-    finally { button.disabled = false; }
+    finally { button.disabled = false; button.textContent = label; }
   });
   document.querySelectorAll(".dialog-cancel").forEach((button) => button.addEventListener("click", () => {
     const dialog = button.closest("dialog");

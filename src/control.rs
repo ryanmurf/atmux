@@ -38,7 +38,7 @@ use crate::{
     recovery::{RecoveryRunner, RecoveryStartError, RecoveryStatus},
     remote::{self, RemoteMachine, encode_segment},
     status::{AgentKind, AgentStatus},
-    systemd_scope,
+    summary, systemd_scope,
     tmux::{
         RESERVED_SERVICE_SESSION, Session, Tmux, UnsupportedModelControl, fast_toggle_verified,
         known_efforts, known_models,
@@ -158,6 +158,11 @@ fn workspace_error(error: &crate::workspace::WorkspaceError) -> anyhow::Error {
     }
 }
 
+/// A duplicate's summarized context waits for the new CLI's empty composer.
+/// The window covers a slow first start; beyond it the owner still has a
+/// running agent and can paste the handover themselves.
+const HANDOVER_DELIVERY_TIMEOUT: Duration = Duration::from_secs(180);
+const HANDOVER_DELIVERY_POLL: Duration = Duration::from_secs(2);
 const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_BROWSE_PATH_BYTES: usize = 4_096;
@@ -408,6 +413,12 @@ pub struct LaunchRequest {
     /// provider session id and configuration path never cross the API.
     #[serde(default)]
     pub resume_session_id: Option<String>,
+    /// Duplicate-with-summary: the pane whose conversation `profile_id`
+    /// summarizes headlessly before this session launches. Present means
+    /// "resume from summary"; the summary is delivered as the new agent's
+    /// first turn. The pane always belongs to the launching machine.
+    #[serde(default)]
+    pub summarize_pane_id: Option<String>,
 }
 
 /// One saved native conversation safe to display in Quick Launch.
@@ -3015,18 +3026,7 @@ impl ControlPlane {
         let machine = request.machine.clone();
         let target = machine.as_deref().unwrap_or(&self.inner.local_id);
         if target != self.inner.local_id {
-            let machine = self.remote_machine(target)?;
-            self.ensure_online(&machine.id)?;
-            // The node validates its own directory and profile allowlists; this
-            // coordinator never forwards a caller-supplied URL or machine hop.
-            let forwarded = LaunchRequest {
-                machine: None,
-                ..request
-            };
-            return machine
-                .post_json("/api/v1/sessions", &forwarded)
-                .await
-                .map_err(|error| upstream(&error));
+            return self.forward_launch(target, request).await;
         }
         self.ensure_local_owner_enabled()?;
         if self
@@ -3067,7 +3067,13 @@ impl ControlPlane {
             Some(lease) => Some(self.acquire_resume_lease(lease).await?),
             None => None,
         };
+        // Summarize before anything is created. A failed summary must leave no
+        // half-configured tmux session behind.
+        let handover = self
+            .prepare_handover(request.summarize_pane_id.as_deref(), &profile, &directory)
+            .await?;
         let name = request.name;
+        let launched_name = name.clone();
         let resources = self.inner.config.agent_resources;
         let launch_lease = resume_lease.clone();
         let launched = local_tmux(
@@ -3105,7 +3111,122 @@ impl ControlPlane {
         );
         launched?;
         self.inner.refresh_now.notify_one();
+        self.spawn_handover_delivery(launched_name, handover);
         Ok(())
+    }
+
+    /// Hands one launch to the machine that owns the tmux server.
+    async fn forward_launch(&self, target: &str, request: LaunchRequest) -> Result<()> {
+        let machine = self.remote_machine(target)?;
+        self.ensure_online(&machine.id)?;
+        // Summarizing runs a full CLI turn on the node, which outlasts the
+        // federated request window. Say so instead of reporting a timeout for
+        // a duplicate the node may still be launching.
+        if request.summarize_pane_id.is_some() {
+            return Err(bad_request(format!(
+                "summarizing a previous session takes longer than a launch to {} may stay open; duplicate from that machine's own atmux",
+                machine.id
+            )));
+        }
+        // The node validates its own directory and profile allowlists; this
+        // coordinator never forwards a caller-supplied URL or machine hop.
+        let forwarded = LaunchRequest {
+            machine: None,
+            ..request
+        };
+        machine
+            .post_json("/api/v1/sessions", &forwarded)
+            .await
+            .map_err(|error| upstream(&error))
+    }
+
+    /// Runs the target profile's CLI non-interactively over one local pane's
+    /// conversation so a duplicate can start where that pane stopped.
+    ///
+    /// The source pane must live on this machine: a coordinator never reads a
+    /// remote machine's transcript, and a forwarded launch summarizes on the
+    /// node that owns both the pane and the credentials.
+    async fn prepare_handover(
+        &self,
+        pane_id: Option<&str>,
+        profile: &AgentProfile,
+        directory: &Path,
+    ) -> Result<Option<String>> {
+        let Some(pane_id) = pane_id else {
+            return Ok(None);
+        };
+        let session = {
+            let state = self.read_state();
+            find_session(&state.sessions, pane_id).cloned()
+        }
+        .ok_or_else(|| not_found(format!("no agent session matches {pane_id}")))?;
+        let source = session.clone();
+        let transcript =
+            tokio::task::spawn_blocking(move || crate::transcript::read(&source, None))
+                .await
+                .map_err(|error| {
+                    internal(&anyhow::Error::new(error).context("transcript read panicked"))
+                })?
+                .map_err(|error| internal(&error))?;
+        let prompt = transcript
+            .messages
+            .as_deref()
+            .and_then(summary::summary_prompt)
+            .ok_or_else(|| {
+                bad_request(format!(
+                    "{} has no readable conversation to summarize",
+                    session.name
+                ))
+            })?;
+        let summary = summary::summarize(profile, directory, &prompt)
+            .await
+            .map_err(|error| upstream(&error))?;
+        Ok(Some(summary::initial_prompt(&summary)))
+    }
+
+    /// Delivers a duplicate's summarized context once its new CLI reaches an
+    /// empty top-level composer.
+    ///
+    /// The launch itself has already succeeded, so this is deliberately
+    /// out-of-band: it never submits into an approval prompt or a working
+    /// agent, and it gives up rather than retrying forever.
+    fn spawn_handover_delivery(&self, name: String, handover: Option<String>) {
+        let Some(text) = handover else {
+            return;
+        };
+        let control = self.clone();
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + HANDOVER_DELIVERY_TIMEOUT;
+            loop {
+                tokio::time::sleep(HANDOVER_DELIVERY_POLL).await;
+                if tokio::time::Instant::now() >= deadline {
+                    eprintln!("atmux could not hand the summary to {name}: it never became idle");
+                    return;
+                }
+                if control.refresh().await.is_err() {
+                    continue;
+                }
+                let ready = {
+                    let state = control.read_state();
+                    find_session(&state.sessions, &name).and_then(|session| {
+                        crate::status::automation_idle(
+                            session.agent,
+                            &session.content,
+                            &session.title,
+                            &control.inner.config.status,
+                        )
+                        .then(|| session.pane_id.clone())
+                    })
+                };
+                let Some(pane_id) = ready else {
+                    continue;
+                };
+                if let Err(error) = control.send_text(&pane_id, text, true).await {
+                    eprintln!("atmux could not hand the summary to {name}: {error:#}");
+                }
+                return;
+            }
+        });
     }
 
     async fn revalidate_resume_candidate(
@@ -5372,6 +5493,7 @@ mod tests {
                 mode_id: None,
                 machine: None,
                 resume_session_id: None,
+                summarize_pane_id: None,
             })
             .await
             .unwrap_err()
@@ -5437,6 +5559,7 @@ mod tests {
                     mode_id: None,
                     machine: Some("gpu-box".to_owned()),
                     resume_session_id: None,
+                    summarize_pane_id: None,
                 })
                 .await
                 .is_err()
@@ -5450,6 +5573,7 @@ mod tests {
                 mode_id: None,
                 machine: Some("ghost".to_owned()),
                 resume_session_id: None,
+                summarize_pane_id: None,
             })
             .await
             .unwrap_err()
@@ -5614,6 +5738,7 @@ mod tests {
                         mode_id: None,
                         machine: None,
                         resume_session_id: None,
+                        summarize_pane_id: None,
                     })
                     .await
                     .unwrap_err()
@@ -5630,6 +5755,7 @@ mod tests {
                         mode_id: None,
                         machine: None,
                         resume_session_id: None,
+                        summarize_pane_id: None,
                     })
                     .await
                     .unwrap_err()
@@ -6128,6 +6254,80 @@ mod tests {
             maintenance_harness(AgentKind::Other),
             None,
             "Other includes Grok and unsupported wrappers and must never be collected"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_that_cannot_be_summarized_never_launches() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("atmux-duplicate-summary-{nonce}"));
+        fs::create_dir_all(&root).unwrap();
+        let mut config = Config::default();
+        config.general.project_roots = vec![root.clone()];
+        config.profiles = vec![AgentProfile {
+            name: "max".to_owned(),
+            harness: "codex".to_owned(),
+            command: "codex".to_owned(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            inherit_discovered: false,
+            modes: Vec::new(),
+        }];
+        let control = super::test_control_with_config(&[], config);
+        control.apply_refresh(vec![session("working")]);
+
+        let request = |pane: &str| LaunchRequest {
+            name: "agent-copy".to_owned(),
+            directory: root.to_string_lossy().into_owned(),
+            profile_id: "profile-0".to_owned(),
+            mode_id: None,
+            machine: None,
+            resume_session_id: None,
+            summarize_pane_id: Some(pane.to_owned()),
+        };
+        assert_eq!(
+            error_kind(&control.launch(request("%404")).await.unwrap_err()),
+            ErrorKind::NotFound,
+            "a summary source that is gone must not silently launch a bare duplicate"
+        );
+        // The fixture pane owns no native log, so no CLI is ever run: the
+        // request is refused before tmux is touched.
+        let unreadable = control.launch(request("%1")).await.unwrap_err();
+        assert_eq!(error_kind(&unreadable), ErrorKind::BadRequest);
+        assert!(
+            unreadable.to_string().contains("no readable conversation"),
+            "{unreadable}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_federated_duplicate_reports_that_it_cannot_summarize_remotely() {
+        let control = control_with_machines(&["gpu-box"]);
+        control.apply_machine_sessions(
+            "gpu-box",
+            vec![remote_summary("gpu-box", "%4", "trainer", "aaaa")],
+            None,
+        );
+        let error = control
+            .launch(LaunchRequest {
+                name: "trainer-copy".to_owned(),
+                directory: "/srv".to_owned(),
+                profile_id: "profile-0".to_owned(),
+                mode_id: None,
+                machine: Some("gpu-box".to_owned()),
+                resume_session_id: None,
+                summarize_pane_id: Some("%4".to_owned()),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error_kind(&error), ErrorKind::BadRequest);
+        assert!(
+            error.to_string().contains("duplicate from that machine"),
+            "{error}"
         );
     }
 
