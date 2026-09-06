@@ -67,7 +67,12 @@ vendor = {{ get $profile "vendor" | quote }}
 [[machines]]
 id = {{ get $machine "id" | quote }}
 label = {{ get $machine "label" | quote }}
-url = {{ printf "https://%s:%v" (get $machine "address") (get $machine "port") | quote }}
+{{- if get $machine "tunnel" }}
+tunnel = true
+{{- end }}
+{{- with get $machine "address" }}
+url = {{ printf "https://%s:%v" . (get $machine "port") | quote }}
+{{- end }}
 token_file = {{ printf "/etc/atmux/federation-tokens/%s.token" (get $machine "id") | quote }}
 {{- end }}
 {{- end -}}

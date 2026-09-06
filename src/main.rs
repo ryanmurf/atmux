@@ -313,13 +313,22 @@ fn doctor(config_path: &std::path::Path) -> Result<()> {
             Err(error) => println!("✗ node token {error:#}"),
         }
     }
+    // An empty registry proves the transport shape without opening anything:
+    // a `tunnel = true` machine still validates, and still has no address.
+    let tunnels = atmux::tunnel::TunnelRegistry::new();
     for machine in &config.machines {
         // Report a bad URL or unreadable credential without contacting anything.
-        match atmux::remote::RemoteMachine::from_config(machine) {
+        match atmux::remote::RemoteMachine::from_config_with_transport(
+            machine,
+            None,
+            Some(tunnels.clone()),
+        ) {
             Ok(remote) => println!(
                 "✓ remote     {} at {} ({})",
                 remote.id,
-                remote.address(),
+                remote
+                    .address()
+                    .unwrap_or_else(|| "an inbound tunnel".to_owned()),
                 if remote.is_authenticated() {
                     "token configured"
                 } else {

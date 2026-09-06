@@ -144,15 +144,17 @@ function mockSession(machine, pane, name, status, extra = {}) {
 function mockOverviewMachines() {
   return [
     {
-      id: "tron", label: "Tron", kind: "local", online: true, sessions: 1,
+      id: "tron", label: "Tron", kind: "local", online: true, sessions: 1, tunnel: false,
       metrics: {
         uptime_seconds: 183_840,
         kernel_version: LONG_KERNEL_VERSION,
         os_version: LONG_OS_VERSION,
       },
     },
-    { id: "midnight", label: "Midnight", kind: "remote", online: true, sessions: 2 },
-    { id: "clue", label: "Clue", kind: "remote", online: false, sessions: 0, health: LONG_MACHINE_HEALTH },
+    // Midnight is the phone-home tunnel fixture: reachable only through the
+    // held-open connection, with no configured address of its own.
+    { id: "midnight", label: "Midnight", kind: "remote", online: true, sessions: 2, tunnel: true },
+    { id: "clue", label: "Clue", kind: "remote", online: false, sessions: 0, health: LONG_MACHINE_HEALTH, tunnel: false },
   ];
 }
 
@@ -1899,6 +1901,19 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       () => cdp.evaluate("!document.getElementById('machine-view').hidden && document.getElementById('machine-name').textContent === 'Midnight'"),
       "Midnight's machine view did not open",
     );
+    // Midnight is phone-home only: no configured address, so the meta line
+    // says so in words rather than rendering a blank or literal "null".
+    const midnightMeta = await cdp.evaluate(`(() => {
+      const meta = document.getElementById('machine-meta');
+      return {
+        text: meta.textContent,
+        overflow: meta.scrollWidth - meta.clientWidth,
+        documentOverflow: document.documentElement.scrollWidth - innerWidth,
+      };
+    })()`);
+    assert.equal(midnightMeta.text, "Online · via tunnel · no direct address · 2 agents");
+    assert.ok(midnightMeta.overflow <= 1, JSON.stringify(midnightMeta));
+    assert.ok(midnightMeta.documentOverflow <= 1, JSON.stringify(midnightMeta));
     await waitFor(
       () => cdp.evaluate("document.querySelector('#machine-software [data-update-action=\"rollback\"]') !== null && !document.querySelector('#machine-software [data-update-action=\"rollback\"]').disabled"),
       "Roll back was never offered for a machine with a previous executable",

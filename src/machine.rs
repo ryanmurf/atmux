@@ -405,7 +405,12 @@ pub struct MachineSummary {
     /// Epoch milliseconds of the last successful contact.
     pub last_seen_ms: Option<u64>,
     /// Credential-free `host:port` of a remote node, for operator diagnostics.
+    /// `None` for a machine that only dials in and has no address to publish.
     pub address: Option<String>,
+    /// Whether a live phone-home tunnel is carrying this machine right now,
+    /// rather than a coordinator-dialed address.
+    #[serde(default)]
+    pub tunnel: bool,
     /// Resource telemetry sampled by the machine that owns this tmux server.
     #[serde(default)]
     pub metrics: MachineMetrics,
@@ -571,6 +576,7 @@ mod tests {
             last_seen_ms: Some(1_700_000_000_000),
             address: Some("gpu-box.tail1234.ts.net:7345".to_owned()),
             metrics: MachineMetrics::default(),
+            tunnel: false,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"kind\":\"remote\""));

@@ -1263,9 +1263,10 @@ mod tests {
         let remote = RemoteMachine::from_config(&crate::config::MachineConfig {
             id: "max".to_owned(),
             label: None,
-            url: "http://127.0.0.1:7345".to_owned(),
+            url: Some("http://127.0.0.1:7345".to_owned()),
             token_env: None,
             token_file: None,
+            tunnel: false,
         })
         .expect("remote");
         let Err(error) = AtmuxPullTransport::new(vec![Arc::new(remote)]) else {

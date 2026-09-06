@@ -183,6 +183,103 @@ if grep -Eq '^  ports:.*7345|^    - port: 7345' "$work/enabled.yaml"; then
   exit 1
 fi
 
+# --- Phone-home tunnel ---------------------------------------------------
+#
+# With the tunnel disabled, oauth2-proxy remains the sole network-facing
+# container, exactly as asserted above: the gateway's bearer/mTLS bridge
+# binds 127.0.0.1:8080 and is reachable only from inside the Pod's own
+# network namespace. server.tunnel.enabled is the one deliberate, reviewed
+# exception to that rule: it opens exactly one MORE network-facing port,
+# owned by the gateway container itself. That is acceptable only because
+# the port serves nothing but /api/v1/tunnel (every other path 404s),
+# never has ${ATMUX_PROXY_TOKEN} injected into it (that credential is for
+# the SSO'd browser path only — injecting it here would let any signed-in
+# browser session impersonate a machine, and would clobber the node's own
+# federation credential), and the coordinator authenticates the caller
+# against exactly one machine's own federation token. oauth2-proxy must
+# never sit in front of this port.
+for rendered in "$work/default.yaml" "$work/enabled.yaml"; do
+  if grep -Fq 'listen 0.0.0.0:8081' "$rendered"; then
+    echo "tunnel disabled but the gateway still opened a tunnel listener: $rendered" >&2
+    exit 1
+  fi
+  if grep -Fq '/api/v1/tunnel' "$rendered"; then
+    echo "tunnel disabled but /api/v1/tunnel is still routed: $rendered" >&2
+    exit 1
+  fi
+  if grep -Fq 'name: tunnel' "$rendered"; then
+    echo "tunnel disabled but a tunnel-named port was still rendered: $rendered" >&2
+    exit 1
+  fi
+done
+
+tunnel_values=(
+  "${enabled_values[@]}"
+  --set server.tunnel.enabled=true
+  --set-json 'server.machines=[{"id":"tron","label":"Tron","address":"192.168.0.109","port":7345,"tokenKey":"tron"},{"id":"laptop","label":"Laptop","tunnel":true,"tokenKey":"laptop"}]'
+)
+"$helm_bin" template atmux-web "$chart" --namespace murphytek \
+  "${tunnel_values[@]}" >"$work/tunnel.yaml"
+assert_unique_top_level_keys "$work/tunnel.yaml"
+
+# Exactly one additional network-facing port exists, and it belongs to the
+# gateway container (not oauth2-proxy, which keeps only its original 4180).
+test "$(grep -Ec '^kind: Service$' "$work/tunnel.yaml")" -eq 1
+grep -Fq '{name: tunnel, port: 8081, targetPort: tunnel}' "$work/tunnel.yaml"
+grep -Fq '{name: tunnel, containerPort: 8081}' "$work/tunnel.yaml"
+grep -Fq 'listen 0.0.0.0:8081;' "$work/tunnel.yaml"
+
+# The tunnel's nginx server block forwards the Upgrade, and must never
+# carry the proxy token that every other location injects.
+awk '/listen 0\.0\.0\.0:8081;/,/^    }$/' "$work/tunnel.yaml" >"$work/tunnel-server-block.txt"
+grep -Fq 'location /api/v1/tunnel {' "$work/tunnel-server-block.txt"
+grep -Fq 'proxy_set_header Upgrade $http_upgrade;' "$work/tunnel-server-block.txt"
+grep -Fq 'proxy_set_header Connection $connection_upgrade;' "$work/tunnel-server-block.txt"
+grep -Fq 'proxy_pass http://127.0.0.1:7345;' "$work/tunnel-server-block.txt"
+grep -Fq 'location / {' "$work/tunnel-server-block.txt"
+grep -Fq 'return 404;' "$work/tunnel-server-block.txt"
+if grep -Fq 'ATMUX_PROXY_TOKEN' "$work/tunnel-server-block.txt"; then
+  echo "tunnel server block must never inject the SSO gateway's proxy token" >&2
+  exit 1
+fi
+grep -Fq 'map $http_upgrade $connection_upgrade {' "$work/tunnel.yaml"
+
+# NetworkPolicy admits the tunnel port from the ingress controller only;
+# egress is untouched (a tunnel machine dials in, so it needs no egress
+# rule of its own — see the laptop machine asserted below).
+test "$(grep -Ec '^kind: NetworkPolicy$' "$work/tunnel.yaml")" -eq 1
+grep -Fq 'ports: [{protocol: TCP, port: 8081}]' "$work/tunnel.yaml"
+
+# The Ingress carries the tunnel path ahead of the catch-all "/" (ingress-
+# nginx actually matches by path length regardless of order, but listing
+# it first keeps the manifest readable), with long proxy timeouts: the
+# tunnel is long-lived and mostly idle between its h2 PING keepalives.
+tunnel_path_line="$(grep -n -E 'path: /api/v1/tunnel$' "$work/tunnel.yaml" | head -1 | cut -d: -f1)"
+root_path_line="$(grep -n -E 'path: /$' "$work/tunnel.yaml" | head -1 | cut -d: -f1)"
+test -n "$tunnel_path_line"
+test -n "$root_path_line"
+test "$tunnel_path_line" -lt "$root_path_line"
+grep -Fq 'nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"' "$work/tunnel.yaml"
+grep -Fq 'nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"' "$work/tunnel.yaml"
+
+# _helpers.tpl: a tunnel machine with no address renders `tunnel = true`
+# and no `url =` line; a machine with an address still renders `url =` as
+# today, and does not pick up `tunnel = true` it never asked for.
+laptop_block="$(grep -A3 -F 'id = "laptop"' "$work/tunnel.yaml")"
+grep -Fq 'label = "Laptop"' <<<"$laptop_block"
+grep -Fq 'tunnel = true' <<<"$laptop_block"
+grep -Fq 'token_file = "/etc/atmux/federation-tokens/laptop.token"' <<<"$laptop_block"
+if grep -Fq 'url = ' <<<"$laptop_block"; then
+  echo "tunnel-only machine unexpectedly rendered a url" >&2
+  exit 1
+fi
+tron_block="$(grep -A3 -F 'id = "tron"' "$work/tunnel.yaml")"
+grep -Fq 'url = "https://192.168.0.109:7345"' <<<"$tron_block"
+if grep -Fq 'tunnel = true' <<<"$tron_block"; then
+  echo "address-only machine unexpectedly rendered tunnel = true" >&2
+  exit 1
+fi
+
 # Either reviewed identity may remain independently authorized during a
 # deliberate allowlist rollout; public access still rejects every other user.
 "$helm_bin" template atmux-web "$chart" --namespace murphytek \
@@ -257,5 +354,12 @@ must_fail "${enabled_values[@]}" --set-json 'server.machines=[{"id":"tron","labe
 must_fail "${enabled_values[@]}" --set-json 'server.pulse.accounts=[{"id":1,"identity":"one@example.com"},{"id":1,"identity":"two@example.com"}]'
 must_fail "${enabled_values[@]}" --set-json 'server.pulse.accounts=[{"id":4,"identity":"ryanmurf@gmail.com","profiles":[{"name":"codex","vendor":"unknown"}]}]'
 must_fail "${enabled_values[@]}" --set-json 'server.pulse.accounts=[{"id":4,"identity":"ryanmurf@gmail.com","profiles":[{"name":"codex","vendor":"openai-codex"},{"name":"codex","vendor":"openai-codex"}]}]'
+
+must_fail_with 'must set tunnel: true or a nonempty address' \
+  "${enabled_values[@]}" --set-json 'server.machines=[{"id":"ghost","label":"Ghost","tokenKey":"ghost"}]'
+must_fail_with 'server.tunnel.enabled requires server.enabled=true' \
+  --set server.tunnel.enabled=true
+must_fail_with 'server.tunnel.port must be between 1 and 65535' \
+  "${enabled_values[@]}" --set server.tunnel.port=70000
 
 echo "Helm render security tests passed"

@@ -24,6 +24,7 @@ mod systemd_scope;
 pub mod tls;
 pub mod tmux;
 pub mod transcript;
+pub mod tunnel;
 pub mod ui;
 pub mod web;
 pub mod workspace;

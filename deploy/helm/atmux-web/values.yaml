@@ -43,6 +43,20 @@ server:
   #   address: 192.168.0.109
   #   port: 7345
   #   tokenKey: tron
+  # A node with only outbound HTTPS can instead phone home over the tunnel
+  # port below: set `tunnel: true` and omit `address`/`port`. An entry may
+  # set both, in which case the coordinator prefers the live tunnel and
+  # falls back to the url.
+  # - id: laptop
+  #   label: Laptop
+  #   tunnel: true
+  #   tokenKey: laptop
+  # Phone-home tunnel: nodes with only outbound HTTPS dial in and stay
+  # controllable. Disabled by default; enabling it opens a second,
+  # non-SSO gateway port that carries only /api/v1/tunnel.
+  tunnel:
+    enabled: false
+    port: 8081
   pulse:
     serve: true
     # Explicit account/profile metadata is safe configuration, not

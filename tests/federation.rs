@@ -21,9 +21,10 @@ use atmux::{
         CloneLaunchRepositoryRequest, ControlPlane, CreateLaunchDirectoryRequest, ErrorKind,
         LaunchRequest, error_kind,
     },
-    machine::MachineKind,
+    machine::{MachineKind, Secret},
     remote::RemoteMachine,
     tmux::{PaneSpecialKey, Tmux},
+    tunnel::TunnelRegistry,
     workspace::{FileWriteRequest, FilesResponse, GitResponse},
 };
 
@@ -623,7 +624,22 @@ async fn start_node_with_memory(advertise_memory: bool) -> (SocketAddr, Shared) 
         advertise_memory,
         ..Recorder::default()
     }));
-    let app = Router::new()
+    let app = node_app(&recorder);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (address, recorder)
+}
+
+/// The fake node's routes, independent of how the coordinator reaches them.
+///
+/// The tunnel tests serve this exact router over an in-memory stream, so a
+/// scenario that passes over a socket and one that passes over a tunnel are
+/// running the same node.
+fn node_app(recorder: &Shared) -> Router {
+    Router::new()
         .route("/api/v1/events", get(events))
         .route("/api/v1/launch-options", get(launch_options))
         .route("/api/v1/launch-directories", get(launch_directories))
@@ -652,13 +668,26 @@ async fn start_node_with_memory(advertise_memory: bool) -> (SocketAddr, Shared) 
         .route("/api/v1/sessions", post(launch))
         .route("/api/v1/memory-launches/v1", post(launch_with_memory))
         .route("/api/v1/sessions/{id}", delete(kill))
-        .with_state(Arc::clone(&recorder));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    (address, recorder)
+        // Sized so one response lands just under the coordinator's 1 MiB cap
+        // and one lands just over it, which is where HTTP/2 flow control would
+        // stall if the tunnel's windows were wrong.
+        .route("/api/v1/panes/{id}/bulk", get(bulk))
+        .with_state(Arc::clone(recorder))
+}
+
+async fn bulk(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<BulkQuery>,
+) -> Response {
+    record(&state, &headers, &format!("/api/v1/panes/{id}/bulk"), "");
+    Json(json!({ "content": "x".repeat(query.bytes) })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct BulkQuery {
+    bytes: usize,
 }
 
 async fn start_legacy_input_node() -> (SocketAddr, Shared) {
@@ -681,9 +710,10 @@ fn machine_config(address: SocketAddr, token_file: Option<&std::path::Path>) -> 
     MachineConfig {
         id: "gpu-box".to_owned(),
         label: Some("GPU box".to_owned()),
-        url: format!("http://{address}"),
+        url: Some(format!("http://{address}")),
         token_env: None,
         token_file: token_file.map(std::path::Path::to_path_buf),
+        tunnel: false,
     }
 }
 
@@ -817,9 +847,10 @@ async fn node_errors_surface_with_their_message_and_unreachable_nodes_fail_fast(
     let dead = RemoteMachine::from_config(&MachineConfig {
         id: "dead".to_owned(),
         label: None,
-        url: "http://127.0.0.1:1".to_owned(),
+        url: Some("http://127.0.0.1:1".to_owned()),
         token_env: None,
         token_file: None,
+        tunnel: false,
     })
     .unwrap();
     let started = Instant::now();
@@ -905,9 +936,10 @@ async fn repeated_failed_stream_opens_leak_no_connections_or_tasks() {
     let hung_machine = RemoteMachine::from_config(&MachineConfig {
         id: "hung".to_owned(),
         label: None,
-        url: format!("http://{hung}"),
+        url: Some(format!("http://{hung}")),
         token_env: None,
         token_file: None,
+        tunnel: false,
     })
     .unwrap()
     .with_timeouts(Duration::from_millis(500), Duration::from_millis(80));
@@ -1715,9 +1747,10 @@ async fn one_unreachable_machine_never_breaks_local_or_healthy_machines() {
         id: "dead".to_owned(),
         label: Some("Dead box".to_owned()),
         // Port 1 is closed, so this machine can never connect.
-        url: "http://127.0.0.1:1".to_owned(),
+        url: Some("http://127.0.0.1:1".to_owned()),
         token_env: None,
         token_file: None,
+        tunnel: false,
     });
     let control = ControlPlane::start(config).await.unwrap();
     assert!(
@@ -2104,4 +2137,431 @@ async fn owner_generation_conflicts_remain_conflicts_through_a_coordinator() {
         })
         .count();
     assert!(rejected >= 5, "forwarded bodies: {:#?}", seen.bodies);
+}
+
+// ---------------------------------------------------------------------------
+// Phone-home tunnel
+//
+// A node with only outbound HTTPS dials the coordinator and serves its own API
+// back down the held-open connection. These tests run the same fake node and
+// the same coordinator transport over that connection, so a scenario that
+// passes over a socket and one that passes over a tunnel are the same scenario.
+// ---------------------------------------------------------------------------
+
+fn tunnel_machine_config(token: Option<&std::path::Path>) -> MachineConfig {
+    MachineConfig {
+        id: "gpu-box".to_owned(),
+        label: Some("GPU box".to_owned()),
+        url: None,
+        token_env: None,
+        token_file: token.map(std::path::Path::to_path_buf),
+        tunnel: true,
+    }
+}
+
+/// Runs the fake node over an in-memory duplex and registers the coordinator's
+/// half, exactly as a real 101 upgrade would.
+fn dial_in(
+    registry: &TunnelRegistry,
+    machine: &str,
+    recorder: &Shared,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let (coordinator, node) = tokio::io::duplex(256 * 1024);
+    let app = node_app(recorder);
+    let node_side = tokio::spawn(async move {
+        let _ = atmux::tunnel::serve_node_stream(app, node).await;
+    });
+    let registry = registry.clone();
+    let machine = machine.to_owned();
+    let coordinator_side = tokio::spawn(async move {
+        atmux::tunnel::register_stream(&registry, &machine, coordinator).await;
+    });
+    vec![node_side, coordinator_side]
+}
+
+async fn await_tunnel(registry: &TunnelRegistry, machine: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !registry.is_connected(machine) {
+        assert!(Instant::now() < deadline, "the tunnel never registered");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn every_federated_call_path_works_over_a_tunnel() {
+    let recorder: Shared = Arc::new(Mutex::new(Recorder::default()));
+    let registry = TunnelRegistry::new();
+    let _tasks = dial_in(&registry, "gpu-box", &recorder);
+    await_tunnel(&registry, "gpu-box").await;
+
+    let token = token_file("tunnel-transport.token");
+    let machine = RemoteMachine::from_config_with_transport(
+        &tunnel_machine_config(Some(&token)),
+        None,
+        Some(registry.clone()),
+    )
+    .unwrap();
+    // A machine that only dials in publishes no address for the dashboard.
+    assert_eq!(machine.address(), None);
+    assert!(machine.tunnel_online());
+    assert!(machine.is_authenticated());
+
+    // A plain JSON read.
+    let options: atmux::control::LaunchOptions =
+        machine.get_json("/api/v1/launch-options").await.unwrap();
+    assert_eq!(options.directories, ["/srv/models"]);
+
+    // A mutation with a body.
+    machine
+        .post_json(
+            "/api/v1/panes/%257/messages",
+            &json!({ "text": "hello", "submit": true }),
+        )
+        .await
+        .unwrap();
+
+    // A rejected status still carries the owner's message.
+    let missing = machine
+        .get_json::<Value>("/api/v1/panes/%259")
+        .await
+        .unwrap_err();
+    assert!(format!("{missing:#}").contains("no agent pane matches"));
+
+    // The long-lived events stream rides the same multiplexed connection.
+    let mut stream = machine.open_events("/api/v1/events").await.unwrap();
+    let snapshot = stream.next_event().await.unwrap();
+    assert_eq!(snapshot.name, "sessions.snapshot");
+    assert_eq!(
+        serde_json::from_str::<Value>(&snapshot.data).unwrap()["revision"],
+        4
+    );
+    let patch = stream.next_event().await.unwrap();
+    assert_eq!(patch.name, "sessions.patch");
+
+    // Interleaving a unary request with the open stream proves the connection
+    // really is multiplexed rather than serialized behind the stream.
+    let _: Value = machine.get_json("/api/v1/panes/%257").await.unwrap();
+    drop(stream);
+
+    let seen = recorder.lock().unwrap();
+    assert!(
+        seen.authorizations
+            .iter()
+            .all(|value| value.as_deref() == Some("Bearer node-token")),
+        "{:?}",
+        seen.authorizations
+    );
+    // The node's Host allow-list has to see the reserved authority, because
+    // HTTP/2 has no Host header of its own.
+    assert!(
+        seen.hosts
+            .iter()
+            .all(|value| value.as_deref() == Some("atmux.tunnel")),
+        "{:?}",
+        seen.hosts
+    );
+}
+
+#[tokio::test]
+async fn a_tunneled_response_is_bounded_exactly_as_a_dialed_one() {
+    let recorder: Shared = Arc::new(Mutex::new(Recorder::default()));
+    let registry = TunnelRegistry::new();
+    let _tasks = dial_in(&registry, "gpu-box", &recorder);
+    await_tunnel(&registry, "gpu-box").await;
+    let machine = RemoteMachine::from_config_with_transport(
+        &tunnel_machine_config(None),
+        None,
+        Some(registry),
+    )
+    .unwrap();
+
+    // Just under the coordinator's 1 MiB ceiling: HTTP/2 flow control has to
+    // hand back every window update for this to complete at all.
+    let large: Value = machine
+        .get_json("/api/v1/panes/%257/bulk?bytes=1040000")
+        .await
+        .unwrap();
+    assert_eq!(large["content"].as_str().unwrap().len(), 1_040_000);
+
+    // Over it, the same bound applies as over a socket.
+    let error = machine
+        .get_json::<Value>("/api/v1/panes/%257/bulk?bytes=1200000")
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("exceeded"),
+        "an oversized tunneled response must be refused: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn the_last_tunnel_for_a_machine_wins_and_the_old_one_stops_answering() {
+    let first: Shared = Arc::new(Mutex::new(Recorder::default()));
+    let second: Shared = Arc::new(Mutex::new(Recorder::default()));
+    let registry = TunnelRegistry::new();
+    let _first_tasks = dial_in(&registry, "gpu-box", &first);
+    await_tunnel(&registry, "gpu-box").await;
+
+    let machine = RemoteMachine::from_config_with_transport(
+        &tunnel_machine_config(None),
+        None,
+        Some(registry.clone()),
+    )
+    .unwrap();
+    let _: atmux::control::LaunchOptions =
+        machine.get_json("/api/v1/launch-options").await.unwrap();
+    assert_eq!(first.lock().unwrap().paths.len(), 1);
+
+    // The laptop moved networks and dialed in again.
+    let _second_tasks = dial_in(&registry, "gpu-box", &second);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        // A request that was already holding the replaced sender is allowed to
+        // fail; the coordinator's watcher reconnects. What must never happen is
+        // the old node continuing to answer.
+        let _ = machine.get_json::<Value>("/api/v1/launch-options").await;
+        if !second.lock().unwrap().paths.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the newer tunnel never took over"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let stale = first.lock().unwrap().paths.len();
+    let _: atmux::control::LaunchOptions =
+        machine.get_json("/api/v1/launch-options").await.unwrap();
+    assert!(second.lock().unwrap().paths.len() >= 2);
+    assert_eq!(
+        first.lock().unwrap().paths.len(),
+        stale,
+        "the replaced tunnel must stop receiving requests"
+    );
+}
+
+#[tokio::test]
+async fn a_machine_with_no_live_tunnel_reports_why_it_cannot_be_reached() {
+    let registry = TunnelRegistry::new();
+    let machine = RemoteMachine::from_config_with_transport(
+        &tunnel_machine_config(None),
+        None,
+        Some(registry.clone()),
+    )
+    .unwrap();
+    assert!(!machine.tunnel_online());
+    let error = machine
+        .get_json::<Value>("/api/v1/launch-options")
+        .await
+        .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("no live tunnel"), "{message}");
+    assert!(message.contains("gpu-box"), "{message}");
+}
+
+#[tokio::test]
+async fn a_dropped_tunnel_is_retired_and_a_reconnect_restores_service() {
+    let recorder: Shared = Arc::new(Mutex::new(Recorder::default()));
+    let registry = TunnelRegistry::new();
+    let tasks = dial_in(&registry, "gpu-box", &recorder);
+    await_tunnel(&registry, "gpu-box").await;
+    let machine = RemoteMachine::from_config_with_transport(
+        &tunnel_machine_config(None),
+        None,
+        Some(registry.clone()),
+    )
+    .unwrap();
+    let _: atmux::control::LaunchOptions =
+        machine.get_json("/api/v1/launch-options").await.unwrap();
+
+    // The coordinator restarted, or the laptop slept: the stream dies.
+    for task in &tasks {
+        task.abort();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while registry.is_connected("gpu-box") {
+        assert!(Instant::now() < deadline, "a dead tunnel was never retired");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        machine
+            .get_json::<Value>("/api/v1/launch-options")
+            .await
+            .is_err()
+    );
+
+    // The node dials back in and everything works again, with no new
+    // configuration and no coordinator restart.
+    let _reconnected = dial_in(&registry, "gpu-box", &recorder);
+    await_tunnel(&registry, "gpu-box").await;
+    let options: atmux::control::LaunchOptions =
+        machine.get_json("/api/v1/launch-options").await.unwrap();
+    assert_eq!(options.directories, ["/srv/models"]);
+}
+
+/// The one test that exercises the real handshake: a node dials a coordinator
+/// over a socket, gets a 101, and the coordinator drives it back down.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_dials_a_real_coordinator_and_is_driven_back_through_it() {
+    let recorder: Shared = Arc::new(Mutex::new(Recorder::default()));
+    let registry = TunnelRegistry::new();
+    let acceptor = atmux::tunnel::TunnelAcceptor::new(
+        registry.clone(),
+        [("gpu-box".to_owned(), Secret::new("node-token"))]
+            .into_iter()
+            .collect(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let coordinator = tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            atmux::tunnel::router(acceptor).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
+    });
+
+    let token = token_file("tunnel-dial.token");
+    let node = atmux::tunnel::PhoneHome::new(
+        &atmux::config::CoordinatorConfig {
+            enabled: true,
+            url: Some(format!("http://{address}")),
+            token_env: None,
+            token_file: Some(token),
+        },
+        "gpu-box",
+        node_app(&recorder),
+    )
+    .unwrap()
+    .spawn();
+    await_tunnel(&registry, "gpu-box").await;
+
+    let machine = RemoteMachine::from_config_with_transport(
+        &tunnel_machine_config(None),
+        None,
+        Some(registry.clone()),
+    )
+    .unwrap();
+    let options: atmux::control::LaunchOptions =
+        machine.get_json("/api/v1/launch-options").await.unwrap();
+    assert_eq!(options.directories, ["/srv/models"]);
+
+    let mut stream = machine.open_events("/api/v1/events").await.unwrap();
+    assert_eq!(stream.next_event().await.unwrap().name, "sessions.snapshot");
+    drop(stream);
+
+    node.abort();
+    coordinator.abort();
+}
+
+/// A wrong credential must fail the dial outright rather than degrade into a
+/// tunnel that exists but carries nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_with_the_wrong_token_never_opens_a_tunnel() {
+    let registry = TunnelRegistry::new();
+    let acceptor = atmux::tunnel::TunnelAcceptor::new(
+        registry.clone(),
+        [("gpu-box".to_owned(), Secret::new("the-real-token"))]
+            .into_iter()
+            .collect(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let coordinator = tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            atmux::tunnel::router(acceptor).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
+    });
+
+    let recorder: Shared = Arc::new(Mutex::new(Recorder::default()));
+    // `token_file` writes "node-token", which is not the configured secret.
+    let node = atmux::tunnel::PhoneHome::new(
+        &atmux::config::CoordinatorConfig {
+            enabled: true,
+            url: Some(format!("http://{address}")),
+            token_env: None,
+            token_file: Some(token_file("tunnel-wrong.token")),
+        },
+        "gpu-box",
+        node_app(&recorder),
+    )
+    .unwrap()
+    .spawn();
+
+    // Give the node several backoff cycles; none of them may register.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        !registry.is_connected("gpu-box"),
+        "a rejected credential must never produce a live tunnel"
+    );
+    node.abort();
+    coordinator.abort();
+}
+
+/// The whole coordinator, driven over a tunnel: watcher, mirror, machine
+/// payload, and a pane read. `coordinator_only` keeps this off tmux, which is
+/// also the shape the Kubernetes coordinator actually runs in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coordinator_mirrors_and_drives_a_machine_that_only_dials_in() {
+    let mut config = Config::default();
+    config.node.id = "hub".to_owned();
+    config.node.coordinator_only = true;
+    config.profiles.clear();
+    config.general.project_roots.clear();
+    config.general.favorite_dirs.clear();
+    config.general.switch_on_launch = false;
+    config.machines = vec![tunnel_machine_config(None)];
+    #[cfg(feature = "pulse")]
+    {
+        config.pulse.collect = false;
+        config.pulse.serve = false;
+        config.pulse.receive = false;
+    }
+
+    let control = ControlPlane::start(config).await.unwrap();
+    // Before the node dials in it is a configured machine with no address at
+    // all, which is exactly what the dashboard has to render.
+    let before = control
+        .machines()
+        .into_iter()
+        .find(|machine| machine.id == "gpu-box")
+        .unwrap();
+    assert!(!before.online);
+    assert_eq!(before.address, None);
+    assert!(!before.tunnel);
+
+    let recorder: Shared = Arc::new(Mutex::new(Recorder::default()));
+    let _tasks = dial_in(&control.tunnels(), "gpu-box", &recorder);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let machine = control
+            .machines()
+            .into_iter()
+            .find(|machine| machine.id == "gpu-box")
+            .unwrap();
+        if machine.online {
+            assert!(machine.tunnel, "a tunneled machine must say so");
+            assert_eq!(machine.address, None);
+            assert_eq!(machine.sessions, 1);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the coordinator never mirrored the tunneled node: {:?}",
+            machine.health
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // A mirrored pane is readable through the tunnel with no direct address.
+    let output = control
+        .pane_output("gpu-box~%7", None, 80)
+        .await
+        .unwrap()
+        .expect("a tunneled pane read");
+    assert_eq!(output.session, "trainer");
+    assert!(output.content.unwrap().contains("epoch 1"));
 }

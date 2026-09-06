@@ -55,6 +55,24 @@
 {{- $serverPersistenceStorageClass := get $serverPersistence "storageClass" | default "" -}}
 {{- $serverPersistenceSize := get $serverPersistence "size" | default "" -}}
 {{- $serverPersistenceAccessMode := get $serverPersistence "accessMode" | default "" -}}
+{{- $serverTunnelRaw := get $server "tunnel" -}}
+{{- $serverTunnel := dict -}}
+{{- if kindIs "map" $serverTunnelRaw -}}
+{{- $serverTunnel = $serverTunnelRaw -}}
+{{- else if $serverTunnelRaw -}}
+{{- fail "server.tunnel must be a map when configured" -}}
+{{- end -}}
+{{- if and (hasKey $serverTunnel "enabled") (not (kindIs "bool" (get $serverTunnel "enabled"))) -}}
+{{- fail "server.tunnel.enabled must be a boolean" -}}
+{{- end -}}
+{{- $serverTunnelEnabled := get $serverTunnel "enabled" | default false -}}
+{{- $serverTunnelPort := get $serverTunnel "port" | default 8081 -}}
+{{- if or (lt (int $serverTunnelPort) 1) (gt (int $serverTunnelPort) 65535) -}}
+{{- fail "server.tunnel.port must be between 1 and 65535" -}}
+{{- end -}}
+{{- if and $serverTunnelEnabled (not $serverEnabled) -}}
+{{- fail "server.tunnel.enabled requires server.enabled=true: the tunnel forwards to the in-cluster coordinator" -}}
+{{- end -}}
 {{- if and .Values.ingress.enabled (eq (len $allowedEmails) 0) -}}
 {{- fail "oauth.allowedEmails must contain at least one approved Google identity" -}}
 {{- end -}}
@@ -165,7 +183,16 @@
 {{- if or (eq (trim $machine.label) "") (gt (len $machine.label) 64) -}}
 {{- fail (printf "server machine %q label must contain 1 to 64 characters" $machine.id) -}}
 {{- end -}}
-{{- $addressParts := splitList "." $machine.address -}}
+{{- if and (hasKey $machine "tunnel") (not (kindIs "bool" (get $machine "tunnel"))) -}}
+{{- fail (printf "server machine %q tunnel must be a boolean" $machine.id) -}}
+{{- end -}}
+{{- $machineTunnel := get $machine "tunnel" | default false -}}
+{{- $machineAddress := get $machine "address" | default "" -}}
+{{- if and (not $machineTunnel) (eq (trim $machineAddress) "") -}}
+{{- fail (printf "server machine %q must set tunnel: true or a nonempty address" $machine.id) -}}
+{{- end -}}
+{{- if ne (trim $machineAddress) "" -}}
+{{- $addressParts := splitList "." $machineAddress -}}
 {{- if ne (len $addressParts) 4 -}}
 {{- fail (printf "server machine %q address must be a reviewed IPv4 address" $machine.id) -}}
 {{- end -}}
@@ -176,6 +203,7 @@
 {{- end -}}
 {{- if or (lt (int $machine.port) 1) (gt (int $machine.port) 65535) -}}
 {{- fail (printf "server machine %q port must be between 1 and 65535" $machine.id) -}}
+{{- end -}}
 {{- end -}}
 {{- if not (regexMatch "^[A-Za-z0-9._-]+$" $machine.tokenKey) -}}
 {{- fail (printf "server machine %q tokenKey is invalid" $machine.id) -}}
@@ -228,6 +256,18 @@ metadata:
   name: {{ $name }}-gateway-config
 data:
   default.conf.template: |
+    {{- if and $serverEnabled $serverTunnelEnabled }}
+    # Used only by the tunnel server block below. nginx sets $http_upgrade
+    # from the client's own Upgrade header, so Connection must mirror it:
+    # "upgrade" for a real upgrade request, "close" for a plain HTTP request
+    # (otherwise every response would carry a stray Upgrade-only Connection
+    # header). This name is local to our own nginx config, not one
+    # ingress-nginx already defines elsewhere in this Pod.
+    map $http_upgrade $connection_upgrade {
+      default upgrade;
+      "" close;
+    }
+    {{- end }}
     server {
       # The privileged bearer/mTLS bridge is reachable only inside this Pod's
       # network namespace. oauth2-proxy is the sole network-facing container.
@@ -261,6 +301,31 @@ data:
         {{- end }}
       }
     }
+    {{- if and $serverEnabled $serverTunnelEnabled }}
+    server {
+      # Phone-home tunnel ingress. Deliberately NOT behind oauth2-proxy: the
+      # caller authenticates with its own machine federation token, which the
+      # coordinator checks against that machine's configured token alone. The
+      # proxy token is never injected here, so an SSO'd browser session can
+      # never open a tunnel as a machine.
+      listen 0.0.0.0:{{ $serverTunnelPort }};
+      server_name _;
+      location /api/v1/tunnel {
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+        proxy_set_header Host "{{ .Values.host }}";
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_pass http://127.0.0.1:7345;
+      }
+      location / {
+        return 404;
+      }
+    }
+    {{- end }}
 ---
 {{- if $serverEnabled }}
 apiVersion: v1
@@ -450,6 +515,10 @@ spec:
                 secretKeyRef:
                   name: {{ ternary $serverProxyTokenSecret .Values.atmux.proxyTokenSecret $serverEnabled }}
                   key: token
+          {{- if and $serverEnabled $serverTunnelEnabled }}
+          ports:
+            - {name: tunnel, containerPort: {{ $serverTunnelPort }}}
+          {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: {drop: ["ALL"]}
@@ -591,7 +660,11 @@ metadata:
   name: {{ $name }}-oauth2-proxy
 spec:
   selector: {app: {{ $name }}-web}
-  ports: [{name: http, port: 4180, targetPort: http}]
+  ports:
+    - {name: http, port: 4180, targetPort: http}
+    {{- if and $serverEnabled $serverTunnelEnabled }}
+    - {name: tunnel, port: {{ $serverTunnelPort }}, targetPort: tunnel}
+    {{- end }}
 ---
 {{- if .Values.ingress.enabled }}
 apiVersion: networking.k8s.io/v1
@@ -606,6 +679,12 @@ metadata:
     nginx.ingress.kubernetes.io/limit-burst-multiplier: "3"
     nginx.ingress.kubernetes.io/proxy-body-size: "18m"
     nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    {{- if and $serverEnabled $serverTunnelEnabled }}
+    # The tunnel connection is long-lived and mostly idle (h2 PING keepalives
+    # every 20s); ingress-nginx's default proxy timeouts would kill it.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    {{- end }}
 spec:
   ingressClassName: {{ .Values.ingress.className }}
   tls:
@@ -615,6 +694,16 @@ spec:
     - host: {{ .Values.host | quote }}
       http:
         paths:
+          {{- if and $serverEnabled $serverTunnelEnabled }}
+          # Listed first for readability; ingress-nginx actually matches by
+          # path length regardless of order, so this always wins over "/".
+          - path: /api/v1/tunnel
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $name }}-oauth2-proxy
+                port: {name: tunnel}
+          {{- end }}
           - path: /
             pathType: Prefix
             backend:
@@ -637,12 +726,22 @@ spec:
           podSelector:
             matchLabels: {name: nginx-ingress-microk8s}
       ports: [{protocol: TCP, port: 4180}]
+    {{- if and $serverEnabled $serverTunnelEnabled }}
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ingress}
+          podSelector:
+            matchLabels: {name: nginx-ingress-microk8s}
+      ports: [{protocol: TCP, port: {{ $serverTunnelPort }}}]
+    {{- end }}
   egress:
     {{- if $serverEnabled }}
     {{- range $machine := $serverMachines }}
+    {{- with get $machine "address" }}
     - to:
-        - ipBlock: {cidr: {{ printf "%s/32" $machine.address | quote }} }
+        - ipBlock: {cidr: {{ printf "%s/32" . | quote }} }
       ports: [{protocol: TCP, port: {{ $machine.port }}}]
+    {{- end }}
     {{- end }}
     {{- else }}
     - to:
