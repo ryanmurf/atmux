@@ -1,0 +1,174 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify tag matches Cargo.toml version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Determine and verify release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          expected="${tag#v}"
+          version="$(awk -F'"' '/^\[package\]/{p=1; next} /^\[/{p=0} p && /^version[[:space:]]*=/{print $2; exit}' Cargo.toml)"
+          if [[ -z "$version" ]]; then
+            echo "could not read [package] version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [[ "$version" != "$expected" ]]; then
+            echo "tag $tag (expected version $expected) does not match Cargo.toml [package] version $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            smoke: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            smoke: true
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            smoke: true
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            smoke: false
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: "1.88"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Build release binary
+        run: cargo build --release --locked --all-features --target ${{ matrix.target }}
+      - name: Smoke test binary
+        if: matrix.smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$(./target/${{ matrix.target }}/release/atmux --version)"
+          echo "atmux --version: $output"
+          if [[ "$output" != *"${{ needs.verify.outputs.version }}"* ]]; then
+            echo "--version output does not contain expected version ${{ needs.verify.outputs.version }}: $output" >&2
+            exit 1
+          fi
+          if [[ "$output" != *"${{ matrix.target }}"* ]]; then
+            echo "--version output does not contain expected target ${{ matrix.target }}: $output" >&2
+            exit 1
+          fi
+      - name: Stage release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "target/${{ matrix.target }}/release/atmux" "atmux-${{ matrix.target }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: atmux-${{ matrix.target }}
+          path: atmux-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Make release binaries executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x dist/atmux-*
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum atmux-* > ../SHA256SUMS)
+      - name: Sign checksums
+        shell: bash
+        env:
+          ATMUX_RELEASE_SIGNING_KEY: ${{ secrets.ATMUX_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key="$(mktemp)"
+          trap 'rm -f "$key"' EXIT
+          printf '%s' "$ATMUX_RELEASE_SIGNING_KEY" > "$key"
+          openssl pkeyutl -sign -inkey "$key" -rawin -in SHA256SUMS | base64 -w0 > SHA256SUMS.sig
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.verify.outputs.tag }}"
+          gh release create "$tag" --verify-tag --generate-notes \
+            dist/atmux-x86_64-unknown-linux-gnu \
+            dist/atmux-aarch64-unknown-linux-gnu \
+            dist/atmux-aarch64-apple-darwin \
+            dist/atmux-x86_64-apple-darwin \
+            SHA256SUMS \
+            SHA256SUMS.sig
+
+  container:
+    name: Publish container image
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build coordinator image
+        run: bash scripts/build-container.sh ghcr.io/ryanmurf/atmux
+      - name: Tag and push image
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          source_image="ghcr.io/ryanmurf/atmux:${commit:0:12}"
+          release_image="ghcr.io/ryanmurf/atmux:${{ needs.verify.outputs.tag }}"
+          latest_image="ghcr.io/ryanmurf/atmux:latest"
+          docker tag "$source_image" "$release_image"
+          docker tag "$source_image" "$latest_image"
+          docker push "$release_image"
+          docker push "$latest_image"
