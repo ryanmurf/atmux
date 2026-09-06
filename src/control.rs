@@ -2893,31 +2893,38 @@ impl ControlPlane {
     /// Each control the request names is applied on its own, so changing one
     /// never resets the others.
     ///
+    /// Returns the pane's capabilities as observed *after* the switch settled.
+    /// The background pane poll is up to a second behind, so a caller that
+    /// re-read the pane immediately would race it and redisplay the controls
+    /// the pane had before the change.
+    ///
     /// # Errors
     ///
     /// Returns an error for a malformed/unavailable choice, an unknown/offline
     /// pane, an unsupported CLI picker, or a failed tmux operation.
-    pub async fn switch_model(&self, id: &str, request: ModelSwitchRequest) -> Result<()> {
+    pub async fn switch_model(&self, id: &str, request: ModelSwitchRequest) -> Result<PaneModels> {
         validate_model_switch(&request)?;
         match self.resolve(id)? {
             Target::Local { pane_id, agent, .. } => {
-                let (content, profile_name) = {
+                let session = {
                     let state = self.read_state();
                     find_session(&state.sessions, &pane_id)
-                        .map(|session| (session.content.clone(), session.profile.clone()))
+                        .cloned()
                         .ok_or_else(|| not_found(format!("no agent session matches {id}")))?
                 };
+                let content = session.content.clone();
+                let profile_name = session.profile.clone();
                 let prompt_lock = self.prompt_lock(&pane_id);
                 let identity = self.local_identity(&pane_id);
                 let inner = Arc::clone(&self.inner);
                 let switch = request.clone();
-                local_model_switch(
+                let settled = local_model_switch(
                     tokio::task::spawn_blocking(move || {
                         // Observing the pane runs several tmux subprocesses, so
                         // it stays on this blocking thread ahead of the gate.
                         let observation = Tmux.model_observation(&pane_id, agent, &content);
                         let capabilities = model_capabilities(
-                            identity,
+                            identity.clone(),
                             agent,
                             &profile_name,
                             observation,
@@ -2973,26 +2980,32 @@ impl ControlPlane {
                                     .unwrap_or_default();
                             Tmux::reconcile_recorded_mode(&pane_id, &modes)?;
                         }
-                        Ok(())
+                        Ok(settled_model_capabilities(
+                            &inner, &pane_id, identity, agent, &session, content,
+                        ))
                     })
                     .await,
                 )?;
                 self.inner.refresh_now.notify_one();
+                Ok(settled)
             }
             Target::Remote {
                 machine, pane_id, ..
             } => {
                 self.ensure_online(&machine.id)?;
-                machine
-                    .post_json(
+                let mut models: PaneModels = machine
+                    .post_json_response(
                         &format!("/api/v1/panes/{}/model", encode_segment(&pane_id)),
                         &request,
                     )
                     .await
                     .map_err(|error| upstream(&error))?;
+                // The owner names the pane by its local id; this aggregator's
+                // callers only know the federated one.
+                models.pane_id = composite_id(&machine.id, &pane_id);
+                Ok(models)
             }
         }
-        Ok(())
     }
 
     /// Restarts an eligible, non-working Claude pane in place with the current
@@ -3233,8 +3246,8 @@ impl ControlPlane {
         &self,
         id: &str,
         key: PaneSpecialKey,
-        expected_machine_id: String,
-        expected_instance_id: String,
+        expected_machine_id: Option<String>,
+        expected_instance_id: Option<String>,
     ) -> Result<()> {
         match self.resolve(id)? {
             Target::Local {
@@ -3242,8 +3255,13 @@ impl ControlPlane {
                 instance_id,
                 ..
             } => {
-                validate_expected_pane_machine(&expected_machine_id, &self.inner.local_id)?;
-                validate_expected_pane_instance(Some(&expected_instance_id), &instance_id)?;
+                // An omitted machine id means "wherever this pane already
+                // lives", which for a local pane is always this node.
+                let checked_machine_id = expected_machine_id
+                    .as_deref()
+                    .unwrap_or(&self.inner.local_id);
+                validate_expected_pane_machine(checked_machine_id, &self.inner.local_id)?;
+                validate_expected_pane_instance(expected_instance_id.as_deref(), &instance_id)?;
                 let prompt_lock = self.prompt_lock(&pane_id);
                 let live_control = self.clone();
                 local_message_mutation(
@@ -3255,7 +3273,7 @@ impl ControlPlane {
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         live_control.validate_live_message_instance(
                             &pane_id,
-                            Some(&expected_instance_id),
+                            expected_instance_id.as_deref(),
                         )?;
                         begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
                         Tmux.send_special_key(&pane_id, key)?;
@@ -3271,8 +3289,14 @@ impl ControlPlane {
                 instance_id,
                 ..
             } => {
-                validate_expected_pane_machine(&expected_machine_id, &machine.id)?;
-                validate_expected_pane_instance(Some(&expected_instance_id), &instance_id)?;
+                // Validate against this node's own id when unset, but still
+                // forward the caller's original (possibly absent) ids rather
+                // than this node's id, which would not describe the owner.
+                let checked_machine_id = expected_machine_id
+                    .as_deref()
+                    .unwrap_or(&self.inner.local_id);
+                validate_expected_pane_machine(checked_machine_id, &machine.id)?;
+                validate_expected_pane_instance(expected_instance_id.as_deref(), &instance_id)?;
                 self.ensure_online(&machine.id)?;
                 machine
                     .post_json(
@@ -3568,18 +3592,11 @@ impl ControlPlane {
                 if control.refresh().await.is_err() {
                     continue;
                 }
-                let ready = {
-                    let state = control.read_state();
-                    find_session(&state.sessions, &name).and_then(|session| {
-                        crate::status::automation_idle(
-                            session.agent,
-                            &session.content,
-                            &session.title,
-                            &control.inner.config.status,
-                        )
-                        .then(|| session.pane_id.clone())
-                    })
-                };
+                let ready = handover_target(
+                    &control.read_state().sessions,
+                    &name,
+                    &control.inner.config.status,
+                );
                 let Some(pane_id) = ready else {
                     continue;
                 };
@@ -4030,11 +4047,18 @@ fn model_capabilities(
         .as_deref()
         .map_or(&[][..], |version| known_efforts(agent, version));
     let model_options = distinct_options(profile, known, |mode| Some(mode.model.as_str()));
-    let effort_options = distinct_options(profile, known_efforts, |mode| mode.effort.as_deref());
+    let effort_options = effort_choices(
+        distinct_options(profile, known_efforts, |mode| mode.effort.as_deref()),
+        known_efforts,
+    );
     let fast_supported = observation
         .version
         .as_deref()
-        .is_some_and(|version| fast_toggle_verified(agent, version));
+        .is_some_and(|version| fast_toggle_verified(agent, version))
+        // A harness that already refused `/fast` cannot be talked into it, so
+        // the control is withdrawn rather than left to fail on every press.
+        && !observation.fast_unavailable;
+    let note = capability_note(&harness, agent, profile, profile_name, known, &observation);
     let current_mode = observation
         .mode
         .filter(|mode_id| {
@@ -4058,33 +4082,6 @@ fn model_capabilities(
                 .collect::<Vec<_>>();
             (matches.len() == 1).then(|| matches[0].id.clone())
         });
-    let note = if agent != AgentKind::Other && profile.is_none() {
-        Some(format!(
-            "No configured {harness} profile matches this pane's profile {profile_name:?}"
-        ))
-    } else if profile.is_some_and(|profile| profile.modes.is_empty()) {
-        Some(format!(
-            "Profile {profile_name:?} defines no selectable modes; add [[profiles.modes]]"
-        ))
-    } else {
-        match agent {
-            AgentKind::Other => {
-                Some("This pane is not a recognized Claude or Codex CLI".to_owned())
-            }
-            AgentKind::Claude | AgentKind::Codex if observation.version.is_none() => Some(format!(
-                "The running {harness} CLI version is not visible yet; model switching is unavailable"
-            )),
-            AgentKind::Claude | AgentKind::Codex if known.is_empty() => Some(format!(
-                "{} {} has an unsupported interactive model picker",
-                harness,
-                observation.version.as_deref().unwrap_or("unknown")
-            )),
-            AgentKind::Claude | AgentKind::Codex if observation.current.is_none() => Some(format!(
-                "The running {harness} model is not visible yet; choices are owner-reported but switching may be rejected"
-            )),
-            AgentKind::Claude | AgentKind::Codex => None,
-        }
-    };
     PaneModels {
         pane_id,
         harness,
@@ -4101,6 +4098,91 @@ fn model_capabilities(
         resume_available: false,
         resume_note: None,
     }
+}
+
+/// This pane's controls as they stand once a switch has settled.
+///
+/// The pane is read again rather than reusing the poll's snapshot: the
+/// confirmation the harness just printed is what proves which controls the
+/// session now has, and the poll is up to a second behind. The answer stands in
+/// for a `GET /models` read, so it carries that endpoint's resume fields too
+/// rather than making the dashboard drop the resume control.
+fn settled_model_capabilities(
+    inner: &Inner,
+    pane_id: &str,
+    identity: String,
+    agent: AgentKind,
+    session: &Session,
+    fallback: String,
+) -> PaneModels {
+    let after = Tmux
+        .capture(pane_id, inner.config.general.preview_lines)
+        .unwrap_or(fallback);
+    let mut settled = model_capabilities(
+        identity,
+        agent,
+        &session.profile,
+        Tmux.model_observation(pane_id, agent, &after),
+        &inner.config.profiles,
+    );
+    let resume =
+        claude_resume_capability(session, crate::config::resume_claude_program().as_deref());
+    settled.resume_available = resume.available;
+    settled.resume_note = resume.note;
+    settled
+}
+
+/// The one thing most worth telling the owner about this pane's controls.
+///
+/// Obstructions are ranked rather than concatenated: a pane whose harness or
+/// profile offers nothing at all is explained ahead of one that merely lost its
+/// fast toggle, because that is the problem the owner has to act on first.
+fn capability_note(
+    harness: &str,
+    agent: AgentKind,
+    profile: Option<&AgentProfile>,
+    profile_name: &str,
+    known: &[crate::tmux::KnownModel],
+    observation: &crate::tmux::ModelObservation,
+) -> Option<String> {
+    if agent != AgentKind::Other && profile.is_none() {
+        return Some(format!(
+            "No configured {harness} profile matches this pane's profile {profile_name:?}"
+        ));
+    }
+    if profile.is_some_and(|profile| profile.modes.is_empty()) {
+        return Some(format!(
+            "Profile {profile_name:?} defines no selectable modes; add [[profiles.modes]]"
+        ));
+    }
+    match agent {
+        AgentKind::Other => {
+            return Some("This pane is not a recognized Claude or Codex CLI".to_owned());
+        }
+        AgentKind::Claude | AgentKind::Codex if observation.version.is_none() => {
+            return Some(format!(
+                "The running {harness} CLI version is not visible yet; model switching is unavailable"
+            ));
+        }
+        AgentKind::Claude | AgentKind::Codex if known.is_empty() => {
+            return Some(format!(
+                "{} {} has an unsupported interactive model picker",
+                harness,
+                observation.version.as_deref().unwrap_or("unknown")
+            ));
+        }
+        AgentKind::Claude | AgentKind::Codex if observation.current.is_none() => {
+            return Some(format!(
+                "The running {harness} model is not visible yet; choices are owner-reported but switching may be rejected"
+            ));
+        }
+        AgentKind::Claude | AgentKind::Codex => {}
+    }
+    // Nothing more fundamental is wrong, so a withdrawn fast toggle is worth
+    // explaining rather than leaving the control to vanish unaccounted for.
+    observation
+        .fast_unavailable
+        .then(|| format!("{harness} fast mode is disabled for this account or organization"))
 }
 
 #[derive(Default)]
@@ -4389,6 +4471,32 @@ fn require_switchable(
     Ok(())
 }
 
+/// The reasoning levels this pane can actually be switched to.
+///
+/// Efforts differ from models: a model is an entitlement the profile has to
+/// grant, but every level of the installed harness's own effort control is
+/// already reachable from the running session. No shipped profile mode sets
+/// `effort`, so deriving the choices from modes alone left the control dead for
+/// every Claude pane. Configured levels stay first so an owner's preferred
+/// ordering still leads, with the rest of the verified list appended.
+fn effort_choices(
+    configured: Vec<PaneModelOption>,
+    known: &[crate::tmux::KnownModel],
+) -> Vec<PaneModelOption> {
+    let mut options = configured;
+    for effort in known {
+        if options.iter().any(|option| option.id == effort.id) {
+            continue;
+        }
+        options.push(PaneModelOption {
+            id: effort.id.to_owned(),
+            label: effort.label.to_owned(),
+            switchable: true,
+        });
+    }
+    options
+}
+
 /// One control's distinct owner-configured values, in configuration order and
 /// switchable only where the installed harness has a verified row for them.
 fn distinct_options(
@@ -4480,15 +4588,19 @@ fn local_message_mutation<T>(
     }
 }
 
-fn local_model_switch(
-    joined: std::result::Result<Result<()>, tokio::task::JoinError>,
-) -> Result<()> {
+fn local_model_switch<T>(
+    joined: std::result::Result<Result<T>, tokio::task::JoinError>,
+) -> Result<T> {
     match joined {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(value)) => Ok(value),
+        // A refused `/fast` is the account's own policy, not this node
+        // malfunctioning, so it reaches the dashboard as a stated conflict
+        // rather than an opaque internal error.
         Ok(Err(error))
-            if error
-                .chain()
-                .any(<dyn std::error::Error>::is::<UnsupportedModelControl>) =>
+            if error.chain().any(|cause| {
+                cause.is::<UnsupportedModelControl>()
+                    || cause.is::<crate::tmux::ClaudeFastUnavailable>()
+            }) =>
         {
             Err(conflict(format!("{error:#}")))
         }
@@ -4539,6 +4651,22 @@ fn remote_offline_note(remote: &RemoteState) -> String {
         || "offline".to_owned(),
         |health| format!("offline: {health}"),
     )
+}
+
+/// Names the pane a pending handover may be submitted into.
+///
+/// The duplicate's CLI has to have reached its own empty, top-level composer:
+/// the footer strip both harnesses now draw beneath that composer is chrome,
+/// not output, so it must not be mistaken for a busy or questioning pane.
+fn handover_target(
+    sessions: &[Session],
+    name: &str,
+    config: &crate::config::StatusConfig,
+) -> Option<String> {
+    find_session(sessions, name).and_then(|session| {
+        crate::status::automation_idle(session.agent, &session.content, &session.title, config)
+            .then(|| session.pane_id.clone())
+    })
 }
 
 fn find_session<'a>(sessions: &'a [Session], id: &str) -> Option<&'a Session> {
@@ -6600,6 +6728,7 @@ mod tests {
                 current: Some("sonnet".to_owned()),
                 effort: None,
                 fast: None,
+                fast_unavailable: false,
                 mode: None,
             },
             &profiles,
@@ -6663,6 +6792,7 @@ mod tests {
                 current: Some("gpt-5.6-sol".to_owned()),
                 effort: Some("xhigh".to_owned()),
                 fast: Some(true),
+                fast_unavailable: false,
                 mode: None,
             },
             &profiles,
@@ -6682,7 +6812,17 @@ mod tests {
                 .iter()
                 .map(|option| (option.id.as_str(), option.switchable))
                 .collect::<Vec<_>>(),
-            [("xhigh", true), ("high", true), ("max", false)]
+            // The profile's own levels lead, then the rest of the installed
+            // harness's verified slider: every level is already reachable from
+            // a running session, so a profile that names none must not leave
+            // the reasoning control dead.
+            [
+                ("xhigh", true),
+                ("high", true),
+                ("max", false),
+                ("low", true),
+                ("medium", true)
+            ]
         );
         assert!(models.fast_supported);
         assert_eq!(models.fast, Some(true));
@@ -6697,12 +6837,78 @@ mod tests {
                 current: Some("gpt-5.6-sol".to_owned()),
                 effort: None,
                 fast: None,
+                fast_unavailable: false,
                 mode: None,
             },
             &profiles,
         );
         assert!(!older.fast_supported);
         assert!(older.effort_options.iter().any(|option| option.switchable));
+    }
+
+    #[test]
+    fn claude_offers_its_whole_effort_slider_and_drops_a_refused_fast_mode() {
+        // No shipped Claude profile sets `effort`, so deriving the choices from
+        // profile modes alone left the reasoning control permanently disabled
+        // and every switch rejected as unreported.
+        let profiles = vec![AgentProfile {
+            name: "Claude".to_owned(),
+            harness: "claude".to_owned(),
+            command: "claude".to_owned(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            inherit_discovered: false,
+            claude_relaunch_permissions: None,
+            modes: vec![ProfileMode {
+                id: "sonnet".to_owned(),
+                label: None,
+                model: "sonnet".to_owned(),
+                effort: None,
+                service_tier: None,
+            }],
+        }];
+        let observed = |fast_unavailable| crate::tmux::ModelObservation {
+            version: Some("2.1.261".to_owned()),
+            current: Some("sonnet".to_owned()),
+            effort: Some("high".to_owned()),
+            fast: Some(false),
+            fast_unavailable,
+            mode: None,
+        };
+        let models = model_capabilities(
+            "%5".to_owned(),
+            AgentKind::Claude,
+            "Claude",
+            observed(false),
+            &profiles,
+        );
+        assert_eq!(
+            models
+                .effort_options
+                .iter()
+                .map(|option| (option.id.as_str(), option.switchable))
+                .collect::<Vec<_>>(),
+            [
+                ("low", true),
+                ("medium", true),
+                ("high", true),
+                ("xhigh", true),
+                ("max", true)
+            ]
+        );
+        assert!(models.fast_supported);
+
+        // An organization that forbids fast mode makes every press fail, so the
+        // control is withdrawn rather than offered and rejected.
+        let refused = model_capabilities(
+            "%5".to_owned(),
+            AgentKind::Claude,
+            "Claude",
+            observed(true),
+            &profiles,
+        );
+        assert!(!refused.fast_supported);
+        assert!(!refused.effort_options.is_empty());
     }
 
     #[test]
@@ -6730,6 +6936,7 @@ mod tests {
                 current: Some(model.to_owned()),
                 effort: Some(effort.to_owned()),
                 fast: None,
+                fast_unavailable: false,
                 mode: recorded_mode.map(str::to_owned),
             }
         };
@@ -6801,6 +7008,7 @@ mod tests {
                 current: Some("gpt-5.4".to_owned()),
                 effort: None,
                 fast: None,
+                fast_unavailable: false,
                 mode: None,
             },
             &profiles,
@@ -6949,6 +7157,45 @@ mod tests {
             None,
             "Other includes Grok and unsupported wrappers and must never be collected"
         );
+    }
+
+    #[test]
+    fn a_handover_waits_for_a_composer_under_its_status_footer() {
+        // Real Claude Code 2.1.261 pane tails. A freshly launched duplicate
+        // never ends on a bare prompt glyph any more: the composer carries a
+        // dim placeholder and a status strip sits beneath it.
+        let idle = concat!(
+            "────────────────────────────────\n",
+            "❯\u{a0}Try \"fix lint errors\"\n",
+            "────────────────────────────────\n",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n",
+        );
+        let streaming = concat!(
+            "  twenty-nine\n",
+            "────────────────────────────────\n",
+            "❯\u{a0}\n",
+            "────────────────────────────────\n",
+            "  ⏸ manual mode on · esc to interrupt · ← for agents\n",
+        );
+        let drafting = concat!(
+            "────────────────────────────────\n",
+            "❯\u{a0}hello there\n",
+            "────────────────────────────────\n",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n",
+        );
+        let claude = |content: &str| {
+            let mut session = test_session("dup", "%7", content);
+            session.agent = AgentKind::Claude;
+            vec![session]
+        };
+        let config = crate::config::StatusConfig::default();
+        assert_eq!(
+            handover_target(&claude(idle), "dup", &config),
+            Some("%7".to_owned())
+        );
+        assert_eq!(handover_target(&claude(streaming), "dup", &config), None);
+        assert_eq!(handover_target(&claude(drafting), "dup", &config), None);
+        assert_eq!(handover_target(&claude(idle), "other", &config), None);
     }
 
     #[tokio::test]

@@ -17,12 +17,20 @@
 [hidden] { display: none !important; }
 html, body { width: 100%; height: 100%; }
 html { overflow: hidden; overscroll-behavior: none; }
+/* Three rows: topbar, health banner, workspace. #health-alert carries [hidden]
+   whenever the fleet is healthy, and `display: none` removes it from the grid
+   altogether -- so without explicit placement .workspace auto-flows into the
+   second (`auto`) track and is sized to its own content instead of the 1fr
+   remainder. That leaves the app surface ending partway down the screen with
+   dead background beneath it (worst on tall phones), which is why
+   `body.has-selection` had to force an explicit height further down. Pin every
+   row so the workspace always owns the remainder. */
 body { height: var(--app-height, 100vh); height: var(--app-height, 100dvh); margin: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr); background: var(--bg); color: var(--text); overflow: hidden; }
 button, input, textarea, select { font: inherit; }
 button { min-height: 44px; cursor: pointer; }
 button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
 
-.topbar { height: 54px; display: flex; align-items: center; gap: 16px; padding: 0 14px; border-bottom: 1px solid var(--line); background: #0d151a; }
+.topbar { grid-row: 1; height: 54px; display: flex; align-items: center; gap: 16px; padding: 0 14px; border-bottom: 1px solid var(--line); background: #0d151a; }
 .rail-toggle { width: 30px; min-width: 30px; min-height: 30px; padding: 0; border-color: transparent; font-size: 22px; line-height: 1; }
 .brand { display: flex; align-items: center; gap: 9px; min-width: 230px; }
 .brand-logo { width: 34px; height: 34px; flex: 0 0 34px; border: 1px solid #263b50; border-radius: 8px; object-fit: cover; object-position: 50% 42%; }
@@ -31,7 +39,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .counts { flex: 1; }
 .count-working { color: var(--green); }
 .count-waiting { color: var(--amber); margin-left: 14px; }
-.health-alert { padding: 9px 20px; color: #ffe8ea; background: #35191e; border-bottom: 1px solid #71333d; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.health-alert { grid-row: 2; padding: 9px 20px; color: #ffe8ea; background: #35191e; border-bottom: 1px solid #71333d; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 button { border: 1px solid var(--line); border-radius: 8px; padding: 0 14px; color: var(--text); background: var(--panel-2); }
 button:hover { border-color: #52717d; }
@@ -39,7 +47,7 @@ button:hover { border-color: #52717d; }
 .danger { color: var(--red); border-color: #6b333b; background: #25171a; }
 .subtle { background: transparent; }
 
-.workspace { min-height: 0; display: grid; grid-template-columns: minmax(220px, 23vw) 1fr; transition: grid-template-columns .16s ease; }
+.workspace { grid-row: 3; min-height: 0; display: grid; grid-template-columns: minmax(220px, 23vw) 1fr; transition: grid-template-columns .16s ease; }
 body.rail-collapsed .workspace { grid-template-columns: 0 1fr; }
 .rail { padding: 10px 8px; border-right: 1px solid var(--line); overflow-y: auto; background: #0d151a; transition: opacity .16s ease; }
 body.rail-collapsed .rail { visibility: hidden; padding-inline: 0; opacity: 0; border-right: 0; pointer-events: none; }
@@ -431,18 +439,24 @@ dialog::backdrop { background: #000a; }
   .brand-wordmark, .brand small, .counts { display: none; }
   .workspace { min-height: 0; display: block; }
   body.rail-collapsed .workspace { display: block; }
-  body.rail-collapsed .rail { visibility: visible; display: block; padding: 10px 8px; opacity: 1; pointer-events: auto; }
+  body.rail-collapsed .rail { visibility: visible; display: block; padding-inline: max(8px, env(safe-area-inset-left)) max(8px, env(safe-area-inset-right)); opacity: 1; pointer-events: auto; }
   .health-alert { padding: 8px 12px; }
   .pulse-account-form { width: 100%; grid-template-columns: auto minmax(0, 1fr); }
   .pulse-tabs { overflow-x: auto; }
   .pulse-setting-row { align-items: stretch; flex-direction: column; }
   .pulse-profile-actions { min-width: 0; width: 100%; align-items: stretch; flex-direction: column; }
   .pulse-profile-settings { width: 100%; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; }
-  .rail { height: 100%; border-right: 0; }
+  /* The rail is the bottom-most surface on the mobile landing and `body` is
+     `position: fixed; inset: 0` under `viewport-fit=cover`, so its last row
+     would otherwise sit under the home indicator. */
+  .rail { height: 100%; padding: 10px max(8px, env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left)); border-right: 0; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
   .detail { width: 100%; height: 100%; display: none; }
   body.has-selection .rail { display: none; }
   body.has-selection.rail-collapsed .rail { display: none; }
-  body.has-selection .workspace, body.has-selection .detail { height: var(--app-height, 100dvh); }
+  /* .workspace owns the 1fr body row and .detail is height:100% of it, so the
+     pair already fills whatever is left under the (hidden) topbar. Restating
+     the full app height here overflowed the body by the health banner's height
+     whenever that banner was showing. */
   body.has-selection .detail { display: block; }
   .mobile-only { display: inline-flex; }
   .agent-view { width: 100%; min-width: 0; grid-template-rows: auto minmax(96px, 1fr) auto; padding: 4px; gap: 4px; overflow: hidden; }
@@ -452,8 +466,8 @@ dialog::backdrop { background: #000a; }
   .agent-head h1 { margin: 0; overflow: hidden; font-size: 16px; line-height: 1.2; text-overflow: ellipsis; white-space: nowrap; }
   .agent-branch { max-width: 45%; flex-shrink: 1; padding: 2px 5px; font-size: 8.5px; }
   .agent-head p, .agent-meta, .launch-command, .model-control, .actions { display: none !important; }
-  #mobile-back { display: inline-flex; grid-column: 1; width: 30px; min-width: 30px; min-height: 32px; padding: 0; overflow: hidden; border: 0; color: transparent; background: transparent; font-size: 0; }
-  #mobile-back::after { content: "‹"; color: var(--muted); font-size: 28px; line-height: 25px; }
+  #mobile-back, #machine-mobile-back, #pulse-mobile-back { display: inline-flex; grid-column: 1; width: 30px; min-width: 30px; min-height: 32px; padding: 0; overflow: hidden; border: 0; color: transparent; background: transparent; font-size: 0; }
+  #mobile-back::after, #machine-mobile-back::after, #pulse-mobile-back::after { content: "‹"; color: var(--muted); font-size: 28px; line-height: 25px; }
   .quick-actions-open { display: inline-flex; grid-column: 3; min-height: 32px; padding-inline: 9px; font-size: 11px; }
   .quick-actions-form { width: min(100%, 360px); }
   .quick-pane-keys { grid-template-columns: minmax(0, 1fr); justify-items: center; padding: 8px; }

@@ -104,8 +104,10 @@ struct SendRequest {
 #[serde(deny_unknown_fields)]
 struct SpecialKeyRequest {
     action: String,
-    machine: String,
-    instance_id: String,
+    #[serde(default)]
+    machine: Option<String>,
+    #[serde(default)]
+    instance_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1101,14 +1103,16 @@ async fn switch_model(
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(request): Json<ModelSwitchRequest>,
-) -> Result<Json<OkResponse>, ApiError> {
+) -> Result<Json<PaneModels>, ApiError> {
     ensure_origin(&headers, &state.allowed_origins)?;
+    // Answering with the settled controls lets the dashboard repaint from the
+    // switch itself instead of waiting out the next pane poll.
     state
         .control
         .switch_model(&id, request)
         .await
-        .map_err(|error| ApiError::from_control(&error))?;
-    Ok(Json(OkResponse { ok: true }))
+        .map(Json)
+        .map_err(|error| ApiError::from_control(&error))
 }
 
 async fn resume_current_claude(
@@ -2760,6 +2764,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn special_key_request_defaults_machine_and_instance_to_none() {
+        let request: SpecialKeyRequest = serde_json::from_str(r#"{"action":"enter"}"#).unwrap();
+        assert_eq!(request.action, "enter");
+        assert_eq!(request.machine, None);
+        assert_eq!(request.instance_id, None);
+
+        let request: SpecialKeyRequest = serde_json::from_str(
+            r#"{"action":"enter","machine":"local","instance_id":"pane-v1-abc"}"#,
+        )
+        .unwrap();
+        assert_eq!(request.machine.as_deref(), Some("local"));
+        assert_eq!(request.instance_id.as_deref(), Some("pane-v1-abc"));
+    }
+
     #[tokio::test]
     async fn pane_mutation_routes_reject_a_recycled_generation_before_delivery() {
         let control = crate::control::test_control(&[]);
@@ -3209,7 +3228,10 @@ mod tests {
             StatusCode::FORBIDDEN,
         );
 
-        assert_eq!(
+        // A body naming only the action binds to this node's own pane rather
+        // than being rejected outright: the generation guard is an optional
+        // extra a caller may supply, not a precondition for pressing a key.
+        assert_ne!(
             status_of(
                 &app,
                 "POST",
@@ -3218,7 +3240,18 @@ mod tests {
             )
             .await,
             StatusCode::UNPROCESSABLE_ENTITY,
-            "machine and instance bindings are mandatory",
+            "omitted machine and instance bindings default to this pane's own",
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/nope/input-keys",
+                Some(r#"{"action":"enter"}"#),
+            )
+            .await,
+            StatusCode::NOT_FOUND,
+            "an unbound key still has to name a pane that exists",
         );
         assert_eq!(
             status_of(

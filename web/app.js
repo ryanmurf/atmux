@@ -1045,6 +1045,8 @@ function duplicateSourceMatches(snapshot, session) {
 const USAGE_LIMIT_MARKERS = [
   "usage limit reached",
   "you've reached your usage limit",
+  "hit your usage limit",
+  "hit your limit",
   "5-hour limit reached",
   "weekly limit reached",
   "out of usage",
@@ -2989,6 +2991,36 @@ function initialize() {
       };
     }
     render();
+  }
+
+  /// The three controls the picker shows, as one comparable value. A switch
+  /// uses it to tell a pane that has caught up from one still reporting the
+  /// state it had before the change.
+  function paneModelSignature(models) {
+    if (!models) return "";
+    return [models.current, models.effort, models.fast].map((value) => value ?? "").join("|");
+  }
+
+  /// Takes a capability snapshot as the picker's current truth, unless the user
+  /// has since selected another pane. Claims the read generation so a `/models`
+  /// request already in flight cannot overwrite it with older observations.
+  function adoptPaneModels(paneId, capabilities) {
+    if (!capabilities || !paneId || state.selected !== paneId) return false;
+    state.paneModelsRequest += 1;
+    state.paneModels = capabilities;
+    return true;
+  }
+
+  /// Some harnesses print their confirmation a beat after answering the switch.
+  /// Re-read the pane a few times over about three seconds, stopping as soon as
+  /// it reports controls other than the ones it had before.
+  async function settlePaneModels(paneId, before) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await new Promise((resolve) => { setTimeout(resolve, 1000); });
+      if (state.selected !== paneId) return;
+      await refreshModels(paneId);
+      if (paneModelSignature(state.paneModels) !== before) return;
+    }
   }
 
   function scheduleTranscript(delay = 300) {
@@ -6440,24 +6472,35 @@ function initialize() {
   $("attachment-clear").addEventListener("click", clearAttachments);
   /// Sends one control's change on its own. The request names only that
   /// control, so the harness keeps the model, effort, or fast mode it omits.
+  ///
+  /// The owner answers with what it observed once the switch settled, so the
+  /// picker repaints from the switch itself. Reading `/models` back instead
+  /// would race the ~750 ms pane poll and redisplay the pre-switch controls
+  /// until the next reload.
   async function switchAgentModel(change, label, warning = "") {
     const paneId = state.selected;
     const sessionName = state.sessions.get(paneId)?.name || paneId;
     if (!paneId || state.modelSwitchingPaneId) return;
+    const before = paneModelSignature(state.paneModels);
     state.modelSwitchingPaneId = paneId;
     render();
+    let adopted = false;
     try {
-      await request(`/api/v1/panes/${encodeURIComponent(paneId)}/model`, {
+      const settled = await request(`/api/v1/panes/${encodeURIComponent(paneId)}/model`, {
         method: "POST",
         body: JSON.stringify(change),
       });
+      adopted = adoptPaneModels(paneId, settled);
       toast(`Switched ${sessionName} to ${label}.${warning}`);
     } catch (error) {
       toast(error.message);
     } finally {
       state.modelSwitchingPaneId = null;
-      if (state.selected === paneId) await refreshModels(paneId);
+      if (state.selected === paneId && !adopted) await refreshModels(paneId);
       render();
+    }
+    if (adopted && paneModelSignature(state.paneModels) === before) {
+      await settlePaneModels(paneId, before);
     }
   }
   function switchAgentModelChoice(model) {

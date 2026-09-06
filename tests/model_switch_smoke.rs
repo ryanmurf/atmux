@@ -40,6 +40,14 @@ fast = False
 def codex_status():
     out(f"model: {models[selected]} {efforts[reason_selected]}{' fast' if fast else ''} /model to change\r\n")
 
+def draw_models():
+    # Real pickers repaint the whole list on every arrow key, and atmux reads
+    # the pane back after each one, so this fixture has to repaint too.
+    out("Select model\r\n" if harness == "claude" else "Select Model and Effort\r\n")
+    for index, model in enumerate(models):
+        marker = "❯" if harness == "claude" and index == selected else ("›" if harness == "codex" and index == selected else " ")
+        out(f"{marker} {index + 1}. {model}\r\n")
+
 try:
     while True:
         value = os.read(fd, 1)
@@ -48,13 +56,7 @@ try:
         if state == "input":
             if value in (b"\r", b"\n"):
                 if line.endswith(b"/model"):
-                    if harness == "claude":
-                        out("Select model\r\n")
-                    else:
-                        out("Select Model and Effort\r\n")
-                    for index, model in enumerate(models):
-                        marker = "❯" if harness == "claude" and index == selected else ("›" if harness == "codex" and index == selected else " ")
-                        out(f"{marker} {index + 1}. {model}\r\n")
+                    draw_models()
                     state = "model"
                 elif harness == "claude" and line.endswith(b"/effort"):
                     out("Use ←/→ to adjust\r\n")
@@ -73,12 +75,16 @@ try:
         elif value == b"\x1b" or escape:
             escape += value
             if escape.endswith(b"[A") or escape.endswith(b"[D"):
-                if state == "model": selected = max(0, selected - 1)
+                if state == "model":
+                    selected = (selected - 1) % len(models)
+                    draw_models()
                 elif state == "effort": effort_index = max(0, effort_index - 1)
                 else: reason_selected = max(0, reason_selected - 1)
                 escape = b""
             elif escape.endswith(b"[B") or escape.endswith(b"[C"):
-                if state == "model": selected = min(len(models) - 1, selected + 1)
+                if state == "model":
+                    selected = (selected + 1) % len(models)
+                    draw_models()
                 elif state == "effort": effort_index = min(4, effort_index + 1)
                 else: reason_selected = min(4, reason_selected + 1)
                 escape = b""

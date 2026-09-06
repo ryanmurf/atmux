@@ -31,6 +31,7 @@ const MAX_PARSE_MESSAGES: usize = MAX_MESSAGES * 2;
 const MAX_ITEM_ID_BYTES: usize = 512;
 const MAX_TIMESTAMP_BYTES: usize = 128;
 const MAX_TOOL_NAME_BYTES: usize = 256;
+const TASK_NOTIFICATION_TAG: &str = "<task-notification>";
 const MAX_NESTED_JSON_DEPTH: usize = 8;
 const MAX_CLAUDE_ROOTS: usize = 64;
 // Claude writes its PID metadata after CLI initialization and authentication;
@@ -735,6 +736,8 @@ fn first_json_values(path: &Path, limit: usize) -> Option<Vec<Value>> {
 fn parse_claude(log: &LogTail) -> (Vec<TranscriptMessage>, bool) {
     let mut messages = Vec::new();
     for value in json_lines(&log.bytes) {
+        // A subagent's own inner turns are intentionally skipped: the parent
+        // log already carries the notification the subagent reported back.
         if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             continue;
         }
@@ -831,11 +834,16 @@ fn push_claude_user(
     timestamp: Option<&str>,
     usage: Option<(u64, u64)>,
 ) {
-    let subagent = claude_tool_authored_user(value);
-    let agent_name = subagent.then(|| claude_subagent_name(value)).flatten();
-    if let Some(markdown) = claude_user_text(value).filter(|text| !text.trim().is_empty())
+    let mut subagent = claude_tool_authored_user(value);
+    let mut agent_name = subagent.then(|| claude_subagent_name(value)).flatten();
+    if let Some(mut markdown) = claude_user_text(value).filter(|text| !text.trim().is_empty())
         && !is_injected_user_context(&markdown)
     {
+        if let Some((name, body)) = claude_task_notification(&markdown) {
+            subagent = true;
+            agent_name = agent_name.or(Some(name));
+            markdown = body;
+        }
         push_message(
             messages,
             if subagent { "subagent" } else { "user" },
@@ -872,9 +880,60 @@ fn claude_tool_authored_user(value: &Value) -> bool {
     value.get("turnCompanion").and_then(Value::as_bool) == Some(true)
         || value.get("isSidechain").and_then(Value::as_bool) == Some(true)
         || value.get("userType").and_then(Value::as_str) == Some("agent")
+        // Claude Code 2.1.261 stamps an Agent tool's completion turn with a
+        // harness origin and prompt source instead of the older tool markers.
+        || value.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification")
+        || value.get("promptSource").and_then(Value::as_str) == Some("system")
         || ["sourceToolAssistantUUID", "sourceToolUseID", "taskId"]
             .iter()
             .any(|key| value.get(key).is_some_and(|marker| !marker.is_null()))
+}
+
+/// An Agent tool completion arrives as a user line whose whole body is a
+/// `<task-notification>` envelope. Rendering that XML verbatim credits the
+/// harness's bookkeeping to the operator, so the envelope is reduced to the
+/// summary and result the subagent actually reported.
+fn claude_task_notification(text: &str) -> Option<(String, String)> {
+    let envelope = text.trim();
+    if !envelope.starts_with(TASK_NOTIFICATION_TAG) {
+        return None;
+    }
+    let summary = xml_element_text(envelope, "summary").unwrap_or_default();
+    let name = quoted_segment(summary)
+        .or(Some(summary).filter(|value| !value.is_empty()))
+        .map_or_else(
+            || "Task".to_owned(),
+            |value| truncate_plain(value, MAX_TOOL_NAME_BYTES),
+        );
+    let body = ["summary", "result"]
+        .iter()
+        .filter_map(|tag| xml_element_text(envelope, tag))
+        .filter(|section| !section.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Some((
+        name,
+        if body.is_empty() {
+            "Task notification".to_owned()
+        } else {
+            body
+        },
+    ))
+}
+
+/// Minimal single-element lookup for the harness's own flat notification
+/// envelope. Nested or attributed elements are deliberately out of scope.
+fn xml_element_text<'a>(source: &'a str, tag: &str) -> Option<&'a str> {
+    let start = source.find(&format!("<{tag}>"))? + tag.len() + 2;
+    let rest = source.get(start..)?;
+    Some(rest[..rest.find(&format!("</{tag}>"))?].trim())
+}
+
+fn quoted_segment(value: &str) -> Option<&str> {
+    let start = value.find('"')? + 1;
+    let rest = value.get(start..)?;
+    let quoted = rest[..rest.find('"')?].trim();
+    (!quoted.is_empty()).then_some(quoted)
 }
 
 fn claude_subagent_name(value: &Value) -> Option<String> {
@@ -1699,6 +1758,51 @@ mod tests {
         assert_eq!(messages[3].input_tokens, Some(1_040));
         assert_eq!(messages[3].output_tokens, Some(7));
         assert_eq!(messages[4].input_tokens, None);
+    }
+
+    #[test]
+    fn claude_task_notification_reads_as_a_named_subagent_report() {
+        // Recorded verbatim from Claude Code 2.1.261: the Agent tool's
+        // completion turn carries no tool markers, only a harness origin.
+        let source = include_str!("../tests/fixtures/claude-task-notification.jsonl");
+        let (messages, _) = parse_claude(&tail(source));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "subagent");
+        assert_eq!(messages[0].agent_name.as_deref(), Some("Reply with PONG"));
+        assert_eq!(
+            messages[0].markdown,
+            "Agent \"Reply with PONG\" finished\n\nPONG"
+        );
+        assert!(!messages[0].markdown.contains("<task-notification>"));
+        assert!(
+            !messages[0]
+                .markdown
+                .contains("tasks/afccf69c7fd0edf4f.output")
+        );
+    }
+
+    #[test]
+    fn claude_harness_authored_user_lines_never_read_as_the_operator() {
+        let source = concat!(
+            r#"{"type":"user","uuid":"typed","promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"do the thing"}}"#,
+            "\n",
+            r#"{"type":"user","uuid":"origin-only","origin":{"kind":"task-notification"},"message":{"role":"user","content":"Agent finished"}}"#,
+            "\n",
+            r#"{"type":"user","uuid":"prompt-source","promptSource":"system","message":{"role":"user","content":"queued follow-up"}}"#,
+            "\n",
+            r#"{"type":"user","uuid":"envelope","message":{"role":"user","content":[{"type":"text","text":"<task-notification><status>completed</status><result>done</result></task-notification>"}]}}"#,
+            "\n",
+        );
+        let (messages, _) = parse_claude(&tail(source));
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            ["user", "subagent", "subagent", "subagent"]
+        );
+        assert_eq!(messages[3].agent_name.as_deref(), Some("Task"));
+        assert_eq!(messages[3].markdown, "done");
     }
 
     #[test]

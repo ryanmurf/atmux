@@ -763,8 +763,8 @@ async fn generation_bound_keys_fail_closed_against_a_legacy_owner() {
         .send_special_key_for_instance(
             "gpu-box~%7",
             PaneSpecialKey::TmuxPrefixTwice,
-            "gpu-box".to_owned(),
-            format!("pane-v1-{}", "a".repeat(64)),
+            Some("gpu-box".to_owned()),
+            Some(format!("pane-v1-{}", "a".repeat(64))),
         )
         .await
         .unwrap_err();
@@ -1562,8 +1562,8 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
             .send_special_key_for_instance(
                 "gpu-box~%7",
                 key,
-                "gpu-box".to_owned(),
-                trainer_instance.clone(),
+                Some("gpu-box".to_owned()),
+                Some(trainer_instance.clone()),
             )
             .await
             .unwrap();
@@ -1574,8 +1574,8 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
             .send_special_key_for_instance(
                 "gpu-box~%8",
                 PaneSpecialKey::Enter,
-                "gpu-box".to_owned(),
-                trainer_instance.clone(),
+                Some("gpu-box".to_owned()),
+                Some(trainer_instance.clone()),
             )
             .await
             .unwrap_err(),
@@ -1583,8 +1583,8 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
             .send_special_key_for_instance(
                 "gpu-box~%7",
                 PaneSpecialKey::Down,
-                "midnight".to_owned(),
-                trainer_instance.clone(),
+                Some("midnight".to_owned()),
+                Some(trainer_instance.clone()),
             )
             .await
             .unwrap_err(),
@@ -2028,8 +2028,8 @@ async fn owner_generation_conflicts_remain_conflicts_through_a_coordinator() {
         .send_special_key_for_instance(
             "gpu-box~%7",
             PaneSpecialKey::Enter,
-            "gpu-box".to_owned(),
-            instance_id.clone(),
+            Some("gpu-box".to_owned()),
+            Some(instance_id.clone()),
         )
         .await
         .unwrap_err();

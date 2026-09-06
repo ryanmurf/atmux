@@ -857,6 +857,24 @@ test("subagent turns are labelled as the subagent and never as the operator", ()
   assert.match(css, /\.message-card\.subagent/);
 });
 
+test("a task notification counts as a subagent turn, never as an operator prompt", () => {
+  const messages = [
+    { id: "p1", role: "user", markdown: "do the thing" },
+    { id: "a1", role: "assistant", markdown: "on it" },
+    { id: "n1", role: "subagent", agent_name: "Reply with PONG", markdown: "PONG" },
+  ];
+  const labels = (preferences) =>
+    filterTranscriptMessages(messages, preferences).map(transcriptRoleLabel);
+  assert.deepEqual(labels({ human: true, internal: true }), [
+    "You",
+    "Agent",
+    "Subagent · Reply with PONG",
+  ]);
+  // Hiding Internal must hide the notification without touching the operator count.
+  assert.deepEqual(labels({ human: true, internal: false }), ["You", "Agent"]);
+  assert.equal(labels({ human: true, internal: true }).filter((label) => label === "You").length, 1);
+});
+
 test("tool summaries normalize namespaces and expose per-tool counts", () => {
   const messages = [
     { id: "a", kind: "tool", tool_name: "functions.collaboration.wait_agent" },
@@ -1021,6 +1039,20 @@ test("mobile controls stay compact and horizontally reachable so the pane gets t
   assert.match(css, /@media \(max-width: 720px\)[\s\S]*body \{[^}]*position: fixed;[^}]*height: var\(--app-height, 100dvh\);/s);
   assert.match(css, /@media \(max-width: 720px\)[\s\S]*body\.has-selection \.topbar \{ display: none; \}/s);
   assert.doesNotMatch(css, /composer-focused/);
+  // #health-alert carries [hidden] whenever the fleet is healthy, and
+  // `display: none` drops it out of the body grid. Without explicit rows the
+  // workspace auto-flows into the second `auto` track and gets content height
+  // instead of the 1fr remainder, so the landing ended partway down the screen
+  // with dead background beneath it. Pin the rows.
+  assert.match(css, /\.topbar \{ grid-row: 1;/);
+  assert.match(css, /\.health-alert \{ grid-row: 2;/);
+  assert.match(css, /\.workspace \{ grid-row: 3;/);
+  // The workspace owns that 1fr row and .detail is height:100% of it, so
+  // restating the whole app height on a selection just overflowed the body by
+  // the health banner's height.
+  assert.doesNotMatch(css, /body\.has-selection \.workspace[^{]*\{[^}]*height: var\(--app-height/s);
+  // The rail is the bottom-most mobile surface under `viewport-fit=cover`.
+  assert.match(css, /@media \(max-width: 720px\)[\s\S]*\.rail \{[^}]*padding: 10px max\(8px, env\(safe-area-inset-right\)\) calc\(10px \+ env\(safe-area-inset-bottom\)\) max\(8px, env\(safe-area-inset-left\)\);/s);
   assert.match(html, /content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"/);
   assert.match(html, /id="quick-actions-dialog"/);
   assert.match(html, /id="quick-agent-model"/);
@@ -2007,6 +2039,20 @@ test("resume from summary is offered only for a duplicate of a readable, visible
   assert.deepEqual(duplicateSummaryState(null, limited, null), { available: false, checked: false });
   assert.equal(
     duplicateSummaryState({ ...claude, agent: "codex" }, ["error: rate limit exceeded"], claude.id, "midnight").checked,
+    true,
+  );
+  // Real Codex 0.153.4 and Claude Code 2.1.261 exhaustion notices.
+  assert.equal(
+    duplicateSummaryState(
+      { ...claude, agent: "codex" },
+      ["■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits."],
+      claude.id,
+      "midnight",
+    ).checked,
+    true,
+  );
+  assert.equal(
+    duplicateSummaryState(claude, ["You've hit your limit — resets at 8pm."], claude.id, "midnight").checked,
     true,
   );
 
