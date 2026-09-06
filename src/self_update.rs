@@ -1037,7 +1037,13 @@ impl SelfUpdater {
             self.check(false).await?;
         }
         let candidate = {
+            // The discovery above released the lock, so claim `busy` in the
+            // same critical section that reads the candidate. Two simultaneous
+            // applies must not both reach the rename.
             let mut shared = lock(&self.shared);
+            if shared.busy {
+                return Err(UpdateError::conflict("an update is already in progress"));
+            }
             let verified = shared.latest.as_ref().is_some_and(|latest| latest.verified);
             let Some(candidate) = shared.candidate.clone().filter(|_| verified) else {
                 return Err(UpdateError::conflict(format!(
