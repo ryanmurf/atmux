@@ -688,11 +688,20 @@ impl SseDecoder {
             bail!("a federated event exceeded {MAX_EVENT_BYTES} bytes");
         }
         self.buffer.extend_from_slice(chunk);
-        while let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let line = self.buffer.drain(..=position).collect::<Vec<_>>();
-            let line = String::from_utf8_lossy(&line);
+        // The buffer is scanned once and drained once; a per-line drain would be
+        // quadratic in the size of a chunk.
+        let buffer = std::mem::take(&mut self.buffer);
+        let mut consumed = 0;
+        for line in buffer.split_inclusive(|byte| *byte == b'\n') {
+            if line.last() != Some(&b'\n') {
+                break;
+            }
+            consumed += line.len();
+            let line = String::from_utf8_lossy(line);
             self.line(line.trim_end_matches(['\r', '\n']), into);
         }
+        self.buffer = buffer;
+        self.buffer.drain(..consumed);
         if self.data.len() > MAX_EVENT_BYTES {
             bail!("a federated event exceeded {MAX_EVENT_BYTES} bytes");
         }
@@ -1005,8 +1014,7 @@ async fn watch_stream(
                 // A node that snapshots is healthy, whatever happens next.
                 reconnect.record_healthy();
                 if !launch_options_fetched {
-                    launch_options_fetched = true;
-                    fetch_launch_options(control, machine).await;
+                    launch_options_fetched = fetch_launch_options(control, machine).await;
                 }
             }
             "sessions.patch" => {
@@ -1024,19 +1032,31 @@ async fn watch_stream(
                 if let Some(metrics) = local_metrics(&patch.machines) {
                     control.set_machine_metrics(&machine.id, metrics);
                 }
+                // A transient fetch failure must not leave the machine
+                // unlaunchable until the stream reconnects.
+                if !launch_options_fetched {
+                    launch_options_fetched = fetch_launch_options(control, machine).await;
+                }
             }
             _ => {}
         }
     }
 }
 
-async fn fetch_launch_options(control: &ControlPlane, machine: &Arc<RemoteMachine>) {
+/// Returns whether the launch options were fetched, so a failure can be retried.
+async fn fetch_launch_options(control: &ControlPlane, machine: &Arc<RemoteMachine>) -> bool {
     match machine
         .get_json::<LaunchOptions>("/api/v1/launch-options")
         .await
     {
-        Ok(options) => control.set_machine_launch_options(&machine.id, options),
-        Err(error) => control.set_machine_launch_note(&machine.id, &format!("{error:#}")),
+        Ok(options) => {
+            control.set_machine_launch_options(&machine.id, options);
+            true
+        }
+        Err(error) => {
+            control.set_machine_launch_note(&machine.id, &format!("{error:#}"));
+            false
+        }
     }
 }
 

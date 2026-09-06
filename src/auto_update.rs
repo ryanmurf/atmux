@@ -25,7 +25,10 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use directories::ProjectDirs;
 use fs2::FileExt as _;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, RawMode};
+use rustix::{
+    fs::{AtFlags, FileType, Mode, OFlags, RawMode},
+    process::{Pid, Signal, kill_process_group, test_kill_process_group},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::process::Command;
@@ -33,6 +36,7 @@ use tokio::process::Command;
 const STATE_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 256 * 1024;
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+const PROCESS_GROUP_GRACE: Duration = Duration::from_secs(5);
 const CODEX_INSTALL_URL: &str = "https://chatgpt.com/codex/install.sh";
 const CODEX_INSTALL_COMMAND: &str = "umask 077 && exec /bin/sh \"$1\"";
 const CODEX_INSTALL_ARGV0: &str = "atmux-codex-installer";
@@ -953,12 +957,28 @@ impl OwnerLock {
         if bytes.len() as u64 > MAX_STATE_BYTES {
             bail!("CLI maintenance state exceeds its size bound");
         }
-        let state: MaintenanceState =
-            serde_json::from_slice(&bytes).context("CLI maintenance state is not valid JSON")?;
-        if state.version != STATE_VERSION {
-            bail!("CLI maintenance state has an unsupported version");
+        match serde_json::from_slice::<MaintenanceState>(&bytes) {
+            Ok(state) if state.version == STATE_VERSION => Ok(state),
+            Ok(_) => self.quarantine_state("has an unsupported version"),
+            Err(error) => self.quarantine_state(&format!("is not valid JSON: {error}")),
         }
-        Ok(state)
+    }
+
+    /// State this build cannot read would otherwise fail every maintenance
+    /// tick forever. Move it aside once, say why, and restart from the default
+    /// baseline instead of leaving maintenance permanently disabled.
+    fn quarantine_state(&self, reason: &str) -> Result<MaintenanceState> {
+        let quarantined = self
+            .state_path
+            .with_extension(format!("json.corrupt-{}", now_ms()));
+        fs::rename(&self.state_path, &quarantined).with_context(|| {
+            format!("CLI maintenance state {reason} and could not be moved aside")
+        })?;
+        eprintln!(
+            "atmux CLI maintenance state {reason}; moved to {} and reinitialized",
+            quarantined.display()
+        );
+        Ok(MaintenanceState::default())
     }
 
     pub(crate) fn store(&self, state: &MaintenanceState) -> Result<()> {
@@ -1305,9 +1325,24 @@ async fn run_bounded_output(
     program: &Path,
     timeout: Duration,
 ) -> Result<String> {
-    let output = tokio::time::timeout(timeout, command.output())
-        .await
-        .with_context(|| format!("{} exceeded its maintenance deadline", program.display()))??;
+    // The child leads a new process group so a maintenance deadline reaches the
+    // installer's descendants (curl/tar) instead of only the shell atmux spawned.
+    let child = command.process_group(0).spawn()?;
+    let group = child
+        .id()
+        .and_then(|id| i32::try_from(id).ok())
+        .and_then(Pid::from_raw);
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(output) => output?,
+        Err(elapsed) => {
+            if let Some(group) = group {
+                terminate_process_group(group).await;
+            }
+            return Err(anyhow::Error::new(elapsed)).with_context(|| {
+                format!("{} exceeded its maintenance deadline", program.display())
+            });
+        }
+    };
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr);
         bail!(
@@ -1318,6 +1353,16 @@ async fn run_bounded_output(
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Mirrors recovery's group cleanup. `kill_on_drop` already reached the leader
+/// when the deadline future was dropped; this reaches everything it started.
+async fn terminate_process_group(group: Pid) {
+    let _ = kill_process_group(group, Signal::TERM);
+    tokio::time::sleep(PROCESS_GROUP_GRACE).await;
+    if test_kill_process_group(group).is_ok() {
+        let _ = kill_process_group(group, Signal::KILL);
+    }
 }
 
 fn resolve_launcher(harness: Harness) -> Option<PathBuf> {
@@ -3018,6 +3063,51 @@ mod tests {
         );
         drop(restarted);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unreadable_state_is_quarantined_once_instead_of_failing_every_tick() {
+        for (label, contents) in [
+            (
+                "version",
+                br#"{"version":99,"last_check_ms":7,"harnesses":{}}"#.to_vec(),
+            ),
+            ("json", b"{ not json".to_vec()),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "atmux-maintenance-corrupt-{label}-{}-{}",
+                std::process::id(),
+                TEMP_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            let lock = OwnerLock::try_acquire_in(root.clone()).unwrap().unwrap();
+            let state_path = root.join("state.json");
+            OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&state_path)
+                .unwrap()
+                .write_all(&contents)
+                .unwrap();
+
+            let reinitialized = lock.load().unwrap();
+            assert_eq!(reinitialized.last_check_ms, None);
+            assert!(reinitialized.harnesses.is_empty());
+            assert!(!state_path.exists());
+            assert!(
+                fs::read_dir(&root).unwrap().flatten().any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("state.json.corrupt-")
+                }),
+                "the unreadable {label} state must be kept for inspection"
+            );
+            // A later tick starts from the default baseline rather than failing.
+            assert!(lock.load().is_ok());
+            drop(lock);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     fn identity(digest: &str) -> ExecutableIdentity {
