@@ -27,6 +27,10 @@ let launchMachinesUnavailable = false;
 let largeLaunchDirectoryFixture = false;
 let launchSessionResponseDelayMs = 0;
 let overviewRevision = 1;
+/// Every fixed update verb the dashboard forwarded, in order.
+const fleetUpdateRequests = [];
+/// The node state Tron reports; applying flips it the way a real node does.
+let tronUpdateState = "idle";
 let delayProjectFilePane = null;
 let delayFileSavePane = null;
 let delayGitSummaryPane = null;
@@ -52,6 +56,59 @@ const LONG_OS_VERSION = "o".repeat(160);
 const LONG_MACHINE_HEALTH = "machine clue is unreachable at https://192.168.0.140:7345: "
   + "error sending request for url (https://192.168.0.140:7345/api/v1/sessions): "
   + "client error (Connect): connection refused";
+
+function mockNodeUpdate(overrides = {}) {
+  return {
+    enabled: true,
+    version: "0.2.0",
+    target: "x86_64-unknown-linux-gnu",
+    mode: "self",
+    latest: null,
+    state: "idle",
+    progress: null,
+    last_checked_at: Date.now() - 30_000,
+    last_error: null,
+    previous: null,
+    ...overrides,
+  };
+}
+
+/// A fleet where exactly one machine has a verified release waiting, one is
+/// already current, and one cannot be reached at all.
+function mockFleetUpdates() {
+  return [
+    {
+      id: "tron",
+      label: "Tron",
+      online: true,
+      error: null,
+      update: mockNodeUpdate({
+        state: tronUpdateState,
+        latest: {
+          version: "0.3.0",
+          tag: "v0.3.0",
+          published_at: new Date(Date.now() - 2 * 3600 * 1000).toISOString(),
+          verified: true,
+          asset: "atmux-x86_64-unknown-linux-gnu",
+        },
+      }),
+    },
+    {
+      id: "midnight",
+      label: "Midnight",
+      online: true,
+      error: null,
+      update: mockNodeUpdate({ target: "aarch64-apple-darwin" }),
+    },
+    {
+      id: "clue",
+      label: "Clue",
+      online: false,
+      error: LONG_MACHINE_HEALTH,
+      update: null,
+    },
+  ];
+}
 
 function fixtureProjectFile(paneId) {
   if (!projectFileContents.has(paneId)) {
@@ -155,6 +212,30 @@ function mockApi(url, response, request) {
     })}\n\n`);
     overviewStreams.add(response);
     request.once("close", () => { overviewStreams.delete(response); });
+    return true;
+  }
+  if (pathname === "/api/v1/fleet/updates") {
+    json(response, mockFleetUpdates());
+    return true;
+  }
+  const updateVerb = /^\/api\/v1\/machines\/([^/]+)\/update\/(check|apply|rollback)$/.exec(pathname);
+  if (updateVerb && request.method === "POST") {
+    const machine = decodeURIComponent(updateVerb[1]);
+    const action = updateVerb[2];
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      fleetUpdateRequests.push({ machine, action, body });
+      if (action === "apply" && machine === "tron") tronUpdateState = "restarting";
+      const entry = mockFleetUpdates().find((item) => item.id === machine);
+      if (!entry?.update) {
+        errorJson(response, 409, "machine cannot update itself");
+        return;
+      }
+      response.writeHead(202, { "content-type": "application/json", "cache-control": "no-store" });
+      response.end(JSON.stringify(entry.update));
+    });
     return true;
   }
   if (/^\/api\/v1\/panes\/[^/]+\/events$/.test(pathname)) {
@@ -816,6 +897,8 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
   launchResponseDelayMs = 0;
   launchDirectoryMutationDelayMs = 0;
   overviewRevision = 1;
+  fleetUpdateRequests.length = 0;
+  tronUpdateState = "idle";
   const transcript = (start, count, hash) => ({
     available: true,
     source: "codex",
@@ -1656,6 +1739,38 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.ok(landingFit.statusRight <= landingFit.innerWidth, JSON.stringify(landingFit));
     assert.equal(landingFit.statusTruncated, true, JSON.stringify(landingFit));
     assert.equal(landingFit.statusText, `Offline · ${LONG_MACHINE_HEALTH}`);
+
+    // A verified release is announced on the landing page with one compact
+    // pill and one action, and both still fit a 390px phone.
+    await waitFor(
+      () => cdp.evaluate("!document.getElementById('update-all-open').hidden"),
+      "the Update all action never appeared for a verified release",
+    );
+    const updateLanding = await cdp.evaluate(`(() => {
+      const rail = document.querySelector('.rail');
+      const pillFor = (label) => [...document.querySelectorAll('.machine-header')]
+        .find((node) => node.querySelector('.machine-label')?.textContent === label)
+        ?.querySelector('.machine-update-pill');
+      const updateAll = document.getElementById('update-all-open');
+      return {
+        innerWidth,
+        tronPill: pillFor('Tron').hidden ? '' : pillFor('Tron').textContent,
+        midnightPill: pillFor('Midnight').hidden ? '' : pillFor('Midnight').textContent,
+        cluePill: pillFor('Clue').hidden ? '' : pillFor('Clue').textContent,
+        updateAllText: updateAll.textContent,
+        updateAllRight: Math.round(updateAll.getBoundingClientRect().right),
+        railOverflow: rail.scrollWidth - rail.clientWidth,
+        documentOverflow: document.documentElement.scrollWidth - innerWidth,
+      };
+    })()`);
+    assert.equal(updateLanding.tronPill, "↑ v0.3.0", JSON.stringify(updateLanding));
+    assert.equal(updateLanding.midnightPill, "", JSON.stringify(updateLanding));
+    assert.equal(updateLanding.cluePill, "", JSON.stringify(updateLanding));
+    assert.equal(updateLanding.updateAllText, "↑ Update all (1)", JSON.stringify(updateLanding));
+    assert.ok(updateLanding.updateAllRight <= updateLanding.innerWidth, JSON.stringify(updateLanding));
+    assert.ok(updateLanding.railOverflow <= 0, JSON.stringify(updateLanding));
+    assert.ok(updateLanding.documentOverflow <= 1, JSON.stringify(updateLanding));
+
     await cdp.evaluate(`(() => {
       [...document.querySelectorAll('.machine-header')]
         .find((node) => node.querySelector('.machine-label')?.textContent === 'Tron')
@@ -1687,7 +1802,102 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.ok(systemCard.documentOverflow <= 1, JSON.stringify(systemCard));
     assert.ok(systemCard.viewOverflow <= 1, JSON.stringify(systemCard));
     assert.ok(systemCard.cardOverflow <= 1, JSON.stringify(systemCard));
+
+    const softwareCard = await cdp.evaluate(`(() => {
+      const card = document.getElementById('machine-software');
+      const button = (name) => card.querySelector('[data-update-action="' + name + '"]');
+      return {
+        heading: card.querySelector('h2').textContent,
+        version: card.querySelector('.software-version').textContent,
+        latest: card.querySelector('.software-latest').textContent,
+        actions: [...card.querySelectorAll('button')].map((node) => ({
+          label: node.textContent, action: node.dataset.updateAction, disabled: node.disabled,
+        })),
+        machineOnButtons: [...card.querySelectorAll('button')].map((node) => node.dataset.machineId),
+        updateEnabled: !button('apply').disabled,
+        rollbackEnabled: !button('rollback').disabled,
+        cardOverflow: card.scrollWidth - card.clientWidth,
+        documentOverflow: document.documentElement.scrollWidth - innerWidth,
+      };
+    })()`);
+    assert.equal(softwareCard.heading, "Software");
+    assert.equal(softwareCard.version, "atmux v0.2.0 · x86_64-unknown-linux-gnu");
+    assert.match(softwareCard.latest, /^v0\.3\.0 available · verified · published /);
+    assert.deepEqual(softwareCard.actions.map((item) => item.action), ["check", "apply", "rollback"]);
+    assert.deepEqual(softwareCard.actions.map((item) => item.label), ["Check now", "Update", "Roll back"]);
+    assert.deepEqual(softwareCard.machineOnButtons, ["tron", "tron", "tron"]);
+    assert.equal(softwareCard.updateEnabled, true, JSON.stringify(softwareCard));
+    // Tron kept no previous executable, so a rollback is never offered.
+    assert.equal(softwareCard.rollbackEnabled, false, JSON.stringify(softwareCard));
+    assert.ok(softwareCard.cardOverflow <= 1, JSON.stringify(softwareCard));
+    assert.ok(softwareCard.documentOverflow <= 1, JSON.stringify(softwareCard));
+
+    // Update is confirmed before anything is sent, and the confirmation says
+    // exactly what happens to the agents running on that machine.
+    await cdp.evaluate("document.querySelector('#machine-software [data-update-action=\"apply\"]').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('update-dialog').open"),
+      "the update confirmation did not open",
+    );
+    assert.deepEqual(await cdp.evaluate(`({
+      target: document.getElementById('update-dialog-target').textContent,
+      note: document.getElementById('update-dialog-note').textContent,
+    })`), {
+      target: "Install the newest verified atmux on Tron.",
+      note: "atmux restarts on Tron; agent sessions keep running in tmux.",
+    });
+    assert.equal(fleetUpdateRequests.length, 0, "no verb may be sent before the confirmation");
+    await cdp.evaluate("document.getElementById('update-confirm').click(); true");
+    await waitFor(
+      () => Promise.resolve(fleetUpdateRequests.length > 0),
+      "the confirmed update never reached the coordinator",
+    );
+    assert.deepEqual(
+      fleetUpdateRequests.map(({ machine, action, body }) => ({ machine, action, body })),
+      [{ machine: "tron", action: "apply", body: "{}" }],
+    );
+    await waitFor(
+      () => cdp.evaluate("(document.querySelector('#machine-software .software-state')?.textContent || '').includes('Restarting')"),
+      "the Software card never reported the restart",
+    );
+    const restarting = await cdp.evaluate(`(() => {
+      const card = document.getElementById('machine-software');
+      return {
+        state: card.querySelector('.software-state').textContent,
+        updateDisabled: card.querySelector('[data-update-action="apply"]').disabled,
+        checkDisabled: card.querySelector('[data-update-action="check"]').disabled,
+        dialogOpen: document.getElementById('update-dialog').open,
+      };
+    })()`);
+    assert.equal(restarting.state, "Restarting into the new version…");
+    assert.equal(restarting.updateDisabled, true, JSON.stringify(restarting));
+    assert.equal(restarting.checkDisabled, true, JSON.stringify(restarting));
+    assert.equal(restarting.dialogOpen, false, JSON.stringify(restarting));
+
     await cdp.evaluate("document.getElementById('machine-mobile-back').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('update-all-open').hidden"),
+      "Update all stayed offered while the only candidate was restarting",
+    );
+    // The landing page still fits the phone with an update in flight.
+    const afterUpdateLanding = await cdp.evaluate(`(() => {
+      const rail = document.querySelector('.rail');
+      const width = (selector) => Math.round(document.querySelector(selector).getBoundingClientRect().width);
+      return {
+        innerWidth,
+        topbar: width('.topbar'),
+        workspace: width('.workspace'),
+        rail: width('.rail'),
+        railOverflow: rail.scrollWidth - rail.clientWidth,
+        documentOverflow: document.documentElement.scrollWidth - innerWidth,
+      };
+    })()`);
+    assert.equal(afterUpdateLanding.topbar, afterUpdateLanding.innerWidth, JSON.stringify(afterUpdateLanding));
+    assert.equal(afterUpdateLanding.workspace, afterUpdateLanding.innerWidth, JSON.stringify(afterUpdateLanding));
+    assert.equal(afterUpdateLanding.rail, afterUpdateLanding.innerWidth, JSON.stringify(afterUpdateLanding));
+    assert.ok(afterUpdateLanding.railOverflow <= 0, JSON.stringify(afterUpdateLanding));
+    assert.ok(afterUpdateLanding.documentOverflow <= 1, JSON.stringify(afterUpdateLanding));
+
     await cdp.evaluate("document.querySelector('.session-button[data-session-id=\"tron~%100\"]').click(); true");
     await waitFor(
       () => cdp.evaluate("document.getElementById('agent-name').textContent === 'codex-main'"),

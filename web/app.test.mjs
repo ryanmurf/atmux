@@ -56,7 +56,17 @@ const {
   STICKY_BOTTOM_TOLERANCE,
   formatUptime,
   formatRelativeTime,
+  fleetUpdatePollDelay,
   groupSessionsByMachine,
+  machineCanCheck,
+  machineCanRollback,
+  machineCanUpdate,
+  machineUpdateInFlight,
+  machineUpdatePill,
+  softwareCardModel,
+  updatableMachines,
+  updateProgressLabel,
+  updateRestartWarning,
   gpuSummary,
   gpuDetailLines,
   gpuDiagnosticLines,
@@ -2635,4 +2645,221 @@ test("pane failures use a pane-scoped surface and never the tmux health alert", 
   const paneHandlers = source.slice(source.indexOf("function connectPane"), source.indexOf("function drawPane"));
   assert.doesNotMatch(paneHandlers, /setHealth\(/);
   assert.match(source, /paneNotice\(machine, state\.paneError, Date\.now\(\)\)/);
+});
+
+const UPDATE_NOW = Date.parse("2026-09-06T12:00:00Z");
+
+function updateEntry(id, label, update, extra = {}) {
+  return { id, label, online: true, update, error: null, ...extra };
+}
+
+function nodeUpdate(overrides = {}) {
+  return {
+    enabled: true,
+    version: "0.2.0",
+    target: "x86_64-unknown-linux-gnu",
+    mode: "self",
+    latest: null,
+    state: "idle",
+    progress: null,
+    last_checked_at: UPDATE_NOW - 1000,
+    last_error: null,
+    previous: null,
+    ...overrides,
+  };
+}
+
+function availableRelease(overrides = {}) {
+  return {
+    version: "0.3.0",
+    tag: "v0.3.0",
+    published_at: "2026-09-06T10:00:00Z",
+    verified: true,
+    asset: "atmux-x86_64-unknown-linux-gnu",
+    ...overrides,
+  };
+}
+
+test("the Software card reports every node mode without inventing an action", () => {
+  const upToDate = softwareCardModel(updateEntry("tron", "Tron", nodeUpdate()), UPDATE_NOW);
+  assert.equal(upToDate.version, "atmux v0.2.0 · x86_64-unknown-linux-gnu");
+  assert.equal(upToDate.latest, "Up to date");
+  assert.equal(upToDate.canCheck, true);
+  assert.equal(upToDate.canUpdate, false);
+  assert.equal(upToDate.canRollback, false);
+
+  const available = softwareCardModel(
+    updateEntry("tron", "Tron", nodeUpdate({ latest: availableRelease() })),
+    UPDATE_NOW,
+  );
+  assert.equal(available.latest, "v0.3.0 available · verified · published 2h ago");
+  assert.equal(available.canUpdate, true);
+
+  // An unverified release is reported but never offered.
+  const unverified = softwareCardModel(
+    updateEntry("tron", "Tron", nodeUpdate({ latest: availableRelease({ verified: false }) })),
+    UPDATE_NOW,
+  );
+  assert.match(unverified.latest, /unverified/);
+  assert.equal(unverified.canUpdate, false);
+
+  const container = softwareCardModel(
+    updateEntry("web", "Coordinator", nodeUpdate({
+      enabled: false, mode: "managed_externally", latest: availableRelease(),
+    })),
+    UPDATE_NOW,
+  );
+  assert.equal(container.latest, "Managed by container image");
+  assert.equal(container.canCheck, false);
+  assert.equal(container.canUpdate, false);
+
+  const disabled = softwareCardModel(
+    updateEntry("clue", "Clue", nodeUpdate({ enabled: false, mode: "disabled" })),
+    UPDATE_NOW,
+  );
+  assert.equal(disabled.latest, "Self-update disabled on this machine");
+  assert.equal(disabled.canCheck, false);
+
+  const unreachable = softwareCardModel(
+    { id: "clue", label: "Clue", online: false, update: null, error: "machine is offline" },
+    UPDATE_NOW,
+  );
+  assert.equal(unreachable.version, "Software state unavailable");
+  assert.equal(unreachable.latest, "machine is offline");
+  assert.equal(unreachable.canCheck, false);
+  assert.equal(unreachable.canUpdate, false);
+  assert.equal(unreachable.canRollback, false);
+});
+
+test("the Software card shows progress and errors while a node is working", () => {
+  const downloading = softwareCardModel(
+    updateEntry("tron", "Tron", nodeUpdate({
+      latest: availableRelease(),
+      state: "downloading",
+      progress: { downloaded: 4 * 1024 * 1024, total: 9 * 1024 * 1024 },
+    })),
+    UPDATE_NOW,
+  );
+  assert.equal(downloading.state, "Downloading… 4.0 MiB of 9.0 MiB");
+  // Nothing is actionable while the node is mid-update.
+  assert.equal(downloading.canCheck, false);
+  assert.equal(downloading.canUpdate, false);
+
+  const restarting = softwareCardModel(
+    updateEntry("tron", "Tron", nodeUpdate({ state: "restarting" })),
+    UPDATE_NOW,
+  );
+  assert.equal(restarting.state, "Restarting into the new version…");
+
+  const failed = softwareCardModel(
+    updateEntry("tron", "Tron", nodeUpdate({
+      state: "failed",
+      last_error: "release signature did not verify against the compiled-in key",
+    })),
+    UPDATE_NOW,
+  );
+  assert.equal(failed.state, "The last update attempt failed");
+  assert.match(failed.error, /signature did not verify/);
+
+  assert.equal(updateProgressLabel({ downloaded: 1024, total: null }), "1.0 KiB");
+  assert.equal(updateProgressLabel(null), "");
+});
+
+test("a rollback is offered only when the node kept a previous executable", () => {
+  const withPrevious = updateEntry("tron", "Tron", nodeUpdate({
+    previous: { version: "0.2.0", path: "/home/ryan/.local/bin/atmux.prev" },
+  }));
+  assert.equal(machineCanRollback(withPrevious), true);
+  assert.equal(softwareCardModel(withPrevious, UPDATE_NOW).canRollback, true);
+  assert.equal(machineCanRollback(updateEntry("tron", "Tron", nodeUpdate())), false);
+  // A container instance never rolls its own executable back.
+  assert.equal(
+    machineCanRollback(updateEntry("web", "Coordinator", nodeUpdate({
+      mode: "managed_externally",
+      previous: { version: "0.1.0", path: "/usr/local/bin/atmux.prev" },
+    }))),
+    false,
+  );
+});
+
+test("the landing pill appears only for a verified installable release", () => {
+  assert.equal(
+    machineUpdatePill(updateEntry("tron", "Tron", nodeUpdate({ latest: availableRelease() }))),
+    "↑ v0.3.0",
+  );
+  assert.equal(machineUpdatePill(updateEntry("tron", "Tron", nodeUpdate())), "");
+  assert.equal(
+    machineUpdatePill(updateEntry("tron", "Tron", nodeUpdate({
+      latest: availableRelease({ verified: false }),
+    }))),
+    "",
+  );
+  assert.equal(
+    machineUpdatePill(updateEntry("web", "Coordinator", nodeUpdate({
+      mode: "managed_externally", latest: availableRelease(),
+    }))),
+    "",
+  );
+  assert.equal(machineUpdatePill(null), "");
+  assert.equal(machineUpdatePill({ id: "clue", update: null, error: "offline" }), "");
+});
+
+test("Update all counts only the machines that can actually install", () => {
+  const roster = [
+    updateEntry("tron", "Tron", nodeUpdate({ latest: availableRelease() })),
+    updateEntry("max", "Max", nodeUpdate({ latest: availableRelease() })),
+    updateEntry("clue", "Clue", nodeUpdate()),
+    updateEntry("web", "Coordinator", nodeUpdate({ mode: "managed_externally", latest: availableRelease() })),
+    { id: "ghost", label: "Ghost", online: false, update: null, error: "offline" },
+  ];
+  assert.deepEqual(updatableMachines(roster).map((entry) => entry.id), ["tron", "max"]);
+  assert.deepEqual(updatableMachines(null), []);
+});
+
+test("the update confirmation always names the machines and promises tmux survives", () => {
+  assert.equal(
+    updateRestartWarning(["Tron"]),
+    "atmux restarts on Tron; agent sessions keep running in tmux.",
+  );
+  assert.equal(
+    updateRestartWarning(["Tron", "Max"]),
+    "atmux restarts on Tron, Max; agent sessions keep running in tmux.",
+  );
+  assert.equal(
+    updateRestartWarning([]),
+    "atmux restarts on this machine; agent sessions keep running in tmux.",
+  );
+});
+
+test("the fleet roster is polled quickly only while a machine is mid-update", () => {
+  const idle = [updateEntry("tron", "Tron", nodeUpdate({ latest: availableRelease() }))];
+  assert.equal(fleetUpdatePollDelay(idle), 60000);
+  assert.equal(machineUpdateInFlight(idle[0]), false);
+  for (const state of ["checking", "downloading", "verifying", "applying", "restarting"]) {
+    const busy = [updateEntry("tron", "Tron", nodeUpdate({ state }))];
+    assert.equal(machineUpdateInFlight(busy[0]), true, state);
+    assert.equal(fleetUpdatePollDelay(busy), 5000, state);
+  }
+  assert.equal(fleetUpdatePollDelay([updateEntry("tron", "Tron", nodeUpdate({ state: "failed" }))]), 60000);
+  assert.equal(fleetUpdatePollDelay([]), 60000);
+  assert.equal(machineCanCheck(updateEntry("tron", "Tron", nodeUpdate({ state: "downloading" }))), false);
+});
+
+test("the dashboard sends only fixed update verbs and never a version or URL", () => {
+  const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  const markup = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+  assert.match(markup, /id="machine-software"/);
+  assert.match(markup, /id="update-all-open"/);
+  assert.match(markup, /id="update-dialog"/);
+  assert.match(markup, /id="update-confirm"/);
+  assert.match(source, /\/api\/v1\/fleet\/updates/);
+  assert.match(
+    source,
+    /`\/api\/v1\/machines\/\$\{encodeURIComponent\(machineId\)\}\/update\/\$\{action\}`/,
+  );
+  // Update is confirmed; only the three owner verbs are ever sent.
+  assert.match(source, /openUpdateConfirm\(\[machine\.id\]\)/);
+  const verbs = [...source.matchAll(/softwareButton\(machine, "([a-z]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(verbs.sort(), ["apply", "check", "rollback"]);
+  assert.doesNotMatch(source, /update\/\$\{[^}]*version/);
 });
