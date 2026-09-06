@@ -24,8 +24,14 @@ html { overflow: hidden; overscroll-behavior: none; }
    remainder. That leaves the app surface ending partway down the screen with
    dead background beneath it (worst on tall phones), which is why
    `body.has-selection` had to force an explicit height further down. Pin every
-   row so the workspace always owns the remainder. */
-body { height: var(--app-height, 100vh); height: var(--app-height, 100dvh); margin: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr); background: var(--bg); color: var(--text); overflow: hidden; }
+   row so the workspace always owns the remainder.
+   The single column must be `minmax(0, 1fr)`, not the implicit `auto`: an auto
+   track grows to the widest min-content in the column, and the rail's
+   unwrappable lines (a long machine status, a session path) propagated through
+   the block-level mobile workspace and pushed the whole column past the phone
+   (648px on a 390px viewport). `overflow: hidden` clipped the document, so the
+   topbar and rail were simply cut off at the right edge with no scrolling. */
+body { height: var(--app-height, 100vh); height: var(--app-height, 100dvh); margin: 0; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto minmax(0, 1fr); background: var(--bg); color: var(--text); overflow: hidden; }
 button, input, textarea, select { font: inherit; }
 button { min-height: 44px; cursor: pointer; }
 button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
@@ -47,16 +53,16 @@ button:hover { border-color: #52717d; }
 .danger { color: var(--red); border-color: #6b333b; background: #25171a; }
 .subtle { background: transparent; }
 
-.workspace { grid-row: 3; min-height: 0; display: grid; grid-template-columns: minmax(220px, 23vw) 1fr; transition: grid-template-columns .16s ease; }
+.workspace { grid-row: 3; min-width: 0; min-height: 0; display: grid; grid-template-columns: minmax(220px, 23vw) minmax(0, 1fr); transition: grid-template-columns .16s ease; }
 body.rail-collapsed .workspace { grid-template-columns: 0 1fr; }
-.rail { padding: 10px 8px; border-right: 1px solid var(--line); overflow-y: auto; background: #0d151a; transition: opacity .16s ease; }
+.rail { min-width: 0; padding: 10px 8px; border-right: 1px solid var(--line); overflow-x: hidden; overflow-y: auto; background: #0d151a; transition: opacity .16s ease; }
 body.rail-collapsed .rail { visibility: hidden; padding-inline: 0; opacity: 0; border-right: 0; pointer-events: none; }
 .search-label { display: block; margin: 0 4px 7px; color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
 input, textarea, select { width: 100%; color: var(--text); background: #0a1115; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
 textarea { resize: vertical; min-height: 74px; max-height: 220px; }
 .session-list { list-style: none; padding: 6px 0 0; margin: 0; }
 .session-row { display: grid; grid-template-columns: minmax(0, 1fr) 30px; align-items: center; gap: 2px; }
-.session-button { width: 100%; display: grid; grid-template-columns: 14px 1fr; gap: 6px; min-height: 42px; padding: 5px 7px; text-align: left; background: transparent; border-color: transparent; }
+.session-button { width: 100%; display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 6px; min-height: 42px; padding: 5px 7px; text-align: left; background: transparent; border-color: transparent; }
 .session-button:hover { background: var(--panel); }
 .session-button.selected { background: var(--panel-2); border-color: var(--line); }
 .session-dot { padding-top: 2px; }
@@ -277,8 +283,8 @@ dialog::backdrop { background: #000a; }
 .machine-row { list-style: none; }
 .machine-header { width: 100%; min-height: 32px; display: flex; align-items: baseline; gap: 6px; padding: 8px 7px 3px; border-color: transparent; border-radius: 6px; font-size: 11px; text-align: left; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); background: transparent; }
 .machine-header:hover, .machine-header.selected { background: var(--panel); border-color: var(--line); }
-.machine-header .machine-label { font-weight: 600; color: #cfe1ea; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.machine-header .machine-status { margin-left: auto; text-transform: none; letter-spacing: 0; font-size: 11px; white-space: nowrap; }
+.machine-header .machine-label { min-width: 0; font-weight: 600; color: #cfe1ea; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.machine-header .machine-status { min-width: 0; margin-left: auto; overflow: hidden; text-overflow: ellipsis; text-transform: none; letter-spacing: 0; font-size: 11px; white-space: nowrap; }
 .machine-header.online .machine-dot { color: #4ec9a5; }
 .machine-header.offline .machine-dot, .machine-header.offline .machine-status { color: #e0975f; }
 .machine-header.offline .machine-label { color: var(--muted); }
