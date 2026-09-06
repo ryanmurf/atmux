@@ -666,6 +666,29 @@ function updateRestartWarning(labels) {
   return `atmux restarts on ${subject}; agent sessions keep running in tmux.`;
 }
 
+/// What the confirmation says for one verb.
+///
+/// Rolling back restarts the node exactly as installing does, so it is
+/// confirmed the same way rather than firing on a single tap.
+function updateConfirmCopy(action, labels) {
+  const names = (Array.isArray(labels) ? labels : [labels]).filter(Boolean);
+  const subject = names.length === 1 ? names[0] : `${names.length} machines`;
+  const note = updateRestartWarning(names);
+  return action === "rollback"
+    ? {
+      title: "Roll back atmux?",
+      target: `Restore the previously installed atmux on ${subject}.`,
+      note,
+      confirm: "Roll back",
+    }
+    : {
+      title: "Install the new atmux?",
+      target: `Install the newest verified atmux on ${subject}.`,
+      note,
+      confirm: "Update",
+    };
+}
+
 function updateProgressLabel(progress) {
   if (!progress || !Number.isFinite(progress.downloaded)) return "";
   const done = formatBytes(progress.downloaded);
@@ -2518,6 +2541,7 @@ if (typeof module !== "undefined" && module.exports) {
     parseMemoryLimitSelection,
     formatRelativeTime,
     fleetUpdatePollDelay,
+    updateConfirmCopy,
     groupSessionsByMachine,
     machineCanCheck,
     machineCanRollback,
@@ -2796,7 +2820,7 @@ function initialize() {
     /// Machines with a verb in flight from this browser, so its buttons stay
     /// disabled until the node answers.
     updateBusy: new Set(),
-    pendingUpdateMachines: [],
+    pendingUpdate: null,
     railCollapsed: readLocalStorage("atmux.rail-collapsed") === "true",
     pulseOpen: initialRoute.view === "usage",
     pulseAccount: requestedPulseAccount || storedPulseAccount,
@@ -4883,8 +4907,9 @@ function initialize() {
     button.dataset.updateAction = action;
     button.dataset.machineId = machine.id;
     button.addEventListener("click", () => {
-      if (action === "apply") openUpdateConfirm([machine.id]);
-      else void runMachineUpdate(machine.id, action);
+      // Both restarting verbs are confirmed; only a read-only check is not.
+      if (action === "check") void runMachineUpdate(machine.id, action);
+      else openUpdateConfirm([machine.id], action);
     });
     return button;
   }
@@ -6281,30 +6306,39 @@ function initialize() {
       || machineId;
   }
 
-  /// Nothing installs without an explicit confirmation naming the machines.
-  function openUpdateConfirm(machineIds) {
+  /// Nothing that restarts a node happens without an explicit confirmation
+  /// naming the machines it will restart.
+  function openUpdateConfirm(machineIds, action) {
     if (!machineIds.length) return;
-    state.pendingUpdateMachines = machineIds;
-    const labels = machineIds.map(machineLabelFor);
-    $("update-dialog-target").textContent = machineIds.length === 1
-      ? `Install the newest verified atmux on ${labels[0]}.`
-      : `Install the newest verified atmux on ${machineIds.length} machines.`;
-    $("update-dialog-note").textContent = updateRestartWarning(labels);
+    state.pendingUpdate = { action, machines: machineIds };
+    const copy = updateConfirmCopy(action, machineIds.map(machineLabelFor));
+    $("update-dialog-title").textContent = copy.title;
+    $("update-dialog-target").textContent = copy.target;
+    $("update-dialog-note").textContent = copy.note;
+    $("update-confirm").textContent = copy.confirm;
     const dialog = $("update-dialog");
     if (!dialog.open) dialog.showModal();
   }
 
-  $("update-dialog").addEventListener("close", () => { state.pendingUpdateMachines = []; });
+  $("update-dialog").addEventListener("close", () => { state.pendingUpdate = null; });
   $("update-all-open").addEventListener("click", () => {
-    openUpdateConfirm(updatableMachines([...state.fleetUpdates.values()]).map((entry) => entry.id));
+    openUpdateConfirm(
+      updatableMachines([...state.fleetUpdates.values()]).map((entry) => entry.id),
+      "apply",
+    );
   });
   $("update-confirm").addEventListener("click", async () => {
-    const targets = state.pendingUpdateMachines;
+    const pending = state.pendingUpdate;
     $("update-dialog").close();
-    if (!targets.length) return;
-    const results = await Promise.all(targets.map((id) => runMachineUpdate(id, "apply")));
+    if (!pending?.machines.length) return;
+    const results = await Promise.all(
+      pending.machines.map((id) => runMachineUpdate(id, pending.action)),
+    );
     const started = results.filter(Boolean).length;
-    if (started) toast(`Updating ${started} machine${started === 1 ? "" : "s"}`);
+    if (!started) return;
+    toast(pending.action === "rollback"
+      ? `Rolling back ${started} machine${started === 1 ? "" : "s"}`
+      : `Updating ${started} machine${started === 1 ? "" : "s"}`);
   });
   $("recovery-open").addEventListener("click", () => { void refreshRecoveryStatus(true); });
   $("recovery-confirm").addEventListener("click", async () => {

@@ -57,6 +57,7 @@ const {
   formatUptime,
   formatRelativeTime,
   fleetUpdatePollDelay,
+  updateConfirmCopy,
   groupSessionsByMachine,
   machineCanCheck,
   machineCanRollback,
@@ -2816,6 +2817,25 @@ test("Update all counts only the machines that can actually install", () => {
   assert.deepEqual(updatableMachines(null), []);
 });
 
+test("rolling back is confirmed exactly like installing, because it also restarts", () => {
+  const update = updateConfirmCopy("apply", ["Tron"]);
+  assert.equal(update.title, "Install the new atmux?");
+  assert.equal(update.target, "Install the newest verified atmux on Tron.");
+  assert.equal(update.confirm, "Update");
+
+  const rollback = updateConfirmCopy("rollback", ["Tron"]);
+  assert.equal(rollback.title, "Roll back atmux?");
+  assert.equal(rollback.target, "Restore the previously installed atmux on Tron.");
+  assert.equal(rollback.confirm, "Roll back");
+  // The restart warning is the point of the dialog and never varies by verb.
+  assert.equal(rollback.note, update.note);
+  assert.equal(rollback.note, "atmux restarts on Tron; agent sessions keep running in tmux.");
+
+  const many = updateConfirmCopy("apply", ["Tron", "Max"]);
+  assert.equal(many.target, "Install the newest verified atmux on 2 machines.");
+  assert.equal(many.note, "atmux restarts on Tron, Max; agent sessions keep running in tmux.");
+});
+
 test("the update confirmation always names the machines and promises tmux survives", () => {
   assert.equal(
     updateRestartWarning(["Tron"]),
@@ -2857,8 +2877,9 @@ test("the dashboard sends only fixed update verbs and never a version or URL", (
     source,
     /`\/api\/v1\/machines\/\$\{encodeURIComponent\(machineId\)\}\/update\/\$\{action\}`/,
   );
-  // Update is confirmed; only the three owner verbs are ever sent.
-  assert.match(source, /openUpdateConfirm\(\[machine\.id\]\)/);
+  // Both restarting verbs are confirmed; only a read-only check fires directly.
+  assert.match(source, /if \(action === "check"\) void runMachineUpdate\(machine\.id, action\);/);
+  assert.match(source, /else openUpdateConfirm\(\[machine\.id\], action\);/);
   const verbs = [...source.matchAll(/softwareButton\(machine, "([a-z]+)"/g)].map((match) => match[1]);
   assert.deepEqual(verbs.sort(), ["apply", "check", "rollback"]);
   assert.doesNotMatch(source, /update\/\$\{[^}]*version/);

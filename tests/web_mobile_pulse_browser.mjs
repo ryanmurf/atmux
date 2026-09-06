@@ -98,7 +98,10 @@ function mockFleetUpdates() {
       label: "Midnight",
       online: true,
       error: null,
-      update: mockNodeUpdate({ target: "aarch64-apple-darwin" }),
+      update: mockNodeUpdate({
+        target: "aarch64-apple-darwin",
+        previous: { version: "0.1.0", path: "/Users/ryan/.local/bin/atmux.prev" },
+      }),
     },
     {
       id: "clue",
@@ -1840,11 +1843,15 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       "the update confirmation did not open",
     );
     assert.deepEqual(await cdp.evaluate(`({
+      title: document.getElementById('update-dialog-title').textContent,
       target: document.getElementById('update-dialog-target').textContent,
       note: document.getElementById('update-dialog-note').textContent,
+      confirm: document.getElementById('update-confirm').textContent,
     })`), {
+      title: "Install the new atmux?",
       target: "Install the newest verified atmux on Tron.",
       note: "atmux restarts on Tron; agent sessions keep running in tmux.",
+      confirm: "Update",
     });
     assert.equal(fleetUpdateRequests.length, 0, "no verb may be sent before the confirmation");
     await cdp.evaluate("document.getElementById('update-confirm').click(); true");
@@ -1878,6 +1885,60 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     await waitFor(
       () => cdp.evaluate("document.getElementById('update-all-open').hidden"),
       "Update all stayed offered while the only candidate was restarting",
+    );
+
+    // Rolling back restarts the node too, so it is confirmed the same way and
+    // sends nothing until the operator agrees.
+    await cdp.evaluate(`(() => {
+      [...document.querySelectorAll('.machine-header')]
+        .find((node) => node.querySelector('.machine-label')?.textContent === 'Midnight')
+        .click();
+      return true;
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("!document.getElementById('machine-view').hidden && document.getElementById('machine-name').textContent === 'Midnight'"),
+      "Midnight's machine view did not open",
+    );
+    await waitFor(
+      () => cdp.evaluate("document.querySelector('#machine-software [data-update-action=\"rollback\"]') !== null && !document.querySelector('#machine-software [data-update-action=\"rollback\"]').disabled"),
+      "Roll back was never offered for a machine with a previous executable",
+    );
+    const requestsBeforeRollback = fleetUpdateRequests.length;
+    await cdp.evaluate("document.querySelector('#machine-software [data-update-action=\"rollback\"]').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('update-dialog').open"),
+      "the rollback confirmation did not open",
+    );
+    assert.deepEqual(await cdp.evaluate(`({
+      title: document.getElementById('update-dialog-title').textContent,
+      target: document.getElementById('update-dialog-target').textContent,
+      note: document.getElementById('update-dialog-note').textContent,
+      confirm: document.getElementById('update-confirm').textContent,
+    })`), {
+      title: "Roll back atmux?",
+      target: "Restore the previously installed atmux on Midnight.",
+      note: "atmux restarts on Midnight; agent sessions keep running in tmux.",
+      confirm: "Roll back",
+    });
+    assert.equal(
+      fleetUpdateRequests.length,
+      requestsBeforeRollback,
+      "a rollback must not reach the coordinator before it is confirmed",
+    );
+    await cdp.evaluate("document.querySelector('#update-dialog .dialog-cancel').click(); true");
+    await waitFor(
+      () => cdp.evaluate("!document.getElementById('update-dialog').open"),
+      "the rollback confirmation did not close",
+    );
+    assert.equal(
+      fleetUpdateRequests.length,
+      requestsBeforeRollback,
+      "cancelling a rollback must send nothing",
+    );
+    await cdp.evaluate("document.getElementById('machine-mobile-back').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('machine-view').hidden"),
+      "the machine view did not close after the rollback confirmation",
     );
     // The landing page still fits the phone with an update in flight.
     const afterUpdateLanding = await cdp.evaluate(`(() => {
