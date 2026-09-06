@@ -197,9 +197,16 @@ async fn main() -> Result<()> {
 ///
 /// With no flag this reports current state without contacting anything.
 async fn run_self_update(config: &Config, check: bool, apply: bool, rollback: bool) -> Result<()> {
-    use atmux::self_update::{Action, SelfUpdater};
+    use atmux::self_update::{Action, Environment, Phase, SelfUpdater};
 
-    let updater = SelfUpdater::production(&config.self_update)?;
+    // A one-shot command must never re-execute its own argv. `--rollback`
+    // would roll back again on every generation, and `--apply` would re-run
+    // against a binary that is already current and exit non-zero. This installs
+    // the file and leaves restarting the service to the operator or systemd.
+    let updater = SelfUpdater::with_environment(
+        &config.self_update,
+        Environment::production()?.without_restart(),
+    )?;
     let action = if apply {
         Some(Action::Apply)
     } else if rollback {
@@ -215,6 +222,38 @@ async fn run_self_update(config: &Config, check: bool, apply: bool, rollback: bo
         Some(Action::Rollback) => updater.rollback().map_err(anyhow::Error::new)?,
         None => updater.status(),
     };
+    print_self_update_status(&status);
+    if !matches!(action, Some(Action::Apply | Action::Rollback)) {
+        return Ok(());
+    }
+    // The pipeline finishes on its own task; report what it settled on rather
+    // than leaving an operator watching a silent terminal.
+    println!("working   installing; a running atmux service keeps its old binary until restarted");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let settled = updater.status();
+        match settled.state {
+            Phase::Failed => {
+                anyhow::bail!(
+                    "{}",
+                    settled
+                        .last_error
+                        .unwrap_or_else(|| "the update failed".to_owned())
+                );
+            }
+            Phase::Restarting => {
+                print_self_update_status(&settled);
+                println!("done      restart atmux to run the installed executable");
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("the update did not finish within its time bound")
+}
+
+fn print_self_update_status(status: &atmux::self_update::UpdateStatus) {
     println!("atmux {} ({})", status.version, status.target);
     println!("mode      {:?}", status.mode);
     println!("state     {:?}", status.state);
@@ -237,27 +276,6 @@ async fn run_self_update(config: &Config, check: bool, apply: bool, rollback: bo
     if let Some(error) = &status.last_error {
         println!("error     {error}");
     }
-    if matches!(action, Some(Action::Apply | Action::Rollback)) {
-        // The pipeline finishes in the background and then replaces this
-        // process, so stay alive for that. A failure ends the wait with the
-        // reason instead of leaving an operator watching a silent terminal.
-        println!("working   installing; this process is replaced once it succeeds");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
-        while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let status = updater.status();
-            if status.state == atmux::self_update::Phase::Failed {
-                anyhow::bail!(
-                    "{}",
-                    status
-                        .last_error
-                        .unwrap_or_else(|| "the update failed".to_owned())
-                );
-            }
-        }
-        anyhow::bail!("the update did not finish within its time bound");
-    }
-    Ok(())
 }
 
 fn doctor(config_path: &std::path::Path) -> Result<()> {
