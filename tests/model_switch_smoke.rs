@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     process::Command,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use atmux::{config::ProfileMode, status::AgentKind, tmux::Tmux};
@@ -170,7 +170,37 @@ fn start_probe() -> Probe {
             .unwrap();
         assert!(status.success());
     }
-    thread::sleep(Duration::from_millis(200));
+    // `tty.setraw` in the fake harness flushes any input queued before Python
+    // finished starting, so keys typed too early vanish and the first picker
+    // never appears. Wait for each harness's startup banner (printed after raw
+    // mode is set) instead of guessing at a fixed delay; cold CI runners have
+    // taken well over 200ms to get there.
+    for (harness, banner) in [("claude", "Claude Code v"), ("codex", "OpenAI Codex (v")] {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let output = Command::new("tmux")
+                .args([
+                    "-L",
+                    &socket,
+                    "capture-pane",
+                    "-p",
+                    "-t",
+                    &format!("{harness}:0.0"),
+                ])
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE")
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&output.stdout).contains(banner) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fake {harness} harness never printed its banner"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
     Probe { socket, directory }
 }
 
