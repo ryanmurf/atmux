@@ -161,10 +161,6 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          # `:latest` is decided by comparing every release tag, and
-          # build-container.sh archives from history.
-          fetch-depth: 0
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -176,6 +172,7 @@ jobs:
         shell: bash
         env:
           TAG: ${{ needs.verify.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           commit="$(git rev-parse --verify 'HEAD^{commit}')"
@@ -184,14 +181,20 @@ jobs:
           docker tag "$source_image" "$release_image"
           docker push "$release_image"
           # Re-running an old tag must not move `:latest` backward, so only the
-          # highest released version ever claims it.
-          highest="$(git tag --list 'v*' \
+          # newest version claims it. Ask which releases actually published: a
+          # tag alone proves nothing, so one mistyped v9.9.9 whose verify job
+          # failed would otherwise starve `:latest` forever.
+          highest="$(gh release list --limit 200 --exclude-drafts --exclude-pre-releases \
+              --json tagName --jq '.[].tagName' \
             | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
             | sort -V \
-            | tail -n 1)"
-          if [ "$highest" = "$TAG" ]; then
+            | tail -n 1 || true)"
+          # This release published before this job ran, so an empty list means
+          # the query failed rather than that nothing is released; claiming
+          # `:latest` is still right for the release that just shipped.
+          if [ -z "$highest" ] || [ "$highest" = "$TAG" ]; then
             docker tag "$source_image" "ghcr.io/ryanmurf/atmux:latest"
             docker push "ghcr.io/ryanmurf/atmux:latest"
           else
-            echo "$TAG is not the newest release ($highest); leaving :latest alone"
+            echo "$TAG is not the newest published release ($highest); leaving :latest alone"
           fi
