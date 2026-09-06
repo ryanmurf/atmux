@@ -238,10 +238,24 @@ async fn run_self_update(config: &Config, check: bool, apply: bool, rollback: bo
         println!("error     {error}");
     }
     if matches!(action, Some(Action::Apply | Action::Rollback)) {
-        // The pipeline runs to completion in the background and then replaces
-        // this process, so hold the CLI open long enough for that to happen.
-        println!("working   installing in the background; this process will be replaced");
-        tokio::time::sleep(Duration::from_secs(300)).await;
+        // The pipeline finishes in the background and then replaces this
+        // process, so stay alive for that. A failure ends the wait with the
+        // reason instead of leaving an operator watching a silent terminal.
+        println!("working   installing; this process is replaced once it succeeds");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let status = updater.status();
+            if status.state == atmux::self_update::Phase::Failed {
+                anyhow::bail!(
+                    "{}",
+                    status
+                        .last_error
+                        .unwrap_or_else(|| "the update failed".to_owned())
+                );
+            }
+        }
+        anyhow::bail!("the update did not finish within its time bound");
     }
     Ok(())
 }
