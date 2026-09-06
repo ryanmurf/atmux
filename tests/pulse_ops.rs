@@ -712,7 +712,7 @@ async fn push_once_backfill_is_bounded_account_scoped_and_does_not_schedule() {
     );
     assert_eq!(
         concrete_store
-            .list_token_grains(account_id(), Some(profile), None, 10)
+            .list_token_grains(account_id(), Some(profile), None, None, 10)
             .await
             .expect("tokens")
             .len(),
@@ -768,7 +768,7 @@ async fn cancelled_backfill_resumes_after_the_committed_cursor_without_duplicate
     assert_eq!(collectors.gemini_calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         concrete_store
-            .list_token_grains(account_id(), None, None, 10,)
+            .list_token_grains(account_id(), None, None, None, 10,)
             .await
             .expect("committed first page")
             .len(),
@@ -800,7 +800,7 @@ async fn cancelled_backfill_resumes_after_the_committed_cursor_without_duplicate
     assert_eq!(resumed.collections.tokens.expect("tokens").succeeded, 2);
     assert_eq!(
         concrete_store
-            .list_token_grains(account_id(), None, None, 10,)
+            .list_token_grains(account_id(), None, None, None, 10,)
             .await
             .expect("completed backfill")
             .len(),
@@ -869,6 +869,7 @@ async fn continuously_changing_backfill_source_fails_bounded_with_safe_cursor() 
             .list_token_grains(
                 account_id(),
                 Some(ProfileName::new("configured").expect("profile")),
+                None,
                 None,
                 10,
             )

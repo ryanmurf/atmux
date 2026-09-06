@@ -21,6 +21,7 @@ use super::{
     collect::{
         ScanLimits, ScannedFile, open_regular_bounded, scan_regular_files, scan_regular_files_since,
     },
+    model::{MAX_MODEL_NAME_BYTES, validate_text},
 };
 
 const JSONL_SCAN: ScanLimits = ScanLimits {
@@ -35,7 +36,8 @@ const MAX_LINES: usize = 2_000_000;
 const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_READ_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_READ_DURATION: Duration = Duration::from_secs(12);
-const DEFAULT_MAX_ROWS: usize = 5_000;
+/// Largest row bound one tally may request.
+pub const DEFAULT_MAX_ROWS: usize = 5_000;
 
 /// Recent incremental collection or an explicit full-history backfill.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,6 +96,7 @@ pub struct TallyStats {
     pub bytes_read: u64,
     pub duplicate_events: usize,
     pub synthetic_events: usize,
+    pub malformed_events: usize,
 }
 
 /// Fine persisted grains plus their coarse derived view.
@@ -297,6 +300,24 @@ pub fn tally_profile_page(
     })
 }
 
+/// Tallies one profile, truncating to `options.max_rows` instead of failing.
+///
+/// Returns the retained grains plus whether rows were dropped, so a caller
+/// keeping a bounded budget records a truncation marker rather than losing the
+/// whole profile.
+///
+/// # Errors
+///
+/// Returns the same bounded storage/configuration errors as [`tally_profile`],
+/// except for exceeding the output row bound.
+pub fn tally_profile_bounded(
+    profile: &Profile,
+    machine: MachineName,
+    options: &TallyOptions,
+) -> PulseResult<(TokenTally, bool)> {
+    tally_profile_inner(profile, machine, options, None, true)
+}
+
 fn tally_profile_inner(
     profile: &Profile,
     machine: MachineName,
@@ -353,6 +374,7 @@ fn tally_profile_inner(
     let stats = TallyStats {
         duplicate_events: tally.duplicate_events,
         synthetic_events: tally.synthetic_events,
+        malformed_events: tally.malformed_events,
         ..budget.stats
     };
     let (grains, truncated) = tally.finish()?;
@@ -539,6 +561,7 @@ struct FineTally {
     truncated: bool,
     duplicate_events: usize,
     synthetic_events: usize,
+    malformed_events: usize,
 }
 
 impl FineTally {
@@ -561,6 +584,7 @@ impl FineTally {
             truncated: false,
             duplicate_events: 0,
             synthetic_events: 0,
+            malformed_events: 0,
         }
     }
 
@@ -577,7 +601,16 @@ impl FineTally {
             return Ok(());
         }
         let settings_hash = dimensions.settings.sha256()?;
-        let session_id = SessionId::new(dimensions.session.clone())?;
+        // One malformed transcript event must not abandon the whole profile
+        // tally; it is counted and skipped instead.
+        let Ok(session_id) = SessionId::new(dimensions.session.clone()) else {
+            self.malformed_events = self.malformed_events.saturating_add(1);
+            return Ok(());
+        };
+        if validate_text("model", &dimensions.model, MAX_MODEL_NAME_BYTES).is_err() {
+            self.malformed_events = self.malformed_events.saturating_add(1);
+            return Ok(());
+        }
         let key = FineKey {
             day: dimensions.day.clone(),
             session: dimensions.session.clone(),
@@ -1198,6 +1231,43 @@ mod tests {
         assert_eq!(tally.grains.len(), 1);
         assert_eq!(tally.grains[0].session_id.as_str(), "recent");
         assert_eq!(tally.stats.files_scanned, 1);
+    }
+
+    #[test]
+    fn bounded_tally_truncates_instead_of_dropping_the_profile() {
+        let temp = TempDirectory::new();
+        let rows = (1..=3)
+            .map(|index| {
+                format!(
+                    r#"{{"type":"assistant","sessionId":"s{index}","requestId":"r{index}","timestamp":"2026-08-0{index}T01:00:00Z","message":{{"role":"assistant","id":"m{index}","model":"claude-opus-4-8","usage":{{"input_tokens":{index}}}}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        temp.write("projects/project/session.jsonl", &rows);
+        let profile = profile(&temp.0, Vendor::AnthropicOauth);
+        let machine = MachineName::new("max").expect("machine");
+        let options = TallyOptions {
+            window: TallyWindow::Recent {
+                since_day: "2026-08-01".to_owned(),
+            },
+            max_rows: 2,
+        };
+        let strict = tally_profile(&profile, machine.clone(), &options)
+            .expect_err("strict tally rejects the overflow");
+        assert_eq!(strict.kind(), PulseErrorKind::Storage);
+        let (tally, truncated) =
+            tally_profile_bounded(&profile, machine, &options).expect("bounded tally");
+        assert!(truncated);
+        assert_eq!(tally.grains.len(), 2);
+        assert_eq!(
+            tally
+                .grains
+                .iter()
+                .map(|grain| grain.day.clone())
+                .collect::<Vec<_>>(),
+            vec!["2026-08-01".to_owned(), "2026-08-02".to_owned()]
+        );
     }
 
     #[test]

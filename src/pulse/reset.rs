@@ -18,6 +18,7 @@ use super::{
 
 const DELIVERY_LEASE_MILLIS: i64 = 5 * 60 * 1_000;
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const DUE_RETRY_FLOOR_MILLIS: u64 = 5_000;
 const IDLE_RECHECK_MILLIS: u64 = 60_000;
 const MAX_SCHEDULER_ACCOUNTS: usize = 1_024;
 const RESTORE_LIMIT: usize = 4_096;
@@ -272,12 +273,29 @@ async fn next_delay(
             .list_pending_reset_resumes(account_id, through, RESTORE_LIMIT)
             .await
             .ok()?;
-        if let Some(resume_at) = jobs.first().map(|job| job.resume_at) {
-            earliest = Some(earliest.map_or(resume_at, |value: Instant| value.min(resume_at)));
+        for job in &jobs {
+            let ready_at = job_ready_at(job, now);
+            earliest = Some(earliest.map_or(ready_at, |value: Instant| value.min(ready_at)));
         }
     }
     let delta = earliest?.epoch_millis().saturating_sub(now.epoch_millis());
-    Some(u64::try_from(delta).unwrap_or(0))
+    Some(match u64::try_from(delta) {
+        Ok(delay) if delay > 0 => delay,
+        // Already due but undeliverable: the channel is unavailable, or the
+        // claim was rejected. Re-poll on a floor instead of spinning the store
+        // once per millisecond.
+        _ => DUE_RETRY_FLOOR_MILLIS,
+    })
+}
+
+/// Earliest instant a pending job can actually be claimed. A live delivery
+/// lease blocks the claim until it expires, so waking before then would only
+/// re-read the same rows.
+fn job_ready_at(job: &ResetResumeJob, now: Instant) -> Instant {
+    match job.lease_until {
+        Some(lease_until) if lease_until > now => lease_until,
+        _ => job.resume_at,
+    }
 }
 
 fn checked_add(instant: Instant, millis: i64) -> PulseResult<Instant> {
@@ -363,6 +381,37 @@ mod tests {
             earliest_future_reset(&retry_before_window, instant(1_000)),
             Some(instant(1_500))
         );
+    }
+
+    #[test]
+    fn a_held_lease_defers_the_next_wakeup_past_the_lease() {
+        let job = ResetResumeJob {
+            id: 1,
+            input: ResetResumeInput {
+                account_id: AccountId::new(1).expect("account"),
+                profile: ProfileName::new("claude").expect("profile"),
+                resets_at: instant(1_000),
+                scheduled_at: instant(1_000),
+            },
+            resume_at: instant(2_000),
+            lease_until: None,
+            attempts: 0,
+            delivered_at: None,
+            cancelled_at: None,
+        };
+        assert_eq!(job_ready_at(&job, instant(3_000)), instant(2_000));
+
+        let leased = ResetResumeJob {
+            lease_until: Some(instant(9_000)),
+            ..job.clone()
+        };
+        assert_eq!(job_ready_at(&leased, instant(3_000)), instant(9_000));
+
+        let expired = ResetResumeJob {
+            lease_until: Some(instant(2_500)),
+            ..job
+        };
+        assert_eq!(job_ready_at(&expired, instant(3_000)), instant(2_000));
     }
 
     #[test]

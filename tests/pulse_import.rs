@@ -478,7 +478,7 @@ async fn dry_run_and_import_are_read_only_bounded_idempotent_and_exact() {
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].snapshot.machine.as_str(), "legacy-host");
     let tokens = store
-        .list_token_grains(account_id, None, None, 100)
+        .list_token_grains(account_id, None, None, None, 100)
         .await
         .expect("tokens");
     assert_eq!(tokens.len(), 1);
@@ -686,7 +686,7 @@ async fn logical_copy_replays_but_mutated_logical_row_conflicts_without_writes()
         .expect_err("mutated logical row must conflict");
     assert_eq!(error.kind(), atmux::pulse::PulseErrorKind::Conflict);
     let tokens = store
-        .list_token_grains(account_id, None, None, 100)
+        .list_token_grains(account_id, None, None, None, 100)
         .await
         .expect("tokens after rejected mutation");
     assert_eq!(tokens.len(), 1);
@@ -823,7 +823,7 @@ async fn machine_aliases_cover_case_variants_existing_names_and_null_fallbacks()
     assert_eq!(machines[0].last_seen.to_iso8601(), "2026-08-09T01:00:00Z");
     assert!(
         store
-            .list_token_grains(account_id, None, None, 10)
+            .list_token_grains(account_id, None, None, None, 10)
             .await
             .expect("tokens")
             .iter()

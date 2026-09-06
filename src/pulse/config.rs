@@ -534,7 +534,11 @@ fn validate_report_target(value: &str) -> PulseResult<bool> {
             "pulse.report_to cannot contain credentials or a query string",
         ));
     }
-    let loopback = host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1";
+    let bare_host = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || bare_host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
     if scheme != "https" && !(scheme == "http" && loopback) {
         return Err(PulseError::configuration(
             "pulse.report_to must use HTTPS unless it targets loopback",

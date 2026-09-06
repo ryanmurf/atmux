@@ -1585,8 +1585,8 @@ async fn pg_local_federation_page(
             .query(
                 "SELECT account_id, name, vendor, config_dir, poll_interval_minutes, \
                  monthly_budget_usd, api_key_env, api_key_file, refresh, hidden, origin \
-                 FROM atmux_pulse.profiles WHERE account_id=$1 AND origin=$2 AND name>$3 \
-                 ORDER BY name LIMIT $4",
+                 FROM atmux_pulse.profiles WHERE account_id=$1 AND origin=$2 \
+                 AND name COLLATE \"C\">$3 ORDER BY name COLLATE \"C\" LIMIT $4",
                 &[&account_id.get(), &origin, &after_name, &remaining],
             )
             .await
@@ -1669,8 +1669,9 @@ async fn pg_local_federation_page(
                  context_tokens, context_percent, effective_limit, last_active_at, \
                  last_reset_at, collected_at FROM atmux_pulse.context_sessions \
                  WHERE account_id=$1 AND machine=$2 \
-                 AND ROW(profile,session_id)>ROW($3::text,$4::text) \
-                 ORDER BY profile,session_id LIMIT $5",
+                 AND ROW(profile COLLATE \"C\",session_id COLLATE \"C\") \
+                   >ROW($3::text,$4::text) \
+                 ORDER BY profile COLLATE \"C\",session_id COLLATE \"C\" LIMIT $5",
                 &[
                     &account_id.get(),
                     &local_machine.as_str(),
@@ -1721,9 +1722,12 @@ async fn pg_local_federation_page(
                  settings, day, tokens_in, tokens_out, cache_write_5m, cache_write_1h, \
                  cache_read, source FROM atmux_pulse.token_usage \
                  WHERE account_id=$1 AND machine=$2 AND \
-                 ROW(profile,session_id,model,settings_hash,day::text,source::text) \
+                 ROW(profile COLLATE \"C\",session_id COLLATE \"C\",model COLLATE \"C\", \
+                   settings_hash COLLATE \"C\",day::text COLLATE \"C\", \
+                   source::text COLLATE \"C\") \
                    >ROW($3::text,$4::text,$5::text,$6::text,$7::text,$8::text) \
-                 ORDER BY profile,session_id,model,settings_hash,day,source::text LIMIT $9",
+                 ORDER BY profile COLLATE \"C\",session_id COLLATE \"C\",model COLLATE \"C\", \
+                 settings_hash COLLATE \"C\",day,source::text COLLATE \"C\" LIMIT $9",
                 &[
                     &account_id.get(),
                     &local_machine.as_str(),
@@ -2146,6 +2150,7 @@ impl Store for PostgresStore {
         account_id: AccountId,
         profile: Option<ProfileName>,
         since_day: Option<String>,
+        through_day: Option<String>,
         limit: usize,
     ) -> StoreFuture<Vec<TokenGrain>> {
         self.account_operation(account_id, move |transaction| {
@@ -2155,15 +2160,19 @@ impl Store for PostgresStore {
                 let since = Date::from_str(since).map_err(|error| {
                     PulseError::invalid_input(format!("invalid since_day: {error}"))
                 })?;
+                let through = through_day.as_deref().unwrap_or("9999-12-31");
+                let through = Date::from_str(through).map_err(|error| {
+                    PulseError::invalid_input(format!("invalid through_day: {error}"))
+                })?;
                 let rows = if let Some(profile) = profile {
                     transaction
                         .query(
                             "SELECT account_id, profile, machine, session_id, model, settings_hash, \
                              settings, day, tokens_in, tokens_out, cache_write_5m, cache_write_1h, \
                              cache_read, source FROM atmux_pulse.token_usage \
-                             WHERE account_id = $1 AND day >= $2 AND profile = $3 \
-                             ORDER BY day DESC, profile, machine, session_id LIMIT $4",
-                            &[&account_id.get(), &since, &profile.as_str(), &limit],
+                             WHERE account_id = $1 AND day >= $2 AND day <= $3 AND profile = $4 \
+                             ORDER BY day DESC, profile, machine, session_id LIMIT $5",
+                            &[&account_id.get(), &since, &through, &profile.as_str(), &limit],
                         )
                         .await
                 } else {
@@ -2172,9 +2181,9 @@ impl Store for PostgresStore {
                             "SELECT account_id, profile, machine, session_id, model, settings_hash, \
                              settings, day, tokens_in, tokens_out, cache_write_5m, cache_write_1h, \
                              cache_read, source FROM atmux_pulse.token_usage \
-                             WHERE account_id = $1 AND day >= $2 \
-                             ORDER BY day DESC, profile, machine, session_id LIMIT $3",
-                            &[&account_id.get(), &since, &limit],
+                             WHERE account_id = $1 AND day >= $2 AND day <= $3 \
+                             ORDER BY day DESC, profile, machine, session_id LIMIT $4",
+                            &[&account_id.get(), &since, &through, &limit],
                         )
                         .await
                 }
@@ -3410,9 +3419,11 @@ impl Store for PostgresStore {
                              settings,day,tokens_in,tokens_out,cache_write_5m,cache_write_1h, \
                              cache_read,source FROM atmux_pulse.token_usage \
                              WHERE account_id=$1 AND machine=$2 AND \
-                             (profile,session_id,model,settings_hash,day,source) \
+                             (profile COLLATE \"C\",session_id COLLATE \"C\", \
+                             model COLLATE \"C\",settings_hash COLLATE \"C\",day,source) \
                              > ($3,$4,$5,$6,$7,$8) \
-                             ORDER BY profile,session_id,model,settings_hash,day,source LIMIT $9",
+                             ORDER BY profile COLLATE \"C\",session_id COLLATE \"C\", \
+                             model COLLATE \"C\",settings_hash COLLATE \"C\",day,source LIMIT $9",
                             &[
                                 &account_id.get(),
                                 &local_machine.as_str(),
@@ -3433,7 +3444,8 @@ impl Store for PostgresStore {
                              settings,day,tokens_in,tokens_out,cache_write_5m,cache_write_1h, \
                              cache_read,source FROM atmux_pulse.token_usage \
                              WHERE account_id=$1 AND machine=$2 \
-                             ORDER BY profile,session_id,model,settings_hash,day,source LIMIT $3",
+                             ORDER BY profile COLLATE \"C\",session_id COLLATE \"C\", \
+                             model COLLATE \"C\",settings_hash COLLATE \"C\",day,source LIMIT $3",
                             &[&account_id.get(), &local_machine.as_str(), &limit],
                         )
                         .await
@@ -3546,6 +3558,26 @@ impl Store for PostgresStore {
                 .await?
                 {
                     return Ok(existing);
+                }
+                let blocked = transaction
+                    .query_opt(
+                        "SELECT 1 FROM atmux_pulse.reporter_pending_pages WHERE account_id=$1 \
+                         AND machine=$2 AND destination_key=$3 AND kind<>$4 FOR UPDATE",
+                        &[
+                            &account_id.get(),
+                            &local_machine.as_str(),
+                            &destination_key,
+                            &draft.kind.as_str(),
+                        ],
+                    )
+                    .await
+                    .map_err(sql_error)?
+                    .is_some();
+                if blocked {
+                    return Err(PulseError::new(
+                        PulseErrorKind::Conflict,
+                        "Pulse reporter outbox still holds another stream's page",
+                    ));
                 }
                 if current != draft.expected {
                     return Err(PulseError::new(
@@ -3813,8 +3845,7 @@ impl Store for PostgresStore {
                 let day_ms = 24_i64 * 60 * 60 * 1_000;
                 let cutoff = |days: u16| {
                     Instant::from_epoch_millis(
-                        now.epoch_millis()
-                            .saturating_sub(i64::from(days) * day_ms),
+                        now.epoch_millis().saturating_sub(i64::from(days) * day_ms),
                     )
                     .and_then(pg_timestamp)
                 };
@@ -3841,7 +3872,8 @@ impl Store for PostgresStore {
                     .execute(
                         "WITH ranked AS (\
                            SELECT id, ROW_NUMBER() OVER (\
-                             PARTITION BY account_id, profile, machine, date_trunc('day', polled_at) \
+                             PARTITION BY account_id, profile, machine, \
+                             date_trunc('day', polled_at AT TIME ZONE 'UTC') \
                              ORDER BY polled_at DESC, id DESC\
                            ) AS rank FROM atmux_pulse.usage_snapshots WHERE polled_at < $1\
                          ) DELETE FROM atmux_pulse.usage_snapshots s USING ranked r \
@@ -3854,7 +3886,8 @@ impl Store for PostgresStore {
                     .execute(
                         "WITH ranked AS (\
                            SELECT id, ROW_NUMBER() OVER (\
-                             PARTITION BY account_id, profile, machine, date_trunc('hour', polled_at) \
+                             PARTITION BY account_id, profile, machine, \
+                             date_trunc('hour', polled_at AT TIME ZONE 'UTC') \
                              ORDER BY polled_at DESC, id DESC\
                            ) AS rank FROM atmux_pulse.usage_snapshots \
                            WHERE polled_at >= $1 AND polled_at < $2\

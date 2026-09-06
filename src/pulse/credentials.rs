@@ -319,10 +319,14 @@ impl Default for RefreshOptions {
 }
 
 /// Whether a refresh adopted a sibling value or performed a durable grant.
+///
+/// `GrantedUnpersisted` carries a rotated credential that could not be written
+/// back to the store; the caller must keep it in memory or it is lost.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshSource {
     Adopted,
     GrantedAndPersisted,
+    GrantedUnpersisted,
 }
 
 /// Result of cooperative refresh; token formatting remains redacted.
@@ -584,12 +588,19 @@ where
         .subscription_type
         .clone_from(&current.subscription_type);
     tokens.rate_limit_tier.clone_from(&current.rate_limit_tier);
-    update_document_tokens(&mut document, &refreshed)?;
-    persist_linux_document(&directory, &document)?;
-    Ok(RefreshResult {
-        tokens,
-        source: RefreshSource::GrantedAndPersisted,
-    })
+    // The grant already rotated the stored refresh token. Discarding it because
+    // the write-back failed would strand the credential, so a persist failure is
+    // reported and the rotated value is still returned to the caller.
+    let source = match update_document_tokens(&mut document, &refreshed)
+        .and_then(|()| persist_linux_document(&directory, &document))
+    {
+        Ok(()) => RefreshSource::GrantedAndPersisted,
+        Err(error) => {
+            eprintln!("pulse credential refresh could not be persisted: {error}");
+            RefreshSource::GrantedUnpersisted
+        }
+    };
+    Ok(RefreshResult { tokens, source })
 }
 
 fn ensure_refresh_grant_is_durable(

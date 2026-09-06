@@ -39,7 +39,7 @@ use super::{
     service::{
         Collected, CollectionFuture, CompletionFuture, PulseCollectors, TokenCollectionRequest,
     },
-    token::{TallyOptions, tally_profile},
+    token::{DEFAULT_MAX_ROWS, TallyOptions, tally_profile_bounded},
 };
 
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -284,19 +284,26 @@ impl NativeCollectors {
         profiles: Vec<Profile>,
         kind: NativePollKind,
         collected_at: Instant,
+        prune: bool,
     ) -> (Vec<(Profile, PollLease)>, usize) {
         let keyed = profiles
             .into_iter()
             .map(|profile| (ProfileStateKey::from(&profile), profile))
             .collect::<Vec<_>>();
-        let active = keyed
-            .iter()
-            .map(|(key, _)| key.clone())
-            .collect::<HashSet<_>>();
         let mut state = lock_native_state(&self.state);
-        state.polls.retain(|key, poll| {
-            key.kind != kind || active.contains(&key.profile) || poll.in_flight_generation.is_some()
-        });
+        // Only a periodic pass observes the full profile set. Pruning against a
+        // force request's subset would evict every other profile's cadence.
+        if prune {
+            let active = keyed
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<HashSet<_>>();
+            state.polls.retain(|key, poll| {
+                key.kind != kind
+                    || active.contains(&key.profile)
+                    || poll.in_flight_generation.is_some()
+            });
+        }
         let mut due = Vec::new();
         let mut failures = 0_usize;
         for (profile_key, profile) in keyed {
@@ -417,8 +424,8 @@ impl NativeCollectors {
         state.claude_tokens.insert(
             key.clone(),
             ClaudeProfileTokens {
-                // Every grant is persisted before it is returned. An adopted
-                // value was just re-read under the same profile lock.
+                // A grant is the freshest value there is, persisted or not; an
+                // adopted value was just re-read under the same profile lock.
                 authoritative: refreshed.tokens.clone(),
                 active: refreshed.tokens.clone(),
             },
@@ -468,14 +475,17 @@ impl NativeCollectors {
         self,
         profiles: Vec<Profile>,
         collected_at: Instant,
+        prune: bool,
     ) -> Collected<UsageSnapshot> {
         let profiles = profiles
             .into_iter()
             .filter(is_local_usage_profile)
             .collect::<Vec<_>>();
-        self.reconcile_claude_token_profiles(&profiles);
+        if prune {
+            self.reconcile_claude_token_profiles(&profiles);
+        }
         let (profiles, mut failures) =
-            self.take_due_profiles(profiles, NativePollKind::Usage, collected_at);
+            self.take_due_profiles(profiles, NativePollKind::Usage, collected_at, prune);
         let semaphore = Arc::new(Semaphore::new(self.concurrency));
         let mut tasks = JoinSet::new();
         for (profile, lease) in profiles {
@@ -901,7 +911,7 @@ impl NativeCollectors {
         let rows_per_profile = MAX_NATIVE_COLLECTION_ITEMS
             .checked_div(profiles.len().max(1))
             .unwrap_or(1)
-            .max(1);
+            .clamp(1, DEFAULT_MAX_ROWS);
         let options = TallyOptions {
             window: super::token::TallyWindow::Recent { since_day },
             max_rows: rows_per_profile,
@@ -914,17 +924,26 @@ impl NativeCollectors {
             let semaphore = Arc::clone(&semaphore);
             tasks.spawn(async move {
                 let _permit = semaphore.acquire_owned().await.map_err(|_| ())?;
-                tokio::task::spawn_blocking(move || tally_profile(&profile, machine, &options))
-                    .await
-                    .map_err(|_| ())?
-                    .map_err(|_| ())
+                tokio::task::spawn_blocking(move || {
+                    tally_profile_bounded(&profile, machine, &options)
+                })
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ())
             });
         }
         let mut items = Vec::new();
         let mut failures = 0_usize;
         while let Some(result) = tasks.join_next().await {
             match result {
-                Ok(Ok(tally)) => items.extend(tally.grains),
+                // A profile that overflows its share of the cap keeps its
+                // bounded grains and reports one truncation marker.
+                Ok(Ok((tally, truncated))) => {
+                    items.extend(tally.grains);
+                    if truncated {
+                        failures = failures.saturating_add(1);
+                    }
+                }
                 Ok(Err(())) | Err(_) => failures = failures.saturating_add(1),
             }
         }
@@ -935,6 +954,7 @@ impl NativeCollectors {
         self,
         profiles: Vec<Profile>,
         collected_at: Instant,
+        prune: bool,
     ) -> Collected<GeminiQuota> {
         let profiles = profiles
             .into_iter()
@@ -942,9 +962,11 @@ impl NativeCollectors {
                 profile.origin == ProfileOrigin::Local && profile.vendor == Vendor::Gemini
             })
             .collect::<Vec<_>>();
-        self.reconcile_gemini_collectors(&profiles);
+        if prune {
+            self.reconcile_gemini_collectors(&profiles);
+        }
         let (profiles, mut failures) =
-            self.take_due_profiles(profiles, NativePollKind::Gemini, collected_at);
+            self.take_due_profiles(profiles, NativePollKind::Gemini, collected_at, prune);
         let mut items = Vec::new();
         for (profile, lease) in profiles {
             let Some(oauth_path) = gemini_oauth_path(&profile) else {
@@ -1003,7 +1025,7 @@ impl PulseCollectors for NativeCollectors {
         collected_at: Instant,
     ) -> CollectionFuture<UsageSnapshot> {
         let collector = self.clone();
-        Box::pin(async move { Ok(collector.collect_usage(profiles, collected_at).await) })
+        Box::pin(async move { Ok(collector.collect_usage(profiles, collected_at, true).await) })
     }
 
     fn context(
@@ -1030,7 +1052,7 @@ impl PulseCollectors for NativeCollectors {
         collected_at: Instant,
     ) -> CollectionFuture<GeminiQuota> {
         let collector = self.clone();
-        Box::pin(async move { Ok(collector.collect_gemini(profiles, collected_at).await) })
+        Box::pin(async move { Ok(collector.collect_gemini(profiles, collected_at, true).await) })
     }
 
     fn force_usage(
@@ -1041,7 +1063,7 @@ impl PulseCollectors for NativeCollectors {
         let collector = self.clone();
         Box::pin(async move {
             collector.force_profiles_due(&profiles, NativePollKind::Usage);
-            Ok(collector.collect_usage(profiles, collected_at).await)
+            Ok(collector.collect_usage(profiles, collected_at, false).await)
         })
     }
 
@@ -1071,7 +1093,9 @@ impl PulseCollectors for NativeCollectors {
         let collector = self.clone();
         Box::pin(async move {
             collector.force_profiles_due(&profiles, NativePollKind::Gemini);
-            Ok(collector.collect_gemini(profiles, collected_at).await)
+            Ok(collector
+                .collect_gemini(profiles, collected_at, false)
+                .await)
         })
     }
 
@@ -1520,7 +1544,7 @@ mod tests {
 
         let _ = collector
             .clone()
-            .collect_usage(vec![claude.clone()], collected_at)
+            .collect_usage(vec![claude.clone()], collected_at, true)
             .await;
         let persisted: serde_json::Value = serde_json::from_slice(
             &fs::read(directory.0.join(".credentials.json")).expect("read persisted credentials"),
@@ -1542,7 +1566,7 @@ mod tests {
 
         let next_poll =
             Instant::from_epoch_millis(collected_at.epoch_millis() + 5 * 60_000).expect("instant");
-        let _ = collector.collect_usage(vec![claude], next_poll).await;
+        let _ = collector.collect_usage(vec![claude], next_poll, true).await;
         let requests = fake.requests.lock().expect("requests");
         assert_eq!(requests.len(), 4);
         assert_eq!(
@@ -1562,6 +1586,39 @@ mod tests {
             lookback_days: 2,
         };
         assert_eq!(recent_day(request).as_deref(), Some("2026-02-27"));
+    }
+
+    #[tokio::test]
+    async fn single_profile_token_collection_keeps_its_bounded_grains() {
+        let temp = TestDirectory::new();
+        let sessions = temp.0.join("projects").join("project");
+        fs::create_dir_all(&sessions).expect("create fixture parent");
+        let event = r#"{"type":"assistant","sessionId":"s1","requestId":"r1","timestamp":"2026-08-08T01:00:00Z","message":{"role":"assistant","id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":100,"output_tokens":20}}}"#;
+        fs::write(sessions.join("session.jsonl"), format!("{event}\n")).expect("write fixture");
+        let mut claude = profile(Vendor::AnthropicOauth, ProfileOrigin::Local);
+        claude.config_dir = Some(temp.0.clone());
+        let request = TokenCollectionRequest {
+            collected_at: Instant::from_iso8601("2026-08-09T00:00:00Z").expect("instant"),
+            lookback_days: 7,
+        };
+        let options = TallyOptions {
+            window: crate::pulse::token::TallyWindow::Recent {
+                since_day: recent_day(request).expect("recent day"),
+            },
+            max_rows: DEFAULT_MAX_ROWS,
+        };
+        let (expected, truncated) =
+            tally_profile_bounded(&claude, MachineName::new("max").expect("machine"), &options)
+                .expect("bounded tally");
+        assert!(!truncated);
+        assert_eq!(expected.grains.len(), 1);
+        let collected = test_collectors()
+            .collect_tokens(vec![claude], request)
+            .await;
+        assert_eq!(
+            collected,
+            Collected::new(expected.grains, 0).expect("bounded collection")
+        );
     }
 
     #[test]
@@ -1598,6 +1655,7 @@ mod tests {
             vec![fast.clone(), slow.clone()],
             NativePollKind::Usage,
             first_at,
+            true,
         );
         assert_eq!(first.len(), 2);
         assert_eq!(failures, 0);
@@ -1606,6 +1664,7 @@ mod tests {
             vec![fast.clone(), slow.clone()],
             NativePollKind::Usage,
             first_at,
+            true,
         );
         assert!(overlap.is_empty());
         assert_eq!(failures, 0);
@@ -1619,6 +1678,7 @@ mod tests {
             vec![fast, slow],
             NativePollKind::Usage,
             five_minutes_later,
+            true,
         );
         assert_eq!(failures, 0);
         assert_eq!(due.len(), 1);
@@ -1630,8 +1690,12 @@ mod tests {
         let collector = test_collectors();
         let initial = named_profile("runtime", Vendor::OpenaiCodex, 30, "/tmp/runtime-a");
         let first_at = Instant::from_epoch_millis(1_000).expect("instant");
-        let (first, _) =
-            collector.take_due_profiles(vec![initial.clone()], NativePollKind::Usage, first_at);
+        let (first, _) = collector.take_due_profiles(
+            vec![initial.clone()],
+            NativePollKind::Usage,
+            first_at,
+            true,
+        );
         assert_eq!(first.len(), 1);
         first
             .into_iter()
@@ -1644,8 +1708,12 @@ mod tests {
             Instant::from_epoch_millis(first_at.epoch_millis() + 5 * 60_000).expect("instant");
         let mut shortened = initial.clone();
         shortened.poll_interval_minutes = 5;
-        let (due, _) =
-            collector.take_due_profiles(vec![shortened], NativePollKind::Usage, five_minutes_later);
+        let (due, _) = collector.take_due_profiles(
+            vec![shortened],
+            NativePollKind::Usage,
+            five_minutes_later,
+            true,
+        );
         assert_eq!(due.len(), 1, "shortening cadence takes effect at runtime");
         drop(due);
 
@@ -1653,6 +1721,7 @@ mod tests {
             vec![initial.clone()],
             NativePollKind::Usage,
             five_minutes_later,
+            true,
         );
         assert_eq!(
             retry.len(),
@@ -1661,8 +1730,12 @@ mod tests {
         );
 
         let moved = named_profile("runtime", Vendor::OpenaiCodex, 30, "/tmp/runtime-b");
-        let (new_path, _) =
-            collector.take_due_profiles(vec![moved], NativePollKind::Usage, five_minutes_later);
+        let (new_path, _) = collector.take_due_profiles(
+            vec![moved],
+            NativePollKind::Usage,
+            five_minutes_later,
+            true,
+        );
         assert_eq!(new_path.len(), 1, "a config-path change is a new identity");
     }
 
@@ -1672,10 +1745,11 @@ mod tests {
         let profile = named_profile("aborted", Vendor::OpenaiCodex, 15, "/tmp/aborted");
         let now = Instant::from_epoch_millis(1_000).expect("instant");
         let (started, _) =
-            collector.take_due_profiles(vec![profile.clone()], NativePollKind::Usage, now);
+            collector.take_due_profiles(vec![profile.clone()], NativePollKind::Usage, now, true);
         assert_eq!(started.len(), 1);
         drop(started);
-        let (retried, _) = collector.take_due_profiles(vec![profile], NativePollKind::Usage, now);
+        let (retried, _) =
+            collector.take_due_profiles(vec![profile], NativePollKind::Usage, now, true);
         assert_eq!(retried.len(), 1);
     }
 
@@ -1690,6 +1764,7 @@ mod tests {
             vec![account_one.clone(), account_two.clone()],
             NativePollKind::Usage,
             now,
+            true,
         );
         assert_eq!(started.len(), 2);
         let mut leases = started.into_iter();
@@ -1701,14 +1776,19 @@ mod tests {
             vec![account_one.clone(), account_two.clone()],
             NativePollKind::Usage,
             now,
+            true,
         );
         assert!(overlap.is_empty(), "force must retain in-flight refusal");
         one_lease.complete(now);
         two_lease.complete(now);
 
         collector.force_profiles_due(std::slice::from_ref(&account_one), NativePollKind::Usage);
-        let (forced, _) =
-            collector.take_due_profiles(vec![account_one, account_two], NativePollKind::Usage, now);
+        let (forced, _) = collector.take_due_profiles(
+            vec![account_one, account_two],
+            NativePollKind::Usage,
+            now,
+            true,
+        );
         assert_eq!(forced.len(), 1);
         assert_eq!(forced[0].0.account_id.get(), 1);
     }
@@ -1727,7 +1807,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let now = Instant::from_epoch_millis(1_000).expect("instant");
-        let (due, failures) = collector.take_due_profiles(profiles, NativePollKind::Usage, now);
+        let (due, failures) =
+            collector.take_due_profiles(profiles, NativePollKind::Usage, now, true);
         assert_eq!(due.len(), MAX_PROFILE_STATE_ENTRIES);
         assert_eq!(failures, 1);
         assert_eq!(

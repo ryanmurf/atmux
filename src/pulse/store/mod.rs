@@ -793,6 +793,7 @@ pub trait Store: Send + Sync {
         account_id: AccountId,
         profile: Option<ProfileName>,
         since_day: Option<String>,
+        through_day: Option<String>,
         limit: usize,
     ) -> StoreFuture<Vec<TokenGrain>>;
     fn token_totals_by_keys(
