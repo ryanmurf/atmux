@@ -11,7 +11,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 #[derive(Debug, Parser)]
-#[command(author, version, about)]
+#[command(author, version = atmux::self_update::VERSION_LINE, about)]
 struct Cli {
     /// Use a configuration file other than ~/.config/atmux/config.toml.
     #[arg(long, global = true)]
@@ -45,6 +45,21 @@ enum Commands {
     },
     /// Check tmux, configuration, folders, and launcher profiles.
     Doctor,
+    /// Inspect or install a signed atmux release for this machine.
+    ///
+    /// The same code paths the web API uses, so an operator over ssh and the
+    /// coordinator's Update button do exactly the same thing.
+    SelfUpdate {
+        /// Ask GitHub what the newest verified release is.
+        #[arg(long, conflicts_with_all = ["apply", "rollback"])]
+        check: bool,
+        /// Install the newest verified release and restart into it.
+        #[arg(long, conflicts_with_all = ["check", "rollback"])]
+        apply: bool,
+        /// Put the previously installed executable back and restart into it.
+        #[arg(long, conflicts_with_all = ["check", "apply"])]
+        rollback: bool,
+    },
     /// Run the streaming web dashboard and stateless MCP server.
     Web {
         /// Address for the HTTP server.
@@ -148,6 +163,14 @@ async fn main() -> Result<()> {
             );
         }
         Some(Commands::Doctor) => return doctor(&config_path),
+        Some(Commands::SelfUpdate {
+            check,
+            apply,
+            rollback,
+        }) => {
+            let (config, _) = Config::load(Some(&config_path))?;
+            return run_self_update(&config, check, apply, rollback).await;
+        }
         Some(Commands::Web {
             bind,
             allow_remote,
@@ -168,6 +191,59 @@ async fn main() -> Result<()> {
     let (config, config_path) = Config::load(Some(&config_path))?;
     let app = App::new(config, config_path)?;
     run(app)
+}
+
+/// Runs one bounded self-update verb and prints the resulting document.
+///
+/// With no flag this reports current state without contacting anything.
+async fn run_self_update(config: &Config, check: bool, apply: bool, rollback: bool) -> Result<()> {
+    use atmux::self_update::{Action, SelfUpdater};
+
+    let updater = SelfUpdater::production(&config.self_update)?;
+    let action = if apply {
+        Some(Action::Apply)
+    } else if rollback {
+        Some(Action::Rollback)
+    } else if check {
+        Some(Action::Check)
+    } else {
+        None
+    };
+    let status = match action {
+        Some(Action::Check) => updater.check(true).await.map_err(anyhow::Error::new)?,
+        Some(Action::Apply) => updater.apply().await.map_err(anyhow::Error::new)?,
+        Some(Action::Rollback) => updater.rollback().await.map_err(anyhow::Error::new)?,
+        None => updater.status(),
+    };
+    println!("atmux {} ({})", status.version, status.target);
+    println!("mode      {:?}", status.mode);
+    println!("state     {:?}", status.state);
+    match &status.latest {
+        Some(latest) => println!(
+            "latest    {} ({}){}",
+            latest.version,
+            latest.tag,
+            if latest.verified {
+                " · signature verified"
+            } else {
+                " · UNVERIFIED"
+            }
+        ),
+        None => println!("latest    nothing newer for this target"),
+    }
+    if let Some(previous) = &status.previous {
+        println!("previous  {} at {}", previous.version, previous.path);
+    }
+    if let Some(error) = &status.last_error {
+        println!("error     {error}");
+    }
+    if matches!(action, Some(Action::Apply | Action::Rollback)) {
+        // The pipeline runs to completion in the background and then replaces
+        // this process, so hold the CLI open long enough for that to happen.
+        println!("working   installing in the background; this process will be replaced");
+        tokio::time::sleep(Duration::from_secs(300)).await;
+    }
+    Ok(())
 }
 
 fn doctor(config_path: &std::path::Path) -> Result<()> {
