@@ -75,8 +75,8 @@ textarea { resize: vertical; min-height: 74px; max-height: 220px; }
 .welcome { max-width: 640px; margin: 16vh auto; padding: 32px; }
 .welcome h1 { font-size: clamp(28px, 4vw, 48px); letter-spacing: -.045em; }
 .welcome p { color: var(--muted); line-height: 1.6; }
-.agent-view { height: 100%; display: grid; grid-template-rows: auto minmax(140px, 1fr) auto; gap: 8px; padding: 10px; }
-.agent-head { display: flex; gap: 10px; align-items: center; }
+.agent-view { height: 100%; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(140px, 1fr) auto; gap: 8px; padding: 10px; }
+.agent-head { display: flex; gap: 10px; align-items: center; min-width: 0; }
 .agent-head > div:nth-child(2) { min-width: 0; flex: 1; }
 .agent-title-row { min-width: 0; display: flex; align-items: center; gap: 8px; }
 .agent-head h1 { margin: 0 0 2px; overflow: hidden; text-overflow: ellipsis; font-size: 18px; }
