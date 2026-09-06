@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::HashMap,
     env, fs,
@@ -197,6 +198,9 @@ pub(crate) struct LivePaneIdentity {
     pub path: PathBuf,
 }
 
+/// Tab-separated fields emitted per pane by `sessions_with_capture`.
+const PANE_FIELDS: usize = 22;
+
 #[derive(Clone, Debug)]
 struct RawPane {
     name: String,
@@ -338,8 +342,12 @@ impl Tmux {
         status_config: &StatusConfig,
         capture_lines: usize,
     ) -> Result<Vec<Session>> {
+        // Field order is load bearing. A tab is the record separator, and a
+        // pane title, cwd, or command can contain one, so every validated or
+        // atmux-owned field is read before any free text and the unbounded
+        // title stays last. See `parse_pane`.
         let format = [
-            "#{session_name}",
+            "#{pane_id}",
             "#{session_attached}",
             "#{session_windows}",
             "#{session_activity}",
@@ -348,11 +356,6 @@ impl Tmux {
             "#{pane_index}",
             "#{pane_active}",
             "#{pane_pid}",
-            "#{pane_current_command}",
-            "#{pane_start_command}",
-            "#{pane_current_path}",
-            "#{pane_title}",
-            "#{pane_id}",
             "#{@atmux_status}",
             "#{@atmux_model}",
             "#{@atmux_agent_version}",
@@ -361,6 +364,11 @@ impl Tmux {
             "#{@atmux_identity}",
             "#{@atmux_systemd_scope}",
             "#{@atmux_memory_max_bytes}",
+            "#{session_name}",
+            "#{pane_current_command}",
+            "#{pane_start_command}",
+            "#{pane_current_path}",
+            "#{pane_title}",
         ]
         .join("\t");
         let (raw_output, summary) = Self::run(["list-panes", "-a", "-F", &format])?;
@@ -577,9 +585,11 @@ impl Tmux {
         let invocation = Self::build_launch_invocation(profile, mode, resume)?;
         let invocation = scope.wrap(invocation)?;
         let shell_command = shell_words::join(invocation);
+        let shell_command = escape_tmux_argument(&shell_command);
         let directory = directory
             .to_str()
             .with_context(|| format!("directory is not valid UTF-8: {}", directory.display()))?;
+        let directory = escape_tmux_argument(directory);
         // Publish every durable claim on a harmless placeholder pane before
         // the native agent starts. If atmux exits mid-launch, restart recovery
         // can either see the lease or see no resumed conversation at all.
@@ -592,7 +602,7 @@ impl Tmux {
             "-s",
             name,
             "-c",
-            directory,
+            &directory,
             "/bin/sleep 2147483647",
         ])?;
         let Some((session_id, pane_id)) = parse_tmux_created_target(&created) else {
@@ -648,7 +658,7 @@ impl Tmux {
             "-t",
             &pane_id,
             "-c",
-            directory,
+            &directory,
             &shell_command,
         ]) {
             let _ = Self::output(["kill-session", "-t", &session_id]);
@@ -785,9 +795,10 @@ impl Tmux {
             .with_context(|| format!("directory is not valid UTF-8: {}", directory.display()))?;
         let invocation = claude_resume_invocation(&claude_program, config_dir, session_id)?;
         let invocation = scope.wrap(invocation)?;
-        let command = shell_words::join(invocation);
+        let command = escape_tmux_argument(&shell_words::join(invocation)).into_owned();
+        let directory = escape_tmux_argument(directory);
         publish_scope_metadata(pane_id, &scope)?;
-        Self::output(respawn_pane_args(pane_id, directory, &command))?;
+        Self::output(respawn_pane_args(pane_id, &directory, &command))?;
         Ok(())
     }
 
@@ -846,12 +857,13 @@ impl Tmux {
         let mut invocation = Self::build_launch_invocation(&exact_profile, Some(mode), None)?;
         invocation.extend(resume_args);
         let invocation = scope.wrap(invocation)?;
-        let command = shell_words::join(invocation);
+        let command = escape_tmux_argument(&shell_words::join(invocation)).into_owned();
         let directory = directory
             .to_str()
             .with_context(|| format!("directory is not valid UTF-8: {}", directory.display()))?;
+        let directory = escape_tmux_argument(directory);
         publish_scope_metadata(pane_id, &scope)?;
-        Self::output(respawn_pane_args(pane_id, directory, &command))?;
+        Self::output(respawn_pane_args(pane_id, &directory, &command))?;
         Ok(())
     }
 
@@ -1392,16 +1404,38 @@ impl Tmux {
 #[must_use]
 pub fn known_models(agent: AgentKind, version: &str) -> &'static [KnownModel] {
     match agent {
-        AgentKind::Claude
-            if matches!(
-                version,
-                "2.1.224" | "2.1.225" | "2.1.226" | "2.1.232" | "2.1.233"
-            ) =>
-        {
-            CLAUDE_MODELS
-        }
-        AgentKind::Codex if matches!(version, "0.146.1" | "0.147.0") => CODEX_MODELS,
+        AgentKind::Claude if claude_picker_verified(version) => CLAUDE_MODELS,
+        AgentKind::Codex if codex_picker_verified(version) => CODEX_MODELS,
         AgentKind::Claude | AgentKind::Codex | AgentKind::Other => &[],
+    }
+}
+
+/// Claude has kept one `/model` picker protocol across the 2.1 line since
+/// 2.1.224, so every later 2.1 patch keeps the verified controls. Pinning
+/// single patch releases silently disabled switching on each CLI update.
+fn claude_picker_verified(version: &str) -> bool {
+    let mut parts = version.split('.');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("2"), Some("1"), Some(patch), None) => {
+            patch.parse::<u32>().is_ok_and(|patch| patch >= 224)
+        }
+        _ => false,
+    }
+}
+
+/// Codex has kept one `/model` picker protocol across the 0.x line since
+/// 0.146.1, so every later 0.x release keeps the verified controls. Pinning
+/// single releases silently disabled switching on each CLI update.
+fn codex_picker_verified(version: &str) -> bool {
+    let mut parts = version.split('.');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("0"), Some(minor), Some(patch), None) => {
+            match (minor.parse::<u32>(), patch.parse::<u32>()) {
+                (Ok(minor), Ok(patch)) => (minor, patch) >= (146, 1),
+                _ => false,
+            }
+        }
+        _ => false,
     }
 }
 
@@ -1810,6 +1844,20 @@ fn auto_compact_delivery_args(pane_id: &str) -> [&str; 10] {
     ]
 }
 
+/// Escapes a trailing `;` in one tmux argument.
+///
+/// tmux ends the current command at an argument whose final `;` is unescaped,
+/// so a launch directory or command word ending in `;` would otherwise split
+/// `new-session`/`respawn-pane` and fail as an unknown command. tmux turns a
+/// final `\;` back into a literal `;`, which also round-trips a path that
+/// already ends in `\;`.
+fn escape_tmux_argument(value: &str) -> Cow<'_, str> {
+    match value.strip_suffix(';') {
+        Some(head) => Cow::Owned(format!("{head}\\;")),
+        None => Cow::Borrowed(value),
+    }
+}
+
 fn respawn_pane_args<'a>(pane_id: &'a str, directory: &'a str, command: &'a str) -> [&'a str; 7] {
     [
         "respawn-pane",
@@ -1879,12 +1927,15 @@ fn check_output(output: &Output, summary: &str) -> Result<String> {
 }
 
 fn parse_pane(line: &str) -> Option<RawPane> {
-    let fields: Vec<_> = line.split('\t').collect();
-    if fields.len() < 15 {
+    // `splitn` keeps every embedded tab inside the trailing pane title, so a
+    // title, path, or command carrying a tab can never shift the pane id or
+    // any atmux-owned field into a neighbouring column.
+    let fields: Vec<_> = line.splitn(PANE_FIELDS, '\t').collect();
+    if fields.len() < PANE_FIELDS || !valid_tmux_pane_id(fields[0]) {
         return None;
     }
     Some(RawPane {
-        name: fields[0].to_owned(),
+        pane_id: fields[0].to_owned(),
         attached: fields[1] == "1",
         windows: fields[2].parse().ok()?,
         activity: fields[3].parse().unwrap_or_default(),
@@ -1893,19 +1944,19 @@ fn parse_pane(line: &str) -> Option<RawPane> {
         pane_index: fields[6].parse().unwrap_or_default(),
         pane_active: fields[7] == "1",
         pane_pid: fields[8].parse().ok()?,
-        command: fields[9].to_owned(),
-        start_command: fields[10].to_owned(),
-        path: PathBuf::from(fields[11]),
-        title: fields[12].to_owned(),
-        pane_id: fields[13].to_owned(),
-        status_override: fields[14].to_owned(),
-        model_override: fields.get(15).copied().unwrap_or_default().to_owned(),
-        agent_version: fields.get(16).copied().unwrap_or_default().to_owned(),
-        profile: fields.get(17).copied().unwrap_or_default().to_owned(),
-        resume_lease: fields.get(18).copied().unwrap_or_default().to_owned(),
-        pane_identity: fields.get(19).copied().unwrap_or_default().to_owned(),
-        systemd_scope: fields.get(20).copied().unwrap_or_default().to_owned(),
-        memory_max_bytes: fields.get(21).copied().unwrap_or_default().to_owned(),
+        status_override: fields[9].to_owned(),
+        model_override: fields[10].to_owned(),
+        agent_version: fields[11].to_owned(),
+        profile: fields[12].to_owned(),
+        resume_lease: fields[13].to_owned(),
+        pane_identity: fields[14].to_owned(),
+        systemd_scope: fields[15].to_owned(),
+        memory_max_bytes: fields[16].to_owned(),
+        name: fields[17].to_owned(),
+        command: fields[18].to_owned(),
+        start_command: fields[19].to_owned(),
+        path: PathBuf::from(fields[20]),
+        title: fields[21].to_owned(),
     })
 }
 
@@ -2630,8 +2681,7 @@ mod tests {
 
     #[test]
     fn parses_tmux_pane() {
-        let line =
-            "work\t1\t2\t123\t0\t1\t1\t1\t42\tnode\tenv codex\t/tmp/work\t⠹ work\t%7\twaiting";
+        let line = "%7\t1\t2\t123\t0\t1\t1\t1\t42\twaiting\t\t\t\t\t\t\t\twork\tnode\tenv codex\t/tmp/work\t⠹ work";
         let pane = parse_pane(line).unwrap();
         assert_eq!(pane.name, "work");
         assert_eq!(pane.pane_id, "%7");
@@ -2642,17 +2692,35 @@ mod tests {
 
     #[test]
     fn parses_pane_with_empty_status_override() {
-        let line = "solo\t0\t1\t123\t0\t1\t0\t1\t42\tbash\t\t/tmp\tsolo\t%0\t";
+        let line = "%0\t0\t1\t123\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\tsolo\tbash\t\t/tmp\tsolo";
         let pane = parse_pane(line).unwrap();
         assert_eq!(pane.name, "solo");
         assert!(pane.status_override.is_empty());
     }
 
     #[test]
+    fn a_tab_in_free_text_pane_fields_cannot_move_the_pane_id() {
+        let line = "%3\t1\t1\t123\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\twork\tnode\tenv codex\t/tmp/work\thijack\t%9\tstopped";
+        let pane = parse_pane(line).unwrap();
+        assert_eq!(pane.pane_id, "%3");
+        assert_eq!(pane.name, "work");
+        assert_eq!(pane.title, "hijack\t%9\tstopped");
+        assert!(parse_pane(&line.replacen("%3", "hijack", 1)).is_none());
+    }
+
+    #[test]
+    fn escapes_a_trailing_semicolon_in_a_tmux_argument() {
+        assert_eq!(escape_tmux_argument("/tmp/work"), "/tmp/work");
+        assert_eq!(escape_tmux_argument("/tmp/work;"), "/tmp/work\\;");
+        assert_eq!(escape_tmux_argument("/tmp/work\\;"), "/tmp/work\\\\;");
+        assert_eq!(escape_tmux_argument(";"), "\\;");
+    }
+
+    #[test]
     fn parses_only_well_formed_persistent_resume_leases() {
         let lease = format!("lease-v1-{}", "a".repeat(64));
         let line = format!(
-            "solo\t0\t1\t123\t0\t1\t0\t1\t42\tcodex\tcodex\t/tmp\tsolo\t%0\t\t\t\tDefault\t{lease}"
+            "%0\t0\t1\t123\t0\t1\t0\t1\t42\t\t\t\tDefault\t{lease}\t\t\t\tsolo\tcodex\tcodex\t/tmp\tsolo"
         );
         let pane = parse_pane(&line).unwrap();
         assert!(valid_resume_lease(&pane.resume_lease));
@@ -2664,7 +2732,7 @@ mod tests {
     fn parses_scope_metadata_only_as_a_valid_complete_pair() {
         let unit = "atmux-tmux-spawn-12-34-0123456789abcdef.scope";
         let line = format!(
-            "solo\t0\t1\t123\t0\t1\t0\t1\t42\tcodex\tcodex\t/tmp\tsolo\t%0\t\t\t\tDefault\t\t\t{unit}\t34359738368"
+            "%0\t0\t1\t123\t0\t1\t0\t1\t42\t\t\t\tDefault\t\t\t{unit}\t34359738368\tsolo\tcodex\tcodex\t/tmp\tsolo"
         );
         let pane = parse_pane(&line).unwrap();
         assert_eq!(
@@ -3024,8 +3092,8 @@ mod tests {
     #[test]
     fn recognized_agent_pane_wins_over_active_shell_pane() {
         let source = concat!(
-            "work\t0\t1\t123\t0\t1\t0\t1\t41\tbash\tsh\t/tmp\tshell\t%1\t\n",
-            "work\t0\t1\t123\t0\t0\t1\t0\t42\tcodex\tenv codex\t/tmp\tagent\t%2\t\n",
+            "%1\t0\t1\t123\t0\t1\t0\t1\t41\t\t\t\t\t\t\t\t\twork\tbash\tsh\t/tmp\tshell\n",
+            "%2\t0\t1\t123\t0\t0\t1\t0\t42\t\t\t\t\t\t\t\t\twork\tcodex\tenv codex\t/tmp\tagent\n",
         );
         let selected = select_session_panes(source, &ProcessTable::default());
         let (pane, agent) = selected.get("work").unwrap();
@@ -3037,8 +3105,8 @@ mod tests {
     #[test]
     fn reserved_service_session_is_not_selected() {
         let source = concat!(
-            "atmux-web\t0\t1\t123\t0\t1\t0\t1\t41\tbash\tsh\t/tmp\tservice\t%1\t\n",
-            "work\t0\t1\t123\t0\t1\t0\t1\t42\tcodex\tcodex\t/tmp\twork\t%2\t\n",
+            "%1\t0\t1\t123\t0\t1\t0\t1\t41\t\t\t\t\t\t\t\t\tatmux-web\tbash\tsh\t/tmp\tservice\n",
+            "%2\t0\t1\t123\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\twork\tcodex\tcodex\t/tmp\twork\n",
         );
 
         let selected = select_session_panes(source, &ProcessTable::default());
@@ -3250,9 +3318,16 @@ mod tests {
     #[test]
     fn model_protocol_is_versioned_and_model_ids_are_data_only() {
         assert_eq!(known_models(AgentKind::Claude, "2.1.224").len(), 5);
+        assert_eq!(known_models(AgentKind::Claude, "2.1.261").len(), 5);
+        assert_eq!(known_models(AgentKind::Codex, "0.146.1").len(), 7);
         assert_eq!(known_models(AgentKind::Codex, "0.147.0").len(), 7);
+        assert_eq!(known_models(AgentKind::Codex, "0.151.0").len(), 7);
+        assert!(known_models(AgentKind::Claude, "2.1.223").is_empty());
+        assert!(known_models(AgentKind::Claude, "2.1").is_empty());
         assert!(known_models(AgentKind::Claude, "2.2.0").is_empty());
-        assert!(known_models(AgentKind::Codex, "0.148.0").is_empty());
+        assert!(known_models(AgentKind::Codex, "0.146.0").is_empty());
+        assert!(known_models(AgentKind::Codex, "0.147").is_empty());
+        assert!(known_models(AgentKind::Codex, "1.0.0").is_empty());
         for model in [
             "default",
             "claude-opus-5",
