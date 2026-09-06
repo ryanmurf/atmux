@@ -115,18 +115,7 @@ pub fn classify(
         .collect::<Vec<_>>()
         .join("\n")
         .to_lowercase();
-    let waiting_markers = [
-        "do you want to proceed?",
-        "would you like to proceed?",
-        "waiting for your input",
-        "press enter to continue",
-        "select an option",
-        "yes, allow",
-        "allow this command",
-        "[y/n]",
-        "(y/n)",
-    ];
-    if waiting_markers
+    if WAITING_MARKERS
         .iter()
         .any(|marker| immediate.contains(marker))
         || config
@@ -137,14 +126,7 @@ pub fn classify(
         return AgentStatus::Waiting;
     }
 
-    let working_markers = [
-        "esc to interrupt",
-        "ctrl+c to interrupt",
-        "working (",
-        "running…",
-        "running...",
-    ];
-    if working_markers.iter().any(|marker| lower.contains(marker))
+    if WORKING_MARKERS.iter().any(|marker| lower.contains(marker))
         || config
             .working_markers
             .iter()
@@ -174,9 +156,106 @@ pub fn classify(
     }
 }
 
+/// Characters the harnesses use to rule off the composer box.
+const COMPOSER_RULE_CHARS: &str = "─━┄┅┈┉│┃┌┐└┘├┤┬┴┼╭╮╯╰═║╔╗╚╝╠╣╦╩╬▁▔";
+
+/// Phrases that mean the harness is mid-turn.
+const WORKING_MARKERS: [&str; 5] = [
+    "esc to interrupt",
+    "ctrl+c to interrupt",
+    "working (",
+    "running…",
+    "running...",
+];
+
+/// Phrases that mean the harness is holding a question open.
+const WAITING_MARKERS: [&str; 9] = [
+    "do you want to proceed?",
+    "would you like to proceed?",
+    "waiting for your input",
+    "press enter to continue",
+    "select an option",
+    "yes, allow",
+    "allow this command",
+    "[y/n]",
+    "(y/n)",
+];
+
+/// Extra dialog phrases that only an automation needs to fear. A first-run
+/// trust dialog reuses the composer glyph as its menu cursor and closes with
+/// this hint, so submitting into it would answer a security question.
+const AUTOMATION_DIALOG_MARKERS: [&str; 1] = ["enter to confirm"];
+
+/// Drops the blank rows a harness pads the pane with. Codex parks its composer
+/// mid-screen, so the last row of the capture carries no signal at all.
+fn visible_tail(content: &str) -> Vec<&str> {
+    let mut lines = content.lines().collect::<Vec<_>>();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
+/// Recognizes a `1.`/`2)` menu enumerator, which marks a dialog choice rather
+/// than composer text or harness chrome.
+fn option_enumerator(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && trimmed[digits..].starts_with(['.', ')'])
+}
+
+/// Accepts the chrome a harness draws under its composer: blank rows, the box
+/// rules, and one-line status or shortcut strips. A dialog instead leaves its
+/// remaining choices there, and those read as enumerated options or sentences.
+fn footer_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.chars().all(|c| COMPOSER_RULE_CHARS.contains(c)) {
+        return true;
+    }
+    if option_enumerator(trimmed) {
+        return false;
+    }
+    !trimmed.ends_with(['.', '?', '!', ':'])
+}
+
+/// Proves the composer holds nothing an automation would corrupt.
+///
+/// Both CLIs now seed the empty composer with a dim placeholder hint, and tmux
+/// hands us plain text with the dim styling already stripped, so an empty row
+/// is not the only shape of "empty". Claude 2.1.261 draws its `←` agents
+/// affordance in the status strip only while the composer is empty (checked in
+/// bypass, auto, accept-edits, plan, and manual modes, and against a single
+/// typed space), and its first-run hint is a quoted suggestion. Codex 0.153.4
+/// uses one fixed placeholder string.
+fn empty_composer(kind: AgentKind, body: &str, footer: &[&str]) -> bool {
+    let body = body.trim();
+    if body.is_empty() {
+        return true;
+    }
+    if option_enumerator(body) {
+        return false;
+    }
+    match kind {
+        AgentKind::Claude => {
+            (body.starts_with("Try \"") && body.ends_with('"'))
+                || footer.iter().any(|line| {
+                    line.split('·')
+                        .any(|segment| segment.trim().starts_with('←'))
+                })
+        }
+        AgentKind::Codex => body == "Ask Codex to do anything",
+        AgentKind::Other => false,
+    }
+}
+
 /// Proves that an automation may safely submit at the harness's empty,
 /// top-level composer. Generic Waiting fallbacks, overrides, approval prompts,
 /// option pickers, and custom waiting markers are deliberately insufficient.
+///
+/// The composer is no longer the last row of the pane: both CLIs render a
+/// status footer beneath it. Idle therefore means a composer row whose body is
+/// empty, with nothing but recognized chrome below it and no spinner or dialog
+/// beside it.
 #[must_use]
 pub(crate) fn automation_idle(
     kind: AgentKind,
@@ -184,74 +263,51 @@ pub(crate) fn automation_idle(
     title: &str,
     config: &StatusConfig,
 ) -> bool {
-    if !matches!(kind, AgentKind::Claude | AgentKind::Codex) {
+    let glyph = match kind {
+        AgentKind::Claude => '❯',
+        AgentKind::Codex => '›',
+        AgentKind::Other => return false,
+    };
+    if title
+        .chars()
+        .next()
+        .is_some_and(|character| ('\u{2801}'..='\u{28ff}').contains(&character))
+    {
         return false;
     }
-    let recent = content
-        .lines()
-        .rev()
-        .take(18)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_lowercase();
-    if [
-        "esc to interrupt",
-        "ctrl+c to interrupt",
-        "working (",
-        "running…",
-        "running...",
-    ]
-    .iter()
-    .any(|marker| recent.contains(marker))
+    let lines = visible_tail(content);
+    let Some(prompt) = lines
+        .iter()
+        .rposition(|line| line.trim_start().starts_with(glyph))
+    else {
+        return false;
+    };
+    // Both harnesses render their live status next to the composer: Claude in
+    // the strip below it, Codex on the row above. Anchoring the scan there
+    // catches the spinner that matters without letting a scrolled-back one
+    // freeze automation forever.
+    let window = lines[prompt.saturating_sub(8)..].join("\n").to_lowercase();
+    if WORKING_MARKERS
+        .iter()
+        .chain(WAITING_MARKERS.iter())
+        .chain(AUTOMATION_DIALOG_MARKERS.iter())
+        .any(|marker| window.contains(marker))
         || config
             .working_markers
             .iter()
-            .any(|marker| recent.contains(&marker.to_lowercase()))
-        || title
-            .chars()
-            .next()
-            .is_some_and(|character| ('\u{2801}'..='\u{28ff}').contains(&character))
+            .any(|marker| window.contains(&marker.to_lowercase()))
     {
         return false;
     }
-    let immediate = content
-        .lines()
-        .rev()
-        .take(8)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_lowercase();
-    if [
-        "do you want to proceed?",
-        "would you like to proceed?",
-        "waiting for your input",
-        "press enter to continue",
-        "select an option",
-        "yes, allow",
-        "allow this command",
-        "[y/n]",
-        "(y/n)",
-    ]
-    .iter()
-    .any(|marker| immediate.contains(marker))
-    {
+    let footer = &lines[prompt + 1..];
+    if !footer.iter().all(|line| footer_row(line)) {
         return false;
     }
-    let Some(tail) = content.lines().rev().find(|line| !line.trim().is_empty()) else {
-        return false;
-    };
-    let tail = tail.trim();
-    match kind {
-        AgentKind::Claude => tail == "❯",
-        AgentKind::Codex => tail == "›",
-        AgentKind::Other => false,
-    }
+    let body = lines[prompt]
+        .trim_start()
+        .strip_prefix(glyph)
+        .unwrap_or_default();
+    empty_composer(kind, body, footer)
 }
 
 #[cfg(test)]
@@ -354,8 +410,165 @@ mod tests {
         );
     }
 
+    /// Real `tmux capture-pane -p` tails from Claude Code 2.1.261 and Codex
+    /// 0.153.4. Both CLIs now draw a status footer under the composer and seed
+    /// the empty composer with a dim placeholder, so neither one ever ends the
+    /// pane on a bare prompt glyph again.
+    mod panes {
+        pub const CLAUDE_FRESH: &str = concat!(
+            "                  tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf\n",
+            "────────────────────────────────────────────────────────────\n",
+            "❯\u{a0}Try \"fix lint errors\"\n",
+            "────────────────────────────────────────────────────────────\n",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n",
+        );
+        pub const CLAUDE_IDLE_SUGGESTION: &str = concat!(
+            "────────────────────────────────────────────────────────────\n",
+            "❯\u{a0}did it finish?\n",
+            "────────────────────────────────────────────────────────────\n",
+            "  ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage\n",
+        );
+        pub const CLAUDE_IDLE_AFTER_TURN: &str = concat!(
+            "✻ Crunched for 3s · done 7:51 PM\n",
+            "────────────────────────────────────────────────────────────\n",
+            "❯\u{a0}now do 41 to 60\n",
+            "────────────────────────────────────────────────────────────\n",
+            "  ⏸ manual mode on · ? for shortcuts · ← for agents\n",
+        );
+        pub const CLAUDE_TYPED: &str = concat!(
+            "────────────────────────────────────────────────────────────\n",
+            "❯\u{a0}hello there\n",
+            "────────────────────────────────────────────────────────────\n",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n",
+        );
+        pub const CLAUDE_STREAMING: &str = concat!(
+            "  twenty-nine\n",
+            "  thirty\n",
+            "                                              ● high · /effort\n",
+            "────────────────────────────────────────────────────────────\n",
+            "❯\u{a0}\n",
+            "────────────────────────────────────────────────────────────\n",
+            "  ⏸ manual mode on · esc to interrupt · ← for agents\n",
+        );
+        pub const CLAUDE_APPROVAL: &str = concat!(
+            " This command requires approval\n",
+            "\n",
+            " Do you want to proceed?\n",
+            " ❯ 1. Yes\n",
+            "   2. Yes, and don’t ask again for: rtk curl *\n",
+            "   3. Yes, and switch to auto mode · auto mode handles these prompts for you\n",
+            "   4. No\n",
+            "\n",
+            " Esc to cancel · Tab to amend\n",
+        );
+        pub const CLAUDE_TRUST: &str = concat!(
+            " Security guide\n",
+            "\n",
+            " ❯ No, exit\n",
+            "   Yes, I trust this folder\n",
+            "\n",
+            " Enter to confirm · Esc to cancel\n",
+        );
+        pub const CODEX_IDLE: &str = concat!(
+            "• You have 2 usage limit resets available. Run /usage to use one.\n",
+            "\n",
+            "\n",
+            "› Ask Codex to do anything\n",
+            "\n",
+            "  gpt-5.6-sol low fast · /tmp/claude-1000/-home-ryan-IdeaProjects-atmux/scratchpad…\n",
+            "\n",
+            "\n",
+            "\n",
+        );
+        pub const CODEX_TYPED: &str = concat!(
+            "• You have 2 usage limit resets available. Run /usage to use one.\n",
+            "\n",
+            "\n",
+            "› hello there\n",
+            "\n",
+            "  gpt-5.6-sol low fast · /tmp/claude-1000/-home-ryan-IdeaProjects-atmux/scratchpad…\n",
+            "\n",
+            "\n",
+            "\n",
+        );
+        pub const CODEX_TRUST: &str = concat!(
+            "  Do you trust the contents of this directory? Working with untrusted contents\n",
+            "  comes with higher risk of prompt injection.\n",
+            "\n",
+            "› 1. Yes, continue\n",
+            "  2. No, quit\n",
+            "\n",
+            "  Press enter to continue\n",
+            "\n",
+            "\n",
+            "\n",
+        );
+    }
+
     #[test]
-    fn automation_requires_exact_empty_native_composer() {
+    fn automation_reads_an_empty_composer_through_the_status_footer() {
+        for pane in [
+            panes::CLAUDE_FRESH,
+            panes::CLAUDE_IDLE_SUGGESTION,
+            panes::CLAUDE_IDLE_AFTER_TURN,
+        ] {
+            assert!(
+                automation_idle(AgentKind::Claude, pane, "", &config()),
+                "expected idle for {pane:?}"
+            );
+        }
+        assert!(automation_idle(
+            AgentKind::Codex,
+            panes::CODEX_IDLE,
+            "",
+            &config()
+        ));
+        // A composer that already holds the operator's own draft is off limits:
+        // submitting would append to it and send the pair.
+        assert!(!automation_idle(
+            AgentKind::Claude,
+            panes::CLAUDE_TYPED,
+            "",
+            &config()
+        ));
+        assert!(!automation_idle(
+            AgentKind::Codex,
+            panes::CODEX_TYPED,
+            "",
+            &config()
+        ));
+    }
+
+    #[test]
+    fn automation_refuses_a_streaming_or_dialog_pane() {
+        for (kind, pane) in [
+            (AgentKind::Claude, panes::CLAUDE_STREAMING),
+            (AgentKind::Claude, panes::CLAUDE_APPROVAL),
+            (AgentKind::Claude, panes::CLAUDE_TRUST),
+            (AgentKind::Codex, panes::CODEX_TRUST),
+        ] {
+            assert!(
+                !automation_idle(kind, pane, "", &config()),
+                "expected busy for {pane:?}"
+            );
+        }
+        // A braille spinner in the pane title outranks a quiet-looking pane.
+        assert!(!automation_idle(
+            AgentKind::Claude,
+            panes::CLAUDE_FRESH,
+            "⠹ thinking",
+            &config()
+        ));
+        assert!(!automation_idle(
+            AgentKind::Other,
+            panes::CLAUDE_FRESH,
+            "",
+            &config()
+        ));
+    }
+
+    #[test]
+    fn automation_requires_a_recognized_composer() {
         assert!(!automation_idle(
             AgentKind::Claude,
             "quiet but unrecognized work",
@@ -374,6 +587,18 @@ mod tests {
             "",
             &config()
         ));
+        // A custom working marker still suppresses delivery.
+        let custom = StatusConfig {
+            working_markers: vec!["crunching widgets".to_owned()],
+            waiting_markers: Vec::new(),
+        };
+        assert!(!automation_idle(
+            AgentKind::Claude,
+            "crunching widgets\n❯\u{a0}\n  ⏵⏵ bypass permissions on · ← for agents",
+            "",
+            &custom
+        ));
+        // Bare composers from older harness builds stay idle.
         assert!(automation_idle(
             AgentKind::Claude,
             "finished\n\n❯ ",

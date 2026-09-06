@@ -1039,6 +1039,39 @@ function duplicateSourceMatches(snapshot, session) {
     && String(session.profile || "") === snapshot.profile;
 }
 
+/// Phrases the Claude and Codex CLIs print once an account has no usage left.
+/// They are hints for a checkbox default only; the launch itself never depends
+/// on terminal text.
+const USAGE_LIMIT_MARKERS = [
+  "usage limit reached",
+  "you've reached your usage limit",
+  "hit your usage limit",
+  "hit your limit",
+  "5-hour limit reached",
+  "weekly limit reached",
+  "out of usage",
+  "quota exceeded",
+  "rate limit",
+];
+
+/// Decides how the duplicate dialog offers "Resume from summary".
+///
+/// Only a Claude or Codex pane keeps a readable conversation, and only the
+/// machine that owns the pane can run the summary within one launch request,
+/// so a federated pane is not offered one. The box is pre-checked when the
+/// visible pane says that account ran out of usage, which is exactly when
+/// swapping credential profiles matters.
+function duplicateSummaryState(session, paneLines = [], paneSessionId = null, localMachineId = "local") {
+  const harness = String(session?.agent || "").toLowerCase();
+  if (!session || !["claude", "codex"].includes(harness)) return { available: false, checked: false };
+  if (sessionMachineId(session, localMachineId) !== localMachineId) {
+    return { available: false, checked: false };
+  }
+  const visible = paneSessionId === session.id && Array.isArray(paneLines) ? paneLines : [];
+  const text = visible.slice(-40).join("\n").toLowerCase();
+  return { available: true, checked: USAGE_LIMIT_MARKERS.some((marker) => text.includes(marker)) };
+}
+
 /// Classifies an overview event against the revision this client holds.
 ///
 /// A snapshot is authoritative and always applies. A patch applies only when it
@@ -2039,11 +2072,17 @@ function sessionDeletePath(id) {
 function modelPickerState(session, capabilities, online, switchingPaneId, composerSending = false) {
   const recognized = session?.agent === "claude" || session?.agent === "codex";
   const matches = capabilities?.pane_id === session?.id;
-  const models = matches && Array.isArray(capabilities.models) ? capabilities.models : [];
+  const models = matches && Array.isArray(capabilities.model_options) ? capabilities.model_options : [];
+  const efforts = matches && Array.isArray(capabilities.effort_options) ? capabilities.effort_options : [];
   const current = matches && typeof capabilities.current === "string" ? capabilities.current : "";
   const effort = matches && typeof capabilities.effort === "string" ? capabilities.effort : "";
   const currentMode = matches && typeof capabilities.current_mode === "string" ? capabilities.current_mode : "";
+  const fastSupported = matches && capabilities.fast_supported === true;
+  const fast = matches && typeof capabilities.fast === "boolean" ? capabilities.fast : null;
   const busy = Boolean(switchingPaneId);
+  // Model, effort, and fast are applied one at a time, so each control is
+  // enabled on its own evidence and a shared in-flight switch blocks them all.
+  const blocked = !online || busy || composerSending;
   return {
     visible: recognized,
     loading: recognized && !matches,
@@ -2051,13 +2090,28 @@ function modelPickerState(session, capabilities, online, switchingPaneId, compos
     effort,
     currentMode,
     models,
-    disabled: !online || busy || composerSending || !models.some((model) => model.switchable),
+    efforts,
+    fast,
+    fastSupported,
+    disabled: blocked || !models.some((model) => model.switchable),
+    effortDisabled: blocked || !efforts.some((choice) => choice.switchable),
+    fastDisabled: blocked || !fastSupported,
     status: !recognized ? ""
       : !online ? "Machine offline"
         : busy ? (switchingPaneId === session?.id ? "Switching…" : "Another model switch is in progress")
           : !matches ? "Checking models…"
-            : capabilities.note || (current ? `Current: ${[current, effort].filter(Boolean).join(" · ")}` : "Current model unavailable"),
+            : capabilities.note || (current ? `Current: ${[current, effort, fast ? "fast" : ""].filter(Boolean).join(" · ")}` : "Current model unavailable"),
   };
+}
+
+/// The choices one picker offers, with the running value shown first and
+/// unselectable when this profile does not configure it.
+function pickerOptions(choices, current) {
+  const options = [...choices];
+  if (current && !options.some((choice) => choice.id === current)) {
+    options.unshift({ id: "", label: `${current} (current; not configured)`, switchable: false });
+  }
+  return options;
 }
 
 function claudeResumeState(session, capabilities, online, resumingPaneId, composerSending = false) {
@@ -2343,6 +2397,7 @@ if (typeof module !== "undefined" && module.exports) {
     duplicateSourceMatches,
     duplicateSourceSnapshot,
     duplicateSessionName,
+    duplicateSummaryState,
     filterDirectories,
     defaultMemoryLimitLabel,
     formatMemoryLimit,
@@ -2424,6 +2479,7 @@ if (typeof module !== "undefined" && module.exports) {
     reduceTranscript,
     sessionDeletePath,
     modelPickerState,
+    pickerOptions,
     claudeResumeState,
     followsLiveTail,
     stickyBottomState,
@@ -2534,6 +2590,7 @@ function initialize() {
     launchBrowseMutation: false,
     launchDialogGeneration: 0,
     launchFlow: null,
+    launchSummarySourceId: null,
     launchSessionsGeneration: 0,
     launchSessionsKey: "",
     launchSessionsController: null,
@@ -2928,10 +2985,42 @@ function initialize() {
         harness: state.sessions.get(paneId)?.agent || "agent",
         current: null,
         models: [],
+        model_options: [],
+        effort_options: [],
         note: error.message,
       };
     }
     render();
+  }
+
+  /// The three controls the picker shows, as one comparable value. A switch
+  /// uses it to tell a pane that has caught up from one still reporting the
+  /// state it had before the change.
+  function paneModelSignature(models) {
+    if (!models) return "";
+    return [models.current, models.effort, models.fast].map((value) => value ?? "").join("|");
+  }
+
+  /// Takes a capability snapshot as the picker's current truth, unless the user
+  /// has since selected another pane. Claims the read generation so a `/models`
+  /// request already in flight cannot overwrite it with older observations.
+  function adoptPaneModels(paneId, capabilities) {
+    if (!capabilities || !paneId || state.selected !== paneId) return false;
+    state.paneModelsRequest += 1;
+    state.paneModels = capabilities;
+    return true;
+  }
+
+  /// Some harnesses print their confirmation a beat after answering the switch.
+  /// Re-read the pane a few times over about three seconds, stopping as soon as
+  /// it reports controls other than the ones it had before.
+  async function settlePaneModels(paneId, before) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await new Promise((resolve) => { setTimeout(resolve, 1000); });
+      if (state.selected !== paneId) return;
+      await refreshModels(paneId);
+      if (paneModelSignature(state.paneModels) !== before) return;
+    }
   }
 
   function scheduleTranscript(delay = 300) {
@@ -4158,6 +4247,9 @@ function initialize() {
   function invalidateLaunchDialog(close = true) {
     state.launchDialogGeneration += 1;
     state.launchFlow = null;
+    state.launchSummarySourceId = null;
+    $("launch-summary").hidden = true;
+    $("launch-summary-resume").checked = false;
     cancelLaunchDirectorySearch();
     hideLaunchDirectorySuggestions(true);
     clearLaunchSessions();
@@ -4448,27 +4540,36 @@ function initialize() {
     control.hidden = !view.visible;
     quickControl.hidden = !view.visible;
     if (!view.visible) return;
-    const options = [...view.models];
-    if (view.current && !view.currentMode) {
-      options.unshift({ id: "", label: `${view.current} (current; no configured mode)`, switchable: false });
-    }
-    const signature = JSON.stringify(options);
-    for (const [selectId, statusId] of [["agent-model", "model-status"], ["quick-agent-model", "quick-model-status"]]) {
-      const select = $(selectId);
+    const models = pickerOptions(view.models, view.current);
+    const efforts = pickerOptions(view.efforts, view.effort);
+    for (const [modelId, effortId, fastId, statusId] of [
+      ["agent-model", "agent-effort", "agent-fast", "model-status"],
+      ["quick-agent-model", "quick-agent-effort", "quick-agent-fast", "quick-model-status"],
+    ]) {
+      syncPickerSelect($(modelId), models, view.current, view.disabled, "No switchable models");
+      syncPickerSelect($(effortId), efforts, view.effort, view.effortDisabled, "No switchable effort levels");
+      const fast = $(fastId);
+      fast.checked = view.fast === true;
+      fast.disabled = view.fastDisabled;
+      fast.closest("label").hidden = !view.fastSupported;
       const status = $(statusId);
-      if (select.dataset.models !== signature) {
-        select.replaceChildren(...(options.length
-          ? options.map((model) => option(model.id, model.label, !model.switchable))
-          : [option("", "No switchable models", true)]));
-        select.dataset.models = signature;
-      }
-      if (view.currentMode && options.some((model) => model.id === view.currentMode)) {
-        select.value = view.currentMode;
-      }
-      select.disabled = view.disabled;
       status.textContent = view.status;
       status.title = view.status;
     }
+  }
+
+  /// Rebuilds one picker only when its choices changed, so a live refresh never
+  /// drops the open dropdown or the selection under the pointer.
+  function syncPickerSelect(select, options, selected, disabled, empty) {
+    const signature = JSON.stringify(options);
+    if (select.dataset.models !== signature) {
+      select.replaceChildren(...(options.length
+        ? options.map((choice) => option(choice.id, choice.label, !choice.switchable))
+        : [option("", empty, true)]));
+      select.dataset.models = signature;
+    }
+    if (selected && options.some((choice) => choice.id === selected)) select.value = selected;
+    select.disabled = disabled;
   }
 
   function renderClaudeResumeAction(session, controllable) {
@@ -6369,33 +6470,60 @@ function initialize() {
     event.target.value = "";
   });
   $("attachment-clear").addEventListener("click", clearAttachments);
-  async function switchAgentModel(modeId) {
+  /// Sends one control's change on its own. The request names only that
+  /// control, so the harness keeps the model, effort, or fast mode it omits.
+  ///
+  /// The owner answers with what it observed once the switch settled, so the
+  /// picker repaints from the switch itself. Reading `/models` back instead
+  /// would race the ~750 ms pane poll and redisplay the pre-switch controls
+  /// until the next reload.
+  async function switchAgentModel(change, label, warning = "") {
     const paneId = state.selected;
     const sessionName = state.sessions.get(paneId)?.name || paneId;
-    if (!paneId || !modeId || state.modelSwitchingPaneId) return;
-    if (state.paneModels?.pane_id === paneId && state.paneModels.current_mode === modeId) return;
+    if (!paneId || state.modelSwitchingPaneId) return;
+    const before = paneModelSignature(state.paneModels);
     state.modelSwitchingPaneId = paneId;
     render();
+    let adopted = false;
     try {
-      await request(`/api/v1/panes/${encodeURIComponent(paneId)}/model`, {
+      const settled = await request(`/api/v1/panes/${encodeURIComponent(paneId)}/model`, {
         method: "POST",
-        body: JSON.stringify({ mode_id: modeId }),
+        body: JSON.stringify(change),
       });
-      const choice = state.paneModels?.models?.find((item) => item.id === modeId);
-      const warning = state.sessions.get(paneId)?.agent === "claude" && choice?.effort
-        ? " Claude saves this effort as the profile default."
-        : "";
-      toast(`Switched ${sessionName} to ${choice?.label || modeId}.${warning}`);
+      adopted = adoptPaneModels(paneId, settled);
+      toast(`Switched ${sessionName} to ${label}.${warning}`);
     } catch (error) {
       toast(error.message);
     } finally {
       state.modelSwitchingPaneId = null;
-      if (state.selected === paneId) await refreshModels(paneId);
+      if (state.selected === paneId && !adopted) await refreshModels(paneId);
       render();
     }
+    if (adopted && paneModelSignature(state.paneModels) === before) {
+      await settlePaneModels(paneId, before);
+    }
   }
-  $("agent-model").addEventListener("change", (event) => { void switchAgentModel(event.currentTarget.value); });
-  $("quick-agent-model").addEventListener("change", (event) => { void switchAgentModel(event.currentTarget.value); });
+  function switchAgentModelChoice(model) {
+    if (!model || state.paneModels?.current === model) return;
+    void switchAgentModel({ model }, model);
+  }
+  function switchAgentEffort(effort) {
+    if (!effort || state.paneModels?.effort === effort) return;
+    const warning = state.sessions.get(state.selected)?.agent === "claude"
+      ? " Claude saves this effort as the profile default."
+      : "";
+    void switchAgentModel({ effort }, `${effort} effort`, warning);
+  }
+  function switchAgentFast(fast) {
+    if (state.paneModels?.fast === fast) return;
+    void switchAgentModel({ fast }, fast ? "fast mode on" : "fast mode off");
+  }
+  $("agent-model").addEventListener("change", (event) => { switchAgentModelChoice(event.currentTarget.value); });
+  $("quick-agent-model").addEventListener("change", (event) => { switchAgentModelChoice(event.currentTarget.value); });
+  $("agent-effort").addEventListener("change", (event) => { switchAgentEffort(event.currentTarget.value); });
+  $("quick-agent-effort").addEventListener("change", (event) => { switchAgentEffort(event.currentTarget.value); });
+  $("agent-fast").addEventListener("change", (event) => { switchAgentFast(event.currentTarget.checked); });
+  $("quick-agent-fast").addEventListener("change", (event) => { switchAgentFast(event.currentTarget.checked); });
   $("quick-actions-open").addEventListener("click", () => {
     const dialog = $("quick-actions-dialog");
     if (!dialog.open) {
@@ -6957,6 +7085,7 @@ function initialize() {
     if (existingDialog.open) invalidateLaunchDialog();
     const generation = ++state.launchDialogGeneration;
     state.launchFlow = null;
+    state.launchSummarySourceId = null;
     const capabilitiesRequest = duplicateSession
       ? request(`/api/v1/panes/${encodeURIComponent(duplicateSession.id)}/models`)
       : Promise.resolve(null);
@@ -7016,6 +7145,7 @@ function initialize() {
       );
       applyDuplicateLaunchSelection(selection);
     }
+    applyDuplicateSummary(sourceSnapshot ? sourceSession : null);
     if (generation !== state.launchDialogGeneration) return false;
     $("launch-dialog-title").textContent = sourceSnapshot ? "Duplicate agent" : "Launch agent";
     $("launch-form").querySelector("button[type=submit]").textContent = sourceSnapshot
@@ -7261,6 +7391,17 @@ function initialize() {
     updateLaunchAvailability(machine);
   }
 
+  /// Offers the summarized handover only for a duplicate of a readable agent.
+  /// The profile selector above stays untouched, so the same dialog swaps the
+  /// credential profile and carries the previous conversation forward.
+  function applyDuplicateSummary(sourceSession) {
+    const local = state.machines.find((machine) => machine.kind === "local")?.id || "local";
+    const view = duplicateSummaryState(sourceSession, state.paneLines, state.selected, local);
+    state.launchSummarySourceId = view.available ? String(sourceSession.pane_id || "") : null;
+    $("launch-summary").hidden = !view.available;
+    $("launch-summary-resume").checked = view.available && view.checked;
+  }
+
   function renderLaunchMemory(selected = currentLaunchMachine()) {
     const choices = memoryLimitChoices(selected.memory);
     const select = $("launch-memory");
@@ -7391,7 +7532,12 @@ function initialize() {
     note.hidden = !message;
   }
 
-  $("launch-machine").addEventListener("change", applyLaunchMachine);
+  $("launch-machine").addEventListener("change", () => {
+    // The summary source is a pane on the machine the duplicate came from.
+    // Retarget the launch and that pane is no longer the right conversation.
+    applyDuplicateSummary(null);
+    applyLaunchMachine();
+  });
   $("launch-directory").addEventListener("input", scheduleLaunchDirectorySearch);
   $("launch-directory").addEventListener("change", () => renderLaunchDirectories());
   $("launch-directory").addEventListener("focus", () => {
@@ -7803,6 +7949,9 @@ function initialize() {
       machine: $("launch-machine").value || null,
       resume_session_id: duplicateFlow ? null : ($("launch-session").value || null),
       memory_max_bytes: memoryMaxBytes,
+      summarize_pane_id: duplicateFlow && $("launch-summary-resume").checked
+        ? (state.launchSummarySourceId || null)
+        : null,
     };
     if (body.resume_session_id) {
       const machine = currentLaunchMachine();
@@ -7822,16 +7971,22 @@ function initialize() {
       }));
       if (!confirmed) return;
     }
+    const label = button.textContent;
     button.disabled = true;
+    // Summarizing runs the chosen profile's CLI before tmux is touched, so the
+    // request stays open for as long as that turn takes.
+    if (body.summarize_pane_id) button.textContent = "Summarizing previous session…";
     try {
       await request("/api/v1/sessions", { method: "POST", body: JSON.stringify(body) });
       persistLaunchDirectory(body.machine || currentLaunchMachine().id, body.directory);
       state.pendingSelectionName = { name: body.name, machine: body.machine };
       reconcileSelection();
       invalidateLaunchDialog();
-      toast(`Launched ${body.name}${body.machine ? ` on ${body.machine}` : ""}`);
+      toast(body.summarize_pane_id
+        ? `Launched ${body.name} with a summary of the previous session`
+        : `Launched ${body.name}${body.machine ? ` on ${body.machine}` : ""}`);
     } catch (error) { toast(error.message); }
-    finally { button.disabled = false; }
+    finally { button.disabled = false; button.textContent = label; }
   });
   document.querySelectorAll(".dialog-cancel").forEach((button) => button.addEventListener("click", () => {
     const dialog = button.closest("dialog");

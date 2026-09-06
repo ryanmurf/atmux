@@ -18,6 +18,7 @@ pub mod pulse;
 pub mod recovery;
 pub mod remote;
 pub mod status;
+mod summary;
 mod systemd_scope;
 pub mod tls;
 pub mod tmux;

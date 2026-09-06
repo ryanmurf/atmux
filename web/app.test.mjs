@@ -46,6 +46,7 @@ const {
   duplicateSourceSnapshot,
   duplicateSessionName,
   defaultMemoryLimitLabel,
+  duplicateSummaryState,
   filterDirectories,
   formatMemoryLimit,
   memoryLimitChoices,
@@ -77,6 +78,7 @@ const {
   machineStatusLabel,
   claudeResumeState,
   modelPickerState,
+  pickerOptions,
   markdownBlocks,
   messageFitsByteLimit,
   moveMessageHistory,
@@ -855,6 +857,24 @@ test("subagent turns are labelled as the subagent and never as the operator", ()
   assert.match(css, /\.message-card\.subagent/);
 });
 
+test("a task notification counts as a subagent turn, never as an operator prompt", () => {
+  const messages = [
+    { id: "p1", role: "user", markdown: "do the thing" },
+    { id: "a1", role: "assistant", markdown: "on it" },
+    { id: "n1", role: "subagent", agent_name: "Reply with PONG", markdown: "PONG" },
+  ];
+  const labels = (preferences) =>
+    filterTranscriptMessages(messages, preferences).map(transcriptRoleLabel);
+  assert.deepEqual(labels({ human: true, internal: true }), [
+    "You",
+    "Agent",
+    "Subagent · Reply with PONG",
+  ]);
+  // Hiding Internal must hide the notification without touching the operator count.
+  assert.deepEqual(labels({ human: true, internal: false }), ["You", "Agent"]);
+  assert.equal(labels({ human: true, internal: true }).filter((label) => label === "You").length, 1);
+});
+
 test("tool summaries normalize namespaces and expose per-tool counts", () => {
   const messages = [
     { id: "a", kind: "tool", tool_name: "functions.collaboration.wait_agent" },
@@ -1019,6 +1039,20 @@ test("mobile controls stay compact and horizontally reachable so the pane gets t
   assert.match(css, /@media \(max-width: 720px\)[\s\S]*body \{[^}]*position: fixed;[^}]*height: var\(--app-height, 100dvh\);/s);
   assert.match(css, /@media \(max-width: 720px\)[\s\S]*body\.has-selection \.topbar \{ display: none; \}/s);
   assert.doesNotMatch(css, /composer-focused/);
+  // #health-alert carries [hidden] whenever the fleet is healthy, and
+  // `display: none` drops it out of the body grid. Without explicit rows the
+  // workspace auto-flows into the second `auto` track and gets content height
+  // instead of the 1fr remainder, so the landing ended partway down the screen
+  // with dead background beneath it. Pin the rows.
+  assert.match(css, /\.topbar \{ grid-row: 1;/);
+  assert.match(css, /\.health-alert \{ grid-row: 2;/);
+  assert.match(css, /\.workspace \{ grid-row: 3;/);
+  // The workspace owns that 1fr row and .detail is height:100% of it, so
+  // restating the whole app height on a selection just overflowed the body by
+  // the health banner's height.
+  assert.doesNotMatch(css, /body\.has-selection \.workspace[^{]*\{[^}]*height: var\(--app-height/s);
+  // The rail is the bottom-most mobile surface under `viewport-fit=cover`.
+  assert.match(css, /@media \(max-width: 720px\)[\s\S]*\.rail \{[^}]*padding: 10px max\(8px, env\(safe-area-inset-right\)\) calc\(10px \+ env\(safe-area-inset-bottom\)\) max\(8px, env\(safe-area-inset-left\)\);/s);
   assert.match(html, /content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"/);
   assert.match(html, /id="quick-actions-dialog"/);
   assert.match(html, /id="quick-agent-model"/);
@@ -1976,6 +2010,59 @@ test("duplicate dialog fails closed across live model, stale request, and resume
   assert.match(source, /launch-dialog"\)\.addEventListener\("close"[\s\S]*invalidateLaunchDialog\(false\)/);
 });
 
+test("resume from summary is offered only for a duplicate of a readable, visible local pane", () => {
+  const claude = { id: "midnight~%5", machine: "midnight", pane_id: "%5", agent: "claude" };
+  const limited = ["Claude usage limit reached. Your limit will reset at 4pm."];
+  assert.deepEqual(
+    duplicateSummaryState(claude, limited, claude.id, "midnight"),
+    { available: true, checked: true },
+  );
+  // A quiet pane still offers the handover; it just does not assume it.
+  assert.deepEqual(
+    duplicateSummaryState(claude, ["> ready"], claude.id, "midnight"),
+    { available: true, checked: false },
+  );
+  // Another pane's visible output must never pre-check this duplicate.
+  assert.deepEqual(
+    duplicateSummaryState(claude, limited, "midnight~%9", "midnight"),
+    { available: true, checked: false },
+  );
+  // A federated pane cannot be summarized within one launch request.
+  assert.deepEqual(
+    duplicateSummaryState(claude, limited, claude.id, "home"),
+    { available: false, checked: false },
+  );
+  assert.deepEqual(
+    duplicateSummaryState({ ...claude, agent: "other" }, limited, claude.id, "midnight"),
+    { available: false, checked: false },
+  );
+  assert.deepEqual(duplicateSummaryState(null, limited, null), { available: false, checked: false });
+  assert.equal(
+    duplicateSummaryState({ ...claude, agent: "codex" }, ["error: rate limit exceeded"], claude.id, "midnight").checked,
+    true,
+  );
+  // Real Codex 0.153.4 and Claude Code 2.1.261 exhaustion notices.
+  assert.equal(
+    duplicateSummaryState(
+      { ...claude, agent: "codex" },
+      ["■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits."],
+      claude.id,
+      "midnight",
+    ).checked,
+    true,
+  );
+  assert.equal(
+    duplicateSummaryState(claude, ["You've hit your limit — resets at 8pm."], claude.id, "midnight").checked,
+    true,
+  );
+
+  const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  assert.match(source, /summarize_pane_id: duplicateFlow && \$\("launch-summary-resume"\)\.checked/);
+  assert.match(source, /state\.launchSummarySourceId = view\.available \? String\(sourceSession\.pane_id \|\| ""\) : null/);
+  assert.match(source, /if \(body\.summarize_pane_id\) button\.textContent = "Summarizing previous session…"/);
+  assert.match(source, /launch-machine"\)\.addEventListener\("change", \(\) => \{\s*\/\/[\s\S]*applyDuplicateSummary\(null\)/);
+});
+
 test("session labels prioritize the folder and suppress an unhelpful Default profile", () => {
   const defaultClaude = {
     agent: "claude",
@@ -2380,10 +2467,12 @@ test("model picker reports current, unsupported, offline, and in-flight states",
   const capabilities = {
     pane_id: claude.id,
     current: "sonnet",
-    models: [
+    model_options: [
       { id: "sonnet", label: "Sonnet", switchable: true },
       { id: "claude-opus-4-1", label: "Pinned", switchable: false },
     ],
+    effort_options: [],
+    fast_supported: false,
     note: null,
   };
   assert.deepEqual(modelPickerState(claude, capabilities, true, null), {
@@ -2392,19 +2481,75 @@ test("model picker reports current, unsupported, offline, and in-flight states",
     current: "sonnet",
     effort: "",
     currentMode: "",
-    models: capabilities.models,
+    models: capabilities.model_options,
+    efforts: [],
+    fast: null,
+    fastSupported: false,
     disabled: false,
+    effortDisabled: true,
+    fastDisabled: true,
     status: "Current: sonnet",
   });
   assert.equal(modelPickerState(claude, capabilities, false, null).status, "Machine offline");
   assert.equal(modelPickerState(claude, capabilities, true, claude.id).status, "Switching…");
   assert.equal(modelPickerState(claude, null, true, null).status, "Checking models…");
 
-  const unsupported = { ...capabilities, models: [], note: "codex 0.999 has an unsupported picker" };
+  const unsupported = { ...capabilities, model_options: [], note: "codex 0.999 has an unsupported picker" };
   const view = modelPickerState({ id: claude.id, agent: "codex" }, unsupported, true, null);
   assert.equal(view.disabled, true);
   assert.match(view.status, /unsupported/);
   assert.equal(modelPickerState({ id: "%9", agent: "shell" }, null, true, null).visible, false);
+});
+
+test("model, effort, and fast are independent controls with their own gates", () => {
+  const codex = { id: "midnight~%5", agent: "codex" };
+  const capabilities = {
+    pane_id: codex.id,
+    current: "gpt-5.6-sol",
+    effort: "xhigh",
+    fast: true,
+    fast_supported: true,
+    model_options: [{ id: "gpt-5.6-sol", label: "GPT-5.6 Sol", switchable: true }],
+    effort_options: [
+      { id: "xhigh", label: "Extra high", switchable: true },
+      { id: "max", label: "max", switchable: false },
+    ],
+    note: null,
+  };
+  const view = modelPickerState(codex, capabilities, true, null);
+  assert.equal(view.disabled, false);
+  assert.equal(view.effortDisabled, false);
+  assert.equal(view.fastDisabled, false);
+  assert.equal(view.fast, true);
+  assert.equal(view.status, "Current: gpt-5.6-sol · xhigh · fast");
+
+  // An older CLI reports no effort rows and no fast toggle, so only the model
+  // picker stays live.
+  const older = modelPickerState(codex, { ...capabilities, effort_options: [], fast_supported: false, fast: null }, true, null);
+  assert.equal(older.disabled, false);
+  assert.equal(older.effortDisabled, true);
+  assert.equal(older.fastDisabled, true);
+  assert.equal(older.fastSupported, false);
+
+  // A switch already in flight freezes every control, not just the one used.
+  const busy = modelPickerState(codex, capabilities, true, codex.id);
+  assert.deepEqual(
+    [busy.disabled, busy.effortDisabled, busy.fastDisabled],
+    [true, true, true],
+  );
+});
+
+test("pickerOptions surfaces an unconfigured running value without offering it", () => {
+  const configured = [{ id: "high", label: "High", switchable: true }];
+  assert.deepEqual(pickerOptions(configured, "high"), configured);
+  assert.deepEqual(pickerOptions(configured, "medium"), [
+    { id: "", label: "medium (current; not configured)", switchable: false },
+    ...configured,
+  ]);
+  assert.deepEqual(pickerOptions(configured, ""), configured);
+  assert.deepEqual(pickerOptions([], "gpt-5.6-sol"), [
+    { id: "", label: "gpt-5.6-sol (current; not configured)", switchable: false },
+  ]);
 });
 
 test("Claude resume action is capability-gated and protects active work", () => {
@@ -2433,7 +2578,7 @@ test("Claude resume action is capability-gated and protects active work", () => 
   assert.equal(claudeResumeState({ id: "%8", agent: "codex" }, ready, true, null).visible, false);
 });
 
-test("model switch captures the pane id before awaiting and routes only a profile mode id", () => {
+test("model switch captures the pane id before awaiting and routes one control at a time", () => {
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
   const handler = source.slice(
     source.indexOf("async function switchAgentModel"),
@@ -2441,10 +2586,16 @@ test("model switch captures the pane id before awaiting and routes only a profil
   );
   assert.match(handler, /const paneId = state\.selected;/);
   assert.match(handler, /encodeURIComponent\(paneId\).*\/model/s);
-  assert.match(handler, /JSON\.stringify\(\{ mode_id: modeId \}\)/);
+  assert.match(handler, /JSON\.stringify\(change\)/);
   assert.doesNotMatch(handler, /state\.selected.*\/model/);
+  // Each control posts only its own field so the harness keeps the rest.
+  assert.match(handler, /switchAgentModel\(\{ model \}, model\)/);
+  assert.match(handler, /switchAgentModel\(\{ effort \}, `\$\{effort\} effort`, warning\)/);
+  assert.match(handler, /switchAgentModel\(\{ fast \}, fast \? "fast mode on" : "fast mode off"\)/);
   assert.match(source, /modelPickerState\([\s\S]*state\.modelSwitchingPaneId/);
-  assert.match(source, /\$\("quick-agent-model"\)\.addEventListener\("change"/);
+  for (const control of ["quick-agent-model", "quick-agent-effort", "quick-agent-fast"]) {
+    assert.match(source, new RegExp(`\\$\\("${control}"\\)\\.addEventListener\\("change"`));
+  }
 });
 
 test("Claude resume uses a confirmation and never sends browser-supplied session data", () => {

@@ -57,9 +57,12 @@ CLAUDE_CONFIG_DIR = "~/.claude"
 # SOME_VARIABLE = "value"
 
 # A profile may expose only the launch modes that its account can use. The
-# dashboard and launcher never invent extra model choices. `effort` and
-# `service_tier` apply only to Codex; `service_tier = "fast"` is selected when
-# a new Codex session launches, not changed in an existing conversation.
+# dashboard and launcher never invent extra model choices. `service_tier`
+# applies only to Codex, while `effort` applies to both Claude and Codex;
+# `service_tier = "fast"` is selected when a new Codex session launches. The
+# dashboard drives a running session's model, reasoning effort, and fast mode
+# as three separate controls: models and efforts come from these modes, while
+# fast mode is the harness's own session toggle.
 # [[profiles.modes]]
 # id = "sol-xhigh-fast"
 # label = "Sol · xhigh · Fast"

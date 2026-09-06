@@ -763,8 +763,8 @@ async fn generation_bound_keys_fail_closed_against_a_legacy_owner() {
         .send_special_key_for_instance(
             "gpu-box~%7",
             PaneSpecialKey::TmuxPrefixTwice,
-            "gpu-box".to_owned(),
-            format!("pane-v1-{}", "a".repeat(64)),
+            Some("gpu-box".to_owned()),
+            Some(format!("pane-v1-{}", "a".repeat(64))),
         )
         .await
         .unwrap_err();
@@ -1057,6 +1057,7 @@ async fn mixed_version_owner_never_receives_an_unadvertised_memory_override() {
                 machine: Some("gpu-box".to_owned()),
                 resume_session_id: None,
                 memory_max_bytes: Some(requested),
+                summarize_pane_id: None,
             })
             .await
             .unwrap_err();
@@ -1103,6 +1104,7 @@ async fn capable_owner_receives_valid_memory_but_coordinator_rejects_advertised_
             machine: Some("gpu-box".to_owned()),
             resume_session_id: None,
             memory_max_bytes: Some(custom),
+            summarize_pane_id: None,
         })
         .await
         .unwrap();
@@ -1127,6 +1129,7 @@ async fn capable_owner_receives_valid_memory_but_coordinator_rejects_advertised_
                 machine: Some("gpu-box".to_owned()),
                 resume_session_id: None,
                 memory_max_bytes: Some(requested),
+                summarize_pane_id: None,
             })
             .await
             .unwrap_err();
@@ -1186,6 +1189,7 @@ async fn stale_capability_cannot_launch_after_an_owner_downgrade() {
             machine: Some("gpu-box".to_owned()),
             resume_session_id: None,
             memory_max_bytes: Some(20 * 1024 * 1024 * 1024),
+            summarize_pane_id: None,
         })
         .await
         .unwrap_err();
@@ -1558,8 +1562,8 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
             .send_special_key_for_instance(
                 "gpu-box~%7",
                 key,
-                "gpu-box".to_owned(),
-                trainer_instance.clone(),
+                Some("gpu-box".to_owned()),
+                Some(trainer_instance.clone()),
             )
             .await
             .unwrap();
@@ -1570,8 +1574,8 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
             .send_special_key_for_instance(
                 "gpu-box~%8",
                 PaneSpecialKey::Enter,
-                "gpu-box".to_owned(),
-                trainer_instance.clone(),
+                Some("gpu-box".to_owned()),
+                Some(trainer_instance.clone()),
             )
             .await
             .unwrap_err(),
@@ -1579,8 +1583,8 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
             .send_special_key_for_instance(
                 "gpu-box~%7",
                 PaneSpecialKey::Down,
-                "midnight".to_owned(),
-                trainer_instance.clone(),
+                Some("midnight".to_owned()),
+                Some(trainer_instance.clone()),
             )
             .await
             .unwrap_err(),
@@ -1604,6 +1608,7 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
             machine: Some("gpu-box".to_owned()),
             resume_session_id: None,
             memory_max_bytes: None,
+            summarize_pane_id: None,
         })
         .await
         .unwrap();
@@ -1786,6 +1791,7 @@ async fn one_unreachable_machine_never_breaks_local_or_healthy_machines() {
                 machine: Some("dead".to_owned()),
                 resume_session_id: None,
                 memory_max_bytes: None,
+                summarize_pane_id: None,
             })
             .await
             .is_err()
@@ -2022,8 +2028,8 @@ async fn owner_generation_conflicts_remain_conflicts_through_a_coordinator() {
         .send_special_key_for_instance(
             "gpu-box~%7",
             PaneSpecialKey::Enter,
-            "gpu-box".to_owned(),
-            instance_id.clone(),
+            Some("gpu-box".to_owned()),
+            Some(instance_id.clone()),
         )
         .await
         .unwrap_err();

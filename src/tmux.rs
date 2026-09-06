@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     env, fs,
     hash::{DefaultHasher, Hash, Hasher},
     io::Write,
@@ -47,6 +47,9 @@ impl Drop for SocketOverrideRestore {
 
 const MODEL_MENU_TIMEOUT: Duration = Duration::from_secs(4);
 const MODEL_MENU_POLL: Duration = Duration::from_millis(25);
+/// How much pane text a model control reads. A tall pane pushes the harness's
+/// confirmation far above the prompt, so this has to outrun the pane height.
+const MENU_CAPTURE_LINES: usize = 120;
 const CLAUDE_SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
 const CLAUDE_PERMISSION_MODE_FLAG: &str = "--permission-mode";
 const CLAUDE_BYPASS_PERMISSIONS_MODE: &str = "bypassPermissions";
@@ -69,8 +72,55 @@ pub struct ModelObservation {
     pub version: Option<String>,
     pub current: Option<String>,
     pub effort: Option<String>,
+    /// Whether the harness's session-scoped fast mode is on, when observable.
+    pub fast: Option<bool>,
+    /// Whether this pane's harness has refused `/fast` outright, so no fast
+    /// mode can be switched on it however new the installed CLI is.
+    pub fast_unavailable: bool,
     /// The opaque profile-scoped mode chosen by atmux, when available.
     pub mode: Option<String>,
+}
+
+/// The launch controls atmux itself recorded on a pane, independent of any
+/// configured profile mode.
+struct RecordedControls {
+    model: String,
+    effort: Option<String>,
+    service_tier: Option<String>,
+    fast: Option<bool>,
+}
+
+impl RecordedControls {
+    /// Codex asks for its fast mode with a launch-time `service_tier`, so a
+    /// recorded fast state is only reproducible when the recorded tier agrees.
+    /// Claude's fast mode is session-only with no launch flag at all, so a
+    /// Claude pane left fast is never reproducible.
+    fn reproducible(&self) -> bool {
+        match self.fast {
+            Some(true) => self.service_tier.as_deref() == Some("fast"),
+            Some(false) => self.service_tier.is_none(),
+            None => true,
+        }
+    }
+
+    /// Whether relaunching with `mode` reproduces exactly what this pane runs.
+    fn reproduced_by(&self, mode: &ProfileMode) -> bool {
+        mode.model == self.model
+            && mode.effort == self.effort
+            && mode.service_tier == self.service_tier
+    }
+
+    /// A synthetic mode describing the pane as it runs. Its id cannot collide
+    /// with a configured mode id, which is a bare profile-name token.
+    fn into_mode(self) -> ProfileMode {
+        ProfileMode {
+            id: format!("recorded:{}", self.model),
+            label: None,
+            model: self.model,
+            effort: self.effort,
+            service_tier: self.service_tier,
+        }
+    }
 }
 
 /// Marker error for a harness whose interactive picker no longer matches the
@@ -85,6 +135,19 @@ impl std::fmt::Display for UnsupportedModelControl {
 }
 
 impl std::error::Error for UnsupportedModelControl {}
+
+/// Marker error for a harness that answered `/fast` with a refusal: the account
+/// or its organization forbids fast mode, so no retry on this pane can succeed.
+#[derive(Debug)]
+pub struct ClaudeFastUnavailable;
+
+impl std::fmt::Display for ClaudeFastUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("fast mode is disabled for this account or organization")
+    }
+}
+
+impl std::error::Error for ClaudeFastUnavailable {}
 
 /// Marker error for a resume launcher which disappeared or stopped satisfying
 /// the owner-local trust boundary before tmux could be invoked.
@@ -122,7 +185,15 @@ const CLAUDE_MODELS: &[KnownModel] = &[
     },
 ];
 
+/// Codex's `/model` rows as of 0.153.4. The order here is only a fallback for
+/// a pane whose picker cannot be read; the walk itself matches the rendered
+/// row labels, so a vendor reordering never moves the selection to a
+/// neighbouring model.
 const CODEX_MODELS: &[KnownModel] = &[
+    KnownModel {
+        id: "gpt-6-astra",
+        label: "GPT-6 Astra",
+    },
     KnownModel {
         id: "gpt-5.6-sol",
         label: "GPT-5.6 Sol",
@@ -140,16 +211,57 @@ const CODEX_MODELS: &[KnownModel] = &[
         label: "GPT-5.5",
     },
     KnownModel {
-        id: "gpt-5.4",
-        label: "GPT-5.4",
-    },
-    KnownModel {
         id: "gpt-5.4-mini",
         label: "GPT-5.4 Mini",
     },
     KnownModel {
         id: "gpt-5.3-codex-spark",
         label: "GPT-5.3 Codex Spark",
+    },
+];
+
+/// Claude's `/effort` slider, in its displayed order.
+const CLAUDE_EFFORTS: &[KnownModel] = &[
+    KnownModel {
+        id: "low",
+        label: "Low",
+    },
+    KnownModel {
+        id: "medium",
+        label: "Medium",
+    },
+    KnownModel {
+        id: "high",
+        label: "High",
+    },
+    KnownModel {
+        id: "xhigh",
+        label: "Extra high",
+    },
+    KnownModel {
+        id: "max",
+        label: "Max",
+    },
+];
+
+/// Codex's reasoning rows that its `/model` picker selects directly. `max` sits
+/// behind the picker's "More reasoning…" page, so it stays launch-only.
+const CODEX_EFFORTS: &[KnownModel] = &[
+    KnownModel {
+        id: "low",
+        label: "Low",
+    },
+    KnownModel {
+        id: "medium",
+        label: "Medium",
+    },
+    KnownModel {
+        id: "high",
+        label: "High",
+    },
+    KnownModel {
+        id: "xhigh",
+        label: "Extra high",
     },
 ];
 
@@ -1306,12 +1418,27 @@ impl Tmux {
         let effort = Self::output(["show-options", "-p", "-v", "-t", pane_id, "@atmux_effort"])
             .ok()
             .filter(|value| valid_effort_id(value));
+        let fast = Self::output(["show-options", "-p", "-v", "-t", pane_id, "@atmux_fast"])
+            .ok()
+            .and_then(|value| stored_fast(&value));
         let mode = Self::output(["show-options", "-p", "-v", "-t", pane_id, "@atmux_mode"])
             .ok()
             .filter(|value| valid_mode_id(value));
+        let fast_refused = Self::output([
+            "show-options",
+            "-p",
+            "-v",
+            "-t",
+            pane_id,
+            "@atmux_fast_unavailable",
+        ])
+        .is_ok_and(|value| value == "1")
+            || (agent == AgentKind::Claude && claude_fast_refused(content));
         let mut observation =
             observe_model(agent, content, stored.as_deref(), stored_version.as_deref());
         observation.effort = displayed_effort(agent, content).or(effort);
+        observation.fast = displayed_fast(agent, content).or(fast);
+        observation.fast_unavailable = fast_refused;
         observation.mode = mode;
         observation
     }
@@ -1331,7 +1458,229 @@ impl Tmux {
         version: &str,
         mode: &ProfileMode,
     ) -> Result<()> {
-        let model = &mode.model;
+        self.apply_model(
+            pane_id,
+            agent,
+            version,
+            &mode.model,
+            mode.effort.as_deref(),
+            mode.service_tier.is_none(),
+        )?;
+        Self::output(["set-option", "-p", "-t", pane_id, "@atmux_mode", &mode.id])?;
+        Ok(())
+    }
+
+    /// Switches only the model of a running TUI, leaving the reasoning effort
+    /// and fast mode the harness already has.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model is not switchable by this installed
+    /// version, the pane disappears, or tmux rejects a fixed operation.
+    pub fn switch_model_choice(
+        &self,
+        pane_id: &str,
+        agent: AgentKind,
+        version: &str,
+        model: &str,
+    ) -> Result<()> {
+        self.apply_model(pane_id, agent, version, model, None, true)?;
+        Self::forget_recorded_mode(pane_id)
+    }
+
+    /// Switches only the reasoning effort of a running TUI, leaving its model
+    /// and fast mode alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the effort is not switchable by this installed
+    /// version, the pane disappears, or the harness does not confirm.
+    pub fn switch_effort(
+        &self,
+        pane_id: &str,
+        agent: AgentKind,
+        version: &str,
+        effort: &str,
+    ) -> Result<()> {
+        if !known_efforts(agent, version)
+            .iter()
+            .any(|candidate| candidate.id == effort)
+        {
+            return Err(UnsupportedModelControl(format!(
+                "{effort} effort is not switchable by {agent} {version}"
+            ))
+            .into());
+        }
+        match agent {
+            AgentKind::Claude => self.switch_claude_effort(pane_id, effort)?,
+            AgentKind::Codex => self.switch_codex_effort(pane_id, effort)?,
+            AgentKind::Other => {
+                return Err(UnsupportedModelControl(
+                    "effort switching is available only for Claude and Codex panes".to_owned(),
+                )
+                .into());
+            }
+        }
+        Self::output(["set-option", "-p", "-t", pane_id, "@atmux_effort", effort])?;
+        Self::forget_recorded_mode(pane_id)
+    }
+
+    /// Turns the harness's session-scoped fast mode on or off, leaving the
+    /// model and reasoning effort alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the installed version has no verified fast-mode
+    /// control, the account is not allowed fast mode, the pane disappears, or
+    /// the harness does not confirm.
+    pub fn switch_fast(
+        &self,
+        pane_id: &str,
+        agent: AgentKind,
+        version: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        if !fast_toggle_verified(agent, version) {
+            return Err(UnsupportedModelControl(format!(
+                "{agent} {version} has no verified session fast-mode control"
+            ))
+            .into());
+        }
+        match agent {
+            AgentKind::Claude => {
+                self.switch_claude_fast(pane_id, enabled)
+                    .inspect_err(|error| {
+                        // A refused `/fast` left the session as it was, so the pane
+                        // records fast off and remembers that asking again is futile.
+                        if error.is::<ClaudeFastUnavailable>() {
+                            Self::record_fast_unavailable(pane_id);
+                        }
+                    })?;
+            }
+            AgentKind::Codex => self.switch_codex_fast(pane_id, enabled)?,
+            AgentKind::Other => {
+                return Err(UnsupportedModelControl(
+                    "fast mode is available only for Claude and Codex panes".to_owned(),
+                )
+                .into());
+            }
+        }
+        let stored = if enabled { "on" } else { "off" };
+        Self::output(["set-option", "-p", "-t", pane_id, "@atmux_fast", stored])?;
+        // Codex's fast mode is its service tier, which is also how a relaunch
+        // asks for it. Claude's is session-only and has no launch flag, so
+        // nothing durable is claimed for it here.
+        if agent == AgentKind::Codex {
+            if enabled {
+                Self::output([
+                    "set-option",
+                    "-p",
+                    "-t",
+                    pane_id,
+                    "@atmux_service_tier",
+                    "fast",
+                ])?;
+            } else {
+                Self::output([
+                    "set-option",
+                    "-p",
+                    "-u",
+                    "-t",
+                    pane_id,
+                    "@atmux_service_tier",
+                ])?;
+            }
+        }
+        Self::forget_recorded_mode(pane_id)
+    }
+
+    /// Remembers that this pane's harness refuses fast mode outright, so the
+    /// dashboard stops offering a control that can only ever fail. The refusal
+    /// also settles the pane's fast mode as off, since nothing was switched.
+    /// Best effort: a pane that vanished mid-refusal has nothing to record on.
+    fn record_fast_unavailable(pane_id: &str) {
+        drop(Self::output([
+            "set-option",
+            "-p",
+            "-t",
+            pane_id,
+            "@atmux_fast",
+            "off",
+        ]));
+        drop(Self::output([
+            "set-option",
+            "-p",
+            "-t",
+            pane_id,
+            "@atmux_fast_unavailable",
+            "1",
+        ]));
+    }
+
+    /// An independently applied model, effort, or fast change no longer proves
+    /// which configured profile mode this pane is running.
+    fn forget_recorded_mode(pane_id: &str) -> Result<()> {
+        Self::output(["set-option", "-p", "-u", "-t", pane_id, "@atmux_mode"]).map(|_| ())
+    }
+
+    /// Re-derives which configured profile mode a pane runs once its controls
+    /// were switched one at a time. The mode is recorded again only when the
+    /// pane's own recorded controls reproduce one exactly, so a split switch
+    /// leaves maintenance able to relaunch the pane as it is actually running.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when tmux rejects reading or writing the pane options.
+    pub(crate) fn reconcile_recorded_mode(pane_id: &str, modes: &[ProfileMode]) -> Result<()> {
+        let Some(recorded) = Self::recorded_pane_controls(pane_id)? else {
+            return Self::forget_recorded_mode(pane_id);
+        };
+        match modes.iter().find(|mode| recorded.reproduced_by(mode)) {
+            Some(mode) => {
+                Self::output(["set-option", "-p", "-t", pane_id, "@atmux_mode", &mode.id])
+                    .map(|_| ())
+            }
+            None => Self::forget_recorded_mode(pane_id),
+        }
+    }
+
+    /// The launch state atmux recorded on a pane, as a mode a relaunch can use
+    /// when no configured mode is recorded. Returns `None` when the recording
+    /// is incomplete or describes a state no launch flag can reproduce.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when tmux rejects reading the pane options.
+    pub(crate) fn recorded_pane_mode(pane_id: &str) -> Result<Option<ProfileMode>> {
+        Ok(Self::recorded_pane_controls(pane_id)?.map(RecordedControls::into_mode))
+    }
+
+    fn recorded_pane_controls(pane_id: &str) -> Result<Option<RecordedControls>> {
+        let read = |option: &str| -> Result<Option<String>> {
+            let value = Self::output(["show-options", "-p", "-q", "-v", "-t", pane_id, option])?;
+            Ok((!value.is_empty()).then_some(value))
+        };
+        let Some(model) = read("@atmux_model")?.filter(|value| valid_model_id(value)) else {
+            return Ok(None);
+        };
+        let recorded = RecordedControls {
+            model,
+            effort: read("@atmux_effort")?.filter(|value| valid_effort_id(value)),
+            service_tier: read("@atmux_service_tier")?.filter(|value| value == "fast"),
+            fast: read("@atmux_fast")?.and_then(|value| stored_fast(&value)),
+        };
+        Ok(recorded.reproducible().then_some(recorded))
+    }
+
+    fn apply_model(
+        &self,
+        pane_id: &str,
+        agent: AgentKind,
+        version: &str,
+        model: &str,
+        effort: Option<&str>,
+        session_scoped_tier: bool,
+    ) -> Result<()> {
         if !valid_model_id(model)
             || !known_models(agent, version)
                 .iter()
@@ -1343,20 +1692,16 @@ impl Tmux {
             .into());
         }
         match agent {
-            AgentKind::Claude
-                if mode.service_tier.is_none()
-                    && mode.effort.as_deref().is_none_or(valid_claude_effort) =>
-            {
+            AgentKind::Claude if session_scoped_tier && effort.is_none_or(valid_claude_effort) => {
                 self.switch_claude_model(pane_id, model)?;
-                if let Some(effort) = mode.effort.as_deref() {
+                if let Some(effort) = effort {
                     self.switch_claude_effort(pane_id, effort)?;
                 }
             }
             AgentKind::Codex
-                if mode.service_tier.is_none()
-                    && mode.effort.as_deref().is_none_or(|effort| effort != "none") =>
+                if session_scoped_tier && effort.is_none_or(|effort| effort != "none") =>
             {
-                self.switch_codex_model(pane_id, model, mode.effort.as_deref())?;
+                self.switch_codex_model(pane_id, model, effort)?;
             }
             AgentKind::Claude | AgentKind::Codex => {
                 return Err(UnsupportedModelControl(
@@ -1372,8 +1717,7 @@ impl Tmux {
             }
         }
         Self::output(["set-option", "-p", "-t", pane_id, "@atmux_model", model])?;
-        Self::output(["set-option", "-p", "-t", pane_id, "@atmux_mode", &mode.id])?;
-        if let Some(effort) = &mode.effort {
+        if let Some(effort) = effort {
             Self::output(["set-option", "-p", "-t", pane_id, "@atmux_effort", effort])?;
         }
         Ok(())
@@ -1381,11 +1725,14 @@ impl Tmux {
 
     fn switch_claude_model(&self, pane_id: &str, model: &str) -> Result<()> {
         self.send_text(pane_id, "/model", true)?;
-        let menu = wait_for_capture(pane_id, |content| {
-            menu_selection(content, "Select model", CLAUDE_MODELS)
-        })?;
-        let target = model_index(CLAUDE_MODELS, model)?;
-        move_menu_selection(pane_id, menu, target)?;
+        let aimed = wait_for_capture(pane_id, |content| {
+            model_menu(content, "Select model", CLAUDE_MODELS)
+        })
+        .and_then(|menu| aim_model_menu(pane_id, "Select model", CLAUDE_MODELS, model, menu));
+        if let Err(error) = aimed {
+            Self::close_picker(pane_id);
+            return Err(error);
+        }
         // Claude's `s` action changes only this running session. Enter would
         // also rewrite the user's default for every future session.
         Self::output(["send-keys", "-t", pane_id, "s"])?;
@@ -1393,12 +1740,20 @@ impl Tmux {
             claude_confirmation(content, model).then_some(())
         });
         if let Err(error) = confirmed {
+            Self::close_picker(pane_id);
             return Err(UnsupportedModelControl(format!(
                 "Claude did not confirm its session-only model change: {error:#}"
             ))
             .into());
         }
         Ok(())
+    }
+
+    /// Dismisses a picker a failed switch may have left open, so the pane goes
+    /// back to its prompt instead of swallowing the user's next keystrokes.
+    /// Esc on an already-closed prompt is harmless, so failure is ignored.
+    fn close_picker(pane_id: &str) {
+        drop(Self::output(["send-keys", "-t", pane_id, "Escape"]));
     }
 
     fn switch_claude_effort(&self, pane_id: &str, effort: &str) -> Result<()> {
@@ -1434,35 +1789,128 @@ impl Tmux {
         model: &str,
         desired_effort: Option<&str>,
     ) -> Result<()> {
-        let before = self.capture(pane_id, 80).unwrap_or_default();
+        let before = self
+            .capture(pane_id, MENU_CAPTURE_LINES)
+            .unwrap_or_default();
         let effort = desired_effort
             .map(str::to_owned)
             .or_else(|| codex_effort(&before));
         self.send_text(pane_id, "/model", true)?;
-        let menu = wait_for_capture(pane_id, |content| {
-            menu_selection(content, "Select Model and Effort", CODEX_MODELS)
-        })?;
-        let target = model_index(CODEX_MODELS, model)?;
-        move_menu_selection(pane_id, menu, target)?;
-        Self::output(["send-keys", "-t", pane_id, "Enter"])?;
-
-        let effort_menu = wait_for_capture(pane_id, |content| {
-            reason_menu_selection(content, effort.as_deref())
-        })?;
-        if let ReasonMenu::Move { current, target } = effort_menu {
-            move_menu_selection(pane_id, current, target)?;
+        let aimed = (|| {
+            let heading = "Select Model and Effort";
+            let menu = wait_for_capture(pane_id, |content| {
+                model_menu(content, heading, CODEX_MODELS)
+            })?;
+            aim_model_menu(pane_id, heading, CODEX_MODELS, model, menu)?;
+            Self::output(["send-keys", "-t", pane_id, "Enter"])?;
+            let effort_menu = wait_for_capture(pane_id, |content| {
+                reason_menu_selection(content, effort.as_deref())
+            })?;
+            if let ReasonMenu::Move { current, target } = effort_menu {
+                move_menu_selection(pane_id, current, target)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = aimed {
+            Self::close_picker(pane_id);
+            return Err(error);
         }
         Self::output(["send-keys", "-t", pane_id, "Enter"])?;
         let confirmed = wait_for_capture(pane_id, |content| {
             codex_confirmation(content, model).then_some(())
         });
         if let Err(error) = confirmed {
+            Self::close_picker(pane_id);
             return Err(UnsupportedModelControl(format!(
                 "Codex did not confirm its model change: {error:#}"
             ))
             .into());
         }
         Ok(())
+    }
+
+    /// Codex reaches its reasoning levels only through `/model`. Confirming the
+    /// already-highlighted row keeps the running model, so the second page of
+    /// the same picker changes the effort on its own.
+    fn switch_codex_effort(&self, pane_id: &str, effort: &str) -> Result<()> {
+        self.send_text(pane_id, "/model", true)?;
+        wait_for_capture(pane_id, |content| {
+            content.contains("Select Model and Effort").then_some(())
+        })?;
+        Self::output(["send-keys", "-t", pane_id, "Enter"])?;
+        let effort_menu = wait_for_capture(pane_id, |content| {
+            reason_menu_selection(content, Some(effort))
+        })?;
+        if let ReasonMenu::Move { current, target } = effort_menu {
+            move_menu_selection(pane_id, current, target)?;
+        }
+        Self::output(["send-keys", "-t", pane_id, "Enter"])?;
+        wait_for_capture(pane_id, |content| {
+            (codex_effort(content).as_deref() == Some(effort)).then_some(())
+        })
+        .map_err(|error| {
+            UnsupportedModelControl(format!(
+                "Codex did not confirm its effort change: {error:#}"
+            ))
+            .into()
+        })
+    }
+
+    /// Claude's `/fast` accepts an explicit `on`/`off` argument, so the desired
+    /// state is stated rather than toggled blind.
+    ///
+    /// Only the settled `Fast mode ON`/`Fast mode OFF` line counts as done: the
+    /// in-flight `Turning fast mode off…` notice names the same words while the
+    /// change may still be abandoned, and an account whose organization forbids
+    /// fast mode answers with a refusal that changes nothing at all. Reporting
+    /// either as success recorded a fast mode the session never had.
+    fn switch_claude_fast(&self, pane_id: &str, enabled: bool) -> Result<()> {
+        let command = if enabled { "/fast on" } else { "/fast off" };
+        self.send_text(pane_id, command, true)?;
+        let settled = wait_for_capture(pane_id, |content| {
+            let answered = output_after_command(content, command);
+            if claude_fast_refused(answered) {
+                return Some(Err(ClaudeFastUnavailable));
+            }
+            (claude_fast(answered) == Some(enabled)).then_some(Ok(()))
+        })
+        .map_err(|error| -> anyhow::Error {
+            UnsupportedModelControl(format!(
+                "Claude did not confirm its fast-mode change: {error:#}"
+            ))
+            .into()
+        })?;
+        settled.map_err(Into::into)
+    }
+
+    /// Codex's `/fast` takes no argument and flips the session service tier, so
+    /// the pane's visible state decides whether it is sent at all.
+    fn switch_codex_fast(&self, pane_id: &str, enabled: bool) -> Result<()> {
+        let before = self.capture(pane_id, 80).unwrap_or_default();
+        let current = codex_fast(&before).ok_or_else(|| {
+            UnsupportedModelControl("Codex's fast mode is not visible in this pane".to_owned())
+        })?;
+        if current == enabled {
+            return Ok(());
+        }
+        self.send_text(pane_id, "/fast", true)?;
+        let confirmation = if enabled {
+            "service tier set to priority"
+        } else {
+            "service tier set to default"
+        };
+        wait_for_capture(pane_id, |content| {
+            content
+                .to_ascii_lowercase()
+                .contains(confirmation)
+                .then_some(())
+        })
+        .map_err(|error| {
+            UnsupportedModelControl(format!(
+                "Codex did not confirm its fast-mode change: {error:#}"
+            ))
+            .into()
+        })
     }
 
     #[must_use]
@@ -1535,6 +1983,43 @@ pub fn known_models(agent: AgentKind, version: &str) -> &'static [KnownModel] {
         AgentKind::Claude if claude_picker_verified(version) => CLAUDE_MODELS,
         AgentKind::Codex if codex_picker_verified(version) => CODEX_MODELS,
         AgentKind::Claude | AgentKind::Codex | AgentKind::Other => &[],
+    }
+}
+
+/// Reasoning levels this installed harness version can be switched to on its
+/// own. Unknown versions intentionally return no controls.
+#[must_use]
+pub fn known_efforts(agent: AgentKind, version: &str) -> &'static [KnownModel] {
+    match agent {
+        AgentKind::Claude if claude_picker_verified(version) => CLAUDE_EFFORTS,
+        AgentKind::Codex if codex_picker_verified(version) => CODEX_EFFORTS,
+        AgentKind::Claude | AgentKind::Codex | AgentKind::Other => &[],
+    }
+}
+
+/// Whether the installed harness exposes a session-scoped fast mode atmux has
+/// verified. Claude answers `/fast on|off` from 2.1.261; Codex's argument-free
+/// `/fast` flips its service tier between default and priority from 0.153.4.
+#[must_use]
+pub fn fast_toggle_verified(agent: AgentKind, version: &str) -> bool {
+    let mut parts = version.split('.');
+    match (
+        agent,
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (AgentKind::Claude, Some("2"), Some("1"), Some(patch), None) => {
+            patch.parse::<u32>().is_ok_and(|patch| patch >= 261)
+        }
+        (AgentKind::Codex, Some("0"), Some(minor), Some(patch), None) => {
+            match (minor.parse::<u32>(), patch.parse::<u32>()) {
+                (Ok(minor), Ok(patch)) => (minor, patch) >= (153, 4),
+                _ => false,
+            }
+        }
+        _ => false,
     }
 }
 
@@ -1759,6 +2244,14 @@ fn valid_effort_id(effort: &str) -> bool {
     valid_codex_effort(effort) || valid_claude_effort(effort) || effort == "ultracode"
 }
 
+fn stored_fast(value: &str) -> Option<bool> {
+    match value {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
+    }
+}
+
 fn observe_model(
     agent: AgentKind,
     content: &str,
@@ -1772,8 +2265,7 @@ fn observe_model(
     ModelObservation {
         version,
         current,
-        effort: None,
-        mode: None,
+        ..ModelObservation::default()
     }
 }
 
@@ -1890,6 +2382,54 @@ fn codex_effort(content: &str) -> Option<String> {
     })
 }
 
+/// Codex prints its service tier as a `fast` word beside the model in its
+/// status footer, so the absence of that word on a model line means off.
+fn codex_fast(content: &str) -> Option<bool> {
+    content.lines().rev().find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower
+            .contains("gpt-")
+            .then(|| lower.split_whitespace().any(|word| word == "fast"))
+    })
+}
+
+/// Claude reports fast mode as a transcript line rather than in its status bar,
+/// and only its settled `Fast mode ON`/`Fast mode OFF` line states the result.
+/// The casing is what separates it from the in-flight `Turning fast mode off…`
+/// notice and from a `Fast mode unavailable: …` refusal, both of which name the
+/// feature in prose without ever having changed it.
+fn claude_fast(content: &str) -> Option<bool> {
+    content.lines().rev().find_map(claude_fast_line)
+}
+
+fn claude_fast_line(line: &str) -> Option<bool> {
+    if line.contains("Fast mode ON") {
+        Some(true)
+    } else if line.contains("Fast mode OFF") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Whether the pane says fast mode cannot be switched at all — an account or
+/// organization policy refusal, which leaves the session's fast mode off.
+fn claude_fast_refused(content: &str) -> bool {
+    content.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("fast mode unavailable")
+            || (lower.contains("fast mode") && lower.contains("has been disabled"))
+    })
+}
+
+fn displayed_fast(agent: AgentKind, content: &str) -> Option<bool> {
+    match agent {
+        AgentKind::Claude => claude_fast(content),
+        AgentKind::Codex => codex_fast(content),
+        AgentKind::Other => None,
+    }
+}
+
 fn displayed_effort(agent: AgentKind, content: &str) -> Option<String> {
     let values: &[&str] = match agent {
         AgentKind::Claude => &["ultracode", "xhigh", "high", "medium", "low", "max"],
@@ -1940,6 +2480,214 @@ fn menu_selection(content: &str, heading: &str, models: &[KnownModel]) -> Option
         }
     }
     selected
+}
+
+/// One rendered picker page: the numbered rows the harness is currently
+/// drawing, keyed by their own row numbers, plus the row it has highlighted and
+/// how many further rows it says it is scrolling out of sight. A short pane
+/// shows a window onto the list rather than all of it, so the page rarely
+/// starts at row 1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PickerPage {
+    /// `(row number, label)` in drawn order. Row numbers are the picker's own,
+    /// so they stay stable while the window scrolls under the cursor.
+    rows: Vec<(usize, String)>,
+    /// The row number the harness highlighted.
+    selected: usize,
+    /// Rows the picker reports it is not drawing, from its `+N models` footer.
+    hidden: usize,
+}
+
+/// How the pane's model picker is being walked. Reading the drawn rows is the
+/// only way an index walk stays correct across vendor model-list changes; the
+/// compiled-in table is a fallback for a picker that cannot be parsed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ModelMenu {
+    Rendered(PickerPage),
+    Table(usize),
+}
+
+/// Splits `❯ 2. gpt-5.6-sol (current)  Reliable…` into its row number, whether
+/// the harness highlighted it, and its leading label column.
+/// A scrolling picker prefixes its first and last drawn rows with an arrow
+/// pointing at the rows it is hiding, so those glyphs are decoration too.
+fn picker_row(line: &str) -> Option<(usize, bool, &str)> {
+    let trimmed = line
+        .trim_start_matches([' ', '│', '┃', '|', '╭', '╰', '\t', '↑', '↓'])
+        .trim_start();
+    let marked = trimmed.starts_with(['❯', '›', '>', '•', '*']);
+    let rest = trimmed
+        .trim_start_matches(['❯', '›', '>', '•', '*'])
+        .trim_start();
+    let (number, tail) = rest.split_once(". ")?;
+    let number = number.parse::<usize>().ok()?;
+    // Pickers separate the row name from its description column with runs of
+    // spaces, so the name is everything before the first such run.
+    let label = tail.split("  ").next().unwrap_or(tail).trim();
+    (!label.is_empty()).then_some((number, marked, label))
+}
+
+/// Reads a picker's rows straight from the pane. Only the last contiguous run
+/// of consecutively numbered rows counts, so scrollback that happens to contain
+/// numbered lines cannot be mistaken for the menu. The run may start at any
+/// number: a pane too short for the whole list scrolls it, and the drawn window
+/// then begins partway down.
+fn picker_page(content: &str, heading: &str) -> Option<PickerPage> {
+    if !content.contains(heading) {
+        return None;
+    }
+    let mut rows: Vec<(usize, String)> = Vec::new();
+    let mut selected = None;
+    for line in content.lines() {
+        let Some((number, marked, label)) = picker_row(line) else {
+            continue;
+        };
+        if rows.last().is_some_and(|(last, _)| number != last + 1) {
+            rows.clear();
+            selected = None;
+        }
+        if marked {
+            selected = Some(number);
+        }
+        rows.push((number, label.to_owned()));
+    }
+    let selected = selected?;
+    (rows.len() > 1).then(|| PickerPage {
+        hidden: picker_hidden_rows(content),
+        rows,
+        selected,
+    })
+}
+
+/// The `… +2 models` footer a scrolling picker draws under its window, as the
+/// number of rows it is withholding. Absent means the whole list is on screen.
+fn picker_hidden_rows(content: &str) -> usize {
+    content
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let (count, tail) = line
+                .trim_start_matches([' ', '│', '┃', '|', '\t', '…', '.'])
+                .trim()
+                .strip_prefix('+')?
+                .split_once(' ')?;
+            if !tail.trim().eq_ignore_ascii_case("models") {
+                return None;
+            }
+            count.parse::<usize>().ok()
+        })
+        .unwrap_or(0)
+}
+
+/// Compares model names without the punctuation and case a picker may restyle.
+fn normalized_model_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+/// The known model a rendered row names, chosen by the longest matching name so
+/// a row for `gpt-5.4-mini` can never resolve to the shorter `gpt-5.4`.
+fn picker_row_model<'a>(row: &str, models: &'a [KnownModel]) -> Option<&'a KnownModel> {
+    let row = normalized_model_name(row);
+    models
+        .iter()
+        .filter_map(|model| {
+            [model.id, model.label]
+                .into_iter()
+                .map(normalized_model_name)
+                .filter(|name| !name.is_empty() && row.starts_with(name.as_str()))
+                .map(|name| name.len())
+                .max()
+                .map(|length| (length, model))
+        })
+        .max_by_key(|(length, _)| *length)
+        .map(|(_, model)| model)
+}
+
+fn model_menu(content: &str, heading: &str, models: &[KnownModel]) -> Option<ModelMenu> {
+    picker_page(content, heading)
+        .map(ModelMenu::Rendered)
+        .or_else(|| menu_selection(content, heading, models).map(ModelMenu::Table))
+}
+
+/// The number of the drawn row naming `model`, when the picker is showing it.
+fn picker_target_row(page: &PickerPage, models: &[KnownModel], model: &str) -> Option<usize> {
+    page.rows.iter().find_map(|(number, label)| {
+        picker_row_model(label, models)
+            .is_some_and(|candidate| candidate.id == model)
+            .then_some(*number)
+    })
+}
+
+/// Walks a rendered picker until it highlights the row naming `model`, one
+/// keypress and one fresh capture at a time.
+///
+/// A pane too short for the whole list scrolls it under its own cursor, so the
+/// drawn window — and which rows are readable at all — changes with every step.
+/// Jumping a precomputed number of rows blind cannot survive that; re-reading
+/// after each keypress can. A target that is not drawn yet is scrolled into
+/// view first, and the picker's `+N models` footer bounds how far that search
+/// runs before the model is declared absent.
+fn aim_rendered_picker(
+    pane_id: &str,
+    heading: &str,
+    models: &[KnownModel],
+    model: &str,
+    page: PickerPage,
+) -> Result<()> {
+    let mut page = page;
+    let mut total = page.rows.len() + page.hidden;
+    let mut scanned: BTreeSet<usize> = BTreeSet::new();
+    for _ in 0..(total * 3 + 12) {
+        total = total.max(page.rows.len() + page.hidden);
+        scanned.extend(page.rows.iter().map(|(number, _)| *number));
+        let target = picker_target_row(&page, models, model);
+        if target == Some(page.selected) {
+            return Ok(());
+        }
+        // Every row has been read and none named the model, so scrolling
+        // further would only cycle the list again.
+        if target.is_none() && scanned.len() >= total {
+            return Err(
+                UnsupportedModelControl(format!("{model} is not offered by this picker")).into(),
+            );
+        }
+        // A row above the highlight is reached upward. Everything else — a row
+        // below it, or one the window is not drawing yet — is reached by
+        // scrolling down until it comes into view.
+        let key = if target.is_some_and(|target| target < page.selected) {
+            "Up"
+        } else {
+            "Down"
+        };
+        let moved_from = page.selected;
+        Tmux::output(["send-keys", "-t", pane_id, key])?;
+        // Wait for the highlight to actually move before deciding again;
+        // reading the pre-keypress frame back would overshoot the target.
+        page = wait_for_capture(pane_id, |content| {
+            picker_page(content, heading).filter(|page| page.selected != moved_from)
+        })?;
+    }
+    Err(UnsupportedModelControl(format!("this picker would not settle on {model}")).into())
+}
+
+/// Puts a menu's highlight on `model`, whichever way the menu could be read.
+fn aim_model_menu(
+    pane_id: &str,
+    heading: &str,
+    models: &[KnownModel],
+    model: &str,
+    menu: ModelMenu,
+) -> Result<()> {
+    match menu {
+        ModelMenu::Rendered(page) => aim_rendered_picker(pane_id, heading, models, model, page),
+        ModelMenu::Table(current) => {
+            move_menu_selection(pane_id, current, model_index(models, model)?)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1998,7 +2746,7 @@ fn move_menu_selection(pane_id: &str, current: usize, target: usize) -> Result<(
 fn wait_for_capture<T>(pane_id: &str, mut parse: impl FnMut(&str) -> Option<T>) -> Result<T> {
     let deadline = Instant::now() + MODEL_MENU_TIMEOUT;
     loop {
-        let content = Tmux.capture(pane_id, 120)?;
+        let content = Tmux.capture(pane_id, MENU_CAPTURE_LINES)?;
         if let Some(value) = parse(&content) {
             return Ok(value);
         }
@@ -2012,8 +2760,40 @@ fn wait_for_capture<T>(pane_id: &str, mut parse: impl FnMut(&str) -> Option<T>) 
     }
 }
 
+/// The pane text a slash command produced: everything below the harness's last
+/// echo of it, or the whole capture when no echo is on screen.
+///
+/// These TUIs run on the alternate screen and keep no scrollback, so a capture
+/// is only what is currently drawn and two captures cannot be diffed to find
+/// what is new — the same line simply scrolls upward. The command's own echo is
+/// the one anchor that ties a result line to the command that caused it.
+fn output_after_command<'a>(content: &'a str, command: &str) -> &'a str {
+    let mut start = 0;
+    let mut offset = 0;
+    for line in content.split_inclusive('\n') {
+        offset += line.len();
+        if echoes_command(line, command) {
+            start = offset;
+        }
+    }
+    &content[start..]
+}
+
+/// Whether a drawn line is the harness echoing exactly this command back, past
+/// whatever prompt marker and box rule it draws around it.
+fn echoes_command(line: &str, command: &str) -> bool {
+    line.trim_end()
+        .trim_start_matches([' ', '❯', '›', '>', '│', '┃', '|', '\t'])
+        .trim_start()
+        == command
+}
+
+/// Whether the pane confirms a session-only switch to `model`.
+///
+/// A tall pane leaves the confirmation dozens of lines above the prompt, so
+/// everything the command printed is scanned rather than the last few rows.
 fn claude_confirmation(content: &str, model: &str) -> bool {
-    content.lines().rev().take(20).any(|line| {
+    output_after_command(content, "/model").lines().any(|line| {
         line.contains("Set model to ")
             && line.contains("for this session only")
             && canonical_claude_model(line).as_deref() == Some(model)
@@ -2021,7 +2801,7 @@ fn claude_confirmation(content: &str, model: &str) -> bool {
 }
 
 fn codex_confirmation(content: &str, model: &str) -> bool {
-    content.lines().rev().take(20).any(|line| {
+    output_after_command(content, "/model").lines().any(|line| {
         line.split_once("Model changed to ")
             .and_then(|(_, tail)| tail.split_whitespace().next())
             == Some(model)
@@ -3922,6 +4702,8 @@ mod tests {
                 version: Some("2.1.226".to_owned()),
                 current: Some("haiku".to_owned()),
                 effort: None,
+                fast: None,
+                fast_unavailable: false,
                 mode: None,
             }
         );
@@ -3932,6 +4714,8 @@ mod tests {
                 version: Some("0.147.0".to_owned()),
                 current: Some("gpt-5.6-luna".to_owned()),
                 effort: None,
+                fast: None,
+                fast_unavailable: false,
                 mode: None,
             }
         );
@@ -3961,6 +4745,87 @@ mod tests {
         for model in ["", "gpt 5", "gpt;touch-pwned", "$(id)", "/model"] {
             assert!(!valid_model_id(model));
         }
+    }
+
+    #[test]
+    fn effort_and_fast_controls_are_versioned_independently_of_the_model_list() {
+        assert_eq!(
+            known_efforts(AgentKind::Claude, "2.1.261")
+                .iter()
+                .map(|effort| effort.id)
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        // Codex reaches `max` only through its "More reasoning…" page, so the
+        // switchable rows stop at xhigh.
+        assert_eq!(
+            known_efforts(AgentKind::Codex, "0.153.4")
+                .iter()
+                .map(|effort| effort.id)
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high", "xhigh"]
+        );
+        assert!(known_efforts(AgentKind::Claude, "2.1.223").is_empty());
+        assert!(known_efforts(AgentKind::Other, "0.153.4").is_empty());
+
+        assert!(fast_toggle_verified(AgentKind::Claude, "2.1.261"));
+        assert!(!fast_toggle_verified(AgentKind::Claude, "2.1.260"));
+        assert!(fast_toggle_verified(AgentKind::Codex, "0.153.4"));
+        assert!(fast_toggle_verified(AgentKind::Codex, "0.154.0"));
+        assert!(!fast_toggle_verified(AgentKind::Codex, "0.153.3"));
+        assert!(!fast_toggle_verified(AgentKind::Codex, "1.0.0"));
+        assert!(!fast_toggle_verified(AgentKind::Other, "0.153.4"));
+    }
+
+    #[test]
+    fn fast_mode_is_read_from_each_harness_own_wording() {
+        let codex_on = "│ >_ OpenAI Codex (v0.153.4) │\n  gpt-5.6-sol xhigh fast · /home/ryan\n";
+        let codex_off = "│ >_ OpenAI Codex (v0.153.4) │\n  gpt-5.6-sol xhigh · /home/ryan\n";
+        assert_eq!(displayed_fast(AgentKind::Codex, codex_on), Some(true));
+        assert_eq!(displayed_fast(AgentKind::Codex, codex_off), Some(false));
+        assert_eq!(displayed_fast(AgentKind::Codex, "no model line"), None);
+
+        assert_eq!(
+            displayed_fast(AgentKind::Claude, "  ⎿  Fast mode ON\n"),
+            Some(true)
+        );
+        assert_eq!(
+            displayed_fast(AgentKind::Claude, "  ⎿  Kept Fast mode OFF\n"),
+            Some(false)
+        );
+        assert_eq!(displayed_fast(AgentKind::Claude, "Sonnet 5\n"), None);
+        assert_eq!(displayed_fast(AgentKind::Other, codex_on), None);
+
+        // The in-flight notice names the same words while the change can still
+        // be abandoned, so it must not settle the state.
+        assert_eq!(
+            displayed_fast(
+                AgentKind::Claude,
+                "  ⎿  Fast mode ON\n  Turning fast mode off… (Esc to cancel)\n"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            displayed_fast(
+                AgentKind::Claude,
+                "  Turning fast mode on… (Esc to cancel)\n"
+            ),
+            None
+        );
+
+        // A refusal changed nothing at all: reporting it as fast mode on
+        // recorded a session state the harness never entered.
+        let refusal = concat!(
+            "❯ /fast on\n",
+            "  ⎿  Fast mode unavailable: Fast mode has been disabled by your organization\n",
+        );
+        assert_eq!(displayed_fast(AgentKind::Claude, refusal), None);
+        assert!(claude_fast_refused(refusal));
+        assert!(!claude_fast_refused("  ⎿  Fast mode ON\n"));
+
+        assert_eq!(stored_fast("on"), Some(true));
+        assert_eq!(stored_fast("off"), Some(false));
+        assert_eq!(stored_fast("maybe"), None);
     }
 
     #[test]
@@ -4070,11 +4935,11 @@ mod tests {
 
         let codex = concat!(
             "Select Model and Effort\n",
-            "  1. gpt-5.6-sol (default)\n",
-            "› 2. gpt-5.6-terra (current)\n",
-            "  3. gpt-5.6-luna\n",
-            "  4. gpt-5.5\n",
-            "  5. gpt-5.4\n",
+            "  1. gpt-6-astra\n",
+            "› 2. gpt-5.6-sol (current)\n",
+            "  3. gpt-5.6-terra\n",
+            "  4. gpt-5.6-luna\n",
+            "  5. gpt-5.5\n",
             "  6. gpt-5.4-mini\n",
             "  7. gpt-5.3-codex-spark\n",
         );
@@ -4082,6 +4947,270 @@ mod tests {
             menu_selection(codex, "Select Model and Effort", CODEX_MODELS),
             Some(1)
         );
+    }
+
+    /// Verbatim rows captured from the installed codex 0.153.4 and claude
+    /// 2.1.261 `/model` pickers.
+    const LIVE_CODEX_PICKER: &str = concat!(
+        "  Select Model and Effort\n",
+        "  Access legacy models by running codex -m <model_name> or in your config.toml\n",
+        "\n",
+        "  1. gpt-6-astra (default)  Our most capable model for complex, demanding work.\n",
+        "› 2. gpt-5.6-sol (current)  Reliable agentic workhorse for everyday tasks.\n",
+        "  3. gpt-5.6-terra          Balanced agentic coding model for everyday work.\n",
+        "  4. gpt-5.6-luna           Fast and affordable agentic coding model.\n",
+        "  5. gpt-5.5                Proven previous-generation model for coding and general work.\n",
+        "  6. gpt-5.4-mini           Small, fast, and cost-efficient model for simpler coding tasks.\n",
+        "  7. gpt-5.3-codex-spark    Ultra-fast coding model.\n",
+        "\n",
+        "  Press enter to confirm or esc to go back\n",
+    );
+
+    const LIVE_CLAUDE_PICKER: &str = concat!(
+        "  Select model\n",
+        "  Switch between Claude models. Your pick becomes the default for new sessions.\n",
+        "\n",
+        "    1. Default (recommended)  Opus 5 with 1M context · Best for everyday tasks\n",
+        "  ❯ 2. Opus (1M context) ✔    Opus 5 with 1M context · Best for everyday tasks\n",
+        "    3. Fable                  Fable 5.1 · Most capable for your hardest tasks\n",
+        "    4. Sonnet                 Sonnet 5 · Efficient for routine tasks\n",
+        "    5. Haiku                  Haiku 4.5 · Fastest for quick answers\n",
+        "\n",
+        "  ◉ xHigh effort ←/→ to adjust\n",
+        "\n",
+        "  Enter to set as default · s to use this session only · Esc to cancel\n",
+    );
+
+    fn rendered(menu: ModelMenu) -> PickerPage {
+        match menu {
+            ModelMenu::Rendered(page) => page,
+            ModelMenu::Table(index) => panic!("expected a rendered page, got table row {index}"),
+        }
+    }
+
+    #[test]
+    fn model_pickers_are_walked_by_their_rendered_rows() {
+        let codex = rendered(
+            model_menu(LIVE_CODEX_PICKER, "Select Model and Effort", CODEX_MODELS).unwrap(),
+        );
+        assert_eq!(codex.selected, 2);
+        for (model, row) in [
+            ("gpt-6-astra", 1),
+            ("gpt-5.6-sol", 2),
+            ("gpt-5.5", 5),
+            // The longer id must win over the shorter name it starts with.
+            ("gpt-5.4-mini", 6),
+            ("gpt-5.3-codex-spark", 7),
+        ] {
+            assert_eq!(
+                picker_target_row(&codex, CODEX_MODELS, model),
+                Some(row),
+                "codex row for {model}"
+            );
+        }
+        // A model this build dropped is refused rather than mis-selected.
+        assert_eq!(picker_target_row(&codex, CODEX_MODELS, "gpt-5.4"), None);
+
+        let claude =
+            rendered(model_menu(LIVE_CLAUDE_PICKER, "Select model", CLAUDE_MODELS).unwrap());
+        assert_eq!(claude.selected, 2);
+        for (model, row) in [
+            ("default", 1),
+            ("opus", 2),
+            ("fable", 3),
+            ("sonnet", 4),
+            ("haiku", 5),
+        ] {
+            assert_eq!(
+                picker_target_row(&claude, CLAUDE_MODELS, model),
+                Some(row),
+                "claude row for {model}"
+            );
+        }
+    }
+
+    /// Claude 2.1.261 in an 80x24 pane, captured after two Down presses: the
+    /// list scrolls, so row 1 is off screen, the drawn window is prefixed with
+    /// scroll arrows, and a `+N models` footer counts what is hidden.
+    const SCROLLED_CLAUDE_PICKER: &str = concat!(
+        "❯ /fast on\n",
+        "  ⎿  Fast mode unavailable: Fast mode has been disabled by your organization\n",
+        "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n",
+        "   Select model\n",
+        "   Switch between Claude models. Your pick becomes the default for new\n",
+        "   sessions. For other/previous model names, specify with --model.\n",
+        "\n",
+        "   ↑ 2. Opus (1M context) ✔    Opus 5 with 1M context · Best for everyday,\n",
+        "                               complex tasks\n",
+        "     3. Fable                  Fable 5.1 · Most capable for your hardest and\n",
+        "                               longest-running tasks\n",
+        "   ❯ 4. Sonnet                 Sonnet 5 · Efficient for routine tasks\n",
+        "      … +2 models\n",
+        "\n",
+        "   ● High effort (default) ←/→ to adjust\n",
+        "\n",
+        "   Enter to set as default · s to use this session only · Esc to cancel\n",
+    );
+
+    #[test]
+    fn a_scrolled_picker_is_read_from_whatever_rows_it_draws() {
+        // The 80x24 pane every detached agent starts in cannot draw the whole
+        // list, so insisting on a run numbered from 1 saw no picker at all.
+        let page =
+            rendered(model_menu(SCROLLED_CLAUDE_PICKER, "Select model", CLAUDE_MODELS).unwrap());
+        assert_eq!(
+            page.rows,
+            vec![
+                (2, "Opus (1M context) ✔".to_owned()),
+                (3, "Fable".to_owned()),
+                (4, "Sonnet".to_owned()),
+            ]
+        );
+        // The highlight and the target are row numbers, so the walk that moves
+        // between them is unaffected by which window happens to be drawn.
+        assert_eq!(page.selected, 4);
+        assert_eq!(page.hidden, 2);
+        assert_eq!(picker_target_row(&page, CLAUDE_MODELS, "opus"), Some(2));
+        assert_eq!(picker_target_row(&page, CLAUDE_MODELS, "sonnet"), Some(4));
+        // Rows scrolled out of the window are found by scrolling, not guessed.
+        assert_eq!(picker_target_row(&page, CLAUDE_MODELS, "haiku"), None);
+        // The full-list rendering of the same picker still reads as before.
+        assert_eq!(picker_hidden_rows(LIVE_CLAUDE_PICKER), 0);
+    }
+
+    #[test]
+    fn rendered_rows_beat_a_stale_compiled_in_table_order() {
+        // A vendor reordering that the compiled-in table has not caught up
+        // with must still select the row the user asked for.
+        let reordered = concat!(
+            "Select Model and Effort\n",
+            "  1. gpt-5.5           Proven previous-generation model.\n",
+            "  2. gpt-5.4-mini      Small, fast, and cost-efficient.\n",
+            "› 3. gpt-6-astra       Our most capable model.\n",
+            "  4. gpt-5.6-sol       Reliable agentic workhorse.\n",
+        );
+        let page =
+            rendered(model_menu(reordered, "Select Model and Effort", CODEX_MODELS).unwrap());
+        assert_eq!(page.selected, 3);
+        assert_eq!(picker_target_row(&page, CODEX_MODELS, "gpt-5.5"), Some(1));
+        assert_eq!(
+            picker_target_row(&page, CODEX_MODELS, "gpt-5.6-sol"),
+            Some(4)
+        );
+        // Rows the picker never drew are not reachable by table index.
+        assert_eq!(picker_target_row(&page, CODEX_MODELS, "gpt-5.6-luna"), None);
+
+        // Scrollback above the live picker never becomes the menu.
+        let stale = format!("  1. gpt-5.6-luna\n  2. gpt-5.5\n{reordered}");
+        let page = rendered(model_menu(&stale, "Select Model and Effort", CODEX_MODELS).unwrap());
+        assert_eq!(page.rows.len(), 4);
+        assert_eq!(
+            picker_target_row(&page, CODEX_MODELS, "gpt-6-astra"),
+            Some(3)
+        );
+
+        // An unreadable picker still falls back to the compiled-in table.
+        let unmarked = concat!(
+            "Select model\n",
+            "  1. Default\n",
+            "  2. Opus\n",
+            "  3. Fable\n",
+            "  4. Sonnet ✔\n",
+            "  5. Haiku\n",
+        );
+        assert!(picker_page(unmarked, "Select model").is_none());
+        assert!(model_menu(unmarked, "Select model", CLAUDE_MODELS).is_none());
+    }
+
+    #[test]
+    fn split_switches_record_a_relaunchable_mode() {
+        let probe = disposable_tmux("recorded-mode");
+        let modes = vec![
+            ProfileMode {
+                id: "terra-high".to_owned(),
+                label: None,
+                model: "gpt-5.6-terra".to_owned(),
+                effort: Some("high".to_owned()),
+                service_tier: None,
+            },
+            ProfileMode {
+                id: "terra-high-fast".to_owned(),
+                label: None,
+                model: "gpt-5.6-terra".to_owned(),
+                effort: Some("high".to_owned()),
+                service_tier: Some("fast".to_owned()),
+            },
+        ];
+        Tmux::with_socket_for_test(&probe.socket, || {
+            Tmux::output([
+                "new-session",
+                "-d",
+                "-s",
+                "recorded",
+                "/bin/sleep 2147483647",
+            ])?;
+            let pane = "recorded:0.0";
+            // A pane switched one control at a time keeps no configured mode.
+            Tmux::output([
+                "set-option",
+                "-p",
+                "-t",
+                pane,
+                "@atmux_model",
+                "gpt-5.6-terra",
+            ])?;
+            Tmux::output(["set-option", "-p", "-t", pane, "@atmux_effort", "high"])?;
+            Tmux::reconcile_recorded_mode(pane, &modes)?;
+            assert_eq!(
+                Tmux::output(["show-options", "-p", "-q", "-v", "-t", pane, "@atmux_mode"])?,
+                "terra-high"
+            );
+
+            // Codex's fast mode is a launch-time service tier, so a fast pane
+            // re-matches the fast mode rather than its default-tier twin.
+            Tmux::output(["set-option", "-p", "-t", pane, "@atmux_fast", "on"])?;
+            Tmux::output([
+                "set-option",
+                "-p",
+                "-t",
+                pane,
+                "@atmux_service_tier",
+                "fast",
+            ])?;
+            Tmux::reconcile_recorded_mode(pane, &modes)?;
+            assert_eq!(
+                Tmux::output(["show-options", "-p", "-q", "-v", "-t", pane, "@atmux_mode"])?,
+                "terra-high-fast"
+            );
+            assert_eq!(
+                Tmux::recorded_pane_mode(pane)?.map(|mode| mode.service_tier),
+                Some(Some("fast".to_owned()))
+            );
+
+            // A model no configured mode names records no mode, but still
+            // describes itself well enough for a faithful relaunch.
+            Tmux::output(["set-option", "-p", "-t", pane, "@atmux_model", "gpt-5.5"])?;
+            Tmux::reconcile_recorded_mode(pane, &modes)?;
+            assert!(
+                Tmux::output(["show-options", "-p", "-q", "-v", "-t", pane, "@atmux_mode"])?
+                    .is_empty()
+            );
+            let recorded = Tmux::recorded_pane_mode(pane)?.unwrap();
+            assert_eq!(recorded.model, "gpt-5.5");
+            assert_eq!(recorded.effort.as_deref(), Some("high"));
+
+            // Claude's session-only fast mode has no launch flag, so a pane
+            // left fast records nothing a relaunch could reproduce.
+            Tmux::output(["set-option", "-p", "-u", "-t", pane, "@atmux_service_tier"])?;
+            assert!(Tmux::recorded_pane_mode(pane)?.is_none());
+            Tmux::reconcile_recorded_mode(pane, &modes)?;
+            assert!(
+                Tmux::output(["show-options", "-p", "-q", "-v", "-t", pane, "@atmux_mode"])?
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
@@ -4097,6 +5226,29 @@ mod tests {
         assert!(codex_confirmation(
             "• Model changed to gpt-5.6-sol xhigh",
             "gpt-5.6-sol"
+        ));
+
+        // A tall pane leaves the confirmation far above the prompt. Reading
+        // only the last rows found nothing and reported a working switch as a
+        // picker that never appeared.
+        let tall = format!(
+            "❯ /model\n  ⎿  Set model to Sonnet 5 for this session only\n{}\n❯ ",
+            "\n".repeat(40)
+        );
+        assert!(claude_confirmation(&tall, "sonnet"));
+        // Switching back to a model the pane already confirmed once is only
+        // done when a *new* confirmation appears. The second `/model` echo
+        // moves the anchor below the first answer, so the stale line no longer
+        // reads as this switch's confirmation.
+        let stale = format!("{tall}\n❯ /model\n  Select model\n  ❯ 4. Sonnet\n");
+        assert!(
+            !claude_confirmation(&stale, "sonnet"),
+            "a confirmation above the newest command echo is last switch's, not this one's"
+        );
+        // Once the repeat switch answers, its own line is below that echo.
+        assert!(claude_confirmation(
+            &format!("{stale}  ⎿  Set model to Sonnet 5 for this session only\n"),
+            "sonnet"
         ));
         let effort = concat!(
             "Select Reasoning Level for gpt-5.6-sol\n",
