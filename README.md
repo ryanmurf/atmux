@@ -74,7 +74,7 @@ Each patch names the revision it applies to. A client that receives a patch whic
 the revision it holds discards it and reconnects for a fresh snapshot, so a missed update can never
 be merged into a half-correct view.
 
-Click a machine header in the session rail to inspect that machine's live CPU, memory, GPU, and temperature readings. GPU data is shown when the host exposes NVIDIA's `nvidia-smi`; unavailable hardware probes stay empty instead of failing the dashboard. The launch dialog has an **Agent** picker (Claude or Codex), a profile picker, and a project field that filters recursively discovered projects as you type. **Browse** safely explores the selected machine's configured project roots; a chosen folder is remembered for that machine while every launch remains server-validated. When viewing an agent in a browser that supports the Web Speech API, hold **Talk** to dictate and release it to send the recognized text directly to that agent.
+Click a machine header in the session rail to inspect that machine's live CPU, memory, GPU, and temperature readings. GPU data is shown when the host exposes NVIDIA's `nvidia-smi`; unavailable hardware probes stay empty instead of failing the dashboard. The launch dialog has an **Agent** picker (Claude or Codex), a profile picker, and a project field that filters recursively discovered projects as you type. Its bounded, accessible suggestion list remains responsive for large project sets and supports keyboard, mouse, and touch selection. **Browse** safely explores the selected machine's configured project roots; it can navigate to every allowed parent, create a folder, or clone a credential-free HTTPS/SSH repository into the displayed directory. These mutations run only on the selected owning machine and never overwrite an existing target. A chosen folder is remembered for that machine while every launch remains server-validated. When viewing an agent in a browser that supports the Web Speech API, hold **Talk** to dictate and release it to send the recognized text directly to that agent.
 
 ### Automatic context compaction
 
@@ -113,6 +113,9 @@ transient systemd user scope with a cgroup `MemoryMax`:
 ```toml
 [agent_resources]
 memory_max_bytes = 34359738368 # 32 GiB; example only, size per host
+# Optional: permit New Agent / Duplicate to select a whole-GiB cap no larger
+# than this explicit owner ceiling. Absence keeps overrides disabled.
+memory_override_max_bytes = 51539607552 # 48 GiB
 ```
 
 This policy is deliberately disabled when the key is absent. When configured,
@@ -135,6 +138,34 @@ maintenance relaunch, and checked-in recovery path receives a unique
 `atmux-tmux-spawn-*.scope`; the foreground scope runner preserves the pane's
 terminal I/O while the whole descendant process tree shares the limit.
 
+`memory_max_bytes` is always the default. `memory_override_max_bytes` is an
+explicit opt-in ceiling for the New Agent memory picker; it requires a default
+and may not be lower than that default. Overrides are whole GiB, greater than
+zero, and are revalidated by the pane's owning node against both the current
+configuration and effective host/cgroup ceiling. A federation coordinator only
+forwards the requested number and cannot expand the owner's policy. The picker
+offers Default, bounded presets, and a bounded custom GiB value. Older clients
+omit the request and therefore continue to receive the default; older nodes
+omit the capability, so the picker stays owner-managed and a new coordinator
+rejects any explicit override before contacting that owner. This prevents an
+older serde decoder from silently ignoring the additive request field.
+Explicit caps are forwarded only through the versioned memory-launch route;
+there is no fallback to the legacy launch endpoint if an owner was downgraded
+after advertising support.
+
+`atmux doctor` reports the effective advertised override ceiling, clamped to a
+whole-GiB value strictly below the current host/inherited-cgroup ceiling. When
+that is lower than the configured policy it labels both values; it never
+presents the configured ceiling as currently accepted capacity.
+
+Duplicate and normal saved-conversation launches carry an explicitly selected
+cap. An in-place Claude resume or automatic CLI-maintenance relaunch preserves
+the exact observed pane cap only while the current owner policy still permits
+it. atmux deliberately does not mutate a live worker's cgroup: a changed limit
+applies only to a new process generation, avoiding a runtime reduction below
+current usage. The session header and API show the cap that is actually stored
+on the pane.
+
 The exact scope name and byte limit are retained in tmux pane metadata and
 reported in session API summaries. `systemctl --user show <scope> -p
 MemoryMax -p MemoryCurrent` can inspect a live worker. Scope arguments are
@@ -148,11 +179,28 @@ The hidden `atmux scoped-exec -- <command>...` bridge is reserved for the
 owner-validated Quick Resume/boot scripts. It reloads the active configuration,
 requires memory isolation to be enabled, preflights once, records scope
 metadata on `TMUX_PANE`, and then replaces itself with the exact scope argv.
+Ordinary recovery entries use the configured worker default. A recovery script
+may request a distinct cap only for its `atmux-web` service entry; atmux accepts
+that cap only when it is a finite whole-GiB value strictly above the configured
+worker ceiling and strictly below the current host/inherited-cgroup limit. The
+canonical Tron bridge therefore keeps workers at their 12 GiB default with a
+48 GiB override ceiling while reserving a bounded 56 GiB scope for the web
+service. This does not raise any worker cap.
 Tron's live `/home/ryan/resume-tron.sh` must replace its raw `send()` function
 with `deploy/systemd/resume-tron-scoped-exec-block.bash` before Quick Resume is
 available; atmux rejects the old script shape. Max's checked-in boot recovery
 already uses the bridge for every roster entry. There is no unbounded recovery
-fallback.
+fallback. `scoped-exec` deliberately preserves opaque launcher argv instead of
+guessing what a credential wrapper does internally; the pinned Claude recovery
+commands remain responsible for supplying their already-configured permission
+policy exactly once.
+
+Boot/Quick Resume roster scripts use the current configured default. They do
+not retain a prior per-pane override across a host reboot because tmux metadata
+is gone and the pinned recovery formats contain no separate authenticated,
+durable per-pane override source. This is an intentional fail-closed fallback:
+recovery never trusts browser input, stale metadata, or a rewritten command to
+raise the cap. A normal saved-conversation launch can select an override again.
 
 Choose a limit below host capacity but above the largest legitimate native or
 GPU build, leaving memory for the OS, tmux, atmux, caches, and other workers.
@@ -195,6 +243,20 @@ explicit resume, auto-compact, and maintenance relaunch uses the same
 owner-local per-pane OS lock plus a durable tmux mutation sequence, so briefly
 overlapping old/new web processes cannot race. Working, approval, unknown,
 wrapper, Grok, and unmapped panes fail closed.
+
+Every native Claude command that atmux launches with the default
+`atmux_injects` profile policy includes exactly one
+`--dangerously-skip-permissions` global option and an explicit
+`--permission-mode bypassPermissions`. The explicit mode prevents a profile's
+`defaultMode = "auto"` setting from silently weakening the requested bypass.
+This applies to fresh sessions, saved-conversation launches, explicit in-place
+resumes, and CLI-maintenance relaunches. Same-looking values after `--` remain
+literal data. Discovery does not inspect opaque executable wrappers, so they
+retain the safe `atmux_injects` default. A manually configured wrapper that
+provides the arguments and owns any `--` forwarding boundary must set
+`claude_relaunch_permissions = "launcher_provides"`; a forwarding wrapper that
+wants atmux to provide it may explicitly select `"atmux_injects"`. All
+non-Claude harnesses keep their existing argv.
 
 A persisted pending plan repairs partial marker writes after a crash. A Ready
 marker remains deferred through transient working, approval, and unrecognized
@@ -508,7 +570,10 @@ rather than merging into a gap.
   or unsafe path prefixes.
 - Credentials are referenced by `token_env` or `token_file`, never inlined in configuration. They
   are redacted from every `Debug` rendering and never appear in an API response or log line.
-- Conversation views show bounded agent messages and collapsed tool calls/results. Tool fields are
+- Conversation views show bounded agent messages and collapsed tool calls/results. The compact
+  **Show** control can independently hide Human messages or Internal tool/status activity; Agent
+  prose always remains enabled, and the preference follows the browser across panes and reloads.
+  Tool fields are
   rendered as text and atmux redacts common secret-bearing JSON keys, headers, assignments, bearer
   values, and private-key blocks. That redaction is defense in depth, not a guarantee: arbitrary
   command output can encode a secret in an unrecognizable form. Anyone allowed to view a session
@@ -649,6 +714,8 @@ name = "Work account"
 harness = "claude"
 command = "claude-hd"
 args = []
+# This opaque wrapper already adds Claude's permission flag itself.
+claude_relaunch_permissions = "launcher_provides"
 
 [status]
 working_markers = []
@@ -667,9 +734,18 @@ profile = "Default"
 
 On startup, atmux also discovers:
 
-- A default Codex or Claude profile when its CLI is installed. On macOS this includes standard Homebrew and Claude desktop-app CLI locations.
-- `~/.codex/<name>.config.toml` as Codex profile `<name>`.
-- Executable `claude-*` wrappers in `~/.local/bin` and `~/bin` as Claude profiles.
+- Executable `codex-*` and `claude-*` wrappers in owner-local bin directories.
+- Simple `codex-*` and `claude-*` aliases from the owner's standard shell profiles.
+- Sorted `~/.codex/<name>.config.toml` files as Codex profile `<name>` fallbacks.
+- A generic default Codex or Claude profile when its CLI is installed. On macOS this includes
+  standard Homebrew and Claude desktop-app CLI locations.
+
+Discovery applies that order consistently: an executable wrapper wins over a same-named alias, a
+shell alias wins over a same-named Codex config, and every named source wins over the generic
+default. A configured profile remains authoritative unless it sets `inherit_discovered = true`;
+an opted-in profile inherits only the first matching discovered command, arguments, and
+credential-bound environment while keeping its configured environment, modes, and explicit Claude
+relaunch permission policy.
 
 ## Agent-state detection
 

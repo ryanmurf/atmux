@@ -19,6 +19,10 @@ for command in "${max_resume_commands[@]}"; do
     printf 'Max recovery command bypasses scoped-exec: %s\n' "$command" >&2
     exit 1
   }
+  [[ $command != *memory-max-bytes* ]] || {
+    printf 'Max recovery must use the owner-configured default MemoryMax: %s\n' "$command" >&2
+    exit 1
+  }
 done
 
 max_resume_tmux() { "$repo_root/tests/fixtures/max_recovery_tmux.sh" "$@"; }

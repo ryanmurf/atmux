@@ -95,7 +95,7 @@ fn scoped_exec_loads_config_publishes_metadata_and_execs_in_place() {
     let config_path = cleanup.directory.join("config.toml");
     let config = DEFAULT_CONFIG.replace(
         "# memory_max_bytes = 34359738368 # 32 GiB",
-        "memory_max_bytes = 67108864",
+        "memory_max_bytes = 12884901888\nmemory_override_max_bytes = 51539607552",
     );
     fs::write(&config_path, config).unwrap();
 
@@ -111,6 +111,8 @@ fn scoped_exec_loads_config_publishes_metadata_and_execs_in_place() {
         "--config",
         config_path.to_str().unwrap(),
         "scoped-exec",
+        "--recovery-service-memory-max-bytes",
+        "60129542144",
         "--",
         "/bin/sh",
         "-lc",
@@ -181,12 +183,15 @@ fn scoped_exec_loads_config_publishes_metadata_and_execs_in_place() {
             "@atmux_memory_max_bytes",
         ],
     );
-    assert_eq!(String::from_utf8(memory.stdout).unwrap().trim(), "67108864");
+    assert_eq!(
+        String::from_utf8(memory.stdout).unwrap().trim(),
+        "60129542144"
+    );
     let systemd_memory =
         user_systemctl(&["--user", "show", &unit, "--property=MemoryMax", "--value"]);
     assert_eq!(
         String::from_utf8(systemd_memory.stdout).unwrap().trim(),
-        "67108864"
+        "60129542144"
     );
 
     assert!(

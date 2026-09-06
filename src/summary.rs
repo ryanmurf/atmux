@@ -259,6 +259,7 @@ mod tests {
             args: args.iter().map(|argument| (*argument).to_owned()).collect(),
             env: std::collections::BTreeMap::new(),
             inherit_discovered: false,
+            claude_relaunch_permissions: None,
             modes: Vec::new(),
         }
     }

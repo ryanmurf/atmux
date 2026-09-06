@@ -26,7 +26,8 @@ use crate::{
     attachment::{ImageMessageRequest, MAX_ATTACHMENT_REQUEST_BODY_BYTES},
     config::Config,
     control::{
-        ControlPlane, ErrorKind, LaunchDirectoryListing, LaunchRequest, ModelSwitchRequest,
+        CloneLaunchRepositoryRequest, ControlPlane, CreateLaunchDirectoryRequest, ErrorKind,
+        LaunchDirectoryActionResult, LaunchDirectoryListing, LaunchRequest, ModelSwitchRequest,
         Overview, PaneModels, PaneOutput, ResumableLaunchSessions, error_kind, overview_patch,
         pane_patch,
     },
@@ -34,6 +35,7 @@ use crate::{
     machine::{MachineSummary, Secret, resolve_token},
     mcp,
     recovery::RecoveryStatus,
+    tmux::PaneSpecialKey,
     transcript::Transcript,
     workspace::{FileWriteRequest, FilesResponse, GitResponse, MAX_FILE_WRITE_REQUEST_BYTES},
 };
@@ -94,10 +96,20 @@ struct SendRequest {
     text: String,
     #[serde(default = "default_submit")]
     submit: bool,
+    #[serde(default)]
+    instance_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SpecialKeyRequest {
+    action: String,
+    machine: String,
+    instance_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacySpecialKeyRequest {
     action: String,
 }
 
@@ -769,9 +781,18 @@ fn routes(state: WebState) -> Router {
             get(quick_resume_status).post(start_quick_resume),
         )
         .route("/api/v1/sessions", get(sessions).post(launch))
+        .route("/api/v1/memory-launches/v1", post(launch_with_memory))
         .route("/api/v1/events", get(overview_events))
         .route("/api/v1/launch-options", get(launch_options))
         .route("/api/v1/launch-directories", get(launch_directories))
+        .route(
+            "/api/v1/launch-directories/folders",
+            post(create_launch_directory),
+        )
+        .route(
+            "/api/v1/launch-directories/clone",
+            post(clone_launch_repository),
+        )
         .route("/api/v1/launch-sessions", get(launch_sessions))
         .route("/api/v1/panes/{id}", get(pane_output))
         .route("/api/v1/panes/{id}/transcript", get(pane_transcript))
@@ -792,7 +813,14 @@ fn routes(state: WebState) -> Router {
             post(send_image_message)
                 .layer(DefaultBodyLimit::max(MAX_ATTACHMENT_REQUEST_BODY_BYTES)),
         )
-        .route("/api/v1/panes/{id}/special-keys", post(send_special_keys))
+        // Keep the original Ctrl+B route for already-loaded old clients. All
+        // generation-bound controls use a new route so an old coordinator or
+        // owner returns 404 instead of silently ignoring their bindings.
+        .route(
+            "/api/v1/panes/{id}/special-keys",
+            post(send_legacy_special_keys),
+        )
+        .route("/api/v1/panes/{id}/input-keys", post(send_input_keys))
         .route("/api/v1/panes/{id}/interrupt", post(interrupt))
         .route("/api/v1/sessions/{id}", delete(kill))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
@@ -934,6 +962,34 @@ async fn launch_directories(
     state
         .control
         .browse_launch_directories(query.machine.as_deref(), query.path.as_deref())
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::from_control(&error))
+}
+
+async fn create_launch_directory(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateLaunchDirectoryRequest>,
+) -> Result<Json<LaunchDirectoryActionResult>, ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    state
+        .control
+        .create_launch_directory(request)
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::from_control(&error))
+}
+
+async fn clone_launch_repository(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(request): Json<CloneLaunchRepositoryRequest>,
+) -> Result<Json<LaunchDirectoryActionResult>, ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    state
+        .control
+        .clone_launch_repository(request)
         .await
         .map(Json)
         .map_err(|error| ApiError::from_control(&error))
@@ -1110,7 +1166,7 @@ async fn send_message(
     ensure_origin(&headers, &state.allowed_origins)?;
     state
         .control
-        .send_text(&id, request.text, request.submit)
+        .send_text_for_instance(&id, request.text, request.submit, request.instance_id)
         .await
         .map_err(|error| ApiError::from_control(&error))?;
     Ok(Json(OkResponse { ok: true }))
@@ -1131,11 +1187,11 @@ async fn send_image_message(
     Ok(Json(OkResponse { ok: true }))
 }
 
-async fn send_special_keys(
+async fn send_legacy_special_keys(
     State(state): State<WebState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(request): Json<SpecialKeyRequest>,
+    Json(request): Json<LegacySpecialKeyRequest>,
 ) -> Result<Json<OkResponse>, ApiError> {
     ensure_origin(&headers, &state.allowed_origins)?;
     if request.action != "tmux_prefix_twice" {
@@ -1144,6 +1200,30 @@ async fn send_special_keys(
     state
         .control
         .tmux_prefix_twice(&id)
+        .await
+        .map_err(|error| ApiError::from_control(&error))?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+async fn send_input_keys(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SpecialKeyRequest>,
+) -> Result<Json<OkResponse>, ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    let key = match request.action.as_str() {
+        "up" => PaneSpecialKey::Up,
+        "down" => PaneSpecialKey::Down,
+        "left" => PaneSpecialKey::Left,
+        "right" => PaneSpecialKey::Right,
+        "enter" => PaneSpecialKey::Enter,
+        "tmux_prefix_twice" => PaneSpecialKey::TmuxPrefixTwice,
+        _ => return Err(ApiError::bad_request("unsupported special key action")),
+    };
+    state
+        .control
+        .send_special_key_for_instance(&id, key, request.machine, request.instance_id)
         .await
         .map_err(|error| ApiError::from_control(&error))?;
     Ok(Json(OkResponse { ok: true }))
@@ -1183,6 +1263,30 @@ async fn launch(
     Json(request): Json<LaunchRequest>,
 ) -> Result<(StatusCode, Json<OkResponse>), ApiError> {
     ensure_origin(&headers, &state.allowed_origins)?;
+    complete_launch(&state, request).await
+}
+
+/// Versioned owner boundary for explicit per-launch memory limits. A new
+/// coordinator must use this route instead of the legacy sessions endpoint so
+/// an old or downgraded owner rejects the request before launching anything.
+async fn launch_with_memory(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(request): Json<LaunchRequest>,
+) -> Result<(StatusCode, Json<OkResponse>), ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    if request.memory_max_bytes.is_none() {
+        return Err(ApiError::bad_request(
+            "the versioned memory launch endpoint requires memory_max_bytes",
+        ));
+    }
+    complete_launch(&state, request).await
+}
+
+async fn complete_launch(
+    state: &WebState,
+    request: LaunchRequest,
+) -> Result<(StatusCode, Json<OkResponse>), ApiError> {
     state
         .control
         .launch(request)
@@ -1690,6 +1794,10 @@ mod tests {
         Router::new()
             .route("/api/probe", get(|| async { "ok" }))
             .route("/api/v1/pulse/probe", get(|| async { "ok" }))
+            .route(
+                "/api/v1/launch-directories/folders",
+                post(|| async { "mutated" }),
+            )
             .route("/public", get(|| async { "ok" }))
             .layer(middleware::from_fn_with_state(
                 policy,
@@ -1778,6 +1886,89 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn folder_mutations_use_the_existing_api_authentication_boundary() {
+        let app = probe_app(Some(Secret::new("folder-node-token")));
+        let request = |token: Option<&str>| {
+            let mut builder = HttpRequest::builder()
+                .method("POST")
+                .uri("/api/v1/launch-directories/folders")
+                .header(header::HOST, "localhost:7345")
+                .extension(ConnectInfo(
+                    "100.64.0.9:41000".parse::<SocketAddr>().unwrap(),
+                ));
+            if let Some(token) = token {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(request(None)).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.oneshot(request(Some("folder-node-token")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn folder_mutation_handlers_reject_cross_origin_before_owner_work() {
+        let mut config = Config::default();
+        config.profiles.clear();
+        config.general.project_roots.clear();
+        config.general.favorite_dirs.clear();
+        config.general.switch_on_launch = false;
+        config.node.id = "home".to_owned();
+        config.node.coordinator_only = true;
+        config.discovery.enabled = false;
+        config.auto_compact.enabled = false;
+        config.maintenance.enabled = false;
+        #[cfg(feature = "pulse")]
+        {
+            config.pulse.collect = false;
+            config.pulse.receive = false;
+            config.pulse.report_to = None;
+        }
+        let control = ControlPlane::start(config).await.unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let app = api_router(
+            control,
+            vec!["https://atmux.example.test".to_owned()],
+            shutdown_rx,
+        );
+        let request = |origin: &'static str| {
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/api/v1/launch-directories/folders")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, origin)
+                .body(Body::from(
+                    r#"{"directory":"/tmp","name":"project","machine":null}"#,
+                ))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request("https://attacker.example"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            app.oneshot(request("https://atmux.example.test"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST,
+            "an allowed origin must reach the owner capability check"
+        );
     }
 
     #[cfg(feature = "pulse")]
@@ -2124,6 +2315,7 @@ mod tests {
 
         for (method, path) in [
             ("GET", "/api/v1/sessions"),
+            ("POST", "/api/v1/memory-launches/v1"),
             ("GET", "/api/v1/panes/nope"),
             ("GET", "/api/v1/panes/nope/transcript"),
             ("GET", "/api/v1/panes/nope/events"),
@@ -2495,6 +2687,17 @@ mod tests {
             status_of(
                 &app,
                 "POST",
+                "/api/v1/memory-launches/v1",
+                Some(r#"{"name":"x","directory":"/srv","profile_id":"profile-0"}"#)
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "the versioned route must reject a request without an explicit memory cap"
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
                 "/api/v1/sessions",
                 Some(
                     r#"{"name":"x","directory":"/srv","profile_id":"profile-0","machine":"ghost"}"#
@@ -2527,8 +2730,11 @@ mod tests {
             ),
             (
                 "POST",
-                "/api/v1/panes/gpu-box~%251/special-keys",
-                Some(r#"{"action":"tmux_prefix_twice"}"#),
+                "/api/v1/panes/gpu-box~%251/input-keys",
+                Some(concat!(
+                    r#"{"action":"tmux_prefix_twice","machine":"gpu-box","instance_id":"pane-v1-"#,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+                )),
             ),
             ("POST", "/api/v1/panes/gpu-box~%251/interrupt", Some("{}")),
             ("DELETE", "/api/v1/sessions/gpu-box~%251", None),
@@ -2551,6 +2757,113 @@ mod tests {
         assert_eq!(
             status_of(&app, "GET", "/api/v1/panes/%254294967295", None).await,
             StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_mutation_routes_reject_a_recycled_generation_before_delivery() {
+        let control = crate::control::test_control(&[]);
+        let mut replacement = crate::control::test_session("agent", "%4294967295", "replacement");
+        let current_instance = format!("pane-v1-{}", "b".repeat(64));
+        replacement.pane_identity.clone_from(&current_instance);
+        control.apply_refresh(vec![replacement]);
+        control.test_set_message_live_instance(
+            "%4294967295",
+            Some(format!("pane-v1-{}", "c".repeat(64))),
+        );
+        let (app, _shutdown) = real_app(control);
+        let stale_instance = format!("pane-v1-{}", "a".repeat(64));
+
+        let message = serde_json::json!({
+            "text": "must stay with the old agent",
+            "submit": true,
+            "instance_id": stale_instance,
+        })
+        .to_string();
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/%254294967295/messages",
+                Some(&message),
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+
+        let image = serde_json::json!({
+            "text": "must stay with the old agent",
+            "images": [],
+            "instance_id": stale_instance,
+        })
+        .to_string();
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/%254294967295/image-messages",
+                Some(&image),
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+
+        // The cached generation matches, but the owner-live seam reports a
+        // same-id replacement. The blocking check must retain its Conflict
+        // classification rather than becoming a local 500.
+        let live_race_message = serde_json::json!({
+            "text": "must not reach a replacement pane",
+            "submit": true,
+            "instance_id": current_instance,
+        })
+        .to_string();
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/%254294967295/messages",
+                Some(&live_race_message),
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+
+        let live_race_image = serde_json::json!({
+            "text": "must not reach a replacement pane",
+            "images": [{
+                "media_type": "image/png",
+                "data": "iVBORw0KGgo=",
+            }],
+            "instance_id": current_instance,
+        })
+        .to_string();
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/%254294967295/image-messages",
+                Some(&live_race_image),
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+
+        let live_race_key = serde_json::json!({
+            "action": "enter",
+            "machine": "local",
+            "instance_id": current_instance,
+        })
+        .to_string();
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/%254294967295/input-keys",
+                Some(&live_race_key),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "a blank Enter must revalidate the live generation under the mutation lock",
         );
     }
 
@@ -2855,21 +3168,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn special_key_route_is_allowlisted() {
+    #[allow(clippy::too_many_lines)]
+    async fn generation_bound_input_key_route_is_allowlisted() {
         let control = crate::control::test_control(&[]);
-        control.apply_refresh(vec![crate::control::test_session(
-            "agent",
-            "%4294967295",
-            "hello",
-        )]);
-        let (app, _shutdown) = real_app(control);
+        let mut session = crate::control::test_session("agent", "%4294967295", "hello");
+        session.pane_identity = format!("pane-v1-{}", "b".repeat(64));
+        control.apply_refresh(vec![session]);
+        let (app, _shutdown) = real_app(control.clone());
+        let (authenticated, _authenticated_shutdown) = authenticated_real_app(control);
+        let current = format!("pane-v1-{}", "b".repeat(64));
+        let stale = format!("pane-v1-{}", "a".repeat(64));
+        let valid_body = serde_json::json!({
+            "action": "enter",
+            "machine": "local",
+            "instance_id": current,
+        })
+        .to_string();
+
+        let anonymous = protected_api(
+            "POST",
+            "/api/v1/panes/%254294967295/input-keys",
+            &valid_body,
+            None,
+            Some("http://localhost:7345"),
+        );
+        assert_eq!(
+            authenticated.oneshot(anonymous).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+        );
+
+        let cross_origin = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/v1/panes/%254294967295/input-keys")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "https://attacker.example")
+            .body(Body::from(valid_body))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(cross_origin).await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+        );
 
         assert_eq!(
             status_of(
                 &app,
                 "POST",
-                "/api/v1/panes/%254294967295/special-keys",
-                Some(r#"{"action":"anything_else"}"#),
+                "/api/v1/panes/%254294967295/input-keys",
+                Some(r#"{"action":"enter"}"#),
+            )
+            .await,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "machine and instance bindings are mandatory",
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/%254294967295/input-keys",
+                Some(
+                    &serde_json::json!({
+                        "action": "anything_else",
+                        "machine": "local",
+                        "instance_id": current,
+                    })
+                    .to_string(),
+                ),
             )
             .await,
             StatusCode::BAD_REQUEST
@@ -2878,11 +3241,77 @@ mod tests {
             status_of(
                 &app,
                 "POST",
+                "/api/v1/panes/%254294967295/input-keys",
+                Some(
+                    &serde_json::json!({
+                        "action": "enter",
+                        "machine": "local",
+                        "instance_id": stale,
+                    })
+                    .to_string(),
+                ),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "a blank Enter must not reach a recycled pane id",
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/%254294967295/input-keys",
+                Some(
+                    &serde_json::json!({
+                        "action": "down",
+                        "machine": "midnight",
+                        "instance_id": current,
+                    })
+                    .to_string(),
+                ),
+            )
+            .await,
+            StatusCode::CONFLICT,
+            "the body machine cannot retarget a local pane",
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/nope/input-keys",
+                Some(
+                    &serde_json::json!({
+                        "action": "tmux_prefix_twice",
+                        "machine": "local",
+                        "instance_id": current,
+                    })
+                    .to_string(),
+                ),
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
                 "/api/v1/panes/nope/special-keys",
                 Some(r#"{"action":"tmux_prefix_twice"}"#),
             )
             .await,
-            StatusCode::NOT_FOUND
+            StatusCode::NOT_FOUND,
+            "the legacy endpoint remains available only for old Ctrl+B clients",
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/nope/special-keys",
+                Some(r#"{"action":"enter"}"#),
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "the legacy endpoint must not gain generic input-key behavior",
         );
     }
 

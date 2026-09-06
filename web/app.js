@@ -9,6 +9,9 @@ const MAX_TOTAL_IMAGE_BYTES = 12 * 1024 * 1024;
 const IMAGE_MESSAGE_TEXT_RESERVE = 2 * 1024;
 const MAX_QUEUED_COMPOSER_MESSAGES = 4;
 const MAX_REMEMBERED_LAUNCH_DIRECTORIES = 32;
+const MAX_LAUNCH_DIRECTORY_CANDIDATES = 4_096;
+const MAX_LAUNCH_DIRECTORY_SUGGESTIONS = 40;
+const LAUNCH_DIRECTORY_SEARCH_DEBOUNCE_MS = 140;
 const MAX_PROJECT_ENTRIES = 512;
 const MAX_PROJECT_SOURCE_CHARS = 256 * 1024;
 const MAX_PROJECT_SOURCE_LINES = 4_000;
@@ -27,9 +30,14 @@ const MIN_COLLAPSED_TOOL_RUN = 3;
 // Bare URLs only: markdown links are already tokenized, and the closing set is
 // trimmed afterwards so surrounding prose never joins the address.
 const AUTOLINK_PATTERN = /https?:\/\/[^\s<>"'`]+/gi;
-const TRANSCRIPT_MESSAGE_ROLES = new Set(["user", "assistant", "subagent"]);
+const MAX_TRANSCRIPT_ANCHOR_MEMBER_CHARS = 512;
+const MAX_TRANSCRIPT_ANCHOR_JSON_CHARS = 128 * 1024;
 const COLLAPSIBLE_COORDINATION_TOOLS = new Set([
   "followup_task", "list_agents", "send_message", "wait_agent",
+]);
+const INTERNAL_TOOL_ALIASES = new Map([
+  ["exec_command", "exec"],
+  ["exec", "exec"],
 ]);
 const BENIGN_COORDINATION_STATUSES = new Set([
   "ok", "sent", "queued", "delivered", "acknowledged", "waiting", "idle", "running",
@@ -38,23 +46,21 @@ const BENIGN_COORDINATION_STATUSES = new Set([
 ]);
 const LAUNCH_DIRECTORY_STORAGE_KEY = "atmux.launch-directories";
 const FILE_READER_STORAGE_KEY = "atmux.file-reader-preferences";
-
-function readStoredValue(key) {
-  try {
-    return localStorage.getItem(key);
-  } catch {
-    // A privacy-restricted browser may deny storage.
-    return null;
-  }
-}
-
-function writeStoredValue(key, value) {
-  try {
-    localStorage.setItem(key, value);
-  } catch {
-    // A privacy-restricted browser may deny storage.
-  }
-}
+const CONVERSATION_VISIBILITY_STORAGE_KEY = "atmux.conversation-visibility";
+const COMPOSER_DRAFT_STORAGE_KEY = "atmux.composer-drafts.v1";
+const MAX_COMPOSER_DRAFT_ENTRIES = 64;
+const MAX_COMPOSER_DRAFT_TOMBSTONES = 256;
+const MAX_COMPOSER_DRAFT_STORAGE_CHARS = 512 * 1024;
+const MAX_COMPOSER_DRAFT_TEXT_CHARS = 65_536;
+const COMPOSER_DRAFT_TOMBSTONE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const PANE_INSTANCE_PATTERN = /^pane-v1-[a-f0-9]{64}$/;
+const MACHINE_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+const PANE_SPECIAL_KEY_ACTIONS = new Set([
+  "up", "down", "left", "right", "enter", "tmux_prefix_twice",
+]);
+const MAX_QUEUED_PANE_KEYS = 16;
+const MAX_PANE_KEY_STATUSES = 64;
+const PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN = /^pane:([A-Za-z0-9_.%~-]{1,96}):(pane-v1-[a-f0-9]{64})$/;
 
 const FILE_READER_SIZES = new Set(["small", "medium", "large"]);
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg"]);
@@ -288,6 +294,251 @@ function sessionMachineId(session, localMachineId = "local") {
   return session.machine || parseCompositeId(session.id).machine || localMachineId;
 }
 
+/// Captures the complete immutable target for one pane-key request. The
+/// request path binds the pane (and its coordinator machine namespace), while
+/// the body independently binds the owning machine and pane generation.
+function paneSpecialKeyDelivery(session, action, localMachineId = "local") {
+  if (!session || typeof session.id !== "string" || !session.id
+      || !PANE_SPECIAL_KEY_ACTIONS.has(action)
+      || !PANE_INSTANCE_PATTERN.test(String(session.instance_id || ""))) return null;
+  const machine = sessionMachineId(session, localMachineId);
+  const compositeMachine = parseCompositeId(session.id).machine;
+  if (!MACHINE_ID_PATTERN.test(machine)
+      || (compositeMachine && compositeMachine !== machine)) return null;
+  return Object.freeze({
+    paneId: session.id,
+    machine,
+    instanceId: session.instance_id,
+    action,
+  });
+}
+
+function paneSpecialKeyTarget(delivery) {
+  return delivery
+    ? `${delivery.machine}\u0000${delivery.paneId}\u0000${delivery.instanceId}`
+    : null;
+}
+
+/// Returns an incarnation-safe identity for browser-local composer state.
+/// Old owners without `instance_id` still get same-page isolation, but their
+/// recyclable pane ids are deliberately never written to persistent storage.
+function composerDraftIdentity(session, localMachineId = "local") {
+  if (!session || typeof session.id !== "string" || !session.id) return null;
+  const instanceId = typeof session.instance_id === "string" ? session.instance_id : "";
+  if (PANE_INSTANCE_PATTERN.test(instanceId)) {
+    return {
+      key: `pane:${encodeURIComponent(sessionMachineId(session, localMachineId))}:${instanceId}`,
+      persistent: true,
+      instanceId,
+    };
+  }
+  return { key: `ephemeral:${session.id}`, persistent: false };
+}
+
+function composerDraftMachine(key) {
+  const match = typeof key === "string" ? key.match(PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN) : null;
+  if (!match) return null;
+  try { return decodeURIComponent(match[1]); } catch { return null; }
+}
+
+function composerDraftInstanceId(key) {
+  const match = typeof key === "string" ? key.match(PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN) : null;
+  return match?.[2] || null;
+}
+
+function sessionMatchesComposerIdentity(session, identityKey, localMachineId = "local") {
+  if (!PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN.test(String(identityKey || ""))) return false;
+  return composerDraftIdentity(session, localMachineId)?.key === identityKey;
+}
+
+/// Only owners explicitly reported online in a complete snapshot have an
+/// authoritative inventory. Drafts for offline or not-yet-connected owners
+/// survive coordinator startup until that owner can report its panes.
+function staleComposerDraftKeys(drafts, sessions, machines) {
+  const authoritativeMachines = new Set((Array.isArray(machines) ? machines : [])
+    .filter((machine) => machine?.online === true && typeof machine.id === "string")
+    .map((machine) => machine.id));
+  if (!authoritativeMachines.size) return [];
+  const live = new Set();
+  const currentSessions = sessions instanceof Map ? sessions.values() : sessions || [];
+  for (const session of currentSessions) {
+    const identity = composerDraftIdentity(session);
+    if (identity?.persistent) live.add(identity.key);
+  }
+  const stale = [];
+  for (const key of drafts instanceof Map ? drafts.keys() : []) {
+    const machine = composerDraftMachine(key);
+    if (machine && authoritativeMachines.has(machine) && !live.has(key)) stale.push(key);
+  }
+  return stale;
+}
+
+function normalizedComposerDraft(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)
+      || typeof entry.text !== "string" || !entry.text
+      || entry.text.length > MAX_COMPOSER_DRAFT_TEXT_CHARS) return null;
+  const selectionStart = Number.isSafeInteger(entry.selectionStart)
+    ? Math.max(0, Math.min(entry.text.length, entry.selectionStart)) : entry.text.length;
+  const selectionEnd = Number.isSafeInteger(entry.selectionEnd)
+    ? Math.max(selectionStart, Math.min(entry.text.length, entry.selectionEnd)) : selectionStart;
+  return {
+    text: entry.text,
+    selectionStart,
+    selectionEnd,
+    version: Number.isSafeInteger(entry.version) && entry.version > 0 ? entry.version : 1,
+    updatedAt: Number.isSafeInteger(entry.updatedAt) && entry.updatedAt > 0 ? entry.updatedAt : 1,
+  };
+}
+
+/// Keeps both persistent and legacy in-memory drafts within a fixed live
+/// budget. Map insertion order is the LRU order, so pruning is linear and the
+/// serializer never has an unbounded collection to sort or stringify.
+function pruneComposerDraftEntries(value, protectedKeys = []) {
+  const drafts = value instanceof Map ? value : new Map();
+  const protectedSet = protectedKeys instanceof Set ? protectedKeys : new Set(protectedKeys || []);
+  const sizes = new Map();
+  let totalChars = 32;
+  for (const [key, entry] of drafts) {
+    const draft = normalizedComposerDraft(entry);
+    if (typeof key !== "string" || key.length > 192 || !draft) {
+      drafts.delete(key);
+      continue;
+    }
+    const size = JSON.stringify({ key, ...draft }).length + 1;
+    sizes.set(key, size);
+    totalChars += size;
+  }
+  for (const key of drafts.keys()) {
+    if (drafts.size <= MAX_COMPOSER_DRAFT_ENTRIES
+        && totalChars <= MAX_COMPOSER_DRAFT_STORAGE_CHARS) break;
+    if (protectedSet.has(key)) continue;
+    totalChars -= sizes.get(key) || 0;
+    drafts.delete(key);
+  }
+  return drafts;
+}
+
+/// Parses a bounded array representation instead of an object keyed by
+/// attacker-controlled strings. Draft text remains plain textarea data.
+function composerDraftEntries(value) {
+  const drafts = new Map();
+  let parsed = value;
+  if (typeof value === "string") {
+    if (value.length > MAX_COMPOSER_DRAFT_STORAGE_CHARS) return drafts;
+    try { parsed = JSON.parse(value); } catch { return drafts; }
+  }
+  if (!parsed || typeof parsed !== "object" || parsed.version !== 1
+      || !Array.isArray(parsed.drafts)) return drafts;
+  for (const item of parsed.drafts.slice(-MAX_COMPOSER_DRAFT_ENTRIES)) {
+    if (!item || typeof item.key !== "string" || item.key.length > 192
+        || !PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN.test(item.key)) continue;
+    const draft = normalizedComposerDraft(item);
+    if (draft) drafts.set(item.key, draft);
+  }
+  return pruneComposerDraftEntries(drafts);
+}
+
+function composerDraftTombstones(value, now = Date.now()) {
+  const tombstones = new Map();
+  let parsed = value;
+  if (typeof value === "string") {
+    if (value.length > MAX_COMPOSER_DRAFT_STORAGE_CHARS) return tombstones;
+    try { parsed = JSON.parse(value); } catch { return tombstones; }
+  }
+  if (!parsed || typeof parsed !== "object" || parsed.version !== 1
+      || !Array.isArray(parsed.tombstones)) return tombstones;
+  const cutoff = now - COMPOSER_DRAFT_TOMBSTONE_TTL_MS;
+  for (const item of parsed.tombstones.slice(-MAX_COMPOSER_DRAFT_TOMBSTONES)) {
+    if (!item || typeof item.key !== "string"
+        || !PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN.test(item.key)
+        || !Number.isSafeInteger(item.deletedAt) || item.deletedAt <= cutoff) continue;
+    const prior = tombstones.get(item.key);
+    if (!prior || item.deletedAt > prior.deletedAt) {
+      tombstones.delete(item.key);
+      tombstones.set(item.key, { deletedAt: item.deletedAt });
+    }
+  }
+  return tombstones;
+}
+
+function composerDraftIsNewer(candidate, prior) {
+  if (!prior || candidate.updatedAt !== prior.updatedAt) {
+    return !prior || candidate.updatedAt > prior.updatedAt;
+  }
+  return JSON.stringify([
+    candidate.version, candidate.text, candidate.selectionStart, candidate.selectionEnd,
+  ]) > JSON.stringify([
+    prior.version, prior.text, prior.selectionStart, prior.selectionEnd,
+  ]);
+}
+
+/// Merges a storage snapshot into this tab's live state by per-entry clocks.
+/// Tombstones win ties so a stale tab cannot revive a successfully submitted
+/// or deleted pane draft with a whole-map last-writer-wins update.
+function mergeComposerDraftState(drafts, tombstones, incoming, now = Date.now(), protectedKeys = []) {
+  const localDrafts = drafts instanceof Map ? drafts : new Map();
+  const localTombstones = tombstones instanceof Map ? tombstones : new Map();
+  const cutoff = now - COMPOSER_DRAFT_TOMBSTONE_TTL_MS;
+  for (const [key, tombstone] of localTombstones) {
+    if (!Number.isSafeInteger(tombstone?.deletedAt) || tombstone.deletedAt <= cutoff) {
+      localTombstones.delete(key);
+    }
+  }
+  for (const [key, tombstone] of composerDraftTombstones(incoming, now)) {
+    const prior = localTombstones.get(key);
+    if (!prior || tombstone.deletedAt > prior.deletedAt) {
+      localTombstones.delete(key);
+      localTombstones.set(key, tombstone);
+    }
+  }
+  for (const [key, draft] of composerDraftEntries(incoming)) {
+    const deletedAt = localTombstones.get(key)?.deletedAt || 0;
+    const prior = localDrafts.get(key);
+    if (draft.updatedAt > deletedAt && composerDraftIsNewer(draft, prior)) {
+      localDrafts.delete(key);
+      localDrafts.set(key, draft);
+    }
+  }
+  for (const [key, tombstone] of localTombstones) {
+    if ((localDrafts.get(key)?.updatedAt || 0) <= tombstone.deletedAt) localDrafts.delete(key);
+    else localTombstones.delete(key);
+  }
+  while (localTombstones.size > MAX_COMPOSER_DRAFT_TOMBSTONES) {
+    localTombstones.delete(localTombstones.keys().next().value);
+  }
+  pruneComposerDraftEntries(localDrafts, protectedKeys);
+  return { drafts: localDrafts, tombstones: localTombstones };
+}
+
+function composerDraftJson(value, protectedKeys = [], tombstoneValue = new Map()) {
+  const candidates = [...pruneComposerDraftEntries(value, protectedKeys)]
+    .filter(([key, draft]) => typeof key === "string"
+      && PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN.test(key)
+      && normalizedComposerDraft(draft))
+    .map(([key, draft]) => ({ key, ...normalizedComposerDraft(draft) }))
+    .slice(-MAX_COMPOSER_DRAFT_ENTRIES);
+  const tombstones = [...(tombstoneValue instanceof Map ? tombstoneValue : new Map())]
+    .filter(([key, tombstone]) => PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN.test(key)
+      && Number.isSafeInteger(tombstone?.deletedAt) && tombstone.deletedAt > 0)
+    .slice(-MAX_COMPOSER_DRAFT_TOMBSTONES)
+    .map(([key, tombstone]) => ({ key, deletedAt: tombstone.deletedAt }));
+  while (candidates.length || tombstones.length) {
+    const encoded = JSON.stringify({ version: 1, drafts: candidates, tombstones });
+    if (encoded.length <= MAX_COMPOSER_DRAFT_STORAGE_CHARS) return encoded;
+    // In-flight drafts stay pinned in memory for rollback, but browser storage
+    // has a non-negotiable hard cap even when escaping expands every entry.
+    if (candidates.length) candidates.shift();
+    else tombstones.shift();
+  }
+  return JSON.stringify({ version: 1, drafts: [], tombstones: [] });
+}
+
+function composerDraftCanClear(draft, submission) {
+  return Boolean(draft && submission)
+    && draft.version === submission.draftVersion
+    && draft.text === submission.message;
+}
+
 /// A launch needs both an owner-configured profile and a project root. The
 /// latter is also the capability that makes bounded folder browsing possible.
 function isLaunchCapableMachine(machine) {
@@ -399,6 +650,13 @@ function attachmentDeliveryTarget(capturedPaneId, selectedPaneId) {
   return capturedPaneId || selectedPaneId || null;
 }
 
+function attachmentSelectionMatches(capturedPaneId, capturedInstanceKey, selectedPaneId, selectedInstanceKey) {
+  return Boolean(capturedPaneId && capturedInstanceKey)
+    && PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN.test(capturedInstanceKey)
+    && capturedPaneId === selectedPaneId
+    && capturedInstanceKey === selectedInstanceKey;
+}
+
 function remainingAttachmentsAfterDelivery(current, delivered) {
   const sent = new Set(delivered || []);
   return Array.from(current || []).filter((attachment) => !sent.has(attachment));
@@ -450,11 +708,22 @@ function moveMessageHistory(history, index, direction) {
   return current < entries.length ? current + 1 : null;
 }
 
-function filterDirectories(directories, query) {
+function filterDirectories(directories, query, limit = MAX_LAUNCH_DIRECTORY_SUGGESTIONS) {
   const normalized = typeof query === "string" ? query.trim().toLowerCase() : "";
-  return (Array.isArray(directories) ? directories : [])
-    .filter((directory) => !normalized
-      || `${directory} ${projectLabel(directory)}`.toLowerCase().includes(normalized));
+  const boundedLimit = Math.max(0, Math.min(
+    Number.isSafeInteger(limit) ? limit : MAX_LAUNCH_DIRECTORY_SUGGESTIONS,
+    MAX_LAUNCH_DIRECTORY_SUGGESTIONS,
+  ));
+  const matches = [];
+  if (!boundedLimit) return matches;
+  for (const directory of Array.isArray(directories) ? directories : []) {
+    if (!normalized
+        || `${directory} ${projectLabel(directory)}`.toLowerCase().includes(normalized)) {
+      matches.push(directory);
+      if (matches.length === boundedLimit) break;
+    }
+  }
+  return matches;
 }
 
 function isManualDirectory(value) {
@@ -502,7 +771,20 @@ function rememberLaunchDirectory(remembered, machine, directory) {
 function availableLaunchDirectories(machine, remembered) {
   const listed = Array.isArray(machine?.directories) ? machine.directories : [];
   const saved = remembered?.[machine?.id] || [];
-  return [...new Set([...saved, ...listed].filter(validRememberedLaunchDirectory))];
+  const directories = [];
+  const seen = new Set();
+  let inspected = 0;
+  candidateSources: for (const source of [saved, listed]) {
+    for (const directory of source) {
+      inspected += 1;
+      if (inspected > MAX_LAUNCH_DIRECTORY_CANDIDATES * 4) break candidateSources;
+      if (!validRememberedLaunchDirectory(directory) || seen.has(directory)) continue;
+      seen.add(directory);
+      directories.push(directory);
+      if (directories.length === MAX_LAUNCH_DIRECTORY_CANDIDATES) break candidateSources;
+    }
+  }
+  return directories;
 }
 
 function launchDirectoryBrowsePath(machine, path) {
@@ -513,6 +795,23 @@ function launchDirectoryBrowsePath(machine, path) {
     params.set("path", path.trim());
   }
   return `/api/v1/launch-directories?${params}`;
+}
+
+function validLaunchChildName(value) {
+  const name = typeof value === "string" ? value.trim() : "";
+  return name.length > 0
+    && new TextEncoder().encode(name).length <= 240
+    && !name.startsWith("-")
+    && !/[\/\\\u0000-\u001f\u007f]/.test(name)
+    && name !== "."
+    && name !== "..";
+}
+
+function repositoryDestinationName(value) {
+  const repository = typeof value === "string" ? value.trim() : "";
+  const withoutSuffix = repository.split(/[?#]/, 1)[0].replace(/\/+$/, "");
+  const segment = withoutSuffix.split(/[/:]/).pop()?.replace(/\.git$/, "").trim() || "";
+  return validLaunchChildName(segment) ? segment : "";
 }
 
 function harnessesForProfiles(profiles) {
@@ -592,8 +891,71 @@ function launchMachines(options) {
       directories: options?.directories || [],
       profiles: options?.profiles || [],
       project_preferences: options?.project_preferences || {},
+      memory: options?.memory || null,
       note: null,
     }];
+}
+
+const GIBIBYTE_BYTES = 1024 * 1024 * 1024;
+
+function safeMemoryBytes(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function formatMemoryLimit(bytes) {
+  const safe = safeMemoryBytes(bytes);
+  if (!safe) return "No cap";
+  const gib = safe / GIBIBYTE_BYTES;
+  return `${Number.isInteger(gib) ? gib : gib.toFixed(1)} GiB`;
+}
+
+/// Returns only bounded owner-advertised choices. This is presentation
+/// validation; the owner repeats all checks against current configuration.
+function memoryLimitChoices(memory) {
+  const advertised = memory !== null && typeof memory === "object";
+  const defaultBytes = safeMemoryBytes(memory?.default_bytes);
+  const ceiling = safeMemoryBytes(memory?.override_max_bytes);
+  const supported = memory?.supported === true && defaultBytes !== null;
+  const presets = [...new Set((Array.isArray(memory?.presets_bytes) ? memory.presets_bytes : [])
+    .map(safeMemoryBytes)
+    .filter((value) => value !== null && ceiling !== null && value <= ceiling))]
+    .sort((left, right) => left - right);
+  const note = advertised
+    ? String(memory?.note || "")
+    : "Memory limit is owner managed; this owner does not advertise override support.";
+  return { advertised, supported, defaultBytes, ceiling, presets, note };
+}
+
+function parseMemoryLimitSelection(memory, selected, customGiB) {
+  const choices = memoryLimitChoices(memory);
+  if (selected === "") return null;
+  if (!choices.supported || choices.ceiling === null) {
+    throw new Error("This machine does not allow per-agent memory overrides");
+  }
+  if (selected === "custom") {
+    const gib = Number(customGiB);
+    if (!Number.isSafeInteger(gib) || gib < 1) {
+      throw new Error("Custom memory must be a whole number of GiB");
+    }
+    const bytes = gib * GIBIBYTE_BYTES;
+    if (!Number.isSafeInteger(bytes) || bytes > choices.ceiling) {
+      throw new Error(`Custom memory must be at most ${formatMemoryLimit(choices.ceiling)}`);
+    }
+    return bytes;
+  }
+  const bytes = Number(selected);
+  if (!Number.isSafeInteger(bytes) || !choices.presets.includes(bytes)) {
+    throw new Error("Choose an owner-approved memory limit");
+  }
+  return bytes;
+}
+
+function defaultMemoryLimitLabel(memory) {
+  const choices = memoryLimitChoices(memory);
+  if (!choices.advertised) return "Default (owner managed)";
+  return choices.defaultBytes === null
+    ? "Default (no configured cap)"
+    : `Default (${formatMemoryLimit(choices.defaultBytes)})`;
 }
 
 /// Resolves a running pane back to owner-issued launch IDs. The browser never
@@ -631,12 +993,29 @@ function duplicateLaunchSelection(options, session, capabilities, sessions = [])
   if (!validRememberedLaunchDirectory(directory)) {
     throw new Error(`The project folder for ${session.name} cannot be reused`);
   }
+  const observedMemory = session.memory_max_bytes == null
+    ? null
+    : safeMemoryBytes(session.memory_max_bytes);
+  if (session.memory_max_bytes != null && observedMemory === null) {
+    throw new Error(`The memory cap for ${session.name} is invalid`);
+  }
+  if (observedMemory !== null) {
+    const memory = memoryLimitChoices(machine.memory);
+    const allowed = memory.supported && (observedMemory === memory.defaultBytes
+      || (memory.ceiling !== null
+        && observedMemory <= memory.ceiling
+        && observedMemory % GIBIBYTE_BYTES === 0));
+    if (!allowed) {
+      throw new Error(`The ${formatMemoryLimit(observedMemory)} cap for ${session.name} is no longer allowed on ${machine.label || machineId}`);
+    }
+  }
   return {
     machineId,
     directory,
     harness: profile.harness,
     profileId: profile.id,
     modeId,
+    memoryMaxBytes: observedMemory,
     name: duplicateSessionName(session, sessions),
   };
 }
@@ -992,6 +1371,40 @@ function fileReaderPreferenceJson(preferences) {
   return JSON.stringify({ wrap: normalized.wrap, size: normalized.size });
 }
 
+function conversationVisibilityPreferences(value) {
+  const defaults = { human: true, internal: true };
+  let stored = value;
+  if (typeof value === "string") {
+    try { stored = JSON.parse(value); } catch { return defaults; }
+  }
+  if (!stored || typeof stored !== "object" || Array.isArray(stored)) return defaults;
+  return {
+    human: typeof stored.human === "boolean" ? stored.human : defaults.human,
+    internal: typeof stored.internal === "boolean" ? stored.internal : defaults.internal,
+  };
+}
+
+function conversationVisibilityPreferenceJson(preferences) {
+  const normalized = conversationVisibilityPreferences(preferences);
+  return JSON.stringify({ human: normalized.human, internal: normalized.internal });
+}
+
+function loadConversationVisibilityPreferences(readStoredValue) {
+  try {
+    return conversationVisibilityPreferences(readStoredValue());
+  } catch {
+    return conversationVisibilityPreferences(null);
+  }
+}
+
+function saveConversationVisibilityPreferences(writeStoredValue, preferences) {
+  try {
+    return writeStoredValue(conversationVisibilityPreferenceJson(preferences)) !== false;
+  } catch {
+    return false;
+  }
+}
+
 function loadFileReaderPreferences(readStoredValue, mobile = false) {
   try {
     return fileReaderPreferences(readStoredValue(), mobile);
@@ -1283,24 +1696,57 @@ function reduceTranscript(current, data) {
 }
 
 /// A Claude Code subagent writes its prompts and reports back with the user
-/// role. Labelling those "You" credits the operator with an agent's words.
+/// role. Labelling those "You" credits the operator with an agent's words, so
+/// the subagent is named ahead of the visibility bucket it shares with the
+/// other internal entries.
 function transcriptRoleLabel(message) {
-  if (message?.role === "user") return "You";
-  if (message?.role !== "subagent") return "Agent";
-  const name = String(message?.agent_name || "").trim();
-  return name ? `Subagent · ${name}` : "Subagent";
+  if (message?.role === "subagent") {
+    const name = String(message?.agent_name || "").trim();
+    return name ? `Subagent · ${name}` : "Subagent";
+  }
+  const visibility = transcriptVisibilityKind(message);
+  return visibility === "human" ? "You" : visibility === "agent" ? "Agent" : "Internal";
 }
 
 function transcriptItemKind(item) {
   return item?.kind === "tool" || item?.role === "tool" ? "tool" : "message";
 }
 
+/// Conversation visibility is deliberately role-based and fail-closed. Only
+/// ordinary assistant prose is Agent text, and only ordinary user prose is
+/// Human text. Tool calls plus future system/status/coordination records are
+/// Internal, so a new transcript shape cannot leak into the wrong filter.
+function transcriptVisibilityKind(item) {
+  if (transcriptItemKind(item) === "tool") return "internal";
+  const kind = typeof item?.kind === "string" && item.kind ? item.kind : "message";
+  if (kind === "message" && item?.role === "assistant") return "agent";
+  if (kind === "message" && item?.role === "user") return "human";
+  return "internal";
+}
+
+function transcriptItemIsVisible(item, preferences) {
+  const visibility = transcriptVisibilityKind(item);
+  if (visibility === "agent") return true;
+  const normalized = conversationVisibilityPreferences(preferences);
+  return visibility === "human" ? normalized.human : normalized.internal;
+}
+
+function filterTranscriptMessages(messages, preferences) {
+  return (Array.isArray(messages) ? messages : [])
+    .filter((message) => transcriptItemIsVisible(message, preferences));
+}
+
 function normalizedToolName(item) {
   const raw = String(item?.tool_name || "Tool").trim() || "Tool";
   const lower = raw.toLowerCase();
-  for (const name of COLLAPSIBLE_COORDINATION_TOOLS) {
+  for (const name of [
+    ...COLLAPSIBLE_COORDINATION_TOOLS,
+    ...INTERNAL_TOOL_ALIASES.keys(),
+  ]) {
     if (lower === name || lower.endsWith(`.${name}`) || lower.endsWith(`/${name}`)
-      || lower.endsWith(`:${name}`) || lower.endsWith(`__${name}`)) return name;
+      || lower.endsWith(`:${name}`) || lower.endsWith(`__${name}`)) {
+      return INTERNAL_TOOL_ALIASES.get(name) || name;
+    }
   }
   return lower;
 }
@@ -1357,9 +1803,92 @@ function coordinationStatusJsonHasInvalidPrimitive(value, depth = 0) {
 }
 
 function collapsibleCoordinationTool(item) {
-  return transcriptItemKind(item) === "tool"
-    && COLLAPSIBLE_COORDINATION_TOOLS.has(normalizedToolName(item))
-    && ["sent", "status"].includes(coordinationResultSignal(item));
+  return internalToolGroupKey(item) === "coordination";
+}
+
+function execJsonResultClass(value, depth = 0) {
+  if (depth > 5 || value === null || typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    const results = value.slice(0, 64).map((entry) => execJsonResultClass(entry, depth + 1));
+    if (results.includes("error")) return "error";
+    if (results.includes("success")) return "success";
+    return results.includes("pending") ? "pending" : null;
+  }
+  let observed = null;
+  for (const [key, entry] of Object.entries(value).slice(0, 64)) {
+    if (/^(?:exit_code|exitCode|exit_status)$/.test(key)
+      && (typeof entry === "number" || (typeof entry === "string" && /^-?\d+$/.test(entry.trim())))) {
+      const code = Number(entry);
+      if (!Number.isFinite(code) || code !== 0) return "error";
+      observed = "success";
+      continue;
+    }
+    if (/^(?:status|code)$/.test(key)
+      && (typeof entry === "number" || (typeof entry === "string" && /^-?\d+$/.test(entry.trim())))) {
+      const code = Number(entry);
+      if (!Number.isFinite(code) || code !== 0) return "error";
+      // A generic zero code is not enough to prove process success.
+      continue;
+    }
+    if ((key === "is_error" && entry === true)
+      || ((key === "success" || key === "ok") && entry === false)) return "error";
+    if ((key === "success" || key === "ok") && entry === true) observed = "success";
+    if (/^(?:status|state)$/.test(key) && typeof entry === "string") {
+      const status = entry.trim().toLowerCase().replace(/[.!]$/, "");
+      if (/^(?:error|failed|failure|timed out|timeout|cancelled|canceled|rejected)$/.test(status)) return "error";
+      if (/^(?:ok|success|succeeded|complete|completed)$/.test(status)) observed = "success";
+      else if (/^(?:pending|queued|running|waiting)$/.test(status) && !observed) observed = "pending";
+    }
+    const nested = execJsonResultClass(entry, depth + 1);
+    if (nested === "error") return "error";
+    if (nested === "success") observed = "success";
+    else if (nested === "pending" && !observed) observed = "pending";
+  }
+  return observed;
+}
+
+function execResultClass(item) {
+  if (normalizedToolName(item) !== "exec") return null;
+  const output = typeof item?.tool_output === "string" ? item.tool_output.trim() : "";
+  if (!output) return null;
+  if (/\b(?:timed?\s*out|timeout)\b/i.test(output)
+    || coordinationResultSignal(item) === "error") return "error";
+
+  let jsonResult = null;
+  try { jsonResult = execJsonResultClass(JSON.parse(output)); } catch { /* Plain tool output. */ }
+  if (jsonResult === "error") return "error";
+
+  const exitCodes = [...output.matchAll(/(?:\b(?:process|command|script)\s+exited\s+with\s+(?:code|status)|\bexit(?:ed)?[_ -]+(?:code|status))[\s:=]*(-?\d+)\b/gi)]
+    .map((match) => Number(match[1]));
+  if (exitCodes.some((code) => !Number.isFinite(code) || code !== 0)) return "error";
+  if (exitCodes.length || jsonResult === "success") return "success";
+  if (jsonResult === "pending") return "pending";
+  if (/^(?:ok|success|succeeded|complete|completed)[.!]?$/i.test(output)) return "success";
+  if (/^(?:pending|queued|running|waiting)[.!]?$/i.test(output)) return "pending";
+  // Command output alone does not prove the tool call completed successfully.
+  return null;
+}
+
+function toolResultSignal(item) {
+  const execClass = execResultClass(item);
+  if (execClass === "error") return "error";
+  if (execClass === "success" || execClass === "pending") return "status";
+  return coordinationResultSignal(item);
+}
+
+function internalToolGroupKey(item) {
+  if (transcriptItemKind(item) !== "tool") return null;
+  if (typeof item?.tool_name !== "string" || !item.tool_name.trim()) return null;
+  const name = normalizedToolName(item);
+  if (COLLAPSIBLE_COORDINATION_TOOLS.has(name)) {
+    const signal = coordinationResultSignal(item);
+    return ["sent", "status"].includes(signal) ? "coordination" : null;
+  }
+  if (name !== "exec") return null;
+  const execClass = execResultClass(item);
+  return execClass === "success" || execClass === "pending"
+    ? `repeat:exec:${execClass}`
+    : null;
 }
 
 function coordinationToolCounts(messages) {
@@ -1376,11 +1905,12 @@ function compactTranscriptItems(messages, maxRun = MAX_COLLAPSED_TOOL_RUN) {
   const source = Array.isArray(messages) ? messages : [];
   const boundedMax = Math.max(2, Math.min(Number.isInteger(maxRun) ? maxRun : MAX_COLLAPSED_TOOL_RUN, MAX_COLLAPSED_TOOL_RUN));
   for (let index = 0; index < source.length;) {
-    if (!collapsibleCoordinationTool(source[index])) {
+    const groupKey = internalToolGroupKey(source[index]);
+    if (!groupKey) {
       items.push({ kind: "item", message: source[index] }); index += 1; continue;
     }
     let end = index;
-    while (end < source.length && collapsibleCoordinationTool(source[end])) end += 1;
+    while (end < source.length && internalToolGroupKey(source[end]) === groupKey) end += 1;
     let cursor = index;
     while (cursor < end) {
       const remaining = end - cursor;
@@ -1405,11 +1935,12 @@ function compactTranscriptItems(messages, maxRun = MAX_COLLAPSED_TOOL_RUN) {
 
 /// A tool card is collapsed on arrival, so a long run of them is a wall of
 /// closed rows. Errors and approvals keep their own row: they are the ones a
-/// reader is scanning for.
+/// reader is scanning for, and the exec-aware signal is what recognizes a
+/// failed command whose text still reads like a benign status.
 function collapsibleToolRun(item) {
   return transcriptItemKind(item) === "tool"
     && !COLLAPSIBLE_COORDINATION_TOOLS.has(normalizedToolName(item))
-    && !["error", "approval"].includes(coordinationResultSignal(item));
+    && !["error", "approval"].includes(toolResultSignal(item));
 }
 
 function toolDisplayName(item) {
@@ -1473,11 +2004,19 @@ function groupRepeatedTools(items, maxRun = MAX_COLLAPSED_TOOL_RUN) {
   return grouped;
 }
 
+/// Dispatches between the folded runs of plain tool cards and the internal
+/// coordination groups; both render through the same collapsed row.
 function coordinationGroupSummary(group) {
   if (group?.kind === "tool-run") return toolRunGroupSummary(group);
+  return toolGroupSummary(group);
+}
+
+function toolGroupSummary(group) {
   const calls = group?.messages?.length || 0;
-  const counts = (group?.counts || []).map(({ name, count }) => `${name} ×${count}`).join(" · ");
-  return `${calls} coordination calls · ${counts} · no errors`;
+  const counts = group?.counts || [];
+  if (counts.length === 1) return `${counts[0].name} ×${calls}`;
+  const labels = counts.map(({ name, count }) => `${name} ×${count}`).join(" · ");
+  return `${calls} internal calls · ${labels}`;
 }
 
 function dictationDelivery(paneId, prefix, finalText) {
@@ -1489,9 +2028,10 @@ function dictationDelivery(paneId, prefix, finalText) {
   };
 }
 
-function dictationPrefix(inputText, composerSending, inFlightText) {
+function dictationPrefix(inputText, composerSending, inFlightText, inFlightTarget, currentTarget) {
   const current = String(inputText || "").trim();
-  return composerSending && current === String(inFlightText || "").trim() ? "" : current;
+  const sameTarget = Boolean(inFlightTarget && currentTarget && inFlightTarget === currentTarget);
+  return composerSending && sameTarget && current === String(inFlightText || "").trim() ? "" : current;
 }
 
 function composerSubmissionMatches(selectedPaneId, targetPaneId, inputText, submittedText) {
@@ -1607,15 +2147,37 @@ function stickyBottomState(element, following, visible, tolerance = STICKY_BOTTO
   return { measurable, follow, deferBottom: false, showJump: !follow };
 }
 
+function transcriptAnchorMembers(value) {
+  if (typeof value !== "string" || !value
+    || value.length > MAX_TRANSCRIPT_ANCHOR_JSON_CHARS) return [];
+  try {
+    const members = JSON.parse(value);
+    if (!Array.isArray(members) || !members.length
+      || members.length > MAX_COLLAPSED_TOOL_RUN
+      || members.some((member) => typeof member !== "string" || !member
+        || member.length > MAX_TRANSCRIPT_ANCHOR_MEMBER_CHARS)) return [];
+    return members;
+  } catch {
+    return [];
+  }
+}
+
+function transcriptAnchorItems(container) {
+  return [...(container?.children || [])]
+    .filter((node) => Boolean(node?.dataset?.transcriptId));
+}
+
 /// Captures the first visible semantic transcript item, not just a pixel
 /// offset. Bounded logs can discard cards above a reader while an agent emits.
-function transcriptReadingAnchor(container) {
+function transcriptReadingAnchor(container, retain = null) {
   const bounds = container.getBoundingClientRect();
-  for (const item of container.querySelectorAll("[data-transcript-id]")) {
+  for (const item of transcriptAnchorItems(container)) {
     const id = item.dataset.transcriptId;
     const box = item.getBoundingClientRect();
-    if (id && box.bottom > bounds.top) {
-      return { id, offset: box.top - bounds.top };
+    if (id && box.bottom > bounds.top && (!retain || retain(item))) {
+      const members = transcriptAnchorMembers(item.dataset.transcriptMembers);
+      const memberId = members[0] || id;
+      return { id, memberId, offset: box.top - bounds.top };
     }
   }
   return null;
@@ -1629,8 +2191,15 @@ function restoreTranscriptReadingAnchor(container, anchor, fallbackOffset) {
     container.scrollTop = fallbackOffset;
     return;
   }
-  const item = [...container.querySelectorAll("[data-transcript-id]")]
-    .find((node) => node.dataset.transcriptId === anchor.id);
+  // Only outer Conversation rows participate. Expanded/collapsed tool-group
+  // descendants carry their own ids but are not independent scroll anchors.
+  const items = transcriptAnchorItems(container);
+  let item = items.find((node) => node.dataset.transcriptId === anchor.id);
+  if (!item && anchor.memberId) {
+    item = items.find((node) => node.dataset.transcriptId === anchor.memberId)
+      || items.find((node) => transcriptAnchorMembers(node.dataset.transcriptMembers)
+        .includes(anchor.memberId));
+  }
   if (!item) {
     container.scrollTop = fallbackOffset;
     return;
@@ -1788,9 +2357,13 @@ if (typeof module !== "undefined" && module.exports) {
     MAX_IMAGE_ATTACHMENTS,
     MAX_IMAGE_BYTES,
     MAX_TOTAL_IMAGE_BYTES,
+    MAX_LAUNCH_DIRECTORY_CANDIDATES,
+    MAX_LAUNCH_DIRECTORY_SUGGESTIONS,
+    LAUNCH_DIRECTORY_SEARCH_DEBOUNCE_MS,
     MAX_FILE_REFERENCE_CHARS,
     MAX_FILE_REFERENCE_LINES,
     attachmentDeliveryTarget,
+    attachmentSelectionMatches,
     agentMenuUrl,
     appRoute,
     remainingAttachmentsAfterDelivery,
@@ -1799,6 +2372,17 @@ if (typeof module !== "undefined" && module.exports) {
     classifyOverviewUpdate,
     compareSessions,
     composerEnterAction,
+    composerDraftCanClear,
+    composerDraftEntries,
+    composerDraftIdentity,
+    composerDraftInstanceId,
+    composerDraftMachine,
+    composerDraftJson,
+    composerDraftTombstones,
+    mergeComposerDraftState,
+    pruneComposerDraftEntries,
+    staleComposerDraftKeys,
+    sessionMatchesComposerIdentity,
     composerSubmissionCanRestore,
     composerSubmissionMatches,
     contentToLines,
@@ -1813,6 +2397,10 @@ if (typeof module !== "undefined" && module.exports) {
     duplicateSessionName,
     duplicateSummaryState,
     filterDirectories,
+    defaultMemoryLimitLabel,
+    formatMemoryLimit,
+    memoryLimitChoices,
+    parseMemoryLimitSelection,
     formatRelativeTime,
     groupSessionsByMachine,
     harnessesForProfiles,
@@ -1822,6 +2410,8 @@ if (typeof module !== "undefined" && module.exports) {
     rememberLaunchDirectory,
     availableLaunchDirectories,
     launchDirectoryBrowsePath,
+    validLaunchChildName,
+    repositoryDestinationName,
     launchMachines,
     imageFilesFromTransfer,
     highlightCode,
@@ -1837,6 +2427,7 @@ if (typeof module !== "undefined" && module.exports) {
     messageFitsByteLimit,
     moveMessageHistory,
     paneTypingText,
+    paneSpecialKeyDelivery,
     paneErrorLabel,
     paneFilesPath,
     paneGitPath,
@@ -1848,6 +2439,10 @@ if (typeof module !== "undefined" && module.exports) {
     fileReaderPreferences,
     fileReaderPreferenceJson,
     loadFileReaderPreferences,
+    conversationVisibilityPreferences,
+    conversationVisibilityPreferenceJson,
+    loadConversationVisibilityPreferences,
+    saveConversationVisibilityPreferences,
     fileReferenceBlock,
     insertComposerReference,
     nextFileLineSelection,
@@ -1894,12 +2489,20 @@ if (typeof module !== "undefined" && module.exports) {
     savedSessionConfirmation,
     savedSessionPreview,
     selectionTouchesPane,
+    transcriptAnchorMembers,
     transcriptItemKind,
+    transcriptVisibilityKind,
+    transcriptItemIsVisible,
+    filterTranscriptMessages,
     normalizedToolName,
     coordinationResultSignal,
+    execResultClass,
+    toolResultSignal,
     collapsibleCoordinationTool,
+    internalToolGroupKey,
     compactTranscriptItems,
     coordinationGroupSummary,
+    toolGroupSummary,
     collapsibleToolRun,
     groupRepeatedTools,
     toolDisplayName,
@@ -1932,14 +2535,35 @@ function initialize() {
   } else {
     history.replaceState(appHistoryState(initialRoute), "", pageUrl);
   }
-  const storedPulseAccount = pulseAccountId(readStoredValue("atmux.pulse-account"));
+  const readLocalStorage = (key) => {
+    try { return localStorage.getItem(key); } catch { return null; }
+  };
+  const writeLocalStorage = (key, value) => {
+    try {
+      localStorage.setItem(key, value);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const storedPulseAccount = pulseAccountId(readLocalStorage("atmux.pulse-account"));
   const storedLaunchDirectories = rememberedLaunchDirectories(
-    readStoredValue(LAUNCH_DIRECTORY_STORAGE_KEY),
+    readLocalStorage(LAUNCH_DIRECTORY_STORAGE_KEY),
   );
   const storedFileReaderPreferences = loadFileReaderPreferences(
-    () => localStorage.getItem(FILE_READER_STORAGE_KEY),
+    () => readLocalStorage(FILE_READER_STORAGE_KEY),
     mobileViewportActive(),
   );
+  const storedConversationVisibility = loadConversationVisibilityPreferences(
+    () => readLocalStorage(CONVERSATION_VISIBILITY_STORAGE_KEY),
+  );
+  const storedComposerDraftValue = readLocalStorage(COMPOSER_DRAFT_STORAGE_KEY);
+  const storedComposerDraftState = mergeComposerDraftState(
+    new Map(),
+    new Map(),
+    storedComposerDraftValue,
+  );
+  const storedComposerDrafts = storedComposerDraftState.drafts;
   const requestedPulseAccount = pulseAccountId(pageUrl.searchParams.get("pulseAccount"));
   const state = {
     revision: 0,
@@ -1961,11 +2585,19 @@ function initialize() {
     launchNamePristine: true,
     rememberedLaunchDirectories: storedLaunchDirectories,
     launchBrowseGeneration: 0,
+    launchBrowseMutation: false,
     launchDialogGeneration: 0,
     launchFlow: null,
     launchSummarySourceId: null,
     launchSessionsGeneration: 0,
     launchSessionsKey: "",
+    launchSessionsController: null,
+    launchDirectorySearchTimer: null,
+    launchDirectoryCandidates: null,
+    launchDirectoryActiveIndex: -1,
+    launchDirectorySuggestionsDismissed: false,
+    launchDirectoryPointerGesture: null,
+    launchDirectorySuppressClick: null,
     paneError: null,
     panePointerDown: false,
     pendingPaneRender: false,
@@ -1979,12 +2611,14 @@ function initialize() {
     transcriptRequest: 0,
     transcriptPointerDown: false,
     pendingTranscriptRender: false,
+    pendingTranscriptFilterChange: false,
     transcriptFollowing: true,
     transcriptExpectedScrollTop: null,
     transcriptReadingScrollTop: 0,
     transcriptPendingBottom: true,
     transcriptUnseen: false,
     transcriptDrawnHash: "",
+    conversationVisibility: storedConversationVisibility,
     viewMode: "conversation",
     projectView: null,
     filesRequest: 0,
@@ -1996,12 +2630,31 @@ function initialize() {
     fileReaderPreferences: storedFileReaderPreferences,
     messageHistory: new Map(),
     messageHistoryNavigation: null,
+    composerDrafts: storedComposerDrafts,
+    composerDraftIdentity: null,
+    composerDraftSequence: Math.max(
+      0,
+      ...[...storedComposerDrafts.values()].map((draft) => draft.version),
+    ),
+    composerDraftTimestamp: Math.max(
+      Date.now(),
+      ...[...storedComposerDrafts.values()].map((draft) => draft.updatedAt),
+      ...[...storedComposerDraftState.tombstones.values()].map((item) => item.deletedAt),
+    ),
+    composerDraftStorageTimer: null,
+    composerDraftTombstones: storedComposerDraftState.tombstones,
+    optimisticComposerClears: new Map(),
     composerSending: false,
+    specialKeySending: null,
+    specialKeyQueue: [],
+    specialKeyStatuses: new Map(),
     inFlightComposerText: null,
+    inFlightComposerIdentity: null,
     composerRevision: 0,
     queuedComposerMessages: [],
     attachments: [],
     attachmentPaneId: null,
+    attachmentInstanceKey: null,
     pendingKillId: null,
     pendingResumeId: null,
     paneModels: null,
@@ -2012,7 +2665,7 @@ function initialize() {
     recoveryStatus: null,
     recoveryLoading: false,
     recoveryPoll: null,
-    railCollapsed: readStoredValue("atmux.rail-collapsed") === "true",
+    railCollapsed: readLocalStorage("atmux.rail-collapsed") === "true",
     pulseOpen: initialRoute.view === "usage",
     pulseAccount: requestedPulseAccount || storedPulseAccount,
     pulseAccounts: [],
@@ -2055,6 +2708,17 @@ function initialize() {
     return window.matchMedia("(max-width: 720px)").matches;
   }
 
+  function revealFocusedLaunchMemoryControl() {
+    const focused = document.activeElement;
+    if (!$("launch-dialog").open
+        || !focused?.matches("#launch-memory, #launch-memory-custom")) return;
+    requestAnimationFrame(() => {
+      if (document.activeElement === focused) {
+        focused.scrollIntoView({ block: "nearest", inline: "nearest" });
+      }
+    });
+  }
+
   // Measure the layout viewport, never the visual viewport.
   //
   // On mobile `body` is `position: fixed`, so it is anchored to the layout
@@ -2084,6 +2748,7 @@ function initialize() {
     const height = window.innerHeight;
     if (Number.isFinite(height) && height > 0) {
       document.documentElement.style.setProperty("--app-height", `${Math.floor(height)}px`);
+      revealFocusedLaunchMemoryControl();
     }
   }
 
@@ -2104,7 +2769,7 @@ function initialize() {
     toggle.setAttribute("aria-expanded", String(!state.railCollapsed));
     toggle.setAttribute("aria-label", state.railCollapsed ? "Expand agent list" : "Collapse agent list");
     toggle.title = state.railCollapsed ? "Expand agent list" : "Collapse agent list";
-    writeStoredValue("atmux.rail-collapsed", String(state.railCollapsed));
+    writeLocalStorage("atmux.rail-collapsed", String(state.railCollapsed));
   }
 
   setRailCollapsed(state.railCollapsed);
@@ -2115,6 +2780,7 @@ function initialize() {
   }
 
   function applyOverview(data) {
+    const previousSessions = state.sessions;
     const result = reduceOverview({ revision: state.revision, sessions: state.sessions }, data);
     if (result.resync) {
       // This patch does not continue the revision we hold, so the session list
@@ -2123,9 +2789,40 @@ function initialize() {
       connectOverview();
       return;
     }
+    mergeComposerDraftState(
+      state.composerDrafts,
+      state.composerDraftTombstones,
+      readLocalStorage(COMPOSER_DRAFT_STORAGE_KEY),
+      Date.now(),
+      protectedComposerDraftKeys(),
+    );
+    syncComposerDraftTimestamp();
+    const snapshotMachines = Array.isArray(data.sessions)
+      ? new Set((Array.isArray(data.machines) ? data.machines : [])
+        .filter((machine) => machine?.online === true)
+        .map((machine) => machine.id))
+      : null;
+    let draftsChanged = false;
+    for (const [id, previous] of previousSessions) {
+      const current = result.sessions.get(id);
+      if (!current && snapshotMachines
+          && !snapshotMachines.has(sessionMachineId(previous))) continue;
+      const previousIdentity = composerDraftIdentity(previous);
+      const currentIdentity = composerDraftIdentity(current);
+      if (!currentIdentity || currentIdentity.key !== previousIdentity?.key) {
+        draftsChanged = forgetComposerDraft(previousIdentity, true, false) || draftsChanged;
+      }
+    }
+    if (Array.isArray(data.sessions)) {
+      for (const key of staleComposerDraftKeys(state.composerDrafts, result.sessions, data.machines)) {
+        draftsChanged = forgetComposerDraft({ key, persistent: true }, true, false) || draftsChanged;
+      }
+    }
+    if (draftsChanged) saveComposerDraftStorage(true);
     state.sessions = result.sessions;
     state.revision = result.revision;
     if (Array.isArray(data.machines) && data.machines.length) state.machines = data.machines;
+    bindComposerDraftToSelection();
     setHealth(data.health);
     reconcileSelection();
     render();
@@ -2202,6 +2899,7 @@ function initialize() {
     state.transcriptRequest += 1;
     state.transcriptPointerDown = false;
     state.pendingTranscriptRender = false;
+    state.pendingTranscriptFilterChange = false;
     state.transcriptFollowing = true;
     state.transcriptExpectedScrollTop = null;
     // Opening or switching agents always starts pinned at the newest message.
@@ -2251,7 +2949,10 @@ function initialize() {
       scheduleTranscript(350);
       $("stream-state").textContent = "Live";
     });
-    source.addEventListener("pane.removed", () => selectSession(null, "replace"));
+    source.addEventListener("pane.removed", () => {
+      forgetComposerDraft(selectedComposerDraftIdentity(), true);
+      selectSession(null, "replace");
+    });
     // A failure on the owning machine belongs to this pane, not to the local
     // tmux monitor, so it never touches the global health alert.
     source.addEventListener("pane.error", (event) => {
@@ -2326,10 +3027,11 @@ function initialize() {
     details.className = "tool-card";
     if (grouped) details.classList.add("tool-card-group-item");
     details.dataset.transcriptId = String(message.id || "");
+    details.dataset.transcriptVisibility = "internal";
     details.open = expandedTools.has(details.dataset.transcriptId);
     const summary = document.createElement("summary");
     const name = String(message.tool_name || "Tool");
-    const resultSignal = coordinationResultSignal(message);
+    const resultSignal = toolResultSignal(message);
     const suffix = resultSignal === "error" ? "error"
       : resultSignal === "approval" ? "approval required"
         : message.tool_output ? "result" : "";
@@ -2348,15 +3050,23 @@ function initialize() {
     return details;
   }
 
-  function renderCoordinationGroup(group, expandedTools) {
+  function renderToolGroup(group, expandedTools) {
     const details = document.createElement("details");
     details.className = "tool-card tool-call-group";
     if (group.kind === "tool-run") details.classList.add("tool-run-group");
     details.dataset.transcriptId = group.id;
+    details.dataset.transcriptMembers = JSON.stringify(
+      group.messages.map((message) => String(message?.id || "")).filter(Boolean),
+    );
+    details.dataset.transcriptVisibility = "internal";
     details.open = expandedTools.has(group.id);
     const summary = document.createElement("summary");
     summary.className = "tool-call-group-summary";
     summary.textContent = coordinationGroupSummary(group);
+    summary.setAttribute(
+      "aria-label",
+      `${summary.textContent}; ${group.messages.length} calls and results`,
+    );
     // Mobile browsers may scroll an expanding <details> to keep its newly
     // exposed body visible. The reader chose this visible summary, so retain
     // their exact Conversation offset while revealing the original calls.
@@ -2428,9 +3138,10 @@ function initialize() {
     }).observe(conversation);
   }
 
-  function drawConversation() {
+  function drawConversation(filterChanged = false) {
     if (state.transcriptPointerDown || selectionTouchesPane(conversation, window.getSelection())) {
       state.pendingTranscriptRender = true;
+      state.pendingTranscriptFilterChange ||= filterChanged;
       return;
     }
     const sticky = stickyBottomState(conversation, state.transcriptFollowing, !conversation.hidden);
@@ -2438,51 +3149,67 @@ function initialize() {
     const readingOffset = sticky.measurable
       ? conversation.scrollTop
       : state.transcriptReadingScrollTop;
+    const retainAfterFilter = filterChanged
+      ? (node) => node.dataset.transcriptVisibility === "agent"
+        || (node.dataset.transcriptVisibility === "human" && state.conversationVisibility.human)
+        || (node.dataset.transcriptVisibility === "internal" && state.conversationVisibility.internal)
+      : null;
     const readingAnchor = shouldFollow || !sticky.measurable
       ? null
-      : transcriptReadingAnchor(conversation);
+      : transcriptReadingAnchor(conversation, retainAfterFilter);
     const expandedTools = new Set(
       [...conversation.querySelectorAll("details.tool-card[open]")]
         .map((node) => node.dataset.transcriptId)
         .filter(Boolean),
     );
     const nodes = [];
-    if (state.transcript.truncated) {
+    if (state.transcript.truncated && state.conversationVisibility.internal) {
       const notice = document.createElement("p");
       notice.className = "transcript-notice";
       notice.textContent = "Showing the newest bounded part of this session log.";
       nodes.push(notice);
     }
-    const transcriptItems = compactTranscriptItems(
-      state.transcript.available ? state.transcript.messages : [],
-    );
+    const sourceMessages = state.transcript.available && Array.isArray(state.transcript.messages)
+      ? state.transcript.messages : [];
+    const visibleMessages = filterTranscriptMessages(sourceMessages, state.conversationVisibility);
+    const transcriptItems = compactTranscriptItems(visibleMessages);
+    let renderedMessages = 0;
     for (const item of transcriptItems) {
       if (item.kind === "tool-group" || item.kind === "tool-run") {
-        nodes.push(renderCoordinationGroup(item, expandedTools));
+        nodes.push(renderToolGroup(item, expandedTools));
+        renderedMessages += item.messages.length;
         continue;
       }
       const message = item.message;
       if (!message) continue;
       if (transcriptItemKind(message) === "tool") {
         nodes.push(renderToolCard(message, expandedTools));
+        renderedMessages += 1;
         continue;
       }
-      if (!TRANSCRIPT_MESSAGE_ROLES.has(message.role)) continue;
+      const visibility = transcriptVisibilityKind(message);
+      if (visibility === "internal" && typeof message.markdown !== "string") continue;
       const article = document.createElement("article");
-      article.className = `message-card ${message.role}`;
+      article.className = `message-card ${String(message.role || "internal")} ${visibility}`;
       article.dataset.transcriptId = String(message.id || "");
+      article.dataset.transcriptVisibility = visibility;
       const label = document.createElement("header");
       label.textContent = transcriptRoleLabel(message);
       const body = document.createElement("div");
       body.className = "markdown-body";
       body.append(markdownFragment(message.markdown));
       article.append(label, body); nodes.push(article);
+      renderedMessages += 1;
     }
-    if (!nodes.length) {
+    const hasOnlyNotice = nodes.length === 1 && nodes[0].classList.contains("transcript-notice");
+    if (!renderedMessages && (!nodes.length || hasOnlyNotice)) {
       const empty = document.createElement("div");
       empty.className = "conversation-empty";
-      empty.textContent = state.transcript.error
-        ? `Conversation log unavailable: ${state.transcript.error}. Raw pane remains available.`
+      const hiddenMessages = Math.max(0, sourceMessages.length - visibleMessages.length);
+      empty.textContent = hiddenMessages > 0
+        ? "No agent messages to show. Change Conversation visibility or choose Show all."
+        : (state.transcript.error && state.conversationVisibility.internal)
+          ? `Conversation log unavailable: ${state.transcript.error}. Raw pane remains available.`
         : (state.transcript.available
           ? `Waiting for ${state.transcript.source} conversation messages…`
           : "No agent session log is mapped yet. Raw pane remains available.");
@@ -2499,6 +3226,7 @@ function initialize() {
     conversation.replaceChildren(...nodes);
     state.pendingTranscriptRender = false;
     state.transcriptFollowing = shouldFollow;
+    state.pendingTranscriptFilterChange = false;
     // Stream updates replace transcript cards wholesale. Following is an
     // explicit reader choice, not merely a position that happens to be near
     // the tail. When reading, anchor the same transcript item in the viewport
@@ -2522,7 +3250,7 @@ function initialize() {
     if (!state.pendingTranscriptRender
       || state.transcriptPointerDown
       || selectionTouchesPane(conversation, window.getSelection())) return;
-    drawConversation();
+    drawConversation(state.pendingTranscriptFilterChange);
   }
 
   function emptyProjectView(paneId) {
@@ -2607,14 +3335,10 @@ function initialize() {
       ...state.fileReaderPreferences,
       ...change,
     });
-    try {
-      localStorage.setItem(
-        FILE_READER_STORAGE_KEY,
-        fileReaderPreferenceJson(state.fileReaderPreferences),
-      );
-    } catch {
-      // Keep the in-memory choice when browser storage is unavailable.
-    }
+    writeLocalStorage(
+      FILE_READER_STORAGE_KEY,
+      fileReaderPreferenceJson(state.fileReaderPreferences),
+    );
     applyFileReaderPreferences($("file-viewer"));
   }
 
@@ -3323,6 +4047,31 @@ function initialize() {
     return true;
   }
 
+  function renderConversationFilters() {
+    const preferences = conversationVisibilityPreferences(state.conversationVisibility);
+    const hiddenCount = Number(!preferences.human) + Number(!preferences.internal);
+    const open = $("conversation-filters-open");
+    const indicator = $("conversation-filters-indicator");
+    $("conversation-show-human").checked = preferences.human;
+    $("conversation-show-internal").checked = preferences.internal;
+    $("conversation-filters-reset").disabled = hiddenCount === 0;
+    open.classList.toggle("active", hiddenCount > 0);
+    open.setAttribute("aria-label", hiddenCount
+      ? `Conversation visibility: ${hiddenCount} message ${hiddenCount === 1 ? "type" : "types"} hidden`
+      : "Conversation visibility: showing all message types");
+    indicator.textContent = hiddenCount ? `${hiddenCount} off` : "All";
+  }
+
+  function setConversationVisibility(next) {
+    state.conversationVisibility = conversationVisibilityPreferences(next);
+    saveConversationVisibilityPreferences(
+      (value) => writeLocalStorage(CONVERSATION_VISIBILITY_STORAGE_KEY, value),
+      state.conversationVisibility,
+    );
+    renderConversationFilters();
+    drawConversation(true);
+  }
+
   function renderViewMode() {
     const raw = state.viewMode === "raw";
     const files = state.viewMode === "files";
@@ -3342,6 +4091,7 @@ function initialize() {
     }
     pane.hidden = !raw;
     conversation.hidden = !conversationMode;
+    $("conversation-filters-open").hidden = !conversationMode;
     filesPanel.hidden = !files;
     gitPanel.hidden = !git;
     // Snapshots normally arrive while Conversation is visible, when the
@@ -3376,6 +4126,7 @@ function initialize() {
       button.setAttribute("aria-pressed", String(selected));
       button.tabIndex = selected ? 0 : -1;
     }
+    renderConversationFilters();
     if (revealFiles) {
       const view = selectedProjectView();
       if (view?.files.listing) renderFiles();
@@ -3467,6 +4218,8 @@ function initialize() {
     state.launchSummarySourceId = null;
     $("launch-summary").hidden = true;
     $("launch-summary-resume").checked = false;
+    cancelLaunchDirectorySearch();
+    hideLaunchDirectorySuggestions(true);
     clearLaunchSessions();
     const dialog = $("launch-dialog");
     if (close && dialog.open) {
@@ -3479,10 +4232,14 @@ function initialize() {
     const changed = state.selected !== id || state.selectedMachine !== null || state.pulseOpen;
     const paneChanged = state.selected !== id;
     if (changed && !confirmDiscardFileEdit()) return false;
-    if (changed) invalidateLaunchDialog();
+    if (changed) {
+      persistBoundComposerDraft(true);
+      invalidateLaunchDialog();
+    }
     state.selected = id;
     state.selectedMachine = null;
     state.pulseOpen = false;
+    bindComposerDraftToSelection();
     stopPulseRefresh();
     stopPulseEvents();
     document.body.classList.toggle("has-selection", Boolean(id));
@@ -3502,10 +4259,14 @@ function initialize() {
   function selectMachine(id, historyMode = "push") {
     const changed = state.selected !== null || state.selectedMachine !== id || state.pulseOpen;
     if (changed && !confirmDiscardFileEdit()) return false;
-    if (changed) invalidateLaunchDialog();
+    if (changed) {
+      persistBoundComposerDraft(true);
+      invalidateLaunchDialog();
+    }
     state.selected = null;
     state.selectedMachine = id;
     state.pulseOpen = false;
+    bindComposerDraftToSelection();
     resetProjectView();
     stopPulseRefresh();
     stopPulseEvents();
@@ -3529,10 +4290,14 @@ function initialize() {
     const nextOpen = Boolean(open);
     const changed = state.selected !== null || state.selectedMachine !== null || state.pulseOpen !== nextOpen;
     if (changed && !confirmDiscardFileEdit()) return false;
-    if (changed) invalidateLaunchDialog();
+    if (changed) {
+      persistBoundComposerDraft(true);
+      invalidateLaunchDialog();
+    }
     state.pulseOpen = nextOpen;
     state.selected = null;
     state.selectedMachine = null;
+    bindComposerDraftToSelection();
     resetProjectView();
     const url = new URL(location.href);
     url.searchParams.delete("session");
@@ -3588,6 +4353,7 @@ function initialize() {
     }
   });
   window.addEventListener("beforeunload", (event) => {
+    persistBoundComposerDraft(true);
     if (!fileEditHasUnsavedWork(state.projectView?.files)) return;
     event.preventDefault();
     event.returnValue = "";
@@ -3667,6 +4433,9 @@ function initialize() {
       machine?.label || sessionMachineId(selected),
       state.statusPresentations.get(selected.id)?.shown || selected.status,
       selected.agent,
+      safeMemoryBytes(selected.memory_max_bytes) === null
+        ? "Memory cap unavailable"
+        : `Memory ${formatMemoryLimit(selected.memory_max_bytes)}`,
     ].filter(Boolean).join(" · ");
     $("agent-meta").title = selected.path || "";
     const launch = $("agent-launch");
@@ -3676,10 +4445,36 @@ function initialize() {
     renderClaudeResumeAction(selected, controllable);
     const resuming = Boolean(state.resumingPaneId);
     const preparingDuplicate = Boolean(state.duplicatingPaneId);
-    for (const id of ["tmux-prefix-twice", "interrupt", "kill-open", "attach", "quick-actions-open", "quick-duplicate", "quick-compact", "quick-tmux-prefix-twice", "quick-interrupt", "quick-kill-open"]) $(id).disabled = !controllable || state.composerSending || resuming || preparingDuplicate;
+    for (const id of ["interrupt", "kill-open", "attach", "quick-actions-open", "quick-duplicate", "quick-compact", "quick-interrupt", "quick-kill-open"]) $(id).disabled = !controllable || state.composerSending || resuming || preparingDuplicate;
+    const keyTarget = paneSpecialKeyDelivery(selected, "enter");
+    const keyTargetId = paneSpecialKeyTarget(keyTarget);
+    const queuedKeys = keyTargetId
+      ? state.specialKeyQueue.filter((item) => paneSpecialKeyTarget(item) === keyTargetId).length
+        + Number(paneSpecialKeyTarget(state.specialKeySending) === keyTargetId)
+      : 0;
+    const keyQueueFull = state.specialKeyQueue.length
+      + Number(Boolean(state.specialKeySending)) >= MAX_QUEUED_PANE_KEYS;
+    document.querySelector(".quick-pane-keypad").setAttribute(
+      "aria-busy",
+      String(state.specialKeyQueue.length > 0 || Boolean(state.specialKeySending)),
+    );
+    document.querySelectorAll("[data-pane-key]").forEach((button) => {
+      button.disabled = !controllable || state.composerSending || resuming || preparingDuplicate || keyQueueFull;
+    });
+    $("tmux-prefix-twice").disabled = !controllable || state.composerSending || resuming || preparingDuplicate || keyQueueFull;
+    $("quick-tmux-prefix-twice").disabled = !controllable || state.composerSending || resuming || preparingDuplicate || keyQueueFull;
+    const keyStatus = $("quick-pane-key-status");
+    if (keyQueueFull) {
+      keyStatus.textContent = `Key queue full (${MAX_QUEUED_PANE_KEYS}). Wait for a key to finish.`;
+    } else if (queuedKeys > 0) {
+      keyStatus.textContent = `${queuedKeys} key${queuedKeys === 1 ? "" : "s"} sending or queued for this agent.`;
+    } else {
+      keyStatus.textContent = state.specialKeyStatuses.get(keyTargetId) || "One key is sent per tap.";
+    }
     $("quick-duplicate").textContent = preparingDuplicate ? "Preparing duplicate…" : "Duplicate agent";
     $("message").disabled = !controllable || resuming;
-    $("send").disabled = !controllable || state.composerSending || resuming;
+    $("send").disabled = !controllable || state.composerSending || resuming
+      || (state.attachments.length > 0 && !attachmentsMatchCurrentSelection());
     const notice = paneNotice(machine, state.paneError, Date.now());
     const offline = $("agent-offline");
     offline.hidden = !notice;
@@ -4242,7 +5037,7 @@ function initialize() {
   }
 
   function rememberPulseAccount(account) {
-    writeStoredValue("atmux.pulse-account", String(account));
+    writeLocalStorage("atmux.pulse-account", String(account));
   }
 
   async function loadPulseAccounts(force = false) {
@@ -4989,9 +5784,21 @@ function initialize() {
 
   function attachmentTargetLabel() {
     const target = state.sessions.get(state.attachmentPaneId);
-    if (!target) return `Sending to ${state.attachmentPaneId || "the selected agent"}`;
+    if (!target) return "These images belong to an unavailable agent. Clear them before sending.";
     const machine = machineOf(target);
-    return `Sending to ${target.name}${machine?.label ? ` on ${machine.label}` : ""}`;
+    const label = `${target.name}${machine?.label ? ` on ${machine.label}` : ""}`;
+    return attachmentsMatchCurrentSelection()
+      ? `Sending to ${label}`
+      : `Images belong to ${label}. Return to that agent or clear them before sending.`;
+  }
+
+  function attachmentsMatchCurrentSelection() {
+    return attachmentSelectionMatches(
+      state.attachmentPaneId,
+      state.attachmentInstanceKey,
+      state.selected,
+      selectedComposerDraftIdentity()?.key,
+    );
   }
 
   function renderAttachments() {
@@ -5026,8 +5833,9 @@ function initialize() {
     for (const attachment of state.attachments) URL.revokeObjectURL?.(attachment.url);
     state.attachments = [];
     state.attachmentPaneId = null;
+    state.attachmentInstanceKey = null;
     $("image-input").value = "";
-    renderAttachments();
+    render();
     return true;
   }
 
@@ -5038,8 +5846,11 @@ function initialize() {
     }
     const [removed] = state.attachments.splice(index, 1);
     if (removed) URL.revokeObjectURL?.(removed.url);
-    if (!state.attachments.length) state.attachmentPaneId = null;
-    renderAttachments();
+    if (!state.attachments.length) {
+      state.attachmentPaneId = null;
+      state.attachmentInstanceKey = null;
+    }
+    render();
     return Boolean(removed);
   }
 
@@ -5050,9 +5861,12 @@ function initialize() {
       if (!retained.has(attachment)) URL.revokeObjectURL?.(attachment.url);
     }
     state.attachments = remaining;
-    if (!remaining.length) state.attachmentPaneId = null;
+    if (!remaining.length) {
+      state.attachmentPaneId = null;
+      state.attachmentInstanceKey = null;
+    }
     $("image-input").value = "";
-    renderAttachments();
+    render();
   }
 
   function addAttachmentFiles(files) {
@@ -5064,7 +5878,12 @@ function initialize() {
       toast("Select an agent before attaching an image");
       return false;
     }
-    if (state.attachments.length && state.attachmentPaneId !== state.selected) {
+    const selectedIdentity = selectedComposerDraftIdentity();
+    if (!selectedIdentity?.persistent) {
+      toast("This agent's identity is unavailable; reconnect before attaching images");
+      return false;
+    }
+    if (state.attachments.length && !attachmentsMatchCurrentSelection()) {
       toast("These images belong to another agent; clear them before adding more");
       return false;
     }
@@ -5073,37 +5892,41 @@ function initialize() {
       toast(selection.error);
       return false;
     }
-    if (!state.attachmentPaneId) state.attachmentPaneId = state.selected;
+    if (!state.attachmentPaneId) {
+      state.attachmentPaneId = state.selected;
+      state.attachmentInstanceKey = selectedIdentity.key;
+    }
     state.attachments = state.attachments.concat(selection.files.map((file) => ({
       file,
       url: URL.createObjectURL(file),
     })));
-    renderAttachments();
+    render();
     return true;
   }
 
-  function rememberMessage(paneId, message) {
-    const history = state.messageHistory.get(paneId) || [];
+  function rememberMessage(identity, message) {
+    if (!identity) return;
+    const history = state.messageHistory.get(identity.key) || [];
     if (history[history.length - 1] !== message) history.push(message);
     if (history.length > MAX_MESSAGE_HISTORY_ENTRIES) {
       history.splice(0, history.length - MAX_MESSAGE_HISTORY_ENTRIES);
     }
-    state.messageHistory.set(paneId, history);
+    state.messageHistory.set(identity.key, history);
     state.messageHistoryNavigation = null;
   }
 
   function browseMessageHistory(direction) {
-    const paneId = state.selected;
+    const identity = selectedComposerDraftIdentity();
     const input = $("message");
-    if (!paneId || input.disabled) return false;
-    const history = state.messageHistory.get(paneId) || [];
+    if (!identity || input.disabled) return false;
+    const history = state.messageHistory.get(identity.key) || [];
     const navigation = state.messageHistoryNavigation;
-    const samePane = navigation?.paneId === paneId;
+    const samePane = navigation?.draftKey === identity.key;
     const index = samePane ? navigation.index : history.length;
     const draft = samePane ? navigation.draft : input.value;
     const next = moveMessageHistory(history, index, direction);
     if (next === null) return false;
-    state.messageHistoryNavigation = { paneId, index: next, draft };
+    state.messageHistoryNavigation = { draftKey: identity.key, index: next, draft };
     replaceComposerValue(next === history.length ? draft : history[next]);
     input.setSelectionRange(input.value.length, input.value.length);
     return true;
@@ -5197,6 +6020,27 @@ function initialize() {
   $("raw-view").addEventListener("click", () => setViewMode("raw"));
   $("files-view").addEventListener("click", () => setViewMode("files"));
   $("git-view").addEventListener("click", () => setViewMode("git"));
+  $("conversation-filters-open").addEventListener("click", () => {
+    const dialog = $("conversation-filters-dialog");
+    if (!dialog.open) {
+      dialog.showModal();
+      $("conversation-filters-open").setAttribute("aria-expanded", "true");
+    }
+  });
+  $("conversation-filters-dialog").addEventListener("close", () => {
+    $("conversation-filters-open").setAttribute("aria-expanded", "false");
+  });
+  for (const [id, key] of [["conversation-show-human", "human"], ["conversation-show-internal", "internal"]]) {
+    $(id).addEventListener("change", (event) => {
+      setConversationVisibility({
+        ...state.conversationVisibility,
+        [key]: event.currentTarget.checked,
+      });
+    });
+  }
+  $("conversation-filters-reset").addEventListener("click", () => {
+    setConversationVisibility({ human: true, internal: true });
+  });
   document.querySelector(".view-switch").addEventListener("keydown", (event) => {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     const modes = ["conversation", "raw", "files", "git"];
@@ -5212,20 +6056,214 @@ function initialize() {
   $("mobile-back").addEventListener("click", backToAgentMenu);
   $("machine-mobile-back").addEventListener("click", backToAgentMenu);
 
-  function replaceComposerValue(value) {
+  function composerDraftIdentityForPane(paneId) {
+    const session = state.sessions.get(paneId);
+    const localMachineId = state.machines.find((machine) => machine.kind === "local")?.id || "local";
+    return composerDraftIdentity(session, localMachineId);
+  }
+
+  function selectedComposerDraftIdentity() {
+    return composerDraftIdentityForPane(state.selected);
+  }
+
+  function composerTargetMatches(paneId, identityKey) {
+    const localMachineId = state.machines.find((machine) => machine.kind === "local")?.id || "local";
+    return sessionMatchesComposerIdentity(state.sessions.get(paneId), identityKey, localMachineId);
+  }
+
+  function protectedComposerDraftKeys() {
+    const keys = new Set(state.optimisticComposerClears.keys());
+    if (state.composerDraftIdentity) keys.add(state.composerDraftIdentity.key);
+    if (state.inFlightComposerIdentity) keys.add(state.inFlightComposerIdentity);
+    for (const queued of state.queuedComposerMessages) {
+      const key = queued.options?.composerSubmission?.draftIdentity?.key;
+      if (key) keys.add(key);
+    }
+    return keys;
+  }
+
+  function nextComposerDraftTimestamp() {
+    state.composerDraftTimestamp = Math.max(state.composerDraftTimestamp + 1, Date.now());
+    return state.composerDraftTimestamp;
+  }
+
+  function syncComposerDraftTimestamp() {
+    for (const draft of state.composerDrafts.values()) {
+      state.composerDraftTimestamp = Math.max(state.composerDraftTimestamp, draft.updatedAt);
+    }
+    for (const tombstone of state.composerDraftTombstones.values()) {
+      state.composerDraftTimestamp = Math.max(state.composerDraftTimestamp, tombstone.deletedAt);
+    }
+  }
+
+  function recordComposerDraftTombstone(identity) {
+    if (!identity?.persistent) return false;
+    const deletedAt = nextComposerDraftTimestamp();
+    state.composerDraftTombstones.delete(identity.key);
+    state.composerDraftTombstones.set(identity.key, { deletedAt });
+    while (state.composerDraftTombstones.size > MAX_COMPOSER_DRAFT_TOMBSTONES) {
+      state.composerDraftTombstones.delete(state.composerDraftTombstones.keys().next().value);
+    }
+    return true;
+  }
+
+  function saveComposerDraftStorage(immediate = false) {
+    if (state.composerDraftStorageTimer !== null) clearTimeout(state.composerDraftStorageTimer);
+    state.composerDraftStorageTimer = null;
+    const write = () => {
+      state.composerDraftStorageTimer = null;
+      mergeComposerDraftState(
+        state.composerDrafts,
+        state.composerDraftTombstones,
+        readLocalStorage(COMPOSER_DRAFT_STORAGE_KEY),
+        Date.now(),
+        protectedComposerDraftKeys(),
+      );
+      syncComposerDraftTimestamp();
+      writeLocalStorage(
+        COMPOSER_DRAFT_STORAGE_KEY,
+        composerDraftJson(
+          state.composerDrafts,
+          protectedComposerDraftKeys(),
+          state.composerDraftTombstones,
+        ),
+      );
+    };
+    if (immediate) write();
+    else state.composerDraftStorageTimer = setTimeout(write, 250);
+  }
+
+  function composerClearRevisionIsPending(identity, revision) {
+    return Boolean(identity)
+      && state.optimisticComposerClears.get(identity.key)?.has(revision);
+  }
+
+  function persistBoundComposerDraft(flush = false) {
+    const identity = state.composerDraftIdentity;
+    if (!identity) return null;
+    const input = $("message");
+    if (!input.value) {
+      if (composerClearRevisionIsPending(identity, state.composerRevision)) {
+        if (flush && identity.persistent) saveComposerDraftStorage(true);
+        return state.composerDrafts.get(identity.key) || null;
+      }
+      const removed = state.composerDrafts.delete(identity.key);
+      if (removed && identity.persistent) {
+        recordComposerDraftTombstone(identity);
+        saveComposerDraftStorage(flush);
+      }
+      return null;
+    }
+    const selectionStart = input.selectionStart ?? input.value.length;
+    const selectionEnd = input.selectionEnd ?? selectionStart;
+    const existing = state.composerDrafts.get(identity.key);
+    const textChanged = existing?.text !== input.value;
+    const draft = {
+      text: input.value,
+      selectionStart,
+      selectionEnd,
+      version: textChanged ? ++state.composerDraftSequence : existing.version,
+      updatedAt: textChanged ? nextComposerDraftTimestamp() : existing.updatedAt,
+    };
+    if (textChanged) {
+      state.composerDrafts.delete(identity.key);
+      state.composerDraftTombstones.delete(identity.key);
+    }
+    state.composerDrafts.set(identity.key, draft);
+    pruneComposerDraftEntries(state.composerDrafts, protectedComposerDraftKeys());
+    if (identity.persistent) saveComposerDraftStorage(flush);
+    return draft;
+  }
+
+  function bindComposerDraftToSelection() {
+    const nextIdentity = selectedComposerDraftIdentity();
+    if (state.composerDraftIdentity?.key === nextIdentity?.key) return;
+    persistBoundComposerDraft(true);
+    state.composerDraftIdentity = nextIdentity;
+    state.messageHistoryNavigation = null;
+    const input = $("message");
+    const draft = nextIdentity ? state.composerDrafts.get(nextIdentity.key) : null;
+    input.value = draft?.text || "";
+    state.composerRevision += 1;
+    if (draft) {
+      try { input.setSelectionRange(draft.selectionStart, draft.selectionEnd); }
+      catch { /* An unfocused mobile textarea can reject selection updates. */ }
+    }
+  }
+
+  function forgetComposerDraft(identity, detach = false, save = true) {
+    if (!identity) return false;
+    const removed = state.composerDrafts.delete(identity.key);
+    const tombstoned = removed && recordComposerDraftTombstone(identity);
+    state.messageHistory.delete(identity.key);
+    if (state.messageHistoryNavigation?.draftKey === identity.key) {
+      state.messageHistoryNavigation = null;
+    }
+    state.optimisticComposerClears.delete(identity.key);
+    if (detach && state.composerDraftIdentity?.key === identity.key) {
+      state.composerDraftIdentity = null;
+      replaceComposerValue("", false);
+    }
+    if ((removed || tombstoned) && identity.persistent && save) saveComposerDraftStorage(true);
+    return removed || tombstoned;
+  }
+
+  function captureComposerDraftSubmission(paneId, message) {
+    const identity = composerDraftIdentityForPane(paneId);
+    if (!identity) return { draftIdentity: null, draftVersion: null };
+    if (state.composerDraftIdentity?.key === identity.key && $("message").value === message) {
+      persistBoundComposerDraft();
+    }
+    const draft = state.composerDrafts.get(identity.key);
+    return {
+      draftIdentity: identity,
+      draftVersion: draft?.text === message ? draft.version : null,
+    };
+  }
+
+  function finishComposerDraftSubmission(submission) {
+    const identity = submission?.draftIdentity;
+    if (!identity) return false;
+    const pending = state.optimisticComposerClears.get(identity.key);
+    if (submission.clearedRevision !== null) {
+      pending?.delete(submission.clearedRevision);
+      if (!pending?.size) state.optimisticComposerClears.delete(identity.key);
+    }
+    const draft = state.composerDrafts.get(identity.key);
+    if (!composerDraftCanClear(draft, submission)) return false;
+    forgetComposerDraft(identity);
+    if (state.composerDraftIdentity?.key === identity.key
+        && $("message").value === submission.message) {
+      replaceComposerValue("", false);
+    }
+    return true;
+  }
+
+  function replaceComposerValue(value, persist = true) {
     const input = $("message");
     const next = String(value);
     if (input.value === next) return state.composerRevision;
     input.value = next;
     state.composerRevision += 1;
+    if (persist) persistBoundComposerDraft();
     return state.composerRevision;
   }
 
   function acceptComposerSubmission(paneId, message) {
-    const submission = { paneId, message, clearedRevision: null };
+    const submission = {
+      paneId,
+      message,
+      clearedRevision: null,
+      ...captureComposerDraftSubmission(paneId, message),
+    };
     const input = $("message");
     if (composerSubmissionMatches(state.selected, paneId, input.value, message)) {
-      submission.clearedRevision = replaceComposerValue("");
+      submission.clearedRevision = replaceComposerValue("", false);
+      if (submission.draftIdentity) {
+        const revisions = state.optimisticComposerClears.get(submission.draftIdentity.key) || new Set();
+        revisions.add(submission.clearedRevision);
+        state.optimisticComposerClears.set(submission.draftIdentity.key, revisions);
+      }
     }
     return submission;
   }
@@ -5237,12 +6275,18 @@ function initialize() {
       $("message").value,
       state.composerRevision,
       submission,
-    );
+    ) && composerTargetMatches(submission.paneId, submission.draftIdentity?.key);
     // Consume the rollback token even if newer composer activity made it stale.
+    const pending = submission.draftIdentity
+      ? state.optimisticComposerClears.get(submission.draftIdentity.key) : null;
+    pending?.delete(submission.clearedRevision);
+    if (submission.draftIdentity && !pending?.size) {
+      state.optimisticComposerClears.delete(submission.draftIdentity.key);
+    }
     submission.clearedRevision = null;
     if (!canRestore) return false;
     const input = $("message");
-    replaceComposerValue(submission.message);
+    replaceComposerValue(submission.message, false);
     input.setSelectionRange(input.value.length, input.value.length);
     return true;
   }
@@ -5258,19 +6302,39 @@ function initialize() {
 
   async function sendComposerMessage(paneId = state.selected, messageOverride = null, options = {}) {
     const input = $("message");
+    const abortStaleTarget = (submission = options.composerSubmission || null) => {
+      restoreComposerSubmission(submission);
+      toast("Agent restarted before this message could be sent. Review the preserved draft and try again.");
+      if (options.fromQueue === true) drainQueuedComposerMessage();
+      return false;
+    };
     if (!paneId || (messageOverride === null && input.disabled)) {
       if (options.fromQueue === true) drainQueuedComposerMessage();
       return false;
     }
     const message = messageOverride === null ? input.value : String(messageOverride);
     const attachments = messageOverride === null ? [...state.attachments] : [];
+    if (attachments.length && !attachmentSelectionMatches(
+      state.attachmentPaneId,
+      state.attachmentInstanceKey,
+      paneId,
+      composerDraftIdentityForPane(paneId)?.key,
+    )) {
+      toast("These images belong to another agent. Return to that agent or clear them before sending.");
+      return false;
+    }
     const targetPaneId = attachments.length
       ? attachmentDeliveryTarget(state.attachmentPaneId, paneId)
       : paneId;
+    const targetIdentityKey = options.targetIdentityKey
+      || options.composerSubmission?.draftIdentity?.key
+      || (attachments.length ? state.attachmentInstanceKey : composerDraftIdentityForPane(targetPaneId)?.key);
     if (!message.trim() && !attachments.length) {
       if (options.fromQueue === true) drainQueuedComposerMessage();
       return false;
     }
+    if (!composerTargetMatches(targetPaneId, targetIdentityKey)) return abortStaleTarget();
+    const targetInstanceId = composerDraftInstanceId(targetIdentityKey);
     const messageLimit = attachments.length ? MAX_MESSAGE_BYTES - IMAGE_MESSAGE_TEXT_RESERVE : MAX_MESSAGE_BYTES;
     if (utf8ByteLength(message) > messageLimit) {
       toast("Message exceeds the 64 KiB UTF-8 limit");
@@ -5280,9 +6344,15 @@ function initialize() {
     const clearOnAccept = options.clearOnAccept === true;
     let composerSubmission = options.composerSubmission || null;
     const markAccepted = () => {
-      if (clearOnAccept && !composerSubmission) {
-        composerSubmission = acceptComposerSubmission(targetPaneId, message);
-      }
+      if (composerSubmission) return;
+      composerSubmission = clearOnAccept
+        ? acceptComposerSubmission(targetPaneId, message)
+        : {
+          paneId: targetPaneId,
+          message,
+          clearedRevision: null,
+          ...captureComposerDraftSubmission(targetPaneId, message),
+        };
     };
     if (state.composerSending) {
       if (messageOverride === null) return false;
@@ -5296,15 +6366,25 @@ function initialize() {
         state.queuedComposerMessages.push({
           paneId,
           message,
-          options: { clearOnAccept, composerSubmission, fromQueue: options.fromQueue === true },
+          options: {
+            clearOnAccept,
+            composerSubmission,
+            targetIdentityKey,
+            fromQueue: options.fromQueue === true,
+          },
           resolve,
         });
       });
     }
     markAccepted();
+    if (composerSubmission?.draftIdentity?.key !== targetIdentityKey
+        || !composerTargetMatches(targetPaneId, targetIdentityKey)) {
+      return abortStaleTarget(composerSubmission);
+    }
     const button = $("send");
     state.composerSending = true;
     state.inFlightComposerText = message;
+    state.inFlightComposerIdentity = composerSubmission?.draftIdentity?.key || null;
     button.disabled = true;
     render();
     try {
@@ -5313,17 +6393,24 @@ function initialize() {
           media_type: file.type,
           data: arrayBufferToBase64(await file.arrayBuffer()),
         })));
+        if (!composerTargetMatches(targetPaneId, targetIdentityKey)) {
+          throw new Error("Agent restarted while images were being prepared. Images were kept; return to the original agent or clear them.");
+        }
         await request(`/api/v1/panes/${encodeURIComponent(targetPaneId)}/image-messages`, {
           method: "POST",
-          body: JSON.stringify({ text: message, images }),
+          body: JSON.stringify({ text: message, images, instance_id: targetInstanceId }),
         });
       } else {
-        await request(`/api/v1/panes/${encodeURIComponent(targetPaneId)}/messages`, { method: "POST", body: JSON.stringify({ text: message, submit: true }) });
+        if (!composerTargetMatches(targetPaneId, targetIdentityKey)) {
+          throw new Error("Agent restarted before this message could be sent. The draft was kept.");
+        }
+        await request(`/api/v1/panes/${encodeURIComponent(targetPaneId)}/messages`, {
+          method: "POST",
+          body: JSON.stringify({ text: message, submit: true, instance_id: targetInstanceId }),
+        });
       }
-      if (message.trim()) rememberMessage(targetPaneId, message);
-      if (!clearOnAccept
-        && (attachments.length || state.selected === targetPaneId)
-        && input.value === message) replaceComposerValue("");
+      if (message.trim()) rememberMessage(composerSubmission?.draftIdentity, message);
+      finishComposerDraftSubmission(composerSubmission);
       if (attachments.length) removeDeliveredAttachments(attachments);
       toast(attachments.length === 1 ? "Image sent" : attachments.length > 1 ? "Images sent" : "Message sent");
       return true;
@@ -5334,6 +6421,7 @@ function initialize() {
     finally {
       state.composerSending = false;
       state.inFlightComposerText = null;
+      state.inFlightComposerIdentity = null;
       render();
       drainQueuedComposerMessage();
     }
@@ -5485,20 +6573,99 @@ function initialize() {
     } catch (error) { toast(error.message); }
     finally { render(); }
   }
-  $("tmux-prefix-twice").addEventListener("click", async () => {
-    const paneId = state.selected;
-    if (!paneId) return;
-    const button = $("tmux-prefix-twice"); button.disabled = true;
-    try {
-      await request(`/api/v1/panes/${encodeURIComponent(paneId)}/special-keys`, { method: "POST", body: JSON.stringify({ action: "tmux_prefix_twice" }) });
-      toast("Sent Ctrl+B twice");
-    } catch (error) { toast(error.message); }
-    finally { render(); }
+  function queuedPaneKeyCount() {
+    return state.specialKeyQueue.length + Number(Boolean(state.specialKeySending));
+  }
+  function discardQueuedPaneKeys(delivery) {
+    const target = paneSpecialKeyTarget(delivery);
+    const before = state.specialKeyQueue.length;
+    state.specialKeyQueue = state.specialKeyQueue.filter((item) => paneSpecialKeyTarget(item) !== target);
+    return before - state.specialKeyQueue.length;
+  }
+  function setPaneKeyStatus(delivery, message) {
+    const target = paneSpecialKeyTarget(delivery);
+    state.specialKeyStatuses.delete(target);
+    state.specialKeyStatuses.set(target, message);
+    while (state.specialKeyStatuses.size > MAX_PANE_KEY_STATUSES) {
+      state.specialKeyStatuses.delete(state.specialKeyStatuses.keys().next().value);
+    }
+  }
+  function paneKeyFailureMessage(error, discarded) {
+    const suffix = discarded > 0
+      ? ` ${discarded} queued key${discarded === 1 ? " was" : "s were"} discarded for that agent.`
+      : "";
+    if ([400, 404, 422].includes(error.status)) {
+      return `Key controls and this atmux server are out of sync.${suffix} Refresh after the server updates, then try again.`;
+    }
+    if (error.status === 409) {
+      return `This agent changed before the key arrived.${suffix} Reopen the agent and try again.`;
+    }
+    if (error.status === 401 || error.status === 403) {
+      return `Key delivery was rejected by sign-in or origin checks.${suffix} Refresh or sign in again, then try again.`;
+    }
+    return `Key delivery failed: ${error.message}.${suffix} Check the agent connection, then try again.`;
+  }
+  async function drainPaneSpecialKeyQueue() {
+    if (state.specialKeySending) return;
+    while (state.specialKeyQueue.length > 0) {
+      const delivery = state.specialKeyQueue.shift();
+      state.specialKeySending = delivery;
+      render();
+      try {
+        await request(`/api/v1/panes/${encodeURIComponent(delivery.paneId)}/input-keys`, {
+          method: "POST",
+          body: JSON.stringify({
+            action: delivery.action,
+            machine: delivery.machine,
+            instance_id: delivery.instanceId,
+          }),
+        });
+        setPaneKeyStatus(delivery, `Sent ${delivery.label}.`);
+      } catch (error) {
+        const discarded = discardQueuedPaneKeys(delivery);
+        const message = paneKeyFailureMessage(error, discarded);
+        setPaneKeyStatus(delivery, message);
+        toast(message);
+      } finally {
+        state.specialKeySending = null;
+        render();
+      }
+    }
+  }
+  function sendPaneSpecialKey(action, label) {
+    const captured = paneSpecialKeyDelivery(state.sessions.get(state.selected), action);
+    const delivery = captured ? Object.freeze({ ...captured, label }) : null;
+    if (!delivery) {
+      toast("This agent changed or does not report a safe key-delivery target");
+      return;
+    }
+    if (queuedPaneKeyCount() >= MAX_QUEUED_PANE_KEYS) {
+      const message = `Key queue full (${MAX_QUEUED_PANE_KEYS}). Wait for a key to finish.`;
+      setPaneKeyStatus(delivery, message);
+      toast(message);
+      render();
+      return;
+    }
+    state.specialKeyQueue.push(delivery);
+    render();
+    void drainPaneSpecialKeyQueue();
+  }
+  document.querySelectorAll("[data-pane-key]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (button.disabled) return;
+      const labels = { up: "Up", down: "Down", left: "Left", right: "Right", enter: "blank Enter" };
+      sendPaneSpecialKey(button.dataset.paneKey, labels[button.dataset.paneKey] || "key");
+    });
+  });
+  $("tmux-prefix-twice").addEventListener("click", () => {
+    sendPaneSpecialKey("tmux_prefix_twice", "Ctrl+B twice");
   });
   $("message").addEventListener("input", () => {
     state.composerRevision += 1;
     state.messageHistoryNavigation = null;
+    persistBoundComposerDraft();
   });
+  $("message").addEventListener("select", () => { persistBoundComposerDraft(); });
   $("message").addEventListener("keydown", (event) => {
     const action = composerEnterAction(event);
     if (action === "send") {
@@ -5600,6 +6767,7 @@ function initialize() {
     releaseRequested: false,
     failed: false,
     paneId: null,
+    identityKey: null,
     prefix: "",
     finalText: "",
     interimText: "",
@@ -5635,10 +6803,22 @@ function initialize() {
     }
     talkButton.classList.remove("recording");
     talkButton.textContent = "Hold to talk";
-    const delivery = dictationDelivery(dictation.paneId, dictation.prefix, dictation.finalText);
+    const paneId = dictation.paneId;
+    const identityKey = dictation.identityKey;
+    const targetMatches = composerTargetMatches(paneId, identityKey);
+    const delivery = targetMatches
+      ? dictationDelivery(paneId, dictation.prefix, dictation.finalText)
+      : null;
     dictation.paneId = null;
+    dictation.identityKey = null;
+    if (!targetMatches && !dictation.failed) {
+      toast("Agent restarted while listening. Speech was not sent to the replacement agent.");
+    }
     if (!dictation.failed && delivery) {
-      void sendComposerMessage(delivery.paneId, delivery.message, { clearOnAccept: true });
+      void sendComposerMessage(delivery.paneId, delivery.message, {
+        clearOnAccept: true,
+        targetIdentityKey: identityKey,
+      });
     }
   }
 
@@ -5666,6 +6846,14 @@ function initialize() {
     };
     const startRecognition = () => {
       if (!dictation.holding || dictation.releaseRequested || dictation.failed || dictation.active) return;
+      if (!composerTargetMatches(dictation.paneId, dictation.identityKey)) {
+        dictation.failed = true;
+        dictation.holding = false;
+        dictation.releaseRequested = true;
+        toast("Agent restarted while listening. Speech was not sent to the replacement agent.");
+        finishDictation(true);
+        return;
+      }
       const generation = dictation.generation;
       const recognition = new SpeechRecognition();
       recognition.continuous = true;
@@ -5675,6 +6863,14 @@ function initialize() {
         && recognition === dictation.recognition;
       recognition.onresult = (event) => {
         if (!isCurrent()) return;
+        if (!composerTargetMatches(dictation.paneId, dictation.identityKey)) {
+          dictation.failed = true;
+          dictation.holding = false;
+          dictation.releaseRequested = true;
+          toast("Agent restarted while listening. Speech was not sent to the replacement agent.");
+          requestRecognitionStop(generation, recognition);
+          return;
+        }
         dictation.restartAttempts = 0;
         let interim = "";
         for (let index = event.resultIndex; index < event.results.length; index += 1) {
@@ -5683,7 +6879,10 @@ function initialize() {
           else interim = [interim, transcript].filter(Boolean).join(" ");
         }
         dictation.interimText = interim;
-        if (state.selected === dictation.paneId) replaceComposerValue(dictationText());
+        if (state.selected === dictation.paneId
+            && composerTargetMatches(dictation.paneId, dictation.identityKey)) {
+          replaceComposerValue(dictationText());
+        }
       };
       recognition.onerror = (event) => {
         if (!isCurrent()) return;
@@ -5748,6 +6947,11 @@ function initialize() {
     };
     talkButton.addEventListener("pointerdown", (event) => {
       if (!state.selected || dictation.holding || dictation.active || dictation.restartTimer !== null) return;
+      const identity = selectedComposerDraftIdentity();
+      if (!identity?.persistent) {
+        toast("This agent's identity is unavailable; reconnect before using Quick Talk");
+        return;
+      }
       event.preventDefault();
       talkButton.setPointerCapture?.(event.pointerId);
       // Starting another hold is composer activity even before speech arrives;
@@ -5758,10 +6962,13 @@ function initialize() {
       dictation.releaseRequested = false;
       dictation.failed = false;
       dictation.paneId = state.selected;
+      dictation.identityKey = identity.key;
       dictation.prefix = dictationPrefix(
         $("message").value,
         state.composerSending,
         state.inFlightComposerText,
+        state.inFlightComposerIdentity,
+        selectedComposerDraftIdentity()?.key,
       );
       dictation.finalText = "";
       dictation.interimText = "";
@@ -5796,6 +7003,8 @@ function initialize() {
     if (state.selected === target && !confirmDiscardFileEdit()) return;
     try {
       await request(sessionDeletePath(target), { method: "DELETE" });
+      const deleted = state.sessions.get(target);
+      if (deleted) forgetComposerDraft(composerDraftIdentity(deleted), true);
       $("kill-dialog").close();
       state.pendingKillId = null;
       if (state.selected === target) selectSession(null, "replace");
@@ -5918,11 +7127,15 @@ function initialize() {
       directories: [],
       profiles: [],
       project_preferences: {},
+      memory: null,
       note: "No online machine currently has both runnable agent profiles and configured project folders.",
     };
   }
 
   function applyLaunchMachine() {
+    cancelLaunchDirectorySearch();
+    state.launchDirectoryCandidates = null;
+    state.launchDirectorySuggestionsDismissed = false;
     const machines = launchMachines(state.launchOptions);
     const candidate = machines.find((machine) => machine.id === $("launch-machine").value);
     const selected = isLaunchCapableMachine(candidate) ? candidate : fallbackLaunchMachine();
@@ -5935,6 +7148,7 @@ function initialize() {
     state.launchNamePristine = true;
     clearLaunchSessions();
     closeLaunchBrowser();
+    renderLaunchMemory(selected);
     renderLaunchDirectories(selected);
   }
 
@@ -5944,11 +7158,25 @@ function initialize() {
     return isLaunchCapableMachine(selected) ? selected : fallbackLaunchMachine();
   }
 
+  function launchDirectoryCandidates(selected = currentLaunchMachine()) {
+    const cache = state.launchDirectoryCandidates;
+    if (cache?.machine === selected
+        && cache.remembered === state.rememberedLaunchDirectories) return cache.directories;
+    const directories = availableLaunchDirectories(selected, state.rememberedLaunchDirectories);
+    state.launchDirectoryCandidates = {
+      machine: selected,
+      remembered: state.rememberedLaunchDirectories,
+      directories,
+    };
+    return directories;
+  }
+
   function renderLaunchDirectories(selected = currentLaunchMachine()) {
+    cancelLaunchDirectorySearch();
     const input = $("launch-directory");
-    const available = availableLaunchDirectories(selected, state.rememberedLaunchDirectories);
+    const available = launchDirectoryCandidates(selected);
     const directories = filterDirectories(available, input.value);
-    $("launch-directory-options").replaceChildren(...directories.map(directoryOption));
+    renderLaunchDirectorySuggestions(directories);
     const directory = available.includes(input.value) ? input.value : "";
     const manual = !directory && isManualDirectory(input.value) ? input.value.trim() : "";
     const previous = input.dataset.selectedDirectory || "";
@@ -5962,6 +7190,146 @@ function initialize() {
     void refreshLaunchSessions();
   }
 
+  function hideLaunchDirectorySuggestions(dismissed = false) {
+    const input = $("launch-directory");
+    const suggestions = $("launch-directory-suggestions");
+    suggestions.hidden = true;
+    input.setAttribute("aria-expanded", "false");
+    input.removeAttribute("aria-activedescendant");
+    state.launchDirectoryActiveIndex = -1;
+    state.launchDirectorySuggestionsDismissed = dismissed;
+    for (const option of suggestions.children) option.setAttribute("aria-selected", "false");
+  }
+
+  function showLaunchDirectorySuggestions() {
+    const suggestions = $("launch-directory-suggestions");
+    if (!suggestions.children.length || state.launchDirectorySuggestionsDismissed) return;
+    suggestions.hidden = false;
+    $("launch-directory").setAttribute("aria-expanded", "true");
+  }
+
+  function activateLaunchDirectorySuggestion(index) {
+    const input = $("launch-directory");
+    const suggestions = $("launch-directory-suggestions");
+    const options = [...suggestions.children];
+    if (!options.length) return;
+    const next = Math.max(0, Math.min(index, options.length - 1));
+    state.launchDirectoryActiveIndex = next;
+    options.forEach((option, optionIndex) => {
+      option.setAttribute("aria-selected", String(optionIndex === next));
+    });
+    input.setAttribute("aria-activedescendant", options[next].id);
+    options[next].scrollIntoView({ block: "nearest" });
+  }
+
+  function selectLaunchDirectorySuggestion(directory) {
+    if (!launchDirectoryCandidates().includes(directory)) return;
+    $("launch-directory").value = directory;
+    state.launchDirectorySuggestionsDismissed = true;
+    renderLaunchDirectories();
+    hideLaunchDirectorySuggestions(true);
+  }
+
+  function renderLaunchDirectorySuggestions(directories) {
+    const suggestions = $("launch-directory-suggestions");
+    state.launchDirectoryActiveIndex = -1;
+    $("launch-directory").removeAttribute("aria-activedescendant");
+    suggestions.replaceChildren(...directories.map((directory, index) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "launch-directory-suggestion";
+      button.id = `launch-directory-suggestion-${index}`;
+      button.setAttribute("role", "option");
+      button.setAttribute("aria-selected", "false");
+      button.tabIndex = -1;
+      button.dataset.directory = directory;
+      button.setAttribute("aria-label", `${projectLabel(directory)}, ${directory}`);
+      const label = document.createElement("strong");
+      label.textContent = projectLabel(directory);
+      const path = document.createElement("small");
+      path.textContent = directory;
+      button.append(label, path);
+      button.addEventListener("pointerdown", (event) => {
+        state.launchDirectorySuppressClick = null;
+        if (!["touch", "pen"].includes(event.pointerType)) return;
+        state.launchDirectoryPointerGesture = {
+          pointerId: event.pointerId,
+          x: event.clientX,
+          y: event.clientY,
+          moved: false,
+        };
+      });
+      button.addEventListener("pointermove", (event) => {
+        const gesture = state.launchDirectoryPointerGesture;
+        if (!gesture || gesture.pointerId !== event.pointerId) return;
+        if (Math.hypot(event.clientX - gesture.x, event.clientY - gesture.y) >= 10) {
+          gesture.moved = true;
+        }
+      });
+      const finishPointerGesture = (event) => {
+        const gesture = state.launchDirectoryPointerGesture;
+        if (!gesture || gesture.pointerId !== event.pointerId) return;
+        state.launchDirectoryPointerGesture = null;
+        if (!gesture.moved) return;
+        const suppression = {};
+        state.launchDirectorySuppressClick = suppression;
+        setTimeout(() => {
+          if (state.launchDirectorySuppressClick === suppression) {
+            state.launchDirectorySuppressClick = null;
+          }
+        }, 250);
+      };
+      button.addEventListener("pointerup", finishPointerGesture);
+      button.addEventListener("pointercancel", finishPointerGesture);
+      // Keep the combobox focused between mouse press and release so its blur
+      // frame cannot hide the option before the click. This is intentionally a
+      // mouse event: touch/pen pointer events remain uncancelled for pan-y.
+      button.addEventListener("mousedown", (event) => event.preventDefault());
+      button.addEventListener("click", (event) => {
+        if (state.launchDirectorySuppressClick) {
+          event.preventDefault();
+          state.launchDirectorySuppressClick = null;
+          return;
+        }
+        selectLaunchDirectorySuggestion(directory);
+      });
+      return button;
+    }));
+    if (document.activeElement === $("launch-directory")
+        && directories.length
+        && !state.launchDirectorySuggestionsDismissed) {
+      showLaunchDirectorySuggestions();
+    } else {
+      hideLaunchDirectorySuggestions(state.launchDirectorySuggestionsDismissed);
+    }
+  }
+
+  function cancelLaunchDirectorySearch() {
+    if (state.launchDirectorySearchTimer !== null) {
+      clearTimeout(state.launchDirectorySearchTimer);
+      state.launchDirectorySearchTimer = null;
+    }
+  }
+
+  function scheduleLaunchDirectorySearch() {
+    cancelLaunchDirectorySearch();
+    const machine = currentLaunchMachine();
+    const input = $("launch-directory");
+    state.launchDirectorySuggestionsDismissed = false;
+    hideLaunchDirectorySuggestions();
+    input.dataset.selectedDirectory = "";
+    clearLaunchSessions();
+    const manual = isManualDirectory(input.value) ? input.value.trim() : "";
+    updateLaunchAvailability(machine, [], manual);
+    const machineId = machine.id;
+    state.launchDirectorySearchTimer = setTimeout(() => {
+      state.launchDirectorySearchTimer = null;
+      if ($("launch-dialog").open && currentLaunchMachine().id === machineId) {
+        renderLaunchDirectories();
+      }
+    }, LAUNCH_DIRECTORY_SEARCH_DEBOUNCE_MS);
+  }
+
   function applyDuplicateLaunchSelection(selection) {
     $("launch-machine").value = selection.machineId;
     applyLaunchMachine();
@@ -5973,6 +7341,7 @@ function initialize() {
     $("launch-profile").value = selection.profileId;
     renderLaunchModes(machine);
     if (selection.modeId) $("launch-mode").value = selection.modeId;
+    selectLaunchMemory(selection.memoryMaxBytes);
     $("launch-session").value = "";
     $("launch-name").value = selection.name;
     state.launchNamePristine = false;
@@ -5988,6 +7357,46 @@ function initialize() {
     state.launchSummarySourceId = view.available ? String(sourceSession.pane_id || "") : null;
     $("launch-summary").hidden = !view.available;
     $("launch-summary-resume").checked = view.available && view.checked;
+  }
+
+  function renderLaunchMemory(selected = currentLaunchMachine()) {
+    const choices = memoryLimitChoices(selected.memory);
+    const select = $("launch-memory");
+    const defaultLabel = defaultMemoryLimitLabel(selected.memory);
+    const options = [option("", defaultLabel)];
+    if (choices.supported && choices.ceiling !== null) {
+      options.push(...choices.presets.map((bytes) => option(String(bytes), formatMemoryLimit(bytes))));
+      options.push(option("custom", "Custom…"));
+    }
+    select.replaceChildren(...options);
+    select.value = "";
+    select.disabled = !isLaunchCapableMachine(selected) || choices.ceiling === null;
+    $("launch-memory-custom").value = "";
+    $("launch-memory-custom").max = choices.ceiling === null
+      ? ""
+      : String(Math.floor(choices.ceiling / GIBIBYTE_BYTES));
+    $("launch-memory-custom").disabled = select.disabled;
+    $("launch-memory-custom-row").hidden = true;
+    $("launch-memory-note").textContent = choices.note;
+    $("launch-memory-group").hidden = selected === null;
+  }
+
+  function selectLaunchMemory(memoryMaxBytes) {
+    const select = $("launch-memory");
+    if (memoryMaxBytes == null) {
+      select.value = "";
+      $("launch-memory-custom-row").hidden = true;
+      return;
+    }
+    const preset = [...select.options].find((candidate) => candidate.value === String(memoryMaxBytes));
+    if (preset) {
+      select.value = preset.value;
+      $("launch-memory-custom-row").hidden = true;
+      return;
+    }
+    select.value = "custom";
+    $("launch-memory-custom").value = String(memoryMaxBytes / GIBIBYTE_BYTES);
+    $("launch-memory-custom-row").hidden = false;
   }
 
   function applyProjectPreferences(selected, directory, forceName) {
@@ -6046,23 +7455,31 @@ function initialize() {
 
   function updateLaunchAvailability(
     selected = currentLaunchMachine(),
-    directories = filterDirectories(
-      availableLaunchDirectories(selected, state.rememberedLaunchDirectories),
-      $("launch-directory").value,
-    ),
-    directory = availableLaunchDirectories(selected, state.rememberedLaunchDirectories)
-      .includes($("launch-directory").value)
-      ? $("launch-directory").value
-      : (isManualDirectory($("launch-directory").value) ? $("launch-directory").value.trim() : ""),
+    directories = null,
+    directory = null,
   ) {
+    const available = launchDirectoryCandidates(selected);
+    const matches = directories ?? filterDirectories(available, $("launch-directory").value);
+    const chosen = directory ?? (available.includes($("launch-directory").value)
+      ? $("launch-directory").value
+      : (isManualDirectory($("launch-directory").value) ? $("launch-directory").value.trim() : ""));
     const profiles = profilesForHarness(selected.profiles, $("launch-harness").value);
     const button = $("launch-form").querySelector("button[type=submit]");
-    button.disabled = !isLaunchCapableMachine(selected) || !directory || !profiles.length;
+    let memoryError = "";
+    try {
+      parseMemoryLimitSelection(
+        selected.memory,
+        $("launch-memory").value,
+        $("launch-memory-custom").value,
+      );
+    } catch (error) {
+      memoryError = error.message;
+    }
+    button.disabled = !isLaunchCapableMachine(selected) || !chosen || !profiles.length || Boolean(memoryError);
     const note = $("launch-note");
-    const listed = availableLaunchDirectories(selected, state.rememberedLaunchDirectories)
-      .includes(directory);
-    const message = selected.note || (!directory
-      ? (!directories.length
+    const listed = available.includes(chosen);
+    const message = selected.note || memoryError || (!chosen
+      ? (!matches.length
         ? "No project matches. Type an absolute folder within a configured project root."
         : "Choose a project or type an absolute folder within a configured project root.")
       : (!profiles.length
@@ -6078,8 +7495,44 @@ function initialize() {
     applyDuplicateSummary(null);
     applyLaunchMachine();
   });
-  $("launch-directory").addEventListener("input", () => renderLaunchDirectories());
+  $("launch-directory").addEventListener("input", scheduleLaunchDirectorySearch);
   $("launch-directory").addEventListener("change", () => renderLaunchDirectories());
+  $("launch-directory").addEventListener("focus", () => {
+    state.launchDirectorySuggestionsDismissed = false;
+    showLaunchDirectorySuggestions();
+  });
+  $("launch-directory").addEventListener("blur", () => {
+    requestAnimationFrame(() => {
+      if (document.activeElement !== $("launch-directory")) hideLaunchDirectorySuggestions();
+    });
+  });
+  $("launch-directory").addEventListener("keydown", (event) => {
+    if (event.isComposing) return;
+    const suggestions = $("launch-directory-suggestions");
+    const options = suggestions.children;
+    if (["ArrowDown", "ArrowUp"].includes(event.key) && options.length) {
+      event.preventDefault();
+      state.launchDirectorySuggestionsDismissed = false;
+      showLaunchDirectorySuggestions();
+      const next = event.key === "ArrowDown"
+        ? (state.launchDirectoryActiveIndex + 1) % options.length
+        : (state.launchDirectoryActiveIndex <= 0
+          ? options.length - 1
+          : state.launchDirectoryActiveIndex - 1);
+      activateLaunchDirectorySuggestion(next);
+      return;
+    }
+    if (event.key === "Enter" && !suggestions.hidden && state.launchDirectoryActiveIndex >= 0) {
+      event.preventDefault();
+      selectLaunchDirectorySuggestion(options[state.launchDirectoryActiveIndex]?.dataset.directory);
+      return;
+    }
+    if (event.key === "Escape" && !suggestions.hidden) {
+      event.preventDefault();
+      event.stopPropagation();
+      hideLaunchDirectorySuggestions(true);
+    }
+  });
   $("launch-harness").addEventListener("change", () => {
     renderLaunchProfiles();
     updateLaunchAvailability();
@@ -6088,6 +7541,14 @@ function initialize() {
     renderLaunchModes();
     updateLaunchAvailability();
   });
+  $("launch-memory").addEventListener("change", () => {
+    $("launch-memory-custom-row").hidden = $("launch-memory").value !== "custom";
+    updateLaunchAvailability();
+    if ($("launch-memory").value === "custom") $("launch-memory-custom").focus();
+  });
+  $("launch-memory").addEventListener("focus", revealFocusedLaunchMemoryControl);
+  $("launch-memory-custom").addEventListener("focus", revealFocusedLaunchMemoryControl);
+  $("launch-memory-custom").addEventListener("input", () => updateLaunchAvailability());
   $("launch-name").addEventListener("input", () => { state.launchNamePristine = false; });
   function persistLaunchDirectory(machine, directory) {
     state.rememberedLaunchDirectories = rememberLaunchDirectory(
@@ -6095,18 +7556,18 @@ function initialize() {
       machine,
       directory,
     );
-    try {
-      localStorage.setItem(
-        LAUNCH_DIRECTORY_STORAGE_KEY,
-        JSON.stringify(state.rememberedLaunchDirectories),
-      );
-    } catch {
-      // A privacy-restricted browser may deny storage. Selection still works
-      // for this page and the launch itself remains fully server-validated.
-    }
+    state.launchDirectoryCandidates = null;
+    // A privacy-restricted browser may deny storage. Selection still works
+    // for this page and the launch itself remains fully server-validated.
+    writeLocalStorage(
+      LAUNCH_DIRECTORY_STORAGE_KEY,
+      JSON.stringify(state.rememberedLaunchDirectories),
+    );
   }
 
   function clearLaunchSessions() {
+    state.launchSessionsController?.abort();
+    state.launchSessionsController = null;
     state.launchSessionsGeneration += 1;
     state.launchSessionsKey = "";
     $("launch-session").replaceChildren(option("", "Start a new conversation"));
@@ -6130,6 +7591,9 @@ function initialize() {
     }
     const key = JSON.stringify([machine.id, directory, profileId]);
     if (state.launchSessionsKey === key) return;
+    state.launchSessionsController?.abort();
+    const controller = new AbortController();
+    state.launchSessionsController = controller;
     const generation = ++state.launchSessionsGeneration;
     state.launchSessionsKey = key;
     const section = $("launch-sessions");
@@ -6144,7 +7608,7 @@ function initialize() {
       profile_id: profileId,
     });
     try {
-      const listing = await request(`/api/v1/launch-sessions?${params}`);
+      const listing = await request(`/api/v1/launch-sessions?${params}`, { signal: controller.signal });
       if (generation !== state.launchSessionsGeneration || state.launchSessionsKey !== key) return;
       if (listing?.directory !== directory || listing?.profile_id !== profileId) {
         throw new Error("Saved conversations changed; select the folder again");
@@ -6172,16 +7636,21 @@ function initialize() {
         ? "Showing the newest saved conversations."
         : "Choose one to continue it, or start a new conversation.";
     } catch (error) {
+      if (error?.name === "AbortError") return;
       if (generation !== state.launchSessionsGeneration) return;
       state.launchSessionsKey = "";
       select.replaceChildren(option("", "Start a new conversation"));
       note.textContent = `${error.message}. A new conversation can still be launched.`;
       section.hidden = false;
+    } finally {
+      if (state.launchSessionsController === controller) state.launchSessionsController = null;
     }
   }
 
   function closeLaunchBrowser() {
     state.launchBrowseGeneration += 1;
+    resetLaunchBrowserMutation();
+    closeLaunchBrowserOperation();
     $("launch-browser").hidden = true;
     $("launch-browser").dataset.current = "";
     $("launch-browser").dataset.parent = "";
@@ -6197,6 +7666,8 @@ function initialize() {
     $("launch-browser-path").title = current;
     $("launch-browser-up").disabled = !parent;
     $("launch-browser-use").disabled = !current;
+    $("launch-browser-new").disabled = !current;
+    $("launch-browser-clone").disabled = !current;
     const folders = (Array.isArray(listing?.directories) ? listing.directories : [])
       .slice(0, 512)
       .filter((folder) => validRememberedLaunchDirectory(folder?.path));
@@ -6204,6 +7675,7 @@ function initialize() {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "launch-browser-folder";
+      button.dataset.path = folder.path;
       button.textContent = `📁 ${String(folder.name || projectLabel(folder.path)).slice(0, 200)}`;
       button.title = folder.path;
       button.addEventListener("click", () => { void loadLaunchBrowser(folder.path); });
@@ -6224,11 +7696,15 @@ function initialize() {
       return;
     }
     const generation = ++state.launchBrowseGeneration;
+    resetLaunchBrowserMutation();
     $("launch-browser").hidden = false;
     $("launch-browser-path").textContent = "Loading folders…";
     $("launch-browser-list").replaceChildren();
     $("launch-browser-up").disabled = true;
     $("launch-browser-use").disabled = true;
+    $("launch-browser-new").disabled = true;
+    $("launch-browser-clone").disabled = true;
+    closeLaunchBrowserOperation();
     try {
       const listing = await request(endpoint);
       if (generation !== state.launchBrowseGeneration
@@ -6259,6 +7735,143 @@ function initialize() {
     closeLaunchBrowser();
     renderLaunchDirectories(machine);
   });
+
+  function closeLaunchBrowserOperation() {
+    const operation = $("launch-browser-operation");
+    operation.hidden = true;
+    operation.dataset.kind = "";
+    $("launch-browser-new").setAttribute("aria-expanded", "false");
+    $("launch-browser-clone").setAttribute("aria-expanded", "false");
+    $("launch-browser-operation-note").textContent = "";
+    $("launch-browser-new-name").value = "";
+    $("launch-browser-repository").value = "";
+    $("launch-browser-destination").value = "";
+    $("launch-browser-destination").dataset.manual = "false";
+  }
+
+  function openLaunchBrowserOperation(kind) {
+    const current = $("launch-browser").dataset.current;
+    if (!validRememberedLaunchDirectory(current) || state.launchBrowseMutation) return;
+    const cloning = kind === "clone";
+    const operation = $("launch-browser-operation");
+    operation.dataset.kind = cloning ? "clone" : "folder";
+    operation.hidden = false;
+    $("launch-browser-operation-title").textContent = cloning ? "Clone repository here" : "Create folder here";
+    $("launch-browser-new-row").hidden = cloning;
+    $("launch-browser-repository-row").hidden = !cloning;
+    $("launch-browser-destination-row").hidden = !cloning;
+    $("launch-browser-operation-confirm").textContent = cloning ? "Clone" : "Create";
+    $("launch-browser-operation-note").textContent = "";
+    $("launch-browser-new").setAttribute("aria-expanded", String(!cloning));
+    $("launch-browser-clone").setAttribute("aria-expanded", String(cloning));
+    $("launch-browser-destination").dataset.manual = "false";
+    requestAnimationFrame(() => {
+      (cloning ? $("launch-browser-repository") : $("launch-browser-new-name")).focus();
+    });
+  }
+
+  function setLaunchBrowserMutation(busy) {
+    state.launchBrowseMutation = busy;
+    const current = validRememberedLaunchDirectory($("launch-browser").dataset.current);
+    for (const id of [
+      "launch-browser-up", "launch-browser-use", "launch-browser-new", "launch-browser-clone",
+      "launch-browser-operation-cancel", "launch-browser-operation-confirm",
+      "launch-browser-new-name", "launch-browser-repository", "launch-browser-destination",
+    ]) $(id).disabled = busy || (!current && id.startsWith("launch-browser-"));
+    if (!busy) {
+      $("launch-browser-up").disabled = !$("launch-browser").dataset.parent;
+      $("launch-browser-use").disabled = !current;
+      $("launch-browser-new").disabled = !current;
+      $("launch-browser-clone").disabled = !current;
+    }
+  }
+
+  function resetLaunchBrowserMutation() {
+    state.launchBrowseMutation = false;
+    for (const id of [
+      "launch-browser-operation-cancel", "launch-browser-operation-confirm",
+      "launch-browser-new-name", "launch-browser-repository", "launch-browser-destination",
+    ]) $(id).disabled = false;
+  }
+
+  async function submitLaunchBrowserOperation() {
+    if (state.launchBrowseMutation) return;
+    const browser = $("launch-browser");
+    const current = browser.dataset.current;
+    const machine = currentLaunchMachine();
+    const kind = $("launch-browser-operation").dataset.kind;
+    if (!validRememberedLaunchDirectory(current) || !["folder", "clone"].includes(kind)) return;
+    const body = { machine: machine.id, directory: current };
+    let endpoint;
+    let success;
+    if (kind === "folder") {
+      const name = $("launch-browser-new-name").value.trim();
+      if (!validLaunchChildName(name)) {
+        $("launch-browser-operation-note").textContent = "Enter one folder name without slashes or a leading dash.";
+        return;
+      }
+      body.name = name;
+      endpoint = "/api/v1/launch-directories/folders";
+      success = `Created ${name}`;
+    } else {
+      const repository = $("launch-browser-repository").value.trim();
+      const destination = $("launch-browser-destination").value.trim();
+      if (!repository || repository.startsWith("-") || /[\u0000-\u001f\u007f]/.test(repository)) {
+        $("launch-browser-operation-note").textContent = "Enter an HTTPS or SSH repository URL.";
+        return;
+      }
+      if (destination && !validLaunchChildName(destination)) {
+        $("launch-browser-operation-note").textContent = "Destination must be one folder name without slashes or a leading dash.";
+        return;
+      }
+      body.repository = repository;
+      body.destination = destination || null;
+      endpoint = "/api/v1/launch-directories/clone";
+      success = `Cloned ${destination || repositoryDestinationName(repository) || "repository"}`;
+    }
+    const generation = state.launchBrowseGeneration;
+    setLaunchBrowserMutation(true);
+    $("launch-browser-operation-note").textContent = kind === "clone" ? "Cloning repository…" : "Creating folder…";
+    try {
+      const result = await request(endpoint, { method: "POST", body: JSON.stringify(body) });
+      if (generation !== state.launchBrowseGeneration || machine.id !== currentLaunchMachine().id) return;
+      if (result?.listing?.machine !== machine.id
+          || !validRememberedLaunchDirectory(result?.directory?.path)) {
+        throw new Error("The owning machine returned an invalid folder result");
+      }
+      renderLaunchBrowser(result.listing, machine);
+      closeLaunchBrowserOperation();
+      [...document.querySelectorAll(".launch-browser-folder")]
+        .find((button) => button.dataset.path === result.directory.path)
+        ?.focus();
+      toast(success);
+    } catch (error) {
+      if (generation === state.launchBrowseGeneration) {
+        $("launch-browser-operation-note").textContent = error.message;
+      }
+    } finally {
+      if (generation === state.launchBrowseGeneration) setLaunchBrowserMutation(false);
+    }
+  }
+
+  $("launch-browser-new").addEventListener("click", () => openLaunchBrowserOperation("folder"));
+  $("launch-browser-clone").addEventListener("click", () => openLaunchBrowserOperation("clone"));
+  $("launch-browser-operation-cancel").addEventListener("click", closeLaunchBrowserOperation);
+  $("launch-browser-operation-confirm").addEventListener("click", () => { void submitLaunchBrowserOperation(); });
+  $("launch-browser-repository").addEventListener("input", () => {
+    const destination = $("launch-browser-destination");
+    if (destination.dataset.manual !== "true") {
+      destination.value = repositoryDestinationName($("launch-browser-repository").value);
+    }
+  });
+  $("launch-browser-destination").addEventListener("input", () => {
+    $("launch-browser-destination").dataset.manual = "true";
+  });
+  $("launch-browser-operation").addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || event.isComposing) return;
+    event.preventDefault();
+    void submitLaunchBrowserOperation();
+  });
   function suggestName(preferences = {}, force = false) {
     if (!force && !state.launchNamePristine && $("launch-name").value) return;
     $("launch-name").value = suggestedSessionName($("launch-directory").value, preferences);
@@ -6269,15 +7882,22 @@ function initialize() {
     node.value = value; node.textContent = label; node.disabled = disabled;
     return node;
   }
-  function directoryOption(directory) {
-    const node = option(directory, projectLabel(directory));
-    node.label = projectLabel(directory);
-    return node;
-  }
   $("launch-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const button = event.currentTarget.querySelector("button[type=submit]");
     const duplicateFlow = state.launchFlow === "duplicate";
+    const launchMachine = currentLaunchMachine();
+    let memoryMaxBytes;
+    try {
+      memoryMaxBytes = parseMemoryLimitSelection(
+        launchMachine.memory,
+        $("launch-memory").value,
+        $("launch-memory-custom").value,
+      );
+    } catch (error) {
+      toast(error.message);
+      return;
+    }
     const body = {
       name: $("launch-name").value,
       directory: $("launch-directory").value,
@@ -6285,6 +7905,7 @@ function initialize() {
       mode_id: $("launch-mode").value || null,
       machine: $("launch-machine").value || null,
       resume_session_id: duplicateFlow ? null : ($("launch-session").value || null),
+      memory_max_bytes: memoryMaxBytes,
       summarize_pane_id: duplicateFlow && $("launch-summary-resume").checked
         ? (state.launchSummarySourceId || null)
         : null,
@@ -6346,6 +7967,7 @@ function initialize() {
 
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
+      persistBoundComposerDraft(true);
       state.overviewSource?.close();
       state.paneSource?.close();
       state.overviewConnection = "paused";
@@ -6361,6 +7983,29 @@ function initialize() {
       if (state.recoveryStatus?.phase === "running") void refreshRecoveryStatus(false);
     }
   });
+  window.addEventListener("storage", (event) => {
+    if (event.key !== COMPOSER_DRAFT_STORAGE_KEY) return;
+    const identity = state.composerDraftIdentity;
+    const before = identity ? state.composerDrafts.get(identity.key) : null;
+    mergeComposerDraftState(
+      state.composerDrafts,
+      state.composerDraftTombstones,
+      event.newValue,
+      Date.now(),
+      protectedComposerDraftKeys(),
+    );
+    syncComposerDraftTimestamp();
+    const after = identity ? state.composerDrafts.get(identity.key) : null;
+    if (before?.updatedAt === after?.updatedAt && before?.text === after?.text) return;
+    const input = $("message");
+    input.value = after?.text || "";
+    state.composerRevision += 1;
+    if (after) {
+      try { input.setSelectionRange(after.selectionStart, after.selectionEnd); }
+      catch { /* An unfocused mobile textarea can reject selection updates. */ }
+    }
+  });
+  window.addEventListener("pagehide", () => { persistBoundComposerDraft(true); });
 
   render();
   connectOverview();

@@ -9,15 +9,30 @@ const {
   MAX_IMAGE_ATTACHMENTS,
   MAX_IMAGE_BYTES,
   MAX_TOTAL_IMAGE_BYTES,
+  MAX_LAUNCH_DIRECTORY_CANDIDATES,
+  MAX_LAUNCH_DIRECTORY_SUGGESTIONS,
+  LAUNCH_DIRECTORY_SEARCH_DEBOUNCE_MS,
   MAX_FILE_REFERENCE_CHARS,
   MAX_FILE_REFERENCE_LINES,
   attachmentDeliveryTarget,
+  attachmentSelectionMatches,
   agentMenuUrl,
   appRoute,
   arrayBufferToBase64,
   applyPanePatch,
   classifyOverviewUpdate,
   composerEnterAction,
+  composerDraftCanClear,
+  composerDraftEntries,
+  composerDraftIdentity,
+  composerDraftInstanceId,
+  composerDraftMachine,
+  composerDraftJson,
+  composerDraftTombstones,
+  mergeComposerDraftState,
+  pruneComposerDraftEntries,
+  staleComposerDraftKeys,
+  sessionMatchesComposerIdentity,
   composerSubmissionCanRestore,
   composerSubmissionMatches,
   contentToLines,
@@ -30,8 +45,12 @@ const {
   duplicateSourceMatches,
   duplicateSourceSnapshot,
   duplicateSessionName,
+  defaultMemoryLimitLabel,
   duplicateSummaryState,
   filterDirectories,
+  formatMemoryLimit,
+  memoryLimitChoices,
+  parseMemoryLimitSelection,
   followsLiveTail,
   stickyBottomState,
   STICKY_BOTTOM_TOLERANCE,
@@ -52,6 +71,8 @@ const {
   rememberLaunchDirectory,
   availableLaunchDirectories,
   launchDirectoryBrowsePath,
+  validLaunchChildName,
+  repositoryDestinationName,
   launchMachines,
   imageFilesFromTransfer,
   machineStatusLabel,
@@ -62,6 +83,7 @@ const {
   messageFitsByteLimit,
   moveMessageHistory,
   paneTypingText,
+  paneSpecialKeyDelivery,
   paneErrorLabel,
   paneFilesPath,
   paneGitPath,
@@ -73,6 +95,10 @@ const {
   fileReaderPreferences,
   fileReaderPreferenceJson,
   loadFileReaderPreferences,
+  conversationVisibilityPreferences,
+  conversationVisibilityPreferenceJson,
+  loadConversationVisibilityPreferences,
+  saveConversationVisibilityPreferences,
   fileReferenceBlock,
   insertComposerReference,
   nextFileLineSelection,
@@ -115,17 +141,25 @@ const {
   savedSessionConfirmation,
   savedSessionPreview,
   selectionTouchesPane,
+  transcriptAnchorMembers,
   sortSessions,
   presentSessionStatuses,
   WORKING_TO_WAITING_HOLD_MS,
   suggestedSessionName,
   transcriptItemKind,
+  transcriptVisibilityKind,
+  transcriptItemIsVisible,
+  filterTranscriptMessages,
   normalizedToolName,
   coordinationResultSignal,
+  execResultClass,
+  toolResultSignal,
   collapsibleCoordinationTool,
   collapsibleToolRun,
+  internalToolGroupKey,
   compactTranscriptItems,
   coordinationGroupSummary,
+  toolGroupSummary,
   groupRepeatedTools,
   toolDisplayName,
   toolRunGroupSummary,
@@ -243,6 +277,9 @@ test("streaming redraws use semantic transcript anchors and explicit reader inte
   assert.match(source, /const sticky = stickyBottomState\(conversation, state\.transcriptFollowing, !conversation\.hidden\);\s*const shouldFollow = sticky\.follow;/s);
   assert.match(source, /article\.dataset\.transcriptId = String\(message\.id \|\| ""\)/);
   assert.match(source, /restoreTranscriptReadingAnchor\(conversation, readingAnchor, readingOffset\)/);
+  assert.match(source, /details\.dataset\.transcriptMembers = JSON\.stringify/);
+  assert.match(source, /node\.dataset\.transcriptId === anchor\.memberId/);
+  assert.match(source, /transcriptAnchorMembers\(node\.dataset\.transcriptMembers\)\s*\.includes\(anchor\.memberId\)/s);
   assert.match(source, /state\.paneFollowing = false;/);
   assert.match(source, /state\.transcriptFollowing = false;/);
   assert.match(source, /paneReadingScrollTop: 0/);
@@ -302,6 +339,296 @@ test("sticky bottom pins within tolerance and offers the jump pill above it", ()
   );
 });
 
+test("tool-group anchor membership is bounded and malformed hints fail closed", () => {
+  assert.deepEqual(transcriptAnchorMembers('["exec-1","exec-2"]'), ["exec-1", "exec-2"]);
+  for (const invalid of [
+    null,
+    "",
+    "not-json",
+    '{}',
+    '[]',
+    '[1]',
+    '[""]',
+    JSON.stringify(Array.from({ length: 25 }, (_, index) => `exec-${index}`)),
+    JSON.stringify(["x".repeat(513)]),
+    "[" + " ".repeat(128 * 1024) + "]",
+  ]) assert.deepEqual(transcriptAnchorMembers(invalid), []);
+});
+
+test("conversation visibility defaults to all and independently filters human and internal records", () => {
+  const messages = [
+    { id: "agent", role: "assistant", markdown: "Agent prose" },
+    { id: "human", role: "user", markdown: "Human prompt" },
+    { id: "tool", role: "tool", kind: "tool", tool_name: "exec" },
+    { id: "system", role: "system", kind: "system", markdown: "System status" },
+    { id: "status", role: "assistant", kind: "status", markdown: "Coordination status" },
+  ];
+  assert.deepEqual(messages.map(transcriptVisibilityKind), [
+    "agent", "human", "internal", "internal", "internal",
+  ]);
+  assert.deepEqual(filterTranscriptMessages(messages, {}).map(({ id }) => id), [
+    "agent", "human", "tool", "system", "status",
+  ]);
+  assert.deepEqual(
+    filterTranscriptMessages(messages, { human: false, internal: true }).map(({ id }) => id),
+    ["agent", "tool", "system", "status"],
+  );
+  assert.deepEqual(
+    filterTranscriptMessages(messages, { human: true, internal: false }).map(({ id }) => id),
+    ["agent", "human"],
+  );
+  assert.deepEqual(
+    filterTranscriptMessages(messages, { human: false, internal: false }).map(({ id }) => id),
+    ["agent"],
+  );
+  assert.equal(transcriptItemIsVisible(messages[0], { human: false, internal: false }), true);
+});
+
+test("conversation visibility preferences persist safely and reject malformed storage", () => {
+  assert.deepEqual(conversationVisibilityPreferences(null), { human: true, internal: true });
+  assert.deepEqual(conversationVisibilityPreferences("not-json"), { human: true, internal: true });
+  assert.deepEqual(conversationVisibilityPreferences("[]"), { human: true, internal: true });
+  assert.deepEqual(conversationVisibilityPreferences('{"human":false,"internal":true,"agent":false}'), {
+    human: false,
+    internal: true,
+  });
+  assert.deepEqual(conversationVisibilityPreferences({ human: "false", internal: false }), {
+    human: true,
+    internal: false,
+  });
+  assert.equal(
+    conversationVisibilityPreferenceJson({ human: false, internal: false, agent: false }),
+    '{"human":false,"internal":false}',
+  );
+  assert.deepEqual(loadConversationVisibilityPreferences(() => {
+    throw new Error("storage denied");
+  }), { human: true, internal: true });
+  let stored = null;
+  assert.equal(saveConversationVisibilityPreferences((value) => { stored = value; }, {
+    human: false, internal: true,
+  }), true);
+  assert.equal(stored, '{"human":false,"internal":true}');
+  assert.equal(saveConversationVisibilityPreferences(() => {
+    throw new Error("quota exceeded");
+  }, { human: false, internal: false }), false);
+  assert.equal(saveConversationVisibilityPreferences(() => false, {
+    human: false, internal: false,
+  }), false);
+});
+
+test("browser storage access is centralized behind fail-open initialization helpers", () => {
+  const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  const calls = [...source.matchAll(/localStorage\.(getItem|setItem|removeItem|clear)\(/g)]
+    .map((match) => match[1]);
+  assert.deepEqual(calls, ["getItem", "setItem"]);
+  assert.match(source, /const readLocalStorage = \(key\) => \{\s*try \{ return localStorage\.getItem\(key\); \} catch \{ return null; \}\s*\};/s);
+  assert.match(source, /const writeLocalStorage = \(key, value\) => \{\s*try \{\s*localStorage\.setItem\(key, value\);\s*return true;\s*\} catch \{\s*return false;\s*\}\s*\};/s);
+  assert.match(source, /setRailCollapsed\(state\.railCollapsed\)/);
+  assert.match(source, /writeLocalStorage\("atmux\.rail-collapsed"/);
+  assert.match(source, /window\.addEventListener\("pagehide", \(\) => \{ persistBoundComposerDraft\(true\); \}\)/);
+  assert.match(source, /document\.addEventListener\("visibilitychange", \(\) => \{\s*if \(document\.hidden\) \{\s*persistBoundComposerDraft\(true\)/s);
+});
+
+test("composer drafts use pane generations, bounded storage, and plain hostile text", () => {
+  const first = composerDraftIdentity({
+    id: "midnight~%7", machine: "midnight",
+    instance_id: `pane-v1-${"a".repeat(64)}`,
+  });
+  const replacement = composerDraftIdentity({
+    id: "midnight~%7", machine: "midnight",
+    instance_id: `pane-v1-${"b".repeat(64)}`,
+  });
+  assert.equal(first.persistent, true);
+  assert.equal(first.instanceId, `pane-v1-${"a".repeat(64)}`);
+  assert.equal(composerDraftInstanceId(first.key), first.instanceId);
+  assert.notEqual(first.key, replacement.key);
+  assert.equal(sessionMatchesComposerIdentity({
+    id: "midnight~%7", machine: "midnight", instance_id: first.instanceId,
+  }, first.key), true);
+  assert.equal(sessionMatchesComposerIdentity({
+    id: "midnight~%7", machine: "midnight", instance_id: replacement.instanceId,
+  }, first.key), false);
+  assert.deepEqual(composerDraftIdentity({ id: "midnight~%7", machine: "midnight" }), {
+    key: "ephemeral:midnight~%7", persistent: false,
+  });
+  assert.equal(composerDraftMachine(first.key), "midnight");
+  assert.equal(composerDraftMachine("ephemeral:midnight~%7"), null);
+
+  const hostile = `<img src=x onerror=alert(1)>\n<script>alert("draft")</script>`;
+  const drafts = new Map([[first.key, {
+    text: hostile, selectionStart: 4, selectionEnd: 12, version: 9, updatedAt: 20,
+  }]]);
+  const encoded = composerDraftJson(drafts);
+  const restored = composerDraftEntries(encoded).get(first.key);
+  assert.equal(restored.text, hostile);
+  assert.equal(restored.selectionStart, 4);
+  assert.equal(restored.selectionEnd, 12);
+  assert.equal(composerDraftCanClear(restored, { message: hostile, draftVersion: 9 }), true);
+  assert.equal(composerDraftCanClear(restored, { message: hostile, draftVersion: 10 }), false);
+  assert.equal(composerDraftCanClear(restored, { message: "different", draftVersion: 9 }), false);
+
+  const oversized = JSON.stringify({
+    version: 1,
+    drafts: [{ key: first.key, text: "x".repeat(65_537), version: 1, updatedAt: 1 }],
+  });
+  assert.equal(composerDraftEntries(oversized).size, 0);
+  assert.equal(composerDraftEntries("not json").size, 0);
+  assert.equal(composerDraftEntries(JSON.stringify({ version: 1, drafts: [
+    { key: "__proto__", text: "nope", version: 1, updatedAt: 1 },
+  ] })).size, 0);
+
+  const many = new Map(Array.from({ length: 64 }, (_, index) => [
+    `pane:tron:pane-v1-${index.toString(16).padStart(64, "0")}`,
+    {
+      text: `${index}:${"x".repeat(32_000)}`,
+      selectionStart: 0,
+      selectionEnd: 0,
+      version: index + 1,
+      updatedAt: index + 1,
+    },
+  ]));
+  pruneComposerDraftEntries(many);
+  assert.ok(many.size < 64, "the live map must obey the same character budget as storage");
+  const bounded = composerDraftJson(many);
+  assert.ok(bounded.length <= 512 * 1024);
+  assert.equal(composerDraftEntries(bounded).size, many.size);
+
+  const identities = new Map(Array.from({ length: 65 }, (_, index) => [
+    `pane:midnight:pane-v1-${index.toString(16).padStart(64, "0")}`,
+    { text: `draft-${index}`, version: index + 1, updatedAt: index + 1 },
+  ]));
+  pruneComposerDraftEntries(identities);
+  assert.equal(identities.size, 64);
+  assert.equal(identities.has(`pane:midnight:pane-v1-${"0".repeat(64)}`), false);
+  assert.equal(identities.has(`pane:midnight:pane-v1-${"40".padStart(64, "0")}`), true);
+
+  const pinnedOldestKey = `pane:tron:pane-v1-${"f".repeat(64)}`;
+  const underPressure = new Map([
+    [pinnedOldestKey, { text: "failed send rollback", version: 1, updatedAt: 1 }],
+    ...Array.from({ length: 64 }, (_, index) => [
+      `pane:midnight:pane-v1-${(index + 500).toString(16).padStart(64, "0")}`,
+      { text: `pressure-${index}`, version: index + 2, updatedAt: index + 2 },
+    ]),
+  ]);
+  pruneComposerDraftEntries(underPressure, new Set([pinnedOldestKey]));
+  assert.equal(underPressure.size, 64);
+  assert.equal(underPressure.get(pinnedOldestKey)?.text, "failed send rollback");
+  assert.equal(
+    underPressure.has(`pane:midnight:pane-v1-${(500).toString(16).padStart(64, "0")}`),
+    false,
+    "the oldest unpinned entry is evicted before a failed-send rollback",
+  );
+
+  const escapedProtected = new Map(Array.from({ length: 6 }, (_, index) => [
+    `pane:tron:pane-v1-${(index + 100).toString(16).padStart(64, "0")}`,
+    {
+      text: "\u0000".repeat(65_536),
+      selectionStart: 0,
+      selectionEnd: 0,
+      version: index + 1,
+      updatedAt: index + 1,
+    },
+  ]));
+  const protectedKeys = new Set(escapedProtected.keys());
+  const escapedJson = composerDraftJson(escapedProtected, protectedKeys);
+  assert.ok(escapedJson.length <= 512 * 1024, "persistent output must honor its hard cap");
+  assert.equal(escapedProtected.size, 6, "pinned rollback drafts stay available in memory");
+  assert.ok(composerDraftEntries(escapedJson).size < escapedProtected.size);
+
+  const onlineOrphan = `pane:midnight:pane-v1-${"c".repeat(64)}`;
+  const offlineOrphan = `pane:clue:pane-v1-${"d".repeat(64)}`;
+  const coldDrafts = new Map([
+    [first.key, drafts.get(first.key)],
+    [onlineOrphan, { text: "deleted while closed", version: 1, updatedAt: 1 }],
+    [offlineOrphan, { text: "offline owner", version: 1, updatedAt: 1 }],
+  ]);
+  assert.deepEqual(staleComposerDraftKeys(coldDrafts, [{
+    id: "midnight~%7", machine: "midnight", instance_id: first.key.split(":").at(-1),
+  }], [
+    { id: "midnight", online: true },
+    { id: "clue", online: false },
+  ]), [onlineOrphan]);
+
+  const tabAKey = `pane:tron:pane-v1-${"a".repeat(64)}`;
+  const tabBKey = `pane:midnight:pane-v1-${"b".repeat(64)}`;
+  const tabA = new Map([[tabAKey, {
+    text: "draft from tab A", selectionStart: 0, selectionEnd: 0, version: 1, updatedAt: 100,
+  }]]);
+  const tabBJson = composerDraftJson(new Map([[tabBKey, {
+    text: "draft from tab B", selectionStart: 0, selectionEnd: 0, version: 1, updatedAt: 101,
+  }]]));
+  const merged = mergeComposerDraftState(tabA, new Map(), tabBJson, 1_000);
+  assert.deepEqual([...merged.drafts.keys()], [tabAKey, tabBKey], "cross-tab writes merge per entry");
+  const deletedAt = 200;
+  merged.tombstones.set(tabAKey, { deletedAt });
+  merged.drafts.delete(tabAKey);
+  const deletedJson = composerDraftJson(merged.drafts, [], merged.tombstones);
+  assert.equal(composerDraftTombstones(deletedJson, 1_000).get(tabAKey)?.deletedAt, deletedAt);
+  assert.equal(composerDraftTombstones(deletedJson, 8 * 24 * 60 * 60 * 1_000).has(tabAKey), false);
+  const staleTabWrite = composerDraftJson(new Map([
+    [tabAKey, {
+      text: "stale resurrection", selectionStart: 0, selectionEnd: 0, version: 1, updatedAt: 100,
+    }],
+    [tabBKey, merged.drafts.get(tabBKey)],
+  ]));
+  const reconciled = mergeComposerDraftState(
+    composerDraftEntries(staleTabWrite),
+    new Map(),
+    deletedJson,
+    1_000,
+  );
+  assert.equal(reconciled.drafts.has(tabAKey), false, "a stale tab cannot resurrect a cleared draft");
+  assert.equal(reconciled.drafts.get(tabBKey)?.text, "draft from tab B");
+});
+
+test("conversation filtering happens before exec grouping and never counts hidden calls", () => {
+  const exec = (id) => ({
+    id, role: "tool", kind: "tool", tool_name: "exec", tool_output: "ok",
+  });
+  const messages = [
+    exec("exec-1"),
+    { id: "human", role: "user", markdown: "a human boundary" },
+    exec("exec-2"),
+    exec("exec-3"),
+    { id: "agent", role: "assistant", markdown: "agent boundary" },
+    exec("exec-4"),
+  ];
+  const withoutHuman = compactTranscriptItems(filterTranscriptMessages(messages, {
+    human: false, internal: true,
+  }));
+  assert.deepEqual(withoutHuman.map((item) => item.kind), ["tool-group", "item", "item"]);
+  assert.equal(toolGroupSummary(withoutHuman[0]), "exec ×3");
+  assert.deepEqual(withoutHuman[0].messages.map(({ id }) => id), ["exec-1", "exec-2", "exec-3"]);
+  const agentOnly = compactTranscriptItems(filterTranscriptMessages(messages, {
+    human: false, internal: false,
+  }));
+  assert.deepEqual(agentOnly.map((item) => item.message.id), ["agent"]);
+});
+
+test("conversation filter controls are recoverable, accessible, and text-only", () => {
+  const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+  const css = readFileSync(new URL("./app.css", import.meta.url), "utf8");
+  assert.match(html, /id="conversation-filters-open"[^>]*aria-haspopup="dialog"[^>]*aria-controls="conversation-filters-dialog"/);
+  assert.match(html, /id="conversation-filters-dialog"[^>]*aria-labelledby="conversation-filters-title"[^>]*aria-describedby="conversation-filters-note"/);
+  assert.match(html, /<input type="checkbox" checked disabled>\s*<span>Agent messages<\/span>/);
+  assert.match(html, /id="conversation-show-human" type="checkbox" checked/);
+  assert.match(html, /id="conversation-show-internal" type="checkbox" checked/);
+  assert.match(html, /id="conversation-filters-reset"[^>]*>Show all<\/button>/);
+  assert.match(source, /indicator\.textContent = hiddenCount \? `\$\{hiddenCount\} off` : "All"/);
+  assert.match(source, /drawConversation\(true\)/);
+  assert.match(source, /state\.pendingTranscriptFilterChange \|\|= filterChanged/);
+  assert.match(source, /drawConversation\(state\.pendingTranscriptFilterChange\)/);
+  assert.match(source, /filterTranscriptMessages\(sourceMessages, state\.conversationVisibility\)/);
+  assert.match(source, /No agent messages to show\. Change Conversation visibility or choose Show all\./);
+  assert.doesNotMatch(source.slice(
+    source.indexOf("function renderConversationFilters"),
+    source.indexOf("function renderViewMode"),
+  ), /innerHTML/);
+  assert.match(css, /@media \(max-width: 720px\)[\s\S]*\.conversation-filters-open \{[^}]*min-height: 44px;/s);
+  assert.match(css, /@media \(max-width: 720px\)[\s\S]*\.conversation-filter-options input \{[^}]*width: 22px;[^}]*height: 22px;/s);
+});
+
 test("adjacent low-signal coordination calls collapse without crossing prose or error boundaries", () => {
   const tool = (id, toolName, toolOutput = null) => ({
     id, kind: "tool", role: "tool", tool_name: toolName, tool_input: `{ "id": "${id}" }`, tool_output: toolOutput,
@@ -328,6 +655,87 @@ test("adjacent low-signal coordination calls collapse without crossing prose or 
   assert.equal(compacted[3].message.id, "error");
   assert.equal(compacted[5].message.id, "exec");
   assert.equal(compacted[6].message.id, "wait-single");
+});
+
+test("adjacent exec variants collapse as exec ×4 without crossing narrative or failures", () => {
+  const exec = (id, name, output) => ({
+    id, kind: "tool", role: "tool", tool_name: name,
+    tool_input: `{ "cmd": "printf ${id}" }`, tool_output: output,
+  });
+  const messages = [
+    { id: "human", role: "user", markdown: "Human plan stays visible" },
+    exec("exec-1", "functions.exec", '{"exit_code":0,"output":"command one output"}'),
+    exec("exec-2", "exec_command", "Process exited with code 0"),
+    exec("exec-3", "tools/exec", "ok"),
+    exec("exec-4", "functions.exec_command", '{"result":{"exit_code":0}}'),
+    { id: "agent", role: "assistant", markdown: "Agent interpretation stays visible" },
+    exec("exec-error", "exec", "Error: command exited with status 1"),
+  ];
+  const compacted = compactTranscriptItems(messages);
+  assert.deepEqual(compacted.map((item) => item.kind), ["item", "tool-group", "item", "item"]);
+  assert.deepEqual(compacted[1].messages.map((item) => item.id), ["exec-1", "exec-2", "exec-3", "exec-4"]);
+  assert.deepEqual(compacted[1].counts, [{ name: "exec", count: 4 }]);
+  assert.equal(toolGroupSummary(compacted[1]), "exec ×4");
+  assert.equal(compacted[0].message.markdown, "Human plan stays visible");
+  assert.equal(compacted[2].message.markdown, "Agent interpretation stays visible");
+  assert.equal(compacted[3].message.id, "exec-error");
+});
+
+test("exec failures and unknown output fail open while safe statuses stay compatible", () => {
+  const tool = (id, name, output) => ({
+    id, kind: "tool", role: "tool", tool_name: name, tool_output: output,
+  });
+  const messages = [
+    tool("timeout", "exec", "timed out"),
+    tool("ok-after-timeout", "exec", "ok"),
+    tool("json-error", "exec_command", '{"exit_code":1}'),
+    tool("json-ok", "exec_command", '{"exit_code":0}'),
+    tool("process-error", "functions.exec", "Process exited with code 1"),
+    tool("tool-failure", "functions.exec", "tool-call failure"),
+    tool("unknown-1", "exec", "command printed useful output"),
+    tool("unknown-2", "exec", "another useful result"),
+    tool("pending-1", "exec", "running"),
+    tool("pending-2", "exec_command", '{"status":"running"}'),
+  ];
+  assert.deepEqual(messages.map(execResultClass), [
+    "error", "success", "error", "success", "error", "error", null, null,
+    "pending", "pending",
+  ]);
+  assert.equal(toolResultSignal(messages[0]), "error");
+  assert.equal(toolResultSignal(messages[2]), "error");
+  assert.equal(toolResultSignal(messages[4]), "error");
+  assert.equal(execResultClass(tool("generic-zero", "exec", '{"code":0}')), null);
+  assert.equal(execResultClass(tool("explicit-ok", "exec", '{"ok":true}')), "success");
+  assert.deepEqual(messages.map(internalToolGroupKey), [
+    null, "repeat:exec:success", null, "repeat:exec:success", null, null, null, null,
+    "repeat:exec:pending", "repeat:exec:pending",
+  ]);
+  const compacted = compactTranscriptItems(messages);
+  assert.deepEqual(compacted.map((item) => item.kind), [
+    "item", "item", "item", "item", "item", "item", "item", "item", "tool-group",
+  ]);
+  assert.equal(toolGroupSummary(compacted.at(-1)), "exec ×2");
+});
+
+test("meaningful non-exec tools never collapse even when repeated", () => {
+  const calls = [
+    ["patch", "apply_patch"],
+    ["web", "web.run"],
+    ["plan", "update_plan"],
+  ].flatMap(([prefix, name]) => [1, 2].map((index) => ({
+    id: `${prefix}-${index}`, kind: "tool", role: "tool", tool_name: name,
+    tool_output: index === 1 ? "ok" : "completed",
+  })));
+  assert.ok(calls.every((item) => internalToolGroupKey(item) === null));
+  // Internal grouping still declines them, so they never become an `exec ×N`
+  // row; the reader-facing fold of an uninterrupted run keeps every call, in
+  // order, one disclosure away.
+  const compacted = compactTranscriptItems(calls);
+  assert.deepEqual(compacted.map((item) => item.kind), ["tool-run"]);
+  assert.deepEqual(
+    compacted.flatMap((item) => item.messages.map((message) => message.id)),
+    calls.map((item) => item.id),
+  );
 });
 
 test("meaningful results, approvals, and lifecycle tools always remain visible", () => {
@@ -442,12 +850,14 @@ test("subagent turns are labelled as the subagent and never as the operator", ()
   assert.equal(transcriptRoleLabel({ role: "subagent", agent_name: "Explore" }), "Subagent · Explore");
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
   const css = readFileSync(new URL("./app.css", import.meta.url), "utf8");
-  assert.match(source, /TRANSCRIPT_MESSAGE_ROLES = new Set\(\["user", "assistant", "subagent"\]\)/);
+  // Subagent prose shares the Internal visibility bucket, so it stays hideable
+  // while keeping its own attribution and card styling.
+  assert.equal(transcriptVisibilityKind({ role: "subagent", markdown: "report" }), "internal");
   assert.match(source, /label\.textContent = transcriptRoleLabel\(message\)/);
   assert.match(css, /\.message-card\.subagent/);
 });
 
-test("coordination summaries normalize namespaces and expose per-tool counts and status", () => {
+test("tool summaries normalize namespaces and expose per-tool counts", () => {
   const messages = [
     { id: "a", kind: "tool", tool_name: "functions.collaboration.wait_agent" },
     { id: "b", kind: "tool", tool_name: "mcp__send_message", tool_output: "sent" },
@@ -456,7 +866,7 @@ test("coordination summaries normalize namespaces and expose per-tool counts and
   const [group] = compactTranscriptItems(messages);
   assert.equal(normalizedToolName(messages[0]), "wait_agent");
   assert.equal(normalizedToolName(messages[1]), "send_message");
-  assert.equal(coordinationGroupSummary(group), "3 coordination calls · wait_agent ×2 · send_message ×1 · no errors");
+  assert.equal(toolGroupSummary(group), "3 internal calls · wait_agent ×2 · send_message ×1");
 });
 
 test("coordination compaction stays inside Conversation and uses text-only DOM rendering", () => {
@@ -464,6 +874,7 @@ test("coordination compaction stays inside Conversation and uses text-only DOM r
   const renderer = source.slice(source.indexOf("function renderToolCard"), source.indexOf("function flushPendingTranscriptRender"));
   assert.match(renderer, /compactTranscriptItems\(/);
   assert.match(renderer, /summary\.textContent = coordinationGroupSummary\(group\)/);
+  assert.match(renderer, /\$\{summary\.textContent\}; \$\{group\.messages\.length\} calls and results/);
   assert.match(renderer, /linkifyInto\(pre, value\)/);
   assert.match(renderer, /state\.transcriptRequest === transcriptGeneration/);
   assert.match(renderer, /details\.isConnected/);
@@ -526,6 +937,14 @@ test("image attachments retain their captured pane and encode bytes without corr
   assert.equal(attachmentDeliveryTarget("midnight~%7", "max~%2"), "midnight~%7");
   assert.equal(attachmentDeliveryTarget(null, "max~%2"), "max~%2");
   assert.equal(attachmentDeliveryTarget(null, null), null);
+  const first = `pane:midnight:pane-v1-${"a".repeat(64)}`;
+  const replacement = `pane:midnight:pane-v1-${"b".repeat(64)}`;
+  assert.equal(attachmentSelectionMatches("midnight~%7", first, "midnight~%7", first), true);
+  assert.equal(attachmentSelectionMatches("midnight~%7", first, "max~%2", replacement), false);
+  assert.equal(attachmentSelectionMatches("midnight~%7", first, "midnight~%7", replacement), false);
+  assert.equal(attachmentSelectionMatches(
+    "midnight~%7", "ephemeral:midnight~%7", "midnight~%7", "ephemeral:midnight~%7",
+  ), false);
   assert.equal(arrayBufferToBase64(Uint8Array.from([0, 1, 2, 253, 254, 255]).buffer), "AAEC/f7/");
 });
 
@@ -752,6 +1171,24 @@ test("focused live panes forward only ordinary typing to the message composer", 
   assert.equal(paneTypingText({ key: "a", isComposing: true }), "");
 });
 
+test("special-key delivery binds one allowlisted action to machine and pane generation", () => {
+  const instanceId = `pane-v1-${"a".repeat(64)}`;
+  const session = {
+    id: "midnight~%7", machine: "midnight", instance_id: instanceId,
+  };
+  for (const action of ["up", "down", "left", "right", "enter", "tmux_prefix_twice"]) {
+    const delivery = paneSpecialKeyDelivery(session, action);
+    assert.deepEqual(delivery, {
+      paneId: "midnight~%7", machine: "midnight", instanceId, action,
+    });
+    assert.equal(Object.isFrozen(delivery), true);
+  }
+  assert.equal(paneSpecialKeyDelivery(session, "C-x; run-shell pwn"), null);
+  assert.equal(paneSpecialKeyDelivery({ ...session, instance_id: "%7" }, "enter"), null);
+  assert.equal(paneSpecialKeyDelivery({ ...session, machine: "tron" }, "enter"), null);
+  assert.equal(paneSpecialKeyDelivery({ ...session, id: "midnight~%8" }, "enter")?.paneId, "midnight~%8");
+});
+
 test("message history moves through sent comments and restores the draft", () => {
   const history = ["first", "second"];
   assert.equal(moveMessageHistory(history, history.length, "up"), 1);
@@ -785,27 +1222,73 @@ test("filterDirectories narrows launch projects case-insensitively as the user t
   assert.deepEqual(filterDirectories(directories, "MERC"), ["/work/mercury"]);
   assert.deepEqual(filterDirectories(directories, ""), directories);
   assert.deepEqual(filterDirectories(null, "atmux"), []);
+  const many = Array.from({ length: 2_000 }, (_, index) => `/work/project-${index}`);
+  assert.deepEqual(
+    filterDirectories(many, "", Number.MAX_SAFE_INTEGER),
+    many.slice(0, MAX_LAUNCH_DIRECTORY_SUGGESTIONS),
+  );
+  assert.deepEqual(filterDirectories(many, "project-1999"), ["/work/project-1999"]);
+  assert.deepEqual(filterDirectories(many, "project", 0), []);
+  assert.equal(LAUNCH_DIRECTORY_SEARCH_DEBOUNCE_MS, 140);
 });
 
-test("launch dialog uses the Project typeahead itself instead of a separate find field", () => {
+test("launch directory candidates and rendered matches stay bounded", () => {
+  const listed = Array.from(
+    { length: MAX_LAUNCH_DIRECTORY_CANDIDATES + 1_000 },
+    (_, index) => `/work/project-${index}`,
+  );
+  const available = availableLaunchDirectories(
+    { id: "tron", directories: listed },
+    { tron: ["/work/remembered"] },
+  );
+  assert.equal(available.length, MAX_LAUNCH_DIRECTORY_CANDIDATES);
+  assert.equal(available[0], "/work/remembered");
+  assert.equal(filterDirectories(available, "").length, MAX_LAUNCH_DIRECTORY_SUGGESTIONS);
+});
+
+test("launch dialog uses a bounded accessible Project combobox", () => {
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
   const markup = readFileSync(new URL("./index.html", import.meta.url), "utf8");
   assert.doesNotMatch(markup, /launch-directory-filter/);
-  assert.match(markup, /id="launch-directory" type="search" list="launch-directory-options"/);
-  assert.match(markup, /<datalist id="launch-directory-options">/);
-  assert.match(source, /launch-directory-options"\)\.replaceChildren/);
+  assert.match(markup, /id="launch-directory" type="search" role="combobox"[^>]*aria-autocomplete="list"[^>]*aria-controls="launch-directory-suggestions"[^>]*aria-expanded="false"/);
+  assert.doesNotMatch(markup, /<datalist|\slist="/);
+  assert.match(markup, /id="launch-directory-suggestions"[^>]*role="listbox"[^>]*aria-label="Matching projects"/);
+  assert.match(source, /setAttribute\("role", "option"\)/);
+  assert.match(source, /setAttribute\("aria-activedescendant"/);
+  assert.match(source, /addEventListener\("input", scheduleLaunchDirectorySearch\)/);
+  assert.match(source, /\["ArrowDown", "ArrowUp"\]/);
+  assert.match(source, /event\.key === "Enter"/);
+  assert.match(source, /event\.key === "Escape"/);
+  assert.match(source, /Math\.hypot\([^)]*\) >= 10/);
+  assert.doesNotMatch(source, /pointerdown[\s\S]{0,240}selectLaunchDirectorySuggestion\(directory\)/);
+  assert.match(source, /addEventListener\("mousedown", \(event\) => event\.preventDefault\(\)\)/);
+  assert.match(source, /new AbortController\(\)/);
   assert.equal(isManualDirectory("/Users/ryan/work/plain"), true);
   assert.equal(isManualDirectory("~/work/plain"), true);
   assert.equal(isManualDirectory("plain/relative"), false);
   assert.match(source, /type an absolute folder within a configured project root/i);
   assert.match(markup, /id="launch-browse"[^>]*>Browse<\/button>/);
   assert.match(markup, /id="launch-browser"/);
+  assert.match(markup, /id="launch-browser-new"[^>]*>New folder<\/button>/);
+  assert.match(markup, /id="launch-browser-clone"[^>]*>Clone repo<\/button>/);
+  assert.match(markup, /id="launch-browser-operation"[^>]*aria-labelledby=/);
   assert.match(source, /request\(endpoint\)/);
   assert.match(markup, /id="launch-sessions"/);
   assert.match(markup, /id="launch-session"/);
   assert.match(source, /\/api\/v1\/launch-sessions/);
   assert.match(source, /resume_session_id: duplicateFlow \? null : \(\$\("launch-session"\)\.value \|\| null\)/);
   assert.match(source, /\^saved-\[0-9a-f\]\{32\}\$/);
+});
+
+test("folder actions keep names component-safe and derive repository destinations", () => {
+  assert.equal(validLaunchChildName("new project"), true);
+  for (const invalid of ["", ".", "..", "../escape", "child/name", "child\\name", "-option", "line\nbreak"]) {
+    assert.equal(validLaunchChildName(invalid), false, invalid);
+  }
+  assert.equal(repositoryDestinationName("https://example.test/team/atmux.git"), "atmux");
+  assert.equal(repositoryDestinationName("ssh://git@example.test/team/project with spaces.git"), "project with spaces");
+  assert.equal(repositoryDestinationName("git@example.test:team/repo.git"), "repo");
+  assert.equal(repositoryDestinationName("https://example.test/team/-option.git"), "");
 });
 
 test("saved conversation launch requires an explicit, sanitized confirmation", () => {
@@ -953,7 +1436,7 @@ test("left rail controls expose encoded per-session deletion and persistent coll
   const css = readFileSync(new URL("./app.css", import.meta.url), "utf8");
   assert.match(app, /deleteButton\.addEventListener\("click", \(\) => openKillDialog\(id\)\)/);
   assert.match(app, /state\.pendingKillId = id/);
-  assert.match(app, /writeStoredValue\("atmux\.rail-collapsed"/);
+  assert.match(app, /writeLocalStorage\("atmux\.rail-collapsed"/);
   assert.match(html, /id="rail-toggle"[^>]+aria-controls="session-rail"/);
   assert.match(css, /body\.rail-collapsed \.workspace/);
   assert.match(css, /\.session-delete/);
@@ -966,8 +1449,13 @@ test("push-to-talk keeps the pane selected when recording began", () => {
   });
   assert.equal(dictationDelivery(null, "", "review this"), null);
   assert.equal(dictationDelivery("midnight~%7", "draft", "  "), null);
-  assert.equal(dictationPrefix("sending now", true, "sending now"), "");
-  assert.equal(dictationPrefix("new draft", true, "sending now"), "new draft");
+  assert.equal(dictationPrefix("sending now", true, "sending now", "pane:a", "pane:a"), "");
+  assert.equal(dictationPrefix("new draft", true, "sending now", "pane:a", "pane:a"), "new draft");
+  assert.equal(
+    dictationPrefix("sending now", true, "sending now", "pane:a", "pane:b"),
+    "sending now",
+    "equal text in another agent is still that agent's dictation prefix",
+  );
   assert.equal(composerSubmissionMatches("midnight~%7", "midnight~%7", "review this", "review this"), true);
   assert.equal(composerSubmissionMatches("midnight~%8", "midnight~%7", "review this", "review this"), false);
   assert.equal(composerSubmissionMatches("midnight~%7", "midnight~%7", "new draft", "review this"), false);
@@ -981,7 +1469,7 @@ test("push-to-talk keeps the pane selected when recording began", () => {
   assert.equal(composerSubmissionCanRestore("midnight~%7", "", 5, clearedSubmission), false);
   assert.equal(composerSubmissionCanRestore("midnight~%8", "", 4, clearedSubmission), false);
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
-  assert.match(source, /sendComposerMessage\(delivery\.paneId, delivery\.message, \{ clearOnAccept: true \}\)/);
+  assert.match(source, /sendComposerMessage\(delivery\.paneId, delivery\.message, \{[\s\S]*clearOnAccept: true,[\s\S]*targetIdentityKey: identityKey/);
   assert.match(source, /restoreComposerSubmission\(composerSubmission\)/);
 });
 
@@ -999,7 +1487,7 @@ test("push-to-talk restarts recognition while held and stops cleanly on release"
   assert.match(source, /recognition\.continuous = true/);
   assert.match(source, /dictationEndAction\([\s\S]*=== "restart"\)[\s\S]*scheduleRestart\(generation\)/);
   assert.match(source, /window\.addEventListener\("blur", stopTalking\)/);
-  assert.match(source, /queuedComposerMessages\.push\(\{[\s\S]*options: \{ clearOnAccept, composerSubmission, fromQueue:[^}]+\}[\s\S]*resolve,[\s\S]*\}\)/);
+  assert.match(source, /queuedComposerMessages\.push\(\{[\s\S]*options: \{[\s\S]*clearOnAccept,[\s\S]*composerSubmission,[\s\S]*targetIdentityKey,[\s\S]*fromQueue:[^}]+\}[\s\S]*resolve,[\s\S]*\}\)/);
   assert.match(source, /state\.inFlightComposerText = message;/);
   assert.match(source, /Message exceeds the 64 KiB UTF-8 limit"\);\s*if \(options\.fromQueue === true\) drainQueuedComposerMessage\(\);/s);
   assert.match(css, /#talk \{[^}]*touch-action: none;/s);
@@ -1175,7 +1663,7 @@ test("Files and Git are accessible lazy tabs with text-only source rendering", (
   assert.match(source, /function renderAgentBranch/);
   assert.match(source, /state\.projectView !== view \|\| view\.paneId !== paneId/);
   assert.match(source, /token\.textContent = segment\.text/);
-  assert.match(source, /localStorage\.setItem\([\s\S]*FILE_READER_STORAGE_KEY/);
+  assert.match(source, /writeLocalStorage\([\s\S]*FILE_READER_STORAGE_KEY/);
   assert.match(source, /editor\.wrap = state\.fileReaderPreferences\.wrap \? "soft" : "off"/);
   assert.doesNotMatch(source, /\.innerHTML\s*=/);
   assert.match(css, /\.project-panel \{[^}]*min-height: 0;[^}]*overflow: hidden;[^}]*overscroll-behavior: contain;/s);
@@ -1369,10 +1857,75 @@ test("duplicate launch reuses exact owner profile and mode IDs with a fresh tmux
     harness: "codex",
     profileId: "profile-codex-max",
     modeId: "sol-fast",
+    memoryMaxBytes: null,
     name: "kernel-copy-2",
   });
   assert.equal(launchMachines({ directories: ["/one"], profiles: [] })[0].id, "local");
   assert.equal(duplicateSessionName({ ...running, name: "x".repeat(100) }, []), `${"x".repeat(95)}-copy`);
+});
+
+test("memory launch choices parse Default, presets, and bounded whole-GiB custom values", () => {
+  const GiB = 1024 ** 3;
+  const memory = {
+    supported: true,
+    default_bytes: 16 * GiB,
+    override_max_bytes: 24 * GiB,
+    presets_bytes: [8 * GiB, 16 * GiB, 24 * GiB, 32 * GiB, 0, "bad"],
+    note: "next relaunch",
+  };
+  assert.deepEqual(memoryLimitChoices(memory), {
+    advertised: true,
+    supported: true,
+    defaultBytes: 16 * GiB,
+    ceiling: 24 * GiB,
+    presets: [8 * GiB, 16 * GiB, 24 * GiB],
+    note: "next relaunch",
+  });
+  assert.equal(parseMemoryLimitSelection(memory, "", ""), null);
+  assert.equal(parseMemoryLimitSelection(memory, String(8 * GiB), ""), 8 * GiB);
+  assert.equal(parseMemoryLimitSelection(memory, "custom", "12"), 12 * GiB);
+  assert.throws(() => parseMemoryLimitSelection(memory, "custom", "1.5"), /whole number/);
+  assert.throws(() => parseMemoryLimitSelection(memory, "custom", "25"), /at most 24 GiB/);
+  assert.throws(() => parseMemoryLimitSelection(memory, String(20 * GiB), ""), /owner-approved/);
+  assert.equal(formatMemoryLimit(16 * GiB), "16 GiB");
+  assert.deepEqual(memoryLimitChoices(null), {
+    advertised: false,
+    supported: false,
+    defaultBytes: null,
+    ceiling: null,
+    presets: [],
+    note: "Memory limit is owner managed; this owner does not advertise override support.",
+  });
+  assert.equal(defaultMemoryLimitLabel(null), "Default (owner managed)");
+  assert.equal(defaultMemoryLimitLabel(memory), "Default (16 GiB)");
+});
+
+test("duplicate preserves an exact owner-allowed cap and rejects stale capability", () => {
+  const GiB = 1024 ** 3;
+  const session = {
+    id: "max~%4", machine: "max", name: "worker", agent: "codex",
+    profile: "Default", path: "/workspace", memory_max_bytes: 20 * GiB,
+  };
+  const machine = {
+    id: "max", label: "Max", online: true, directories: [session.path],
+    profiles: [{ id: "profile-0", name: "Default", harness: "codex", modes: [] }],
+    memory: {
+      supported: true, default_bytes: 16 * GiB, override_max_bytes: 24 * GiB,
+      presets_bytes: [16 * GiB, 24 * GiB],
+    },
+  };
+  assert.equal(
+    duplicateLaunchSelection({ machines: [machine] }, session, null).memoryMaxBytes,
+    20 * GiB,
+  );
+  assert.throws(
+    () => duplicateLaunchSelection({ machines: [{ ...machine, memory: null }] }, session, null),
+    /no longer allowed/,
+  );
+  assert.throws(
+    () => duplicateLaunchSelection({ machines: [{ ...machine, memory: { ...machine.memory, override_max_bytes: 18 * GiB } }] }, session, null),
+    /no longer allowed/,
+  );
 });
 
 test("duplicate launch refuses stale profile or ambiguous model settings", () => {
@@ -1510,8 +2063,20 @@ test("Actions groups fixed special keys and Compact outside the composer", () =>
   assert.match(markup, /id="quick-duplicate"[^>]*>Duplicate agent</);
   assert.match(markup, /id="quick-compact"/);
   assert.doesNotMatch(markup, /id="compact"/);
-  assert.match(source, /special-keys/);
-  assert.match(source, /action: "tmux_prefix_twice"/);
+  assert.match(source, /input-keys/);
+  assert.doesNotMatch(
+    source.match(/async function drainPaneSpecialKeyQueue\(\)[\s\S]*?\n  \}/)?.[0] || "",
+    /special-keys/,
+  );
+  assert.match(source, /MAX_QUEUED_PANE_KEYS = 16/);
+  assert.match(source, /MAX_PANE_KEY_STATUSES = 64/);
+  assert.match(source, /\[400, 404, 422\]\.includes\(error\.status\)/);
+  assert.match(source, /sendPaneSpecialKey\("tmux_prefix_twice", "Ctrl\+B twice"\)/);
+  for (const action of ["up", "down", "left", "right", "enter"]) {
+    assert.match(markup, new RegExp(`data-pane-key="${action}"`));
+  }
+  assert.match(markup, /data-pane-key="enter"[^>]*aria-label="Send blank Enter"/);
+  assert.match(source, /document\.querySelectorAll\("\[data-pane-key\]"\)/);
   assert.match(source, /compactSelectedAgent/);
   assert.match(source, /text: "\/compact"/);
   assert.match(source, /duplicateLaunchSelection\([\s\S]*\[\.\.\.state\.sessions\.values\(\)\]/);
@@ -1522,7 +2087,7 @@ test("composer Send has a dedicated tap handler and stays disabled while sending
   const markup = readFileSync(new URL("./index.html", import.meta.url), "utf8");
   assert.match(markup, /<button id="send" class="primary" type="button">Send<\/button>/);
   assert.match(source, /\$\("send"\)\.addEventListener\("click", \(\) => \{ void sendComposerMessage\(\); \}\);/);
-  assert.match(source, /\$\("send"\)\.disabled = !controllable \|\| state\.composerSending \|\| resuming;/);
+  assert.match(source, /\$\("send"\)\.disabled = !controllable \|\| state\.composerSending \|\| resuming\s*\|\| \(state\.attachments\.length > 0 && !attachmentsMatchCurrentSelection\(\)\);/);
   assert.match(source, /state\.composerSending = true;/);
 });
 
@@ -2001,6 +2566,7 @@ test("Claude resume uses a confirmation and never sends browser-supplied session
   assert.match(handler, /encodeURIComponent\(target\)\}\/resume/);
   assert.match(handler, /body: JSON\.stringify\(\{\}\)/);
   assert.doesNotMatch(handler, /session_id:\s*[^,}]+/);
+  assert.doesNotMatch(handler, /dangerously-skip-permissions/);
   assert.doesNotMatch(source, /CLAUDE_CONFIG_DIR/);
 });
 

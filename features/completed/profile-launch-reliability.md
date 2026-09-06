@@ -6,6 +6,10 @@ Status: completed
 
 - Configured default Claude and Codex profiles resolve to the discovered absolute executable while
   preserving their arguments and environment.
+- Discovery deterministically prefers executable wrappers, then shell aliases, then sorted Codex
+  config files, and finally generic defaults for same-named profiles.
+- A configured profile opts into discovered command details only with `inherit_discovered = true`;
+  its configured environment, modes, and explicit Claude relaunch policy remain authoritative.
 - Launching does not depend on the reduced `PATH` inherited by a launchd/tmux web service.
 - Max can launch its reported default Codex profile from the web API.
 - The existing Claude profile/config-directory behavior remains unchanged on Midnight.
@@ -29,3 +33,5 @@ Status: completed
   `CLAUDE_CONFIG_DIR=/Users/ryan/.claude-max`; its protected Aqua tmux server was not rebuilt.
 - Fable/Claude Max and the independent security reviewer both returned `SAFE` on the final frozen
   snapshot, including the canonical absolute executable resolution and launch-label redaction.
+- Full-pipeline discovery regressions cover executable-versus-alias precedence, aliases without a
+  wrapper, named Codex config fallbacks, generic defaults, and deterministic case collisions.

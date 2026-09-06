@@ -17,10 +17,15 @@ const paneStreams = new Set();
 const overviewStreams = new Set();
 const launchRequests = [];
 const launchSessionRequests = [];
+const launchDirectoryMutationRequests = [];
+const launchBrowserChildren = new Set();
 let failLiveModels = false;
 let launchOptionsDelayMs = 0;
 let launchResponseDelayMs = 0;
+let launchDirectoryMutationDelayMs = 0;
 let launchMachinesUnavailable = false;
+let largeLaunchDirectoryFixture = false;
+let launchSessionResponseDelayMs = 0;
 let overviewRevision = 1;
 let delayProjectFilePane = null;
 let delayFileSavePane = null;
@@ -29,6 +34,15 @@ let delayGitDiffPane = null;
 let nextFileSaveConflict = false;
 const fileSaveRequests = [];
 const messageRequests = [];
+const imageMessageRequests = [];
+const specialKeyRequests = [];
+const legacySpecialKeyRequests = [];
+let nextSpecialKeyStatus = null;
+let nextSpecialKeyResponseDelayMs = 0;
+let nextSpecialKeyResponseGate = null;
+let simulateOldCoordinatorInputRoute = false;
+let nextMessageFailurePane = null;
+let messageResponseDelayMs = 0;
 const projectFileContents = new Map();
 const projectFileVersions = new Map();
 const LONG_KERNEL_VERSION = "k".repeat(160);
@@ -51,11 +65,29 @@ function fixtureProjectHash(paneId) {
 }
 
 function mockSession(machine, pane, name, status, extra = {}) {
+  const digit = [...`${machine}:${pane}`]
+    .reduce((sum, character) => sum + character.charCodeAt(0), 0)
+    .toString(16).at(-1);
   return {
     id: `${machine}~${pane}`, pane_id: pane, machine, name, status,
+    instance_id: `pane-v1-${digit.repeat(64)}`,
     agent: "claude", profile: "max", path: "/workspace", command: "claude",
     ...extra,
   };
+}
+
+function mockOverviewMachines() {
+  return [
+    {
+      id: "tron", label: "Tron", kind: "local", online: true, sessions: 1,
+      metrics: {
+        uptime_seconds: 183_840,
+        kernel_version: LONG_KERNEL_VERSION,
+        os_version: LONG_OS_VERSION,
+      },
+    },
+    { id: "midnight", label: "Midnight", kind: "remote", online: true, sessions: 2 },
+  ];
 }
 
 function emitOverviewPatch(upsert, remove = []) {
@@ -68,6 +100,17 @@ function emitOverviewPatch(upsert, remove = []) {
     remove,
     health: null,
     machines: [],
+  })}\n\n`;
+  for (const response of overviewStreams) response.write(payload);
+}
+
+function emitOverviewSnapshot(sessions) {
+  overviewRevision += 1;
+  const payload = `event: sessions.snapshot\ndata: ${JSON.stringify({
+    revision: overviewRevision,
+    sessions,
+    health: null,
+    machines: mockOverviewMachines(),
   })}\n\n`;
   for (const response of overviewStreams) response.write(payload);
 }
@@ -95,22 +138,13 @@ function mockApi(url, response, request) {
       revision: overviewRevision,
       sessions: [{
         id: "tron~%100", pane_id: "%100", machine: "tron", name: "codex-main",
+        instance_id: `pane-v1-${"1".repeat(64)}`,
         status: "waiting", agent: "codex", profile: "codex-max", path: "/workspace", command: "codex",
       },
       mockSession("midnight", "%5", "alpha-planner", "working"),
       mockSession("midnight", "%7", "beta-planner", "waiting"),
       ],
-      machines: [
-        {
-          id: "tron", label: "Tron", kind: "local", online: true, sessions: 1,
-          metrics: {
-            uptime_seconds: 183_840,
-            kernel_version: LONG_KERNEL_VERSION,
-            os_version: LONG_OS_VERSION,
-          },
-        },
-        { id: "midnight", label: "Midnight", kind: "remote", online: true, sessions: 2 },
-      ],
+      machines: mockOverviewMachines(),
       health: null,
     })}\n\n`);
     overviewStreams.add(response);
@@ -228,10 +262,72 @@ function mockApi(url, response, request) {
     return true;
   }
   if (/^\/api\/v1\/panes\/[^/]+\/messages$/.test(pathname) && request.method === "POST") {
+    const paneId = decodeURIComponent(pathname.split("/")[4]);
     let body = "";
     request.setEncoding("utf8");
     request.on("data", (chunk) => { body += chunk; });
-    request.on("end", () => { messageRequests.push(body); json(response, {}); });
+    request.on("end", () => {
+      messageRequests.push({ paneId, body });
+      const reply = () => {
+        if (nextMessageFailurePane === paneId) {
+          nextMessageFailurePane = null;
+          errorJson(response, 503, "message fixture rejected the send");
+        } else json(response, {});
+      };
+      if (messageResponseDelayMs > 0) setTimeout(reply, messageResponseDelayMs);
+      else reply();
+    });
+    return true;
+  }
+  if (/^\/api\/v1\/panes\/[^/]+\/image-messages$/.test(pathname) && request.method === "POST") {
+    const paneId = decodeURIComponent(pathname.split("/")[4]);
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      imageMessageRequests.push({ paneId, body: JSON.parse(body) });
+      json(response, {});
+    });
+    return true;
+  }
+  if (/^\/api\/v1\/panes\/[^/]+\/input-keys$/.test(pathname) && request.method === "POST") {
+    if (simulateOldCoordinatorInputRoute) {
+      simulateOldCoordinatorInputRoute = false;
+      request.resume();
+      errorJson(response, 404, "legacy coordinator has no input-key route");
+      return true;
+    }
+    const paneId = decodeURIComponent(pathname.split("/")[4]);
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      specialKeyRequests.push({ paneId, body: JSON.parse(body) });
+      const status = nextSpecialKeyStatus;
+      const delayMs = nextSpecialKeyResponseDelayMs;
+      const responseGate = nextSpecialKeyResponseGate;
+      nextSpecialKeyStatus = null;
+      nextSpecialKeyResponseDelayMs = 0;
+      nextSpecialKeyResponseGate = null;
+      const reply = () => {
+        if (status) errorJson(response, status, "fixture input-key rejection");
+        else json(response, {});
+      };
+      if (responseGate) void responseGate.then(reply);
+      else if (delayMs > 0) setTimeout(reply, delayMs);
+      else reply();
+    });
+    return true;
+  }
+  if (/^\/api\/v1\/panes\/[^/]+\/special-keys$/.test(pathname) && request.method === "POST") {
+    const paneId = decodeURIComponent(pathname.split("/")[4]);
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      legacySpecialKeyRequests.push({ paneId, body: JSON.parse(body) });
+      json(response, {});
+    });
     return true;
   }
   if (/^\/api\/v1\/panes\/[^/]+\/models$/.test(pathname)) {
@@ -252,6 +348,9 @@ function mockApi(url, response, request) {
     return true;
   }
   if (pathname === "/api/v1/launch-options") {
+    const tronDirectories = largeLaunchDirectoryFixture
+      ? Array.from({ length: 2_000 }, (_, index) => `/workspace/mobile-search-${index}`)
+      : ["/workspace", "/workspace/discovered"];
     const value = {
       directories: ["/workspace/discovered"],
       profiles: [{ id: "profile-0", name: "Default", harness: "codex" }],
@@ -265,7 +364,7 @@ function mockApi(url, response, request) {
         },
         {
           id: "tron", label: "Tron", online: true,
-          directories: ["/workspace", "/workspace/discovered"],
+          directories: tronDirectories,
           profiles: [{
             id: "profile-codex-max", name: "codex-max", harness: "codex",
             modes: [
@@ -273,6 +372,13 @@ function mockApi(url, response, request) {
               { id: "sol-fast", label: "Sol · xhigh · fast", model: "gpt-5.6-sol", effort: "xhigh", service_tier: "fast" },
             ],
           }],
+          memory: {
+            supported: true,
+            default_bytes: 17179869184,
+            override_max_bytes: 25769803776,
+            presets_bytes: [8589934592, 17179869184, 25769803776],
+            note: "Changes apply on the next launch or relaunch.",
+          },
           project_preferences: {}, note: null,
         },
       ],
@@ -291,22 +397,63 @@ function mockApi(url, response, request) {
   }
   if (pathname === "/api/v1/launch-directories") {
     const path = url.searchParams.get("path");
-    json(response, path === "/workspace/custom"
-      ? {
-        machine: "tron", current: "/workspace/custom", parent: null,
-        directories: [], truncated: false,
-      }
-      : {
-        machine: "tron", current: null, parent: null,
-        directories: [{ path: "/workspace/custom", name: "custom" }], truncated: false,
-      });
+    const current = path === "/workspace" || path === "/workspace/custom" ? path : null;
+    const directories = current === "/workspace/custom"
+      ? [...launchBrowserChildren].map((name) => ({ path: `/workspace/custom/${name}`, name }))
+      : [{ path: "/workspace/custom", name: "custom" }];
+    json(response, {
+      machine: "tron", current,
+      parent: current === "/workspace/custom" ? "/workspace" : null,
+      directories, truncated: false,
+    });
+    return true;
+  }
+  if (["/api/v1/launch-directories/folders", "/api/v1/launch-directories/clone"].includes(pathname)
+      && request.method === "POST") {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      let parsed = null;
+      try { parsed = JSON.parse(body); } catch { /* asserted below */ }
+      launchDirectoryMutationRequests.push({ pathname, body: parsed });
+      const reply = () => {
+        if (parsed?.name === "existing") {
+          errorJson(response, 409, "destination already exists");
+          return;
+        }
+        if (/^https:\/\/[^/]*@/.test(String(parsed?.repository || ""))) {
+          errorJson(response, 400, "credential-bearing HTTPS repository URLs are not allowed");
+          return;
+        }
+        const derived = String(parsed?.repository || "").split(/[?#]/, 1)[0]
+          .replace(/\/+$/, "").split(/[/:]/).pop()?.replace(/\.git$/, "");
+        const name = parsed?.name || parsed?.destination || derived;
+        launchBrowserChildren.add(name);
+        json(response, {
+          directory: { path: `/workspace/custom/${name}`, name },
+          listing: {
+            machine: "tron", current: "/workspace/custom", parent: "/workspace",
+            directories: [...launchBrowserChildren].map((child) => ({
+              path: `/workspace/custom/${child}`, name: child,
+            })),
+            truncated: false,
+          },
+        });
+      };
+      if (launchDirectoryMutationDelayMs > 0) {
+        const delayMs = launchDirectoryMutationDelayMs;
+        launchDirectoryMutationDelayMs = 0;
+        setTimeout(reply, delayMs);
+      } else reply();
+    });
     return true;
   }
   if (pathname === "/api/v1/launch-sessions") {
     const directory = url.searchParams.get("directory");
     const profileId = url.searchParams.get("profile_id");
     launchSessionRequests.push({ directory, profileId, machine: url.searchParams.get("machine") });
-    json(response, {
+    const reply = {
       machine: "tron", directory, profile_id: profileId, truncated: false,
       sessions: directory === "/workspace/custom" && profileId === "profile-codex-max"
         ? [{
@@ -315,7 +462,12 @@ function mockApi(url, response, request) {
           preview: "Continue the mobile launch flow",
         }]
         : [],
-    });
+    };
+    if (launchSessionResponseDelayMs > 0) {
+      const delayMs = launchSessionResponseDelayMs;
+      launchSessionResponseDelayMs = 0;
+      setTimeout(() => json(response, reply), delayMs);
+    } else json(response, reply);
     return true;
   }
   if (pathname === "/api/v1/sessions" && request.method === "POST") {
@@ -636,15 +788,27 @@ async function openCdp(browserSocket, pageUrl) {
 test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dashboard", { timeout: 120_000 }, async () => {
   launchRequests.length = 0;
   launchSessionRequests.length = 0;
+  launchDirectoryMutationRequests.length = 0;
+  launchBrowserChildren.clear();
   fileSaveRequests.length = 0;
   messageRequests.length = 0;
+  imageMessageRequests.length = 0;
+  specialKeyRequests.length = 0;
+  legacySpecialKeyRequests.length = 0;
+  nextSpecialKeyStatus = null;
+  nextSpecialKeyResponseDelayMs = 0;
+  nextSpecialKeyResponseGate = null;
+  simulateOldCoordinatorInputRoute = false;
   projectFileContents.clear();
   projectFileVersions.clear();
   delayFileSavePane = null;
   nextFileSaveConflict = false;
+  nextMessageFailurePane = null;
+  messageResponseDelayMs = 0;
   failLiveModels = false;
   launchOptionsDelayMs = 0;
   launchResponseDelayMs = 0;
+  launchDirectoryMutationDelayMs = 0;
   overviewRevision = 1;
   const transcript = (start, count, hash) => ({
     available: true,
@@ -673,8 +837,30 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     const browser = await launchChrome(profileDirectory);
     chrome = browser.chrome;
     const { browserSocket } = browser;
-    cdp = await openCdp(browserSocket, `http://127.0.0.1:${port}/?session=tron~%25100`);
+    cdp = await openCdp(browserSocket, "about:blank");
     await cdp.send("Page.enable");
+    await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: String.raw`
+      window.__speechInstances = [];
+      class FakeSpeechRecognition {
+        constructor() { window.__speechInstances.push(this); }
+        start() {}
+        stop() { queueMicrotask(() => this.onend?.()); }
+        abort() {}
+      }
+      window.SpeechRecognition = FakeSpeechRecognition;
+      Element.prototype.setPointerCapture = function setPointerCapture() {};
+      const nativeArrayBuffer = File.prototype.arrayBuffer;
+      File.prototype.arrayBuffer = function delayedArrayBuffer() {
+        if (!window.__delayNextFileRead) return nativeArrayBuffer.call(this);
+        window.__delayNextFileRead = false;
+        return new Promise((resolve) => {
+          window.__releaseDelayedFileRead = async () => resolve(await nativeArrayBuffer.call(this));
+        });
+      };
+    ` });
+    await cdp.send("Page.navigate", {
+      url: `http://127.0.0.1:${port}/?session=tron~%25100`,
+    });
     await waitFor(
       () => cdp.evaluate("document.readyState === 'complete' && Boolean(document.getElementById('agent-view')) && !document.getElementById('agent-view').hidden"),
       "agent detail did not render",
@@ -711,9 +897,424 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(mobile.branch, "Git · feature/tron~%100/<script>alert(1)</script>");
     assert.equal(mobile.overflowX, 0, JSON.stringify(mobile));
 
+    const hostileDraft = `<img src=x onerror=alert(1)>\n<script>window.draftLeaked=true</script>`;
+    const switchedDrafts = await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      const shellTopBefore = document.querySelector('.terminal-shell').getBoundingClientRect().top;
+      input.focus({ preventScroll: true });
+      input.value = ${JSON.stringify(hostileDraft)};
+      input.setSelectionRange(5, 17);
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'x' }));
+      input.blur();
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      const blankOnB = input.value;
+      const focusOnB = document.activeElement.id;
+      input.value = 'beta agent private draft';
+      input.setSelectionRange(4, 10);
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 't' }));
+      document.querySelector('[data-session-id="tron~%100"]').click();
+      return {
+        blankOnB,
+        focusOnB,
+        restoredA: input.value,
+        selectionStart: input.selectionStart,
+        selectionEnd: input.selectionEnd,
+        injectedNode: Boolean(document.querySelector('[src="x"]')),
+        injectedScriptRan: window.draftLeaked === true,
+        shellTopBefore,
+        shellTop: document.querySelector('.terminal-shell').getBoundingClientRect().top,
+      };
+    })()`);
+    assert.equal(switchedDrafts.blankOnB, "", JSON.stringify(switchedDrafts));
+    assert.notEqual(switchedDrafts.focusOnB, "message", JSON.stringify(switchedDrafts));
+    assert.equal(switchedDrafts.restoredA, hostileDraft, JSON.stringify(switchedDrafts));
+    assert.equal(switchedDrafts.selectionStart, 5, JSON.stringify(switchedDrafts));
+    assert.equal(switchedDrafts.selectionEnd, 17, JSON.stringify(switchedDrafts));
+    assert.equal(switchedDrafts.injectedNode, false, JSON.stringify(switchedDrafts));
+    assert.equal(switchedDrafts.injectedScriptRan, false, JSON.stringify(switchedDrafts));
+    assert.equal(switchedDrafts.shellTop, switchedDrafts.shellTopBefore, JSON.stringify(switchedDrafts));
+
+    await cdp.evaluate("document.getElementById('launch-open').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('launch-dialog').open"),
+      "new-agent dialog did not open over the pane draft",
+    );
+    assert.equal(await cdp.evaluate("document.getElementById('message').value"), hostileDraft);
+    await cdp.evaluate("document.querySelector('#launch-dialog .dialog-cancel').click(); true");
+    await waitFor(
+      () => cdp.evaluate("!document.getElementById('launch-dialog').open"),
+      "new-agent dialog did not close",
+    );
+    assert.equal(await cdp.evaluate("document.getElementById('message').value"), hostileDraft);
+
+    const pagehideDraft = `${hostileDraft}\nflush immediately on pagehide`;
+    assert.equal(await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.value = ${JSON.stringify(pagehideDraft)};
+      input.setSelectionRange(7, 19);
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'e' }));
+      window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }));
+      const stored = JSON.parse(localStorage.getItem('atmux.composer-drafts.v1'));
+      stored.drafts.push({
+        key: 'pane:midnight:pane-v1-${"d".repeat(64)}',
+        text: 'pane deleted while this browser was closed',
+        selectionStart: 0,
+        selectionEnd: 0,
+        version: 1,
+        updatedAt: 1,
+      });
+      localStorage.setItem('atmux.composer-drafts.v1', JSON.stringify(stored));
+      window.__atmuxBeforeDraftReload = true;
+      return stored.drafts.some((draft) => draft.text === input.value);
+    })()`), true, "pagehide did not flush the draft before its debounce elapsed");
+    await cdp.send("Page.reload", { ignoreCache: true });
+    await waitFor(
+      () => cdp.evaluate(`window.__atmuxBeforeDraftReload !== true
+        && document.readyState === 'complete'
+        && !document.getElementById('agent-view').hidden
+        && document.getElementById('message').value === ${JSON.stringify(pagehideDraft)}`),
+      "the selected agent draft did not survive a mobile refresh",
+    );
+    const refreshedDraft = await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      return {
+        value: input.value,
+        selectionStart: input.selectionStart,
+        selectionEnd: input.selectionEnd,
+        focused: document.activeElement === input,
+        shellTop: document.querySelector('.terminal-shell').getBoundingClientRect().top,
+      };
+    })()`);
+    assert.equal(refreshedDraft.value, pagehideDraft, JSON.stringify(refreshedDraft));
+    assert.equal(refreshedDraft.selectionStart, 7, JSON.stringify(refreshedDraft));
+    assert.equal(refreshedDraft.selectionEnd, 19, JSON.stringify(refreshedDraft));
+    assert.equal(refreshedDraft.focused, false, JSON.stringify(refreshedDraft));
+    assert.equal(refreshedDraft.shellTop, switchedDrafts.shellTopBefore, JSON.stringify(refreshedDraft));
+    assert.equal(await cdp.evaluate(`JSON.parse(
+      localStorage.getItem('atmux.composer-drafts.v1')
+    ).drafts.some((draft) => draft.text === 'pane deleted while this browser was closed')`), false,
+    "an online owner's cold-start orphan survived its authoritative snapshot");
+
+    const messagesBeforeMismatchedAttachment = messageRequests.length;
+    const imagesBeforeMismatchedAttachment = imageMessageRequests.length;
+    const mismatchedAttachment = await cdp.evaluate(`(async () => {
+      const picker = document.getElementById('image-input');
+      const transfer = new DataTransfer();
+      transfer.items.add(new File(
+        [new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])],
+        'draft.png',
+        { type: 'image/png' },
+      ));
+      picker.files = transfer.files;
+      picker.dispatchEvent(new Event('change', { bubbles: true }));
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      const input = document.getElementById('message');
+      const mismatch = {
+        draftB: input.value,
+        sendDisabled: document.getElementById('send').disabled,
+        guidance: document.getElementById('attachment-target').textContent,
+      };
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      document.querySelector('[data-session-id="tron~%100"]').click();
+      mismatch.returnedA = input.value;
+      mismatch.sendEnabledOnA = !document.getElementById('send').disabled;
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      document.getElementById('attachment-clear').click();
+      mismatch.draftBAfterClear = input.value;
+      mismatch.sendEnabledAfterClear = !document.getElementById('send').disabled;
+      mismatch.attachmentsAfterClear = document.querySelectorAll('.attachment-preview').length;
+      document.querySelector('[data-session-id="tron~%100"]').click();
+      mismatch.returnedAAfterClear = input.value;
+      return mismatch;
+    })()`);
+    assert.equal(mismatchedAttachment.draftB, "beta agent private draft", JSON.stringify(mismatchedAttachment));
+    assert.equal(mismatchedAttachment.sendDisabled, true, JSON.stringify(mismatchedAttachment));
+    assert.match(mismatchedAttachment.guidance, /Return to that agent or clear them before sending/);
+    assert.equal(mismatchedAttachment.returnedA, pagehideDraft, JSON.stringify(mismatchedAttachment));
+    assert.equal(mismatchedAttachment.sendEnabledOnA, true, JSON.stringify(mismatchedAttachment));
+    assert.equal(mismatchedAttachment.draftBAfterClear, "beta agent private draft", JSON.stringify(mismatchedAttachment));
+    assert.equal(mismatchedAttachment.sendEnabledAfterClear, true, JSON.stringify(mismatchedAttachment));
+    assert.equal(mismatchedAttachment.attachmentsAfterClear, 0, JSON.stringify(mismatchedAttachment));
+    assert.equal(mismatchedAttachment.returnedAAfterClear, pagehideDraft, JSON.stringify(mismatchedAttachment));
+    assert.equal(messageRequests.length, messagesBeforeMismatchedAttachment);
+    assert.equal(imageMessageRequests.length, imagesBeforeMismatchedAttachment);
+
+    messageResponseDelayMs = 250;
+    const messagesBeforeDraftSubmit = messageRequests.length;
+    await cdp.evaluate(`(() => {
+      document.getElementById('send').click();
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+    })()`);
+    await waitFor(
+      () => messageRequests.length === messagesBeforeDraftSubmit + 1,
+      "the first agent draft was not submitted",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    messageResponseDelayMs = 0;
+    assert.equal(await cdp.evaluate("document.getElementById('message').value"), "beta agent private draft");
+    assert.deepEqual(messageRequests.at(-1), {
+      paneId: "tron~%100",
+      body: JSON.stringify({
+        text: pagehideDraft,
+        submit: true,
+        instance_id: `pane-v1-${"1".repeat(64)}`,
+      }),
+    });
+    assert.equal(await cdp.evaluate(`(() => {
+      document.querySelector('[data-session-id="tron~%100"]').click();
+      return document.getElementById('message').value;
+    })()`), "");
+    assert.deepEqual(await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.value = 'new draft after a successful send';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'd' }));
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      const b = input.value;
+      document.querySelector('[data-session-id="tron~%100"]').click();
+      const restoredA = input.value;
+      input.value = '';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: null }));
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      return { b, restoredA };
+    })()`), {
+      b: "beta agent private draft",
+      restoredA: "new draft after a successful send",
+    });
+
+    nextMessageFailurePane = "midnight~%5";
+    messageResponseDelayMs = 2_000;
+    const messagesBeforeFailedDraftSubmit = messageRequests.length;
+    await cdp.evaluate(`(() => {
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      document.getElementById('send').click();
+    })()`);
+    await waitFor(
+      () => messageRequests.length === messagesBeforeFailedDraftSubmit + 1,
+      "the protected failed-send fixture was not accepted",
+    );
+    const pressureSessions = Array.from({ length: 65 }, (_, index) => mockSession(
+      "midnight",
+      `%${200 + index}`,
+      `draft-pressure-${index}`,
+      "waiting",
+      { instance_id: `pane-v1-${(index + 1_000).toString(16).padStart(64, "0")}` },
+    ));
+    emitOverviewPatch(pressureSessions);
+    await waitFor(
+      () => cdp.evaluate("Boolean(document.querySelector('[data-session-id=\"midnight~%264\"]'))"),
+      "draft-pressure panes were not rendered",
+    );
+    assert.equal(await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      for (let index = 0; index < 65; index += 1) {
+        document.querySelector('[data-session-id="midnight~%' + (200 + index) + '"]').click();
+        input.value = 'pressure draft ' + index;
+        input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'x' }));
+      }
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      return input.value;
+    })()`), "beta agent private draft", "capacity pressure evicted an in-flight failed-send draft");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('toast').textContent.includes('rejected the send')"),
+      "the failed-send fixture did not reach the composer",
+      5_000,
+    );
+    messageResponseDelayMs = 0;
+    assert.equal(await cdp.evaluate("document.getElementById('message').value"), "beta agent private draft");
+    assert.deepEqual(await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      document.querySelector('[data-session-id="tron~%100"]').click();
+      const a = input.value;
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      return { a, b: input.value };
+    })()`), { a: "", b: "beta agent private draft" });
+
+    messageResponseDelayMs = 250;
+    const messagesBeforeReincarnation = messageRequests.length;
+    await cdp.evaluate("document.getElementById('send').click(); true");
+    await waitFor(
+      () => messageRequests.length === messagesBeforeReincarnation + 1,
+      "the old incarnation send was not accepted by the fixture",
+    );
+    emitOverviewPatch([
+      mockSession("midnight", "%5", "alpha-planner", "working", {
+        instance_id: `pane-v1-${"e".repeat(64)}`,
+      }),
+    ]);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('message').value === ''"),
+      "a recreated pane id inherited the deleted agent's draft",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    messageResponseDelayMs = 0;
+    assert.equal(await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
+      return input.value;
+    })()`), "", "late success history leaked into a new pane incarnation");
+    assert.equal(await cdp.evaluate(`JSON.parse(
+      localStorage.getItem('atmux.composer-drafts.v1')
+    ).drafts.some((draft) => draft.text === 'beta agent private draft')`), false,
+    "reincarnated pane's old draft remained in browser storage");
+
+    await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.value = 'draft for a pane omitted by the next snapshot';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 't' }));
+    })()`);
+    emitOverviewSnapshot([
+      {
+        id: "tron~%100", pane_id: "%100", machine: "tron", name: "codex-main",
+        instance_id: `pane-v1-${"1".repeat(64)}`,
+        status: "waiting", agent: "codex", profile: "codex-max", path: "/workspace", command: "codex",
+      },
+      mockSession("midnight", "%7", "beta-planner", "waiting"),
+    ]);
+    await waitFor(
+      () => cdp.evaluate("!document.body.classList.contains('has-selection')"),
+      "authoritative snapshot did not remove the selected pane",
+    );
+    assert.equal(await cdp.evaluate(`JSON.parse(
+      localStorage.getItem('atmux.composer-drafts.v1')
+    ).drafts.length`), 0, "snapshot-removed pane draft remained in browser storage");
+    emitOverviewPatch([
+      mockSession("midnight", "%5", "alpha-planner", "working", {
+        instance_id: `pane-v1-${"f".repeat(64)}`,
+      }),
+    ]);
+    await waitFor(
+      () => cdp.evaluate("Boolean(document.querySelector('[data-session-id=\"midnight~%5\"]'))"),
+      "the fixture pane was not restored after snapshot cleanup",
+    );
+
+    const messagesBeforeRecognitionRace = messageRequests.length;
+    await cdp.evaluate(`(() => {
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      const input = document.getElementById('message');
+      input.value = 'old incarnation speech prefix';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'x' }));
+      document.getElementById('talk').dispatchEvent(new PointerEvent(
+        'pointerdown', { bubbles: true, pointerId: 70, pointerType: 'touch' },
+      ));
+      window.__activeReincarnationRecognition = window.__speechInstances.at(-1);
+    })()`);
+    emitOverviewPatch([
+      mockSession("midnight", "%5", "alpha-planner", "working", {
+        instance_id: `pane-v1-${"7".repeat(64)}`,
+      }),
+    ]);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('message').value === ''"),
+      "replacement composer did not detach from active recognition",
+    );
+    const activeRecognitionRace = await cdp.evaluate(`(async () => {
+      const recognition = window.__activeReincarnationRecognition;
+      recognition.onresult?.({
+        resultIndex: 0,
+        results: [Object.assign([{ transcript: 'must not reach replacement UI' }], { isFinal: true })],
+      });
+      document.getElementById('talk').dispatchEvent(new PointerEvent(
+        'pointerup', { bubbles: true, pointerId: 70, pointerType: 'touch' },
+      ));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return {
+        text: document.getElementById('message').value,
+        notice: document.getElementById('toast').textContent,
+      };
+    })()`);
+    assert.equal(activeRecognitionRace.text, "", JSON.stringify(activeRecognitionRace));
+    assert.match(activeRecognitionRace.notice, /restarted while listening/);
+    assert.equal(messageRequests.length, messagesBeforeRecognitionRace,
+      "active recognition posted to a replacement pane incarnation");
+
+    messageResponseDelayMs = 500;
+    const messagesBeforeQueuedRace = messageRequests.length;
+    await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.value = 'busy race send';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'x' }));
+      document.getElementById('send').click();
+    })()`);
+    await waitFor(
+      () => messageRequests.length === messagesBeforeQueuedRace + 1,
+      "busy send did not reach the queue race fixture",
+    );
+    await cdp.evaluate(`(() => {
+      const talk = document.getElementById('talk');
+      talk.dispatchEvent(new PointerEvent(
+        'pointerdown', { bubbles: true, pointerId: 71, pointerType: 'touch' },
+      ));
+      const recognition = window.__speechInstances.at(-1);
+      recognition.onresult({
+        resultIndex: 0,
+        results: [Object.assign([{ transcript: 'queued stale speech' }], { isFinal: true })],
+      });
+      talk.dispatchEvent(new PointerEvent(
+        'pointerup', { bubbles: true, pointerId: 71, pointerType: 'touch' },
+      ));
+    })()`);
+    emitOverviewPatch([
+      mockSession("midnight", "%5", "alpha-planner", "working", {
+        instance_id: `pane-v1-${"8".repeat(64)}`,
+      }),
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    messageResponseDelayMs = 0;
+    assert.equal(messageRequests.filter(({ body }) => body.includes("queued stale speech")).length, 0,
+      "queued recognition posted after its pane incarnation was replaced");
+    assert.equal(await cdp.evaluate("document.getElementById('message').value"), "",
+      "queued recognition mutated the replacement composer");
+
+    const imagesBeforeConversionRace = imageMessageRequests.length;
+    await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.value = 'delayed image from old incarnation';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'x' }));
+      const transfer = new DataTransfer();
+      transfer.items.add(new File(
+        [new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])],
+        'delayed.png',
+        { type: 'image/png' },
+      ));
+      window.__delayNextFileRead = true;
+      const picker = document.getElementById('image-input');
+      picker.files = transfer.files;
+      picker.dispatchEvent(new Event('change', { bubbles: true }));
+      document.getElementById('send').click();
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("typeof window.__releaseDelayedFileRead === 'function'"),
+      "image conversion did not reach its delayed boundary",
+    );
+    emitOverviewPatch([
+      mockSession("midnight", "%5", "alpha-planner", "working", {
+        instance_id: `pane-v1-${"9".repeat(64)}`,
+      }),
+    ]);
+    await cdp.evaluate("window.__releaseDelayedFileRead(); true");
+    await waitFor(
+      () => cdp.evaluate("!document.getElementById('attachment-clear').disabled"),
+      "stale image conversion did not finish",
+    );
+    const imageConversionRace = await cdp.evaluate(`({
+      text: document.getElementById('message').value,
+      attachments: document.querySelectorAll('.attachment-preview').length,
+      target: document.getElementById('attachment-target').textContent,
+      notice: document.getElementById('toast').textContent,
+    })`);
+    assert.equal(imageMessageRequests.length, imagesBeforeConversionRace,
+      "delayed image conversion posted to a replacement pane incarnation");
+    assert.equal(imageConversionRace.text, "", JSON.stringify(imageConversionRace));
+    assert.equal(imageConversionRace.attachments, 1, JSON.stringify(imageConversionRace));
+    assert.match(imageConversionRace.target, /Return to that agent or clear them/);
+    assert.match(imageConversionRace.notice, /Images were kept/);
+    await cdp.evaluate("document.getElementById('attachment-clear').click(); true");
+
     // The first launch option is online but cannot launch. The federated
     // `tron~pane` owner remains the contextual target and Home/local cannot be
     // selected accidentally.
+    largeLaunchDirectoryFixture = true;
     await cdp.evaluate("document.getElementById('launch-open').click(); true");
     await waitFor(
       () => cdp.evaluate("document.getElementById('launch-dialog').open"),
@@ -724,7 +1325,291 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       await cdp.evaluate("document.querySelector('#launch-machine option[value=local]').disabled"),
       true,
     );
+    launchSessionResponseDelayMs = 1_000;
+    const mobileSearch = await cdp.evaluate(`(async () => {
+      const input = document.getElementById('launch-directory');
+      const suggestions = document.getElementById('launch-directory-suggestions');
+      const nativeFetch = window.fetch;
+      let savedSessionAborted = false;
+      window.fetch = (resource, options = {}) => {
+        if (String(resource).startsWith('/api/v1/launch-sessions?')) {
+          options.signal?.addEventListener('abort', () => { savedSessionAborted = true; });
+        }
+        return nativeFetch.call(window, resource, options);
+      };
+      input.focus({ preventScroll: true });
+      let mutations = 0;
+      const observer = new MutationObserver((records) => { mutations += records.length; });
+      observer.observe(suggestions, { childList: true });
+      const started = performance.now();
+      for (const value of [
+        'm', 'mo', 'mob', 'mobi', 'mobile', 'mobile-', 'mobile-s',
+        'mobile-se', 'mobile-sea', 'mobile-sear', 'mobile-searc',
+        'mobile-search', 'mobile-search-', 'mobile-search-1',
+        'mobile-search-19', 'mobile-search-199', 'mobile-search-1999',
+      ]) {
+        input.value = value;
+        input.dispatchEvent(new InputEvent('input', { bubbles: true, data: value.at(-1) }));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      observer.disconnect();
+      const result = {
+        elapsed: performance.now() - started,
+        nativeList: input.getAttribute('list'),
+        comboboxRole: input.getAttribute('role'),
+        controls: input.getAttribute('aria-controls'),
+        expanded: input.getAttribute('aria-expanded'),
+        suggestionCount: suggestions.children.length,
+        suggestionDisplay: getComputedStyle(suggestions).display,
+        suggestionTapHeight: suggestions.querySelector('button')?.getBoundingClientRect().height || 0,
+        overflowX: document.documentElement.scrollWidth - innerWidth,
+        mutations,
+        machine: document.getElementById('launch-machine').value,
+        match: suggestions.querySelector('button')?.dataset.directory || null,
+      };
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+      result.activeDescendant = input.getAttribute('aria-activedescendant');
+      result.activeSelected = document.getElementById(result.activeDescendant)
+        ?.getAttribute('aria-selected');
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      result.selected = input.value;
+      result.selectedDirectory = input.dataset.selectedDirectory;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      input.value = 'no-project-matches-this';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'x' }));
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      result.savedSessionAborted = savedSessionAborted;
+      result.savedSessionsHidden = document.getElementById('launch-sessions').hidden;
+      input.value = 'mobile-search-1';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: '1' }));
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+      result.firstActive = input.getAttribute('aria-activedescendant');
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+      result.secondActive = input.getAttribute('aria-activedescendant');
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
+      result.activeBeforeEscape = input.getAttribute('aria-activedescendant');
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      result.expandedAfterEscape = input.getAttribute('aria-expanded');
+      result.activeAfterEscape = input.getAttribute('aria-activedescendant');
+      window.fetch = nativeFetch;
+      return result;
+    })()`);
+    launchSessionResponseDelayMs = 0;
+    assert.equal(mobileSearch.nativeList, null, JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.comboboxRole, "combobox", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.controls, "launch-directory-suggestions", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.expanded, "true", JSON.stringify(mobileSearch));
+    assert.ok(mobileSearch.suggestionCount <= 40, JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.suggestionDisplay, "grid", JSON.stringify(mobileSearch));
+    assert.ok(mobileSearch.suggestionTapHeight >= 44, JSON.stringify(mobileSearch));
+    assert.ok(mobileSearch.overflowX <= 1, JSON.stringify(mobileSearch));
+    assert.ok(mobileSearch.mutations <= 2, JSON.stringify(mobileSearch));
+    assert.ok(mobileSearch.elapsed < 1_500, JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.machine, "tron", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.match, "/workspace/mobile-search-1999", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.activeDescendant, "launch-directory-suggestion-0", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.activeSelected, "true", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.selected, "/workspace/mobile-search-1999", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.selectedDirectory, "/workspace/mobile-search-1999", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.savedSessionAborted, true, JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.savedSessionsHidden, true, JSON.stringify(mobileSearch));
+    assert.ok(mobileSearch.firstActive, JSON.stringify(mobileSearch));
+    assert.notEqual(mobileSearch.secondActive, mobileSearch.firstActive, JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.activeBeforeEscape, mobileSearch.firstActive, JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.expandedAfterEscape, "false", JSON.stringify(mobileSearch));
+    assert.equal(mobileSearch.activeAfterEscape, null, JSON.stringify(mobileSearch));
+    const mouseTarget = await cdp.evaluate(`(async () => {
+      const input = document.getElementById('launch-directory');
+      input.focus({ preventScroll: true });
+      input.value = 'mobile-search-1666';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: '6' }));
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const button = document.querySelector('#launch-directory-suggestions [role=option]');
+      const box = button.getBoundingClientRect();
+      return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+    })()`);
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mousePressed", x: mouseTarget.x, y: mouseTarget.y, button: "left", clickCount: 1,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(await cdp.evaluate(`(() => {
+      const input = document.getElementById('launch-directory');
+      return {
+        active: document.activeElement?.id || null,
+        expanded: input.getAttribute('aria-expanded'),
+        hidden: document.getElementById('launch-directory-suggestions').hidden,
+        value: input.value,
+      };
+    })()`), {
+      active: "launch-directory",
+      expanded: "true",
+      hidden: false,
+      value: "mobile-search-1666",
+    });
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mouseReleased", x: mouseTarget.x, y: mouseTarget.y, button: "left", clickCount: 1,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(await cdp.evaluate(`(() => {
+      const input = document.getElementById('launch-directory');
+      return { value: input.value, selectedDirectory: input.dataset.selectedDirectory };
+    })()`), {
+      value: "/workspace/mobile-search-1666",
+      selectedDirectory: "/workspace/mobile-search-1666",
+    });
+    await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: 390, height: 844, deviceScaleFactor: 1, mobile: true,
+    });
+    const touchDrag = await cdp.evaluate(`(async () => {
+      const input = document.getElementById('launch-directory');
+      input.focus({ preventScroll: true });
+      input.value = 'mobile-search';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'h' }));
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const suggestions = document.getElementById('launch-directory-suggestions');
+      suggestions.scrollTop = 0;
+      const box = suggestions.getBoundingClientRect();
+      window.__folderTouchEvents = [];
+      for (const name of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'touchstart', 'touchmove', 'touchend', 'touchcancel']) {
+        suggestions.addEventListener(name, (event) => {
+          window.__folderTouchEvents.push([name, event.defaultPrevented]);
+        });
+      }
+      const x = Math.round(box.left + box.width / 2);
+      const visibleY = [];
+      for (let y = Math.max(0, Math.ceil(box.top) + 4); y < Math.min(innerHeight, Math.floor(box.bottom) - 4); y += 8) {
+        if (suggestions.contains(document.elementFromPoint(x, y))) visibleY.push(y);
+      }
+      return {
+        x,
+        startY: visibleY.at(-1) || 0,
+        endY: visibleY[0] || 0,
+        before: suggestions.scrollTop,
+        value: input.value,
+        selectedDirectory: input.dataset.selectedDirectory,
+        scrollHeight: suggestions.scrollHeight,
+        clientHeight: suggestions.clientHeight,
+        visiblePoints: visibleY.length,
+      };
+    })()`);
+    assert.ok(touchDrag.scrollHeight > touchDrag.clientHeight, JSON.stringify(touchDrag));
+    assert.ok(touchDrag.visiblePoints > 8, JSON.stringify(touchDrag));
+    await cdp.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [{ x: touchDrag.x, y: touchDrag.startY, radiusX: 4, radiusY: 4, force: 1 }],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    for (const y of [touchDrag.startY - 40, touchDrag.startY - 80, touchDrag.endY]) {
+      await cdp.send("Input.dispatchTouchEvent", {
+        type: "touchMove",
+        touchPoints: [{ x: touchDrag.x, y, radiusX: 4, radiusY: 4, force: 1 }],
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const touchDragResult = await cdp.evaluate(`(() => {
+      const input = document.getElementById('launch-directory');
+      const suggestions = document.getElementById('launch-directory-suggestions');
+      return {
+        scrollTop: suggestions.scrollTop,
+        value: input.value,
+        selectedDirectory: input.dataset.selectedDirectory,
+        expanded: input.getAttribute('aria-expanded'),
+        events: window.__folderTouchEvents,
+      };
+    })()`);
+    assert.ok(
+      touchDragResult.scrollTop > touchDrag.before,
+      JSON.stringify({ touchDrag, touchDragResult }),
+    );
+    assert.equal(touchDragResult.value, touchDrag.value, JSON.stringify(touchDragResult));
+    assert.equal(touchDragResult.selectedDirectory, touchDrag.selectedDirectory, JSON.stringify(touchDragResult));
+    assert.equal(touchDragResult.expanded, "true", JSON.stringify(touchDragResult));
+    assert.deepEqual(
+      touchDragResult.events.find(([name]) => name === "pointerdown"),
+      ["pointerdown", false],
+      JSON.stringify(touchDragResult),
+    );
+    assert.ok(
+      touchDragResult.events.some(([name]) => name === "pointermove"),
+      JSON.stringify(touchDragResult),
+    );
+    const touchTarget = await cdp.evaluate(`(async () => {
+      const input = document.getElementById('launch-directory');
+      input.value = 'mobile-search-1777';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: '7' }));
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const button = document.querySelector('#launch-directory-suggestions [role=option]');
+      const box = button.getBoundingClientRect();
+      return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+    })()`);
+    await cdp.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [{ x: touchTarget.x, y: touchTarget.y, radiusX: 4, radiusY: 4, force: 1 }],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(await cdp.evaluate(`(() => {
+      const input = document.getElementById('launch-directory');
+      return { value: input.value, selectedDirectory: input.dataset.selectedDirectory };
+    })()`), {
+      value: "/workspace/mobile-search-1777",
+      selectedDirectory: "/workspace/mobile-search-1777",
+    });
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: 1024, height: 768, deviceScaleFactor: 1, mobile: true,
+    });
+    const wideTouchSearch = await cdp.evaluate(`(async () => {
+      const input = document.getElementById('launch-directory');
+      input.focus({ preventScroll: true });
+      input.value = 'mobile-search-1888';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: '8' }));
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const suggestions = document.getElementById('launch-directory-suggestions');
+      return {
+        wideLayout: !matchMedia('(max-width: 720px)').matches,
+        touchPoints: navigator.maxTouchPoints,
+        nativeList: input.getAttribute('list'),
+        role: input.getAttribute('role'),
+        expanded: input.getAttribute('aria-expanded'),
+        count: suggestions.children.length,
+        match: suggestions.querySelector('[role=option]')?.dataset.directory || null,
+      };
+    })()`);
+    assert.deepEqual(wideTouchSearch, {
+      wideLayout: true,
+      touchPoints: 5,
+      nativeList: null,
+      role: "combobox",
+      expanded: "true",
+      count: 1,
+      match: "/workspace/mobile-search-1888",
+    });
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: 768, height: 1024, deviceScaleFactor: 1, mobile: true,
+    });
+    assert.deepEqual(await cdp.evaluate(`({
+      wideLayout: !matchMedia('(max-width: 720px)').matches,
+      nativeList: document.getElementById('launch-directory').getAttribute('list'),
+      role: document.getElementById('launch-directory').getAttribute('role'),
+      match: document.querySelector('#launch-directory-suggestions [role=option]')?.dataset.directory || null,
+    })`), {
+      wideLayout: true,
+      nativeList: null,
+      role: "combobox",
+      match: "/workspace/mobile-search-1888",
+    });
+    await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: 390, height: 844, deviceScaleFactor: 1, mobile: false,
+    });
     await cdp.evaluate("document.querySelector('#launch-dialog .dialog-cancel').click(); true");
+    largeLaunchDirectoryFixture = false;
+    launchSessionRequests.length = 0;
 
     // Machine details expose owner-sampled system identity without inventing a
     // coordinator Home machine. Values are rendered as text, not owner markup.
@@ -788,6 +1673,195 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(quickActions.modelControl, true, JSON.stringify(quickActions));
     assert.deepEqual(quickActions.actions, ["Duplicate agent", "Relaunch & resume", "Compact", "Ctrl+B ×2", "Interrupt", "Kill agent"]);
     assert.equal(quickActions.compactInComposer, false, JSON.stringify(quickActions));
+
+    const keyLayout = await cdp.evaluate(`(() => ({
+      labels: [...document.querySelectorAll('[data-pane-key]')].map((button) => button.getAttribute('aria-label')),
+      targets: [...document.querySelectorAll('[data-pane-key]')].map((button) => {
+        const box = button.getBoundingClientRect();
+        return { width: box.width, height: box.height };
+      }),
+      dialogOverflow: document.getElementById('quick-actions-dialog').scrollWidth
+        - document.getElementById('quick-actions-dialog').clientWidth,
+    }))()`);
+    assert.deepEqual(keyLayout.labels, [
+      "Send Up arrow", "Send Left arrow", "Send Down arrow", "Send Right arrow", "Send blank Enter",
+    ]);
+    assert.ok(keyLayout.targets.every(({ width, height }) => width >= 44 && height >= 44), JSON.stringify(keyLayout));
+    assert.ok(keyLayout.dialogOverflow <= 1, JSON.stringify(keyLayout));
+
+    // Interactive keys use their own generation-bound route and a bounded
+    // ordered queue. Deliberate rapid taps remain distinct without touching
+    // the per-agent composer draft.
+    const messagesBeforePaneKeys = messageRequests.length;
+    nextSpecialKeyResponseDelayMs = 250;
+    await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.value = 'draft stays with this agent';
+      input.setSelectionRange(6, 11);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      const down = document.querySelector('[data-pane-key="down"]');
+      down.click(); down.click(); down.click();
+      document.querySelector('[data-pane-key="enter"]').click();
+      return true;
+    })()`);
+    await waitFor(() => specialKeyRequests.length === 1, "the first delayed Down was not dispatched");
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(specialKeyRequests.length, 1, "queued keys were dispatched concurrently");
+    const queuedStatus = await cdp.evaluate(`({
+      status: document.getElementById('quick-pane-key-status').textContent,
+      keyDisabled: document.querySelector('[data-pane-key="down"]').disabled,
+      duplicateDisabled: document.getElementById('quick-duplicate').disabled,
+      busy: document.querySelector('.quick-pane-keypad').getAttribute('aria-busy'),
+    })`);
+    assert.match(queuedStatus.status, /4 keys sending or queued/);
+    assert.equal(queuedStatus.keyDisabled, false, JSON.stringify(queuedStatus));
+    assert.equal(queuedStatus.duplicateDisabled, false, JSON.stringify(queuedStatus));
+    assert.equal(queuedStatus.busy, "true", JSON.stringify(queuedStatus));
+    await waitFor(() => specialKeyRequests.length === 4, "Down×3 then Enter did not drain in order");
+    const draftAfterArrow = await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      return { value: input.value, start: input.selectionStart, end: input.selectionEnd };
+    })()`);
+    assert.deepEqual(draftAfterArrow, { value: "draft stays with this agent", start: 6, end: 11 });
+    assert.equal(messageRequests.length, messagesBeforePaneKeys, "a pane key must not become a chat message");
+
+    assert.equal(await cdp.evaluate("document.getElementById('message').value"), "draft stays with this agent");
+    await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.value = '';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('[data-pane-key="enter"]').click();
+      return true;
+    })()`);
+    await waitFor(() => specialKeyRequests.length === 5, "blank Enter was disabled by an empty composer");
+    await waitFor(
+      () => cdp.evaluate("!document.querySelector('[data-pane-key=\"up\"]').disabled"),
+      "key controls stayed busy after blank Enter",
+    );
+
+    // Native button semantics provide keyboard activation without installing
+    // a page-level arrow-key handler that could steal textarea cursor keys.
+    await cdp.evaluate("document.querySelector('[data-pane-key=\"up\"]').focus(); true");
+    await cdp.send("Input.dispatchKeyEvent", {
+      type: "rawKeyDown", key: " ", code: "Space", windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32,
+    });
+    await cdp.send("Input.dispatchKeyEvent", {
+      type: "keyUp", key: " ", code: "Space", windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32,
+    });
+    await waitFor(() => specialKeyRequests.length === 6, "keyboard activation did not send Up");
+    for (const action of ["left", "right"]) {
+      await waitFor(
+        () => cdp.evaluate(`!document.querySelector('[data-pane-key="${action}"]').disabled`),
+        `${action} arrow stayed disabled after the prior request`,
+      );
+      await cdp.evaluate(`document.querySelector('[data-pane-key="${action}"]').click(); true`);
+      await waitFor(
+        () => specialKeyRequests.length === (action === "left" ? 7 : 8),
+        `${action} arrow was not delivered`,
+      );
+    }
+    const expectedInstance = `pane-v1-${"1".repeat(64)}`;
+    assert.deepEqual(specialKeyRequests, ["down", "down", "down", "enter", "enter", "up", "left", "right"].map((action) => ({
+      paneId: "tron~%100",
+      body: { action, machine: "tron", instance_id: expectedInstance },
+    })));
+    assert.equal(messageRequests.length, messagesBeforePaneKeys, "blank Enter must bypass the empty chat composer");
+    await waitFor(
+      () => cdp.evaluate("document.querySelector('.quick-pane-keypad').getAttribute('aria-busy') === 'false'"),
+      "the prior key queue did not become idle before the cap check",
+    );
+
+    // The cap includes the in-flight request. Only this target's key buttons
+    // disable at the cap; the rest of Quick actions remains usable.
+    let releaseCappedKey;
+    nextSpecialKeyResponseGate = new Promise((resolveGate) => { releaseCappedKey = resolveGate; });
+    await cdp.evaluate(`(() => {
+      const down = document.querySelector('[data-pane-key="down"]');
+      for (let index = 0; index < 20; index += 1) down.click();
+      return true;
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('quick-pane-key-status').textContent.includes('full (16)')"),
+      "the pane-key queue did not expose its cap",
+    );
+    const capState = await cdp.evaluate(`({
+      keyDisabled: document.querySelector('[data-pane-key="down"]').disabled,
+      duplicateDisabled: document.getElementById('quick-duplicate').disabled,
+    })`);
+    assert.equal(capState.keyDisabled, true, JSON.stringify(capState));
+    assert.equal(capState.duplicateDisabled, false, JSON.stringify(capState));
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(specialKeyRequests.length, 9, "a delayed key allowed concurrent queue dispatch");
+    releaseCappedKey();
+    await waitFor(() => specialKeyRequests.length === 24, "the bounded queue did not drain exactly 16 taps");
+    await waitFor(
+      () => cdp.evaluate("!document.querySelector('[data-pane-key=\"down\"]').disabled"),
+      "key controls stayed capped after the queue drained",
+    );
+
+    // A conflict invalidates only the queued events for that exact pane
+    // generation. Keys captured after switching agents retain their original
+    // pane and machine while the first target is still in flight.
+    nextSpecialKeyStatus = 409;
+    nextSpecialKeyResponseDelayMs = 250;
+    await cdp.evaluate(`(() => {
+      const down = document.querySelector('[data-pane-key="down"]');
+      down.click(); down.click(); down.click();
+      document.getElementById('quick-actions-dialog').close();
+      document.querySelector('[data-session-id="midnight~%5"]').click();
+      document.getElementById('quick-actions-open').click();
+      document.querySelector('[data-pane-key="left"]').click();
+      document.querySelector('[data-pane-key="enter"]').click();
+      return true;
+    })()`);
+    await waitFor(() => specialKeyRequests.length === 27, "the cross-agent queue did not finish safely");
+    const midnightInstance = `pane-v1-${"9".repeat(64)}`;
+    assert.deepEqual(specialKeyRequests.slice(24), [
+      { paneId: "tron~%100", body: { action: "down", machine: "tron", instance_id: expectedInstance } },
+      { paneId: "midnight~%5", body: { action: "left", machine: "midnight", instance_id: midnightInstance } },
+      { paneId: "midnight~%5", body: { action: "enter", machine: "midnight", instance_id: midnightInstance } },
+    ]);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('quick-pane-key-status').textContent.includes('Sent blank Enter')"),
+      "the switched agent did not receive a completed queue status",
+    );
+    assert.match(
+      await cdp.evaluate("document.getElementById('quick-pane-key-status').textContent"),
+      /Sent blank Enter/,
+    );
+    await cdp.evaluate(`(() => {
+      document.getElementById('quick-actions-dialog').close();
+      document.querySelector('[data-session-id="tron~%100"]').click();
+      document.getElementById('quick-actions-open').click();
+      return true;
+    })()`);
+    const conflictStatus = await cdp.evaluate("document.getElementById('quick-pane-key-status').textContent");
+    assert.match(conflictStatus, /agent changed/);
+    assert.match(conflictStatus, /2 queued keys were discarded/);
+
+    // A new browser must not fall back to an old coordinator's unbound
+    // /special-keys route. Its 404 is actionable mixed-version guidance.
+    simulateOldCoordinatorInputRoute = true;
+    await cdp.evaluate("document.querySelector('[data-pane-key=\"right\"]').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('quick-pane-key-status').textContent.includes('out of sync')"),
+      "an old coordinator did not produce refresh guidance",
+    );
+    assert.equal(specialKeyRequests.length, 27, "an old coordinator accepted a generation-bound key");
+    assert.equal(legacySpecialKeyRequests.length, 0, "the new browser fell back to legacy special-keys");
+
+    nextSpecialKeyStatus = 422;
+    await cdp.evaluate("document.querySelector('[data-pane-key=\"down\"]').click(); true");
+    await waitFor(() => specialKeyRequests.length === 28, "the mixed-version fixture did not receive the key");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('quick-pane-key-status').textContent.includes('out of sync')"),
+      "a mixed-version key rejection did not provide refresh guidance",
+    );
+    assert.match(
+      await cdp.evaluate("document.getElementById('quick-pane-key-status').textContent"),
+      /Refresh after the server updates/,
+    );
+    assert.equal(legacySpecialKeyRequests.length, 0, "generation-bound keys used the legacy route");
 
     // A cached model observation must never authorize Duplicate when the
     // owner's live capability endpoint fails.
@@ -855,6 +1929,9 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       harness: document.getElementById('launch-harness').value,
       profile: document.getElementById('launch-profile').value,
       mode: document.getElementById('launch-mode').value,
+      memory: document.getElementById('launch-memory').value,
+      memoryOverflow: document.getElementById('launch-memory-group').scrollWidth
+        > document.getElementById('launch-memory-group').clientWidth,
       name: document.getElementById('launch-name').value,
       conversation: document.getElementById('launch-session').value,
       submit: document.querySelector('#launch-form button[type=submit]').textContent,
@@ -866,10 +1943,121 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       harness: "codex",
       profile: "profile-codex-max",
       mode: "sol-fast",
+      memory: "",
+      memoryOverflow: false,
       name: "codex-main-copy",
       conversation: "",
       submit: "Launch duplicate",
     });
+
+    const originalMemoryViewport = await cdp.evaluate("({ width: innerWidth, height: innerHeight })");
+    const memorySelect = await cdp.evaluate(`(() => {
+      const select = document.getElementById('launch-memory');
+      select.focus({ preventScroll: true });
+      const box = select.getBoundingClientRect();
+      return {
+        fontSize: parseFloat(getComputedStyle(select).fontSize),
+        height: box.height,
+        focused: document.activeElement === select,
+        label: [...select.labels].map((node) => node.textContent).join(' '),
+        documentOverflow: document.documentElement.scrollWidth - innerWidth,
+      };
+    })()`);
+    assert.ok(memorySelect.fontSize >= 16, JSON.stringify(memorySelect));
+    assert.ok(memorySelect.height >= 44, JSON.stringify(memorySelect));
+    assert.equal(memorySelect.focused, true, JSON.stringify(memorySelect));
+    assert.match(memorySelect.label, /Memory limit/);
+    assert.ok(memorySelect.documentOverflow <= 1, JSON.stringify(memorySelect));
+
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: 390, height: 430, deviceScaleFactor: 1, mobile: false,
+    });
+    await waitFor(
+      () => cdp.evaluate("getComputedStyle(document.documentElement).getPropertyValue('--app-height').trim() === '430px'"),
+      "focused memory select did not follow the keyboard-sized viewport",
+    );
+    await waitFor(
+      () => cdp.evaluate(`(() => {
+        const box = document.getElementById('launch-memory').getBoundingClientRect();
+        return box.top >= 0 && box.bottom <= (window.visualViewport?.height || innerHeight) + 1;
+      })()`),
+      "focused memory select was not revealed inside the keyboard-sized viewport",
+    );
+    const keyboardSelect = await cdp.evaluate(`(() => {
+      const select = document.getElementById('launch-memory');
+      const box = select.getBoundingClientRect();
+      return {
+        viewport: window.visualViewport?.height || innerHeight,
+        top: box.top, bottom: box.bottom, right: box.right,
+        focused: document.activeElement === select,
+        documentOverflow: document.documentElement.scrollWidth - innerWidth,
+      };
+    })()`);
+    assert.equal(keyboardSelect.focused, true, JSON.stringify(keyboardSelect));
+    assert.ok(keyboardSelect.top >= 0, JSON.stringify(keyboardSelect));
+    assert.ok(keyboardSelect.bottom <= keyboardSelect.viewport + 1, JSON.stringify(keyboardSelect));
+    assert.ok(keyboardSelect.right <= 390, JSON.stringify(keyboardSelect));
+    assert.ok(keyboardSelect.documentOverflow <= 1, JSON.stringify(keyboardSelect));
+
+    await cdp.evaluate(`(() => {
+      const select = document.getElementById('launch-memory');
+      select.value = 'custom';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      const input = document.getElementById('launch-memory-custom');
+      input.value = '20';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.focus({ preventScroll: true });
+      return true;
+    })()`);
+    await waitFor(
+      () => cdp.evaluate(`(() => {
+        const input = document.getElementById('launch-memory-custom');
+        const box = input.getBoundingClientRect();
+        return document.activeElement === input && box.top >= 0
+          && box.bottom <= (window.visualViewport?.height || innerHeight) + 1;
+      })()`),
+      "focused custom memory input was not revealed inside the keyboard-sized viewport",
+    );
+    const customMemory = await cdp.evaluate(`(() => {
+      const input = document.getElementById('launch-memory-custom');
+      const box = input.getBoundingClientRect();
+      return {
+        visible: !document.getElementById('launch-memory-custom-row').hidden,
+        fontSize: parseFloat(getComputedStyle(input).fontSize),
+        height: box.height,
+        focused: document.activeElement === input,
+        label: [...input.labels].map((node) => node.textContent).join(' '),
+        viewport: window.visualViewport?.height || innerHeight,
+        top: box.top, bottom: box.bottom, right: box.right,
+        documentOverflow: document.documentElement.scrollWidth - innerWidth,
+        scrollHeight: document.documentElement.scrollHeight,
+        clientHeight: document.documentElement.clientHeight,
+      };
+    })()`);
+    assert.equal(customMemory.visible, true, JSON.stringify(customMemory));
+    assert.ok(customMemory.fontSize >= 16, JSON.stringify(customMemory));
+    assert.ok(customMemory.height >= 44, JSON.stringify(customMemory));
+    assert.equal(customMemory.focused, true, JSON.stringify(customMemory));
+    assert.match(customMemory.label, /Custom GiB/);
+    assert.ok(customMemory.top >= 0, JSON.stringify(customMemory));
+    assert.ok(customMemory.bottom <= customMemory.viewport + 1, JSON.stringify(customMemory));
+    assert.ok(customMemory.right <= 390, JSON.stringify(customMemory));
+    assert.ok(customMemory.documentOverflow <= 1, JSON.stringify(customMemory));
+    assert.ok(customMemory.scrollHeight <= customMemory.clientHeight, JSON.stringify(customMemory));
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: originalMemoryViewport.width, height: originalMemoryViewport.height,
+      deviceScaleFactor: 1, mobile: false,
+    });
+    await waitFor(
+      () => cdp.evaluate(`getComputedStyle(document.documentElement).getPropertyValue('--app-height').trim() === '${originalMemoryViewport.height}px'`),
+      "memory controls did not restore after the keyboard-sized viewport",
+    );
+    await cdp.evaluate(`(() => {
+      const select = document.getElementById('launch-memory');
+      select.value = '';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    })()`);
     assert.equal(launchRequests.length, 0, "opening Duplicate must not launch or resume a session");
     assert.equal(launchSessionRequests.length, 0, "Duplicate must skip saved-session discovery");
     await cdp.evaluate(`(() => {
@@ -888,6 +2076,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(launchRequests[0].body.resume_session_id, null, JSON.stringify(launchRequests[0]));
     assert.equal(launchRequests[0].body.profile_id, "profile-codex-max");
     assert.equal(launchRequests[0].body.mode_id, "sol-fast");
+    assert.equal(launchRequests[0].body.memory_max_bytes, null);
     await cdp.evaluate("document.querySelector('#launch-dialog .dialog-cancel').click(); true");
     launchRequests.length = 0;
 
@@ -1722,6 +2911,25 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
         { id: "tool-wait-2", role: "tool", kind: "tool", tool_name: "collaboration.wait_agent", tool_output: "timed out" },
         { id: "tool-send-1", role: "tool", kind: "tool", tool_name: "send_message", tool_input: "<img src=x onerror=alert(1)>", tool_output: "delivered" },
         { id: "tool-agent-middle", role: "assistant", markdown: "This prose splits coordination runs" },
+        { id: "tool-exec-1", role: "tool", kind: "tool", tool_name: "functions.exec", tool_input: "<img src=x onerror=exec(1)>", tool_output: '{"exit_code":0,"output":"first command output"}' },
+        { id: "tool-exec-2", role: "tool", kind: "tool", tool_name: "exec_command", tool_input: "second command", tool_output: "Process exited with code 0" },
+        { id: "tool-exec-3", role: "tool", kind: "tool", tool_name: "tools/exec", tool_input: "third command", tool_output: '{"exit_code":0,"output":"third <script>safe</script> output"}' },
+        { id: "tool-exec-4", role: "tool", kind: "tool", tool_name: "functions.exec_command", tool_input: "fourth command", tool_output: "ok" },
+        { id: "tool-exec-timeout", role: "tool", kind: "tool", tool_name: "exec", tool_output: "timed out" },
+        { id: "tool-exec-ok-after-timeout", role: "tool", kind: "tool", tool_name: "exec", tool_output: "ok" },
+        { id: "tool-exec-json-error", role: "tool", kind: "tool", tool_name: "exec_command", tool_output: '{"exit_code":1}' },
+        { id: "tool-exec-json-ok", role: "tool", kind: "tool", tool_name: "exec_command", tool_output: '{"exit_code":0}' },
+        { id: "tool-exec-process-error", role: "tool", kind: "tool", tool_name: "exec", tool_output: "Process exited with code 1" },
+        { id: "tool-apply-1", role: "tool", kind: "tool", tool_name: "apply_patch", tool_output: "ok" },
+        { id: "tool-apply-2", role: "tool", kind: "tool", tool_name: "apply_patch", tool_output: "completed" },
+        { id: "tool-web-1", role: "tool", kind: "tool", tool_name: "web.run", tool_output: "ok" },
+        { id: "tool-web-2", role: "tool", kind: "tool", tool_name: "web.run", tool_output: "completed" },
+        { id: "tool-plan-1", role: "tool", kind: "tool", tool_name: "update_plan", tool_output: "ok" },
+        { id: "tool-plan-2", role: "tool", kind: "tool", tool_name: "update_plan", tool_output: "completed" },
+        { id: "tool-exec-error", role: "tool", kind: "tool", tool_name: "exec", tool_output: "Error: command failed with status 1" },
+        { id: "tool-exec-split-1", role: "tool", kind: "tool", tool_name: "exec", tool_output: "result before another tool" },
+        { id: "tool-patch-split", role: "tool", kind: "tool", tool_name: "apply_patch", tool_output: "updated a different resource" },
+        { id: "tool-exec-split-2", role: "tool", kind: "tool", tool_name: "exec", tool_output: "result after another tool" },
         { id: "tool-send-2", role: "tool", kind: "tool", tool_name: "send_message" },
         { id: "tool-follow-1", role: "tool", kind: "tool", tool_name: "followup_task", tool_output: '{"status":"completed"}' },
         { id: "tool-wait-error", role: "tool", kind: "tool", tool_name: "wait_agent", tool_output: "Error: failed to receive approval" },
@@ -1739,13 +2947,15 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       ],
     };
     await waitFor(
-      () => cdp.evaluate("document.querySelectorAll('#conversation .tool-call-group').length === 3"),
-      "coordination tool runs did not collapse on mobile",
+      () => cdp.evaluate("document.querySelectorAll('#conversation .tool-call-group:not(.tool-run-group)').length === 4"),
+      "internal tool runs did not collapse on mobile",
       5_000,
     );
     const compactTools = await cdp.evaluate(`(() => {
       const conversation = document.getElementById('conversation');
-      const groups = [...conversation.querySelectorAll('.tool-call-group')];
+      // Folded runs of ordinary tool cards are a separate row type; these
+      // assertions are about the internal exec/coordination groups.
+      const groups = [...conversation.querySelectorAll('.tool-call-group:not(.tool-run-group)')];
       const first = groups[0];
       const bounds = conversation.getBoundingClientRect();
       conversation.scrollTop += first.getBoundingClientRect().top - bounds.top - 18;
@@ -1765,6 +2975,18 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
         malformedStatusSummaries: ['numeric', 'boolean', 'null'].map((suffix) =>
           conversation.querySelector('[data-transcript-id="tool-wait-' + suffix + '"] > summary')?.textContent),
         meaningfulSeparate: Boolean(conversation.querySelector('[data-transcript-id="tool-wait-meaningful"]')),
+        execErrorSummary: conversation.querySelector('[data-transcript-id="tool-exec-error"] > summary')?.textContent,
+        execBoundarySummaries: ['timeout', 'ok-after-timeout', 'json-error', 'json-ok', 'process-error']
+          .map((suffix) => conversation.querySelector('[data-transcript-id="tool-exec-' + suffix + '"] > summary')?.textContent),
+        splitToolsSeparate: [
+          'tool-exec-split-1', 'tool-patch-split', 'tool-exec-split-2',
+          'tool-apply-1', 'tool-apply-2', 'tool-web-1', 'tool-web-2', 'tool-plan-1', 'tool-plan-2',
+        ]
+          .every((id) => {
+            const node = conversation.querySelector('[data-transcript-id="' + id + '"]');
+            return Boolean(node) && !node.closest('.tool-call-group:not(.tool-run-group)');
+          }),
+        fileReaderPreferences: localStorage.getItem('atmux.file-reader-preferences'),
         markupInjected: Boolean(conversation.querySelector('img, script')),
         escapedInputVisible: first.textContent.includes('<img src=x onerror=alert(1)>'),
         before,
@@ -1775,7 +2997,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.deepEqual(compactTools.order, ["tool-wait-1", "tool-wait-2", "tool-send-1"]);
     assert.ok(compactTools.groupSummaries[0].includes("wait_agent ×2"), JSON.stringify(compactTools));
     assert.ok(compactTools.groupSummaries[0].includes("send_message ×1"), JSON.stringify(compactTools));
-    assert.ok(compactTools.groupSummaries.every((summary) => summary.endsWith("no errors")), JSON.stringify(compactTools));
+    assert.ok(compactTools.groupSummaries.includes("exec ×4"), JSON.stringify(compactTools));
     assert.equal(compactTools.humanVisible, true, JSON.stringify(compactTools));
     assert.equal(compactTools.agentVisible, true, JSON.stringify(compactTools));
     assert.equal(compactTools.errorSummary, "wait_agent · error", JSON.stringify(compactTools));
@@ -1784,9 +3006,37 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       "wait_agent · error", "wait_agent · error", "wait_agent · error",
     ], JSON.stringify(compactTools));
     assert.equal(compactTools.meaningfulSeparate, true, JSON.stringify(compactTools));
+    assert.equal(compactTools.execErrorSummary, "exec · error", JSON.stringify(compactTools));
+    assert.deepEqual(compactTools.execBoundarySummaries, [
+      "exec · error", "exec · result", "exec_command · error", "exec_command · result", "exec · error",
+    ], JSON.stringify(compactTools));
+    assert.equal(compactTools.splitToolsSeparate, true, JSON.stringify(compactTools));
+    assert.equal(compactTools.fileReaderPreferences, '{"wrap":true,"size":"small"}');
     assert.equal(compactTools.markupInjected, false, JSON.stringify(compactTools));
     assert.equal(compactTools.escapedInputVisible, true, JSON.stringify(compactTools));
     assert.ok(Math.abs(compactTools.after - compactTools.before) <= 1, JSON.stringify(compactTools));
+
+    const expandedExec = await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      const group = [...conversation.querySelectorAll('.tool-call-group:not(.tool-run-group)')]
+        .find((node) => node.querySelector(':scope > summary').textContent === 'exec ×4');
+      const summary = group.querySelector(':scope > summary');
+      summary.click();
+      return new Promise((resolve) => requestAnimationFrame(() => resolve({
+        open: group.open,
+        label: summary.getAttribute('aria-label'),
+        order: [...group.querySelectorAll('.tool-card-group-item')].map((node) => node.dataset.transcriptId),
+        inputVisible: group.textContent.includes('<img src=x onerror=exec(1)>'),
+        resultVisible: group.textContent.includes('third <script>safe</script> output'),
+        markupInjected: Boolean(group.querySelector('img, script')),
+      })));
+    })()`);
+    assert.equal(expandedExec.open, true, JSON.stringify(expandedExec));
+    assert.equal(expandedExec.label, "exec ×4; 4 calls and results");
+    assert.deepEqual(expandedExec.order, ["tool-exec-1", "tool-exec-2", "tool-exec-3", "tool-exec-4"]);
+    assert.equal(expandedExec.inputVisible, true, JSON.stringify(expandedExec));
+    assert.equal(expandedExec.resultVisible, true, JSON.stringify(expandedExec));
+    assert.equal(expandedExec.markupInjected, false, JSON.stringify(expandedExec));
 
     // A stale expansion callback must not mutate a freshly reconnected
     // transcript even when it is still the same pane. Hold the queued callback,
@@ -1794,7 +3044,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     // the new Conversation generation.
     const staleExpansionSetup = await cdp.evaluate(`(() => {
       const conversation = document.getElementById('conversation');
-      const group = conversation.querySelector('.tool-call-group');
+      const group = conversation.querySelector('.tool-call-group:not(.tool-run-group)');
       group.dataset.oldGeneration = 'true';
       const original = window.requestAnimationFrame;
       window.__staleToolExpansionCallbacks = [];
@@ -1814,7 +3064,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       base_revision: 999, revision: 1_000, start_line: 0, delete_lines: 0, lines: [],
     })}\n\n`);
     await waitFor(
-      () => cdp.evaluate("document.getElementById('stream-state').textContent === 'Live' && document.querySelectorAll('#conversation .tool-call-group:not([data-old-generation])').length === 3"),
+      () => cdp.evaluate("document.getElementById('stream-state').textContent === 'Live' && document.querySelectorAll('#conversation .tool-call-group:not(.tool-run-group):not([data-old-generation])').length === 4"),
       "same-pane reconnect did not replace the old tool group generation",
       5_000,
     );
@@ -1830,24 +3080,229 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
         before,
         after: conversation.scrollTop,
         oldConnected: Boolean(document.querySelector('[data-old-generation]')),
-        groupCount: document.querySelectorAll('#conversation .tool-call-group').length,
+        groupCount: document.querySelectorAll('#conversation .tool-call-group:not(.tool-run-group)').length,
       };
     })()`);
     assert.equal(staleExpansionResult.oldConnected, false, JSON.stringify(staleExpansionResult));
-    assert.equal(staleExpansionResult.groupCount, 3, JSON.stringify(staleExpansionResult));
+    assert.equal(staleExpansionResult.groupCount, 4, JSON.stringify(staleExpansionResult));
     assert.ok(Math.abs(staleExpansionResult.after - staleExpansionResult.before) <= 1, JSON.stringify({ staleExpansionSetup, staleExpansionResult }));
+
+    // Conversation visibility is a same-row mobile control. Agent prose can
+    // never be hidden; Human and Internal are independent, persistent filters.
+    const filterDefaults = await cdp.evaluate(`(() => {
+      const open = document.getElementById('conversation-filters-open');
+      open.click();
+      const dialog = document.getElementById('conversation-filters-dialog');
+      const title = document.querySelector('.terminal-title').getBoundingClientRect();
+      const openBounds = open.getBoundingClientRect();
+      const labels = [...dialog.querySelectorAll('.conversation-filter-options label')];
+      const inputs = [...dialog.querySelectorAll('.conversation-filter-options input')];
+      return {
+        open: dialog.open,
+        expanded: open.getAttribute('aria-expanded'),
+        indicator: document.getElementById('conversation-filters-indicator').textContent,
+        active: open.classList.contains('active'),
+        openHeight: openBounds.height,
+        titleHeight: title.height,
+        sameRow: openBounds.top >= title.top - 1 && openBounds.bottom <= title.bottom + 1,
+        checked: inputs.map((input) => input.checked),
+        disabled: inputs.map((input) => input.disabled),
+        inputSizes: inputs.map((input) => {
+          const box = input.getBoundingClientRect();
+          return [box.width, box.height];
+        }),
+        targetHeights: labels.map((label) => label.getBoundingClientRect().height),
+        buttonHeights: [...dialog.querySelectorAll('button')].map((button) => button.getBoundingClientRect().height),
+        label: open.getAttribute('aria-label'),
+        describedBy: dialog.getAttribute('aria-describedby'),
+        overflowX: document.documentElement.scrollWidth - innerWidth,
+      };
+    })()`);
+    assert.equal(filterDefaults.open, true, JSON.stringify(filterDefaults));
+    assert.equal(filterDefaults.expanded, "true", JSON.stringify(filterDefaults));
+    assert.equal(filterDefaults.indicator, "All", JSON.stringify(filterDefaults));
+    assert.equal(filterDefaults.active, false, JSON.stringify(filterDefaults));
+    assert.ok(filterDefaults.openHeight >= 44, JSON.stringify(filterDefaults));
+    assert.ok(filterDefaults.titleHeight <= 48, JSON.stringify(filterDefaults));
+    assert.equal(filterDefaults.sameRow, true, JSON.stringify(filterDefaults));
+    assert.deepEqual(filterDefaults.checked, [true, true, true]);
+    assert.deepEqual(filterDefaults.disabled, [true, false, false]);
+    assert.ok(filterDefaults.inputSizes.every(([width, height]) => width >= 16 && height >= 16), JSON.stringify(filterDefaults));
+    assert.ok(filterDefaults.targetHeights.every((height) => height >= 44), JSON.stringify(filterDefaults));
+    assert.ok(filterDefaults.buttonHeights.every((height) => height >= 44), JSON.stringify(filterDefaults));
+    assert.equal(filterDefaults.label, "Conversation visibility: showing all message types");
+    assert.equal(filterDefaults.describedBy, "conversation-filters-note");
+    assert.ok(filterDefaults.overflowX <= 1, JSON.stringify(filterDefaults));
+
+    const filterReadingAnchor = await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      const target = conversation.querySelector('[data-transcript-id="tool-agent-middle"]');
+      const bounds = conversation.getBoundingClientRect();
+      conversation.scrollTop += target.getBoundingClientRect().top - bounds.top - 12;
+      conversation.dispatchEvent(new Event('scroll'));
+      return {
+        id: target.dataset.transcriptId,
+        offset: target.getBoundingClientRect().top - bounds.top,
+        scrollTop: conversation.scrollTop,
+      };
+    })()`);
+    const humanHidden = await cdp.evaluate(`(() => {
+      document.getElementById('conversation-show-human').click();
+      const conversation = document.getElementById('conversation');
+      const bounds = conversation.getBoundingClientRect();
+      const target = conversation.querySelector('[data-transcript-id="tool-agent-middle"]');
+      return {
+        humans: conversation.querySelectorAll('[data-transcript-visibility="human"]').length,
+        agents: conversation.querySelectorAll('[data-transcript-visibility="agent"]').length,
+        groups: conversation.querySelectorAll('.tool-call-group:not(.tool-run-group)').length,
+        targetOffset: target.getBoundingClientRect().top - bounds.top,
+        indicator: document.getElementById('conversation-filters-indicator').textContent,
+        active: document.getElementById('conversation-filters-open').classList.contains('active'),
+        stored: localStorage.getItem('atmux.conversation-visibility'),
+      };
+    })()`);
+    assert.equal(humanHidden.humans, 0, JSON.stringify(humanHidden));
+    assert.ok(humanHidden.agents > 0, JSON.stringify(humanHidden));
+    assert.equal(humanHidden.groups, 4, JSON.stringify(humanHidden));
+    assert.ok(Math.abs(humanHidden.targetOffset - filterReadingAnchor.offset) <= 1, JSON.stringify({ filterReadingAnchor, humanHidden }));
+    assert.equal(humanHidden.indicator, "1 off", JSON.stringify(humanHidden));
+    assert.equal(humanHidden.active, true, JSON.stringify(humanHidden));
+    assert.equal(humanHidden.stored, '{"human":false,"internal":true}');
+
+    const internalHidden = await cdp.evaluate(`(() => {
+      document.getElementById('conversation-show-human').click();
+      document.getElementById('conversation-show-internal').click();
+      const conversation = document.getElementById('conversation');
+      return {
+        humans: conversation.querySelectorAll('[data-transcript-visibility="human"]').length,
+        agents: conversation.querySelectorAll('[data-transcript-visibility="agent"]').length,
+        internals: conversation.querySelectorAll('[data-transcript-visibility="internal"]').length,
+        errors: [...conversation.querySelectorAll('summary')].filter((node) => node.textContent.includes('error')).length,
+        indicator: document.getElementById('conversation-filters-indicator').textContent,
+        stored: localStorage.getItem('atmux.conversation-visibility'),
+      };
+    })()`);
+    assert.ok(internalHidden.humans > 0, JSON.stringify(internalHidden));
+    assert.ok(internalHidden.agents > 0, JSON.stringify(internalHidden));
+    assert.equal(internalHidden.internals, 0, JSON.stringify(internalHidden));
+    assert.equal(internalHidden.errors, 0, JSON.stringify(internalHidden));
+    assert.equal(internalHidden.indicator, "1 off", JSON.stringify(internalHidden));
+    assert.equal(internalHidden.stored, '{"human":true,"internal":false}');
+
+    const agentOnly = await cdp.evaluate(`(() => {
+      document.getElementById('conversation-show-human').click();
+      const conversation = document.getElementById('conversation');
+      return {
+        humans: conversation.querySelectorAll('[data-transcript-visibility="human"]').length,
+        agents: conversation.querySelectorAll('[data-transcript-visibility="agent"]').length,
+        internals: conversation.querySelectorAll('[data-transcript-visibility="internal"]').length,
+        indicator: document.getElementById('conversation-filters-indicator').textContent,
+        label: document.getElementById('conversation-filters-open').getAttribute('aria-label'),
+        resetDisabled: document.getElementById('conversation-filters-reset').disabled,
+        stored: localStorage.getItem('atmux.conversation-visibility'),
+      };
+    })()`);
+    assert.equal(agentOnly.humans, 0, JSON.stringify(agentOnly));
+    assert.ok(agentOnly.agents > 0, JSON.stringify(agentOnly));
+    assert.equal(agentOnly.internals, 0, JSON.stringify(agentOnly));
+    assert.equal(agentOnly.indicator, "2 off", JSON.stringify(agentOnly));
+    assert.equal(agentOnly.label, "Conversation visibility: 2 message types hidden");
+    assert.equal(agentOnly.resetDisabled, false, JSON.stringify(agentOnly));
+    assert.equal(agentOnly.stored, '{"human":false,"internal":false}');
+    await cdp.evaluate("document.querySelector('#conversation-filters-dialog .primary').click(); true");
+
+    const filteredBeforeIncoming = await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      const target = conversation.querySelector('[data-transcript-id="tool-agent-middle"]');
+      const bounds = conversation.getBoundingClientRect();
+      conversation.scrollTop += target.getBoundingClientRect().top - bounds.top - 10;
+      conversation.dispatchEvent(new Event('scroll'));
+      return { id: target.dataset.transcriptId, offset: target.getBoundingClientRect().top - bounds.top };
+    })()`);
+    transcriptFixture = {
+      ...transcriptFixture,
+      content_hash: "conversation-filter-incoming",
+      messages: [
+        ...transcriptFixture.messages,
+        { id: "hidden-incoming-human", role: "user", markdown: "HIDDEN HUMAN <img src=x onerror=human()>" },
+        { id: "hidden-incoming-tool", role: "tool", kind: "tool", tool_name: "exec", tool_output: "Error: HIDDEN TOOL" },
+        { id: "visible-incoming-agent", role: "assistant", markdown: "VISIBLE AGENT <img src=x onerror=agent()>" },
+      ],
+    };
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('conversation').textContent.includes('VISIBLE AGENT')"),
+      "a visible incoming agent message did not render through agent-only mode",
+      5_000,
+    );
+    const filteredIncoming = await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      const bounds = conversation.getBoundingClientRect();
+      const target = conversation.querySelector('[data-transcript-id="tool-agent-middle"]');
+      return {
+        humanHidden: !conversation.textContent.includes('HIDDEN HUMAN'),
+        toolHidden: !conversation.textContent.includes('HIDDEN TOOL'),
+        agentVisible: conversation.textContent.includes('VISIBLE AGENT'),
+        targetOffset: target.getBoundingClientRect().top - bounds.top,
+        markupInjected: Boolean(conversation.querySelector('img, script')),
+      };
+    })()`);
+    assert.equal(filteredIncoming.humanHidden, true, JSON.stringify(filteredIncoming));
+    assert.equal(filteredIncoming.toolHidden, true, JSON.stringify(filteredIncoming));
+    assert.equal(filteredIncoming.agentVisible, true, JSON.stringify(filteredIncoming));
+    assert.equal(filteredIncoming.markupInjected, false, JSON.stringify(filteredIncoming));
+    assert.ok(Math.abs(filteredIncoming.targetOffset - filteredBeforeIncoming.offset) <= 1, JSON.stringify({ filteredBeforeIncoming, filteredIncoming }));
+
+    // Reconnect and a full document reload retain the same filters. Neither
+    // operation can flash hidden transcript records from the selected pane.
+    const filteredPaneStream = [...paneStreams].at(-1);
+    assert.ok(filteredPaneStream, "conversation filter reconnect needs a pane stream");
+    filteredPaneStream.write(`event: pane.patch\ndata: ${JSON.stringify({
+      base_revision: 9_999, revision: 10_000, start_line: 0, delete_lines: 0, lines: [],
+    })}\n\n`);
+    await waitFor(
+      () => cdp.evaluate(`document.getElementById('stream-state').textContent === 'Live'
+        && document.getElementById('conversation').textContent.includes('VISIBLE AGENT')
+        && !document.getElementById('conversation').textContent.includes('HIDDEN HUMAN')
+        && document.getElementById('conversation-filters-indicator').textContent === '2 off'`),
+      "agent-only visibility did not survive a pane reconnect",
+      5_000,
+    );
+    // Page.reload acknowledges the command before the replacement document is
+    // necessarily installed. The transcript predicate below also matches the
+    // old document, so waiting on content alone can let a Back click race (and
+    // be discarded by) the pending navigation on a slow CI worker.
+    await cdp.evaluate("window.__atmuxFilterReloadGeneration = 'before-reload'; true");
+    await cdp.send("Page.reload");
+    await waitFor(
+      () => cdp.evaluate(`window.__atmuxFilterReloadGeneration !== 'before-reload'
+        && document.readyState === 'complete'
+        && document.getElementById('conversation').textContent.includes('VISIBLE AGENT')
+        && !document.getElementById('conversation').textContent.includes('HIDDEN HUMAN')
+        && document.getElementById('conversation-filters-indicator').textContent === '2 off'
+        && document.querySelector('.session-button[data-session-id="midnight~%5"]') !== null`),
+      "agent-only visibility did not restore from local storage",
+      5_000,
+    );
 
     // A pane change clears group expansion/content synchronously; an identical
     // transcript id from another owner cannot inherit the previous pane DOM.
     transcriptFixture = {
       available: true, source: "codex", changed: true, content_hash: "pane-b-prose", truncated: false,
-      messages: [{ id: "pane-b-agent", role: "assistant", markdown: "Different pane conversation" }],
+      messages: [
+        { id: "pane-b-human", role: "user", markdown: "Different pane human" },
+        { id: "pane-b-tool", role: "tool", kind: "tool", tool_name: "exec", tool_output: "ok" },
+        { id: "pane-b-agent", role: "assistant", markdown: "Different pane conversation" },
+      ],
     };
     await cdp.evaluate("document.getElementById('mobile-back').click(); true");
-    await waitFor(() => cdp.evaluate("!document.body.classList.contains('has-selection')"), "tool grouping test did not return to agent list");
+    await waitFor(
+      () => cdp.evaluate(`!document.body.classList.contains('has-selection')
+        && document.querySelector('.session-button[data-session-id="midnight~%5"]') !== null`),
+      "tool grouping test did not return to the populated agent list",
+    );
     const groupClearedOnPaneChange = await cdp.evaluate(`(() => {
       document.querySelector('.session-button[data-session-id="midnight~%5"]').click();
-      return !document.querySelector('#conversation .tool-call-group');
+      return !document.querySelector('#conversation .tool-call-group:not(.tool-run-group)');
     })()`);
     assert.equal(groupClearedOnPaneChange, true, "pane A tool group remained visible under pane B");
     await waitFor(
@@ -1855,6 +3310,128 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       "pane B conversation did not replace pane A tool groups",
       5_000,
     );
+    const paneFilterPersistence = await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      return {
+        agent: conversation.textContent.includes('Different pane conversation'),
+        human: conversation.textContent.includes('Different pane human'),
+        tool: conversation.querySelector('[data-transcript-id="pane-b-tool"]') !== null,
+        indicator: document.getElementById('conversation-filters-indicator').textContent,
+      };
+    })()`);
+    assert.deepEqual(paneFilterPersistence, {
+      agent: true, human: false, tool: false, indicator: "2 off",
+    });
+    transcriptFixture = {
+      available: true, source: "codex", changed: true, content_hash: "pane-b-hidden-only", truncated: false,
+      messages: [
+        { id: "pane-b-human", role: "user", markdown: "Different pane human" },
+        { id: "pane-b-tool", role: "tool", kind: "tool", tool_name: "exec", tool_output: "ok" },
+      ],
+    };
+    await waitFor(
+      () => cdp.evaluate("document.querySelector('#conversation .conversation-empty')?.textContent.includes('No agent messages to show')"),
+      "agent-only mode did not expose a recoverable filtered empty state",
+      5_000,
+    );
+    await cdp.evaluate(`(() => {
+      document.getElementById('conversation-filters-open').click();
+      document.getElementById('conversation-filters-reset').click();
+      document.querySelector('#conversation-filters-dialog .primary').click();
+      return true;
+    })()`);
+    const filtersReset = await cdp.evaluate(`(() => ({
+      human: document.getElementById('conversation').textContent.includes('Different pane human'),
+      tool: document.getElementById('conversation').querySelector('[data-transcript-id="pane-b-tool"]') !== null,
+      indicator: document.getElementById('conversation-filters-indicator').textContent,
+      active: document.getElementById('conversation-filters-open').classList.contains('active'),
+      stored: localStorage.getItem('atmux.conversation-visibility'),
+    }))()`);
+    assert.deepEqual(filtersReset, {
+      human: true, tool: true, indicator: "All", active: false,
+      stored: '{"human":true,"internal":true}',
+    });
+
+    // Hiding Human can merge two tool runs. Anchor restoration follows the
+    // first underlying tool member when the group's generated outer id changes.
+    transcriptFixture = {
+      available: true, source: "codex", changed: true, content_hash: "filter-merged-tool-anchor", truncated: false,
+      messages: [
+        ...Array.from({ length: 10 }, (_, index) => ({
+          id: `anchor-prefix-${index}`, role: "assistant",
+          markdown: `Anchor prefix ${index} ${"stable reading context ".repeat(8)}`,
+        })),
+        { id: "anchor-exec-1", role: "tool", kind: "tool", tool_name: "exec", tool_output: "ok" },
+        { id: "anchor-human", role: "user", markdown: "Human boundary between exec calls" },
+        { id: "anchor-exec-2", role: "tool", kind: "tool", tool_name: "exec", tool_output: "ok" },
+        { id: "anchor-exec-3", role: "tool", kind: "tool", tool_name: "exec", tool_output: "ok" },
+        ...Array.from({ length: 12 }, (_, index) => ({
+          id: `anchor-suffix-${index}`, role: "assistant",
+          markdown: `Anchor suffix ${index} ${"more stable reading context ".repeat(8)}`,
+        })),
+      ],
+    };
+    await waitFor(
+      () => cdp.evaluate("document.querySelector('[data-transcript-id=\"tool-group:anchor-exec-2\"]') !== null"),
+      "pre-filter exec-2 group did not render",
+      5_000,
+    );
+    const mergedGroupAnchorBefore = await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      const group = conversation.querySelector('[data-transcript-id="tool-group:anchor-exec-2"]');
+      const bounds = conversation.getBoundingClientRect();
+      conversation.scrollTop += group.getBoundingClientRect().top - bounds.top - 14;
+      conversation.dispatchEvent(new Event('scroll'));
+      return {
+        offset: group.getBoundingClientRect().top - bounds.top,
+        members: JSON.parse(group.dataset.transcriptMembers),
+      };
+    })()`);
+    assert.deepEqual(mergedGroupAnchorBefore.members, ["anchor-exec-2", "anchor-exec-3"]);
+    const mergedGroupAnchorAfter = await cdp.evaluate(`(() => {
+      document.getElementById('conversation-filters-open').click();
+      document.getElementById('conversation-show-human').click();
+      const conversation = document.getElementById('conversation');
+      const group = conversation.querySelector('[data-transcript-id="tool-group:anchor-exec-1"]');
+      const bounds = conversation.getBoundingClientRect();
+      return {
+        offset: group.getBoundingClientRect().top - bounds.top,
+        members: JSON.parse(group.dataset.transcriptMembers),
+        summary: group.querySelector(':scope > summary').textContent,
+        oldOuterGone: !conversation.querySelector('[data-transcript-id="tool-group:anchor-exec-2"]'),
+      };
+    })()`);
+    assert.deepEqual(mergedGroupAnchorAfter.members, ["anchor-exec-1", "anchor-exec-2", "anchor-exec-3"]);
+    assert.equal(mergedGroupAnchorAfter.summary, "exec ×3", JSON.stringify(mergedGroupAnchorAfter));
+    assert.equal(mergedGroupAnchorAfter.oldOuterGone, true, JSON.stringify(mergedGroupAnchorAfter));
+    assert.ok(Math.abs(mergedGroupAnchorAfter.offset - mergedGroupAnchorBefore.offset) <= 1, JSON.stringify({
+      mergedGroupAnchorBefore, mergedGroupAnchorAfter,
+    }));
+    const splitGroupAnchorAfterReset = await cdp.evaluate(`(() => {
+      document.getElementById('conversation-filters-reset').click();
+      const conversation = document.getElementById('conversation');
+      const singleton = conversation.querySelector('[data-transcript-id="anchor-exec-1"]');
+      const bounds = conversation.getBoundingClientRect();
+      return {
+        offset: singleton.getBoundingClientRect().top - bounds.top,
+        singletonOutsideGroup: !singleton.closest('.tool-call-group:not(.tool-run-group)'),
+        humanRestored: conversation.textContent.includes('Human boundary between exec calls'),
+        splitGroupMembers: JSON.parse(
+          conversation.querySelector('[data-transcript-id="tool-group:anchor-exec-2"]')
+            .dataset.transcriptMembers,
+        ),
+      };
+    })()`);
+    assert.equal(splitGroupAnchorAfterReset.singletonOutsideGroup, true, JSON.stringify(splitGroupAnchorAfterReset));
+    assert.equal(splitGroupAnchorAfterReset.humanRestored, true, JSON.stringify(splitGroupAnchorAfterReset));
+    assert.deepEqual(splitGroupAnchorAfterReset.splitGroupMembers, ["anchor-exec-2", "anchor-exec-3"]);
+    assert.ok(Math.abs(splitGroupAnchorAfterReset.offset - mergedGroupAnchorAfter.offset) <= 1, JSON.stringify({
+      mergedGroupAnchorAfter, splitGroupAnchorAfterReset,
+    }));
+    await cdp.evaluate(`(() => {
+      document.querySelector('#conversation-filters-dialog .primary').click();
+      return true;
+    })()`);
 
     const composerBeforeFocus = await cdp.evaluate(`(() => {
       const box = document.getElementById('composer').getBoundingClientRect();
@@ -1983,6 +3560,140 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       () => cdp.evaluate("!document.getElementById('launch-browser-use').disabled"),
       "folder browser did not navigate into the selected folder",
     );
+    assert.equal(await cdp.evaluate("document.getElementById('launch-browser-up').disabled"), false);
+    await cdp.evaluate("document.getElementById('launch-browser-up').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('launch-browser-path').textContent === '/workspace'"),
+      "folder browser did not navigate to its allowed parent",
+    );
+    assert.equal(
+      await cdp.evaluate("document.getElementById('launch-browser-up').disabled"),
+      true,
+      "Up must be disabled only at the actual allowed root",
+    );
+    await cdp.evaluate("document.querySelector('.launch-browser-folder').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('launch-browser-path').textContent === '/workspace/custom'"),
+      "folder browser did not return to the selected child",
+    );
+
+    const browserActionGeometry = await cdp.evaluate(`(() => ({
+      documentWidth: document.documentElement.scrollWidth,
+      viewportWidth: window.innerWidth,
+      buttons: [...document.querySelectorAll('.launch-browser-actions button')].map((button) => ({
+        height: button.getBoundingClientRect().height,
+        right: button.getBoundingClientRect().right,
+      })),
+    }))()`);
+    assert.ok(browserActionGeometry.documentWidth <= browserActionGeometry.viewportWidth, JSON.stringify(browserActionGeometry));
+    assert.ok(browserActionGeometry.buttons.every((button) => button.height >= 44 && button.right <= browserActionGeometry.viewportWidth + 1), JSON.stringify(browserActionGeometry));
+
+    await cdp.evaluate("document.getElementById('launch-browser-new').click(); true");
+    await cdp.evaluate(`(() => {
+      document.getElementById('launch-browser-new-name').value = 'new project';
+      document.getElementById('launch-browser-operation-confirm').click();
+      return true;
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("[...document.querySelectorAll('.launch-browser-folder')].some((button) => button.dataset.path === '/workspace/custom/new project')"),
+      "new folder action did not refresh the current listing",
+    );
+    assert.deepEqual(launchDirectoryMutationRequests.at(-1), {
+      pathname: "/api/v1/launch-directories/folders",
+      body: { machine: "tron", directory: "/workspace/custom", name: "new project" },
+    });
+
+    await cdp.evaluate("document.getElementById('launch-browser-clone').click(); true");
+    const clonePanel = await cdp.evaluate(`(() => {
+      const repository = document.getElementById('launch-browser-repository');
+      repository.value = 'https://example.test/team/cloned project.git';
+      repository.dispatchEvent(new Event('input', { bubbles: true }));
+      const destination = document.getElementById('launch-browser-destination');
+      return {
+        destination: destination.value,
+        fontSize: getComputedStyle(repository).fontSize,
+        inputHeight: repository.getBoundingClientRect().height,
+        expanded: document.getElementById('launch-browser-clone').getAttribute('aria-expanded'),
+      };
+    })()`);
+    assert.equal(clonePanel.destination, "cloned project", JSON.stringify(clonePanel));
+    assert.equal(clonePanel.fontSize, "16px", JSON.stringify(clonePanel));
+    assert.ok(clonePanel.inputHeight >= 44, JSON.stringify(clonePanel));
+    assert.equal(clonePanel.expanded, "true", JSON.stringify(clonePanel));
+    await cdp.evaluate("document.getElementById('launch-browser-operation-confirm').click(); true");
+    await waitFor(
+      () => cdp.evaluate("[...document.querySelectorAll('.launch-browser-folder')].some((button) => button.dataset.path === '/workspace/custom/cloned project')"),
+      "clone action did not refresh the current listing",
+    );
+    assert.deepEqual(launchDirectoryMutationRequests.at(-1), {
+      pathname: "/api/v1/launch-directories/clone",
+      body: {
+        machine: "tron", directory: "/workspace/custom",
+        repository: "https://example.test/team/cloned project.git",
+        destination: "cloned project",
+      },
+    });
+    assert.equal(await cdp.evaluate("document.getElementById('launch-browser-operation').hidden"), true);
+
+    await cdp.evaluate(`(() => {
+      document.getElementById('launch-browser-clone').click();
+      const repository = document.getElementById('launch-browser-repository');
+      repository.value = 'https://oauth2:super-secret@example.test/team/private.git';
+      repository.dispatchEvent(new Event('input', { bubbles: true }));
+      document.getElementById('launch-browser-operation-confirm').click();
+      return true;
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('launch-browser-operation-note').textContent.includes('credential-bearing')"),
+      "credential-bearing repository rejection was not shown inline",
+    );
+    const credentialError = await cdp.evaluate("document.getElementById('launch-browser-operation-note').textContent");
+    assert.doesNotMatch(credentialError, /super-secret|oauth2|private\.git/);
+    await cdp.evaluate("document.getElementById('launch-browser-operation-cancel').click(); true");
+
+    launchDirectoryMutationDelayMs = 600;
+    await cdp.evaluate(`(() => {
+      document.getElementById('launch-browser-clone').click();
+      const repository = document.getElementById('launch-browser-repository');
+      repository.value = 'https://example.test/team/stale-clone.git';
+      repository.dispatchEvent(new Event('input', { bubbles: true }));
+      document.getElementById('launch-browser-operation-confirm').click();
+      return true;
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('launch-browser-operation-confirm').disabled"),
+      "delayed clone did not enter its disabled mutation state",
+    );
+    await cdp.evaluate("document.getElementById('launch-browser-close').click(); true");
+    await cdp.evaluate("document.getElementById('launch-browse').click(); true");
+    await waitFor(
+      () => cdp.evaluate("!document.getElementById('launch-browser').hidden && document.querySelector('.launch-browser-folder')?.dataset.path === '/workspace/custom'"),
+      "folder browser did not reopen while an old clone response was pending",
+    );
+    await cdp.evaluate("document.querySelector('.launch-browser-folder').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('launch-browser-path').textContent === '/workspace/custom'"),
+      "folder browser did not navigate after reopening during an old clone request",
+    );
+    await cdp.evaluate("document.getElementById('launch-browser-clone').click(); true");
+    const reopenedControls = await cdp.evaluate(`(() => ({
+      repository: document.getElementById('launch-browser-repository').disabled,
+      destination: document.getElementById('launch-browser-destination').disabled,
+      cancel: document.getElementById('launch-browser-operation-cancel').disabled,
+      confirm: document.getElementById('launch-browser-operation-confirm').disabled,
+    }))()`);
+    assert.deepEqual(reopenedControls, {
+      repository: false, destination: false, cancel: false, confirm: false,
+    });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 700));
+    assert.equal(
+      await cdp.evaluate("[...document.querySelectorAll('.launch-browser-folder')].some((button) => button.dataset.path.endsWith('/stale-clone'))"),
+      false,
+      "a stale clone response mutated the reopened browser",
+    );
+    assert.equal(await cdp.evaluate("document.getElementById('launch-browser-operation').hidden"), false);
+    await cdp.evaluate("document.getElementById('launch-browser-operation-cancel').click(); true");
+
     await cdp.evaluate("document.getElementById('launch-browser-use').click(); true");
     assert.equal(await cdp.evaluate("document.getElementById('launch-directory').value"), "/workspace/custom");
     await waitFor(
@@ -2057,7 +3768,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     );
     assert.equal(await cdp.evaluate("document.getElementById('launch-machine').value"), "tron");
     await waitFor(
-      () => cdp.evaluate("[...document.querySelectorAll('#launch-directory-options option')].some((option) => option.value === '/workspace/custom')"),
+      () => cdp.evaluate("[...document.querySelectorAll('#launch-directory-suggestions [role=option]')].some((option) => option.dataset.directory === '/workspace/custom')"),
       "remembered folder did not return to the project picker",
     );
     await cdp.evaluate("document.querySelector('#launch-dialog .dialog-cancel').click(); true");
@@ -2120,6 +3831,63 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     }
     assert.ok(dashboard.reportSummary.includes("claude-max"));
     assert.ok(dashboard.reportSummary.includes("1,500,000 tokens · $4.00"));
+
+    // Privacy modes and restrictive embedded browsers can expose Storage but
+    // throw from every method. This script runs before app.js in a fresh
+    // document, proving initialization itself (including setRailCollapsed)
+    // fails open and still renders usable Conversation visibility controls.
+    await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: `
+      for (const method of ['getItem', 'setItem', 'removeItem', 'clear']) {
+        Object.defineProperty(Storage.prototype, method, {
+          configurable: true,
+          value() { throw new DOMException('Storage disabled by fixture', 'SecurityError'); },
+        });
+      }
+    ` });
+    await cdp.send("Page.navigate", { url: `http://127.0.0.1:${port}/?session=tron~%25100` });
+    await waitFor(
+      () => cdp.evaluate(`document.readyState === 'complete'
+        && !document.getElementById('agent-view').hidden
+        && document.getElementById('conversation-filters-indicator').textContent === 'All'`),
+      "throwing browser Storage aborted Conversation initialization",
+      5_000,
+    );
+    const storageDeniedInitialization = await cdp.evaluate(`(() => {
+      let storageThrows = false;
+      try { localStorage.getItem('probe'); } catch { storageThrows = true; }
+      const open = document.getElementById('conversation-filters-open');
+      open.click();
+      const human = document.getElementById('conversation-show-human');
+      const internal = document.getElementById('conversation-show-internal');
+      const defaults = [human.checked, internal.checked];
+      human.click();
+      const afterWriteFailure = {
+        indicator: document.getElementById('conversation-filters-indicator').textContent,
+        human: human.checked,
+        internal: internal.checked,
+      };
+      document.getElementById('conversation-filters-reset').click();
+      return {
+        storageThrows,
+        agentViewVisible: !document.getElementById('agent-view').hidden,
+        dialogOpen: document.getElementById('conversation-filters-dialog').open,
+        defaults,
+        afterWriteFailure,
+        reset: [human.checked, internal.checked],
+        resetIndicator: document.getElementById('conversation-filters-indicator').textContent,
+        overflowX: document.documentElement.scrollWidth - innerWidth,
+      };
+    })()`);
+    assert.equal(storageDeniedInitialization.storageThrows, true, JSON.stringify(storageDeniedInitialization));
+    assert.equal(storageDeniedInitialization.agentViewVisible, true, JSON.stringify(storageDeniedInitialization));
+    assert.equal(storageDeniedInitialization.dialogOpen, true, JSON.stringify(storageDeniedInitialization));
+    assert.deepEqual(storageDeniedInitialization.defaults, [true, true]);
+    assert.deepEqual(storageDeniedInitialization.afterWriteFailure, {
+      indicator: "1 off", human: false, internal: true,
+    });
+    assert.deepEqual(storageDeniedInitialization.reset, [true, true]);
+    assert.equal(storageDeniedInitialization.resetIndicator, "All", JSON.stringify(storageDeniedInitialization));
+    assert.ok(storageDeniedInitialization.overflowX <= 1, JSON.stringify(storageDeniedInitialization));
   } catch (error) {
     testError = error;
     throw error;

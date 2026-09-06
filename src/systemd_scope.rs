@@ -27,6 +27,7 @@ const SYSTEMCTL: &str = "/usr/bin/systemctl";
 static SCOPE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_POLL: Duration = Duration::from_millis(20);
+pub(crate) const GIBIBYTE: u64 = 1024 * 1024 * 1024;
 
 /// One already-preflighted policy for one agent process generation.
 ///
@@ -80,7 +81,18 @@ pub(crate) fn prepare(
     resources: &AgentResourcesConfig,
     launch_hint: &str,
 ) -> Result<PreparedScope> {
-    let Some(memory_max_bytes) = resources.memory_max_bytes else {
+    prepare_override(resources, None, launch_hint)
+}
+
+/// Resolves one request against owner configuration and preflights its exact
+/// cap. `None` always selects the configured default. A caller-supplied value
+/// can never enable isolation or raise the owner-configured override ceiling.
+pub(crate) fn prepare_override(
+    resources: &AgentResourcesConfig,
+    requested_memory_max_bytes: Option<u64>,
+    launch_hint: &str,
+) -> Result<PreparedScope> {
+    let Some(memory_max_bytes) = resolve_memory_max(resources, requested_memory_max_bytes)? else {
         return Ok(PreparedScope {
             unit: None,
             memory_max_bytes: None,
@@ -107,6 +119,100 @@ pub(crate) fn prepare(
             "[agent_resources].memory_max_bytes requires Linux with a working systemd user manager"
         )
     }
+}
+
+/// Prepares the control-plane scope used by a fixed owner recovery script.
+/// Its cap must leave headroom above every configured worker cap while still
+/// remaining strictly below the effective host/inherited cgroup ceiling.
+pub(crate) fn prepare_recovery_service(
+    resources: &AgentResourcesConfig,
+    requested_memory_max_bytes: u64,
+    launch_hint: &str,
+) -> Result<PreparedScope> {
+    #[cfg(target_os = "linux")]
+    {
+        let effective_ceiling = effective_host_ceiling()?;
+        let memory_max_bytes = resolve_recovery_service_memory_max(
+            resources,
+            requested_memory_max_bytes,
+            effective_ceiling,
+        )?;
+        let user_bus = user_bus_environment()?;
+        prepare_linux(memory_max_bytes, launch_hint, user_bus, run_probe)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (resources, requested_memory_max_bytes, launch_hint);
+        bail!("recovery service MemoryMax requires Linux with a working systemd user manager")
+    }
+}
+
+/// Applies the owner policy without consulting systemd. Host and inherited
+/// cgroup bounds are checked immediately afterwards by `prepare_override`.
+pub(crate) fn resolve_memory_max(
+    resources: &AgentResourcesConfig,
+    requested_memory_max_bytes: Option<u64>,
+) -> Result<Option<u64>> {
+    let Some(requested) = requested_memory_max_bytes else {
+        return Ok(resources.memory_max_bytes);
+    };
+    if requested == 0 {
+        bail!("requested agent MemoryMax must be greater than zero");
+    }
+    if requested == u64::MAX {
+        bail!("requested agent MemoryMax cannot be infinity");
+    }
+    let Some(default) = resources.memory_max_bytes else {
+        bail!("this machine does not enable per-agent memory isolation");
+    };
+    // Preserve a pane launched under the current default without requiring
+    // overrides to be enabled. This also lets Duplicate state the observed
+    // exact cap rather than depending on browser assumptions.
+    if requested == default {
+        return Ok(Some(requested));
+    }
+    let Some(ceiling) = resources.memory_override_max_bytes else {
+        bail!("this machine does not allow per-agent memory overrides");
+    };
+    if !requested.is_multiple_of(GIBIBYTE) {
+        bail!("agent memory overrides must be a whole number of GiB");
+    }
+    if requested > ceiling {
+        bail!(
+            "requested agent MemoryMax={requested} exceeds the configured override ceiling of {ceiling} bytes"
+        );
+    }
+    Ok(Some(requested))
+}
+
+fn resolve_recovery_service_memory_max(
+    resources: &AgentResourcesConfig,
+    requested: u64,
+    effective_host_ceiling: u64,
+) -> Result<u64> {
+    if requested == 0 {
+        bail!("recovery service MemoryMax must be greater than zero");
+    }
+    if requested == u64::MAX {
+        bail!("recovery service MemoryMax cannot be infinity");
+    }
+    if !requested.is_multiple_of(GIBIBYTE) {
+        bail!("recovery service MemoryMax must be a whole number of GiB");
+    }
+    let default = resources
+        .memory_max_bytes
+        .context("recovery service MemoryMax requires per-agent memory isolation")?;
+    let worker_ceiling = resources
+        .memory_override_max_bytes
+        .unwrap_or(default)
+        .max(default);
+    if requested <= worker_ceiling {
+        bail!(
+            "recovery service MemoryMax={requested} must exceed the configured worker ceiling of {worker_ceiling} bytes"
+        );
+    }
+    validate_effective_ceiling(requested, effective_host_ceiling)?;
+    Ok(requested)
 }
 
 #[cfg(target_os = "linux")]
@@ -150,10 +256,43 @@ fn user_bus_environment() -> Result<UserBusEnvironment> {
 
 #[cfg(target_os = "linux")]
 fn validate_host_ceiling(memory_max_bytes: u64) -> Result<()> {
+    let effective_ceiling = effective_host_ceiling()?;
+    validate_effective_ceiling(memory_max_bytes, effective_ceiling)
+}
+
+#[cfg(target_os = "linux")]
+fn effective_host_ceiling() -> Result<u64> {
     let host_total = linux_host_total_bytes()?;
     let inherited = inherited_cgroup_memory_max()?;
-    let effective_ceiling = inherited.map_or(host_total, |limit| limit.min(host_total));
-    validate_effective_ceiling(memory_max_bytes, effective_ceiling)
+    Ok(inherited.map_or(host_total, |limit| limit.min(host_total)))
+}
+
+/// Largest whole-GiB request the owner can truthfully advertise right now.
+/// Launch still repeats this check because cgroup ancestry can change between
+/// option discovery and process creation.
+pub(crate) fn advertised_override_ceiling(resources: &AgentResourcesConfig) -> Result<Option<u64>> {
+    let Some(configured) = resources.memory_override_max_bytes else {
+        return Ok(None);
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let effective = effective_host_ceiling()?;
+        Ok(clamp_advertised_override_ceiling(configured, effective))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = configured;
+        bail!("per-agent memory overrides require Linux")
+    }
+}
+
+fn clamp_advertised_override_ceiling(configured: u64, effective_host_ceiling: u64) -> Option<u64> {
+    let strict_whole_gib = effective_host_ceiling
+        .saturating_sub(1)
+        .checked_div(GIBIBYTE)
+        .unwrap_or(0)
+        .saturating_mul(GIBIBYTE);
+    (strict_whole_gib > 0).then_some(configured.min(strict_whole_gib))
 }
 
 fn validate_effective_ceiling(memory_max_bytes: u64, effective_ceiling: u64) -> Result<()> {
@@ -475,6 +614,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn owner_policy_bounds_every_requested_override() {
+        let resources = AgentResourcesConfig {
+            memory_max_bytes: Some(16 * GIBIBYTE),
+            memory_override_max_bytes: Some(24 * GIBIBYTE),
+        };
+        assert_eq!(
+            resolve_memory_max(&resources, None).unwrap(),
+            Some(16 * GIBIBYTE)
+        );
+        assert_eq!(
+            resolve_memory_max(&resources, Some(8 * GIBIBYTE)).unwrap(),
+            Some(8 * GIBIBYTE)
+        );
+        assert_eq!(
+            resolve_memory_max(&resources, Some(24 * GIBIBYTE)).unwrap(),
+            Some(24 * GIBIBYTE)
+        );
+        assert_eq!(
+            resolve_memory_max(&resources, Some(20 * GIBIBYTE)).unwrap(),
+            Some(20 * GIBIBYTE),
+            "a non-preset whole-GiB cap remains valid for Duplicate/relaunch"
+        );
+        for malicious in [0, 8 * GIBIBYTE + 1, 25 * GIBIBYTE, u64::MAX] {
+            assert!(resolve_memory_max(&resources, Some(malicious)).is_err());
+        }
+        let tightened = AgentResourcesConfig {
+            memory_max_bytes: Some(16 * GIBIBYTE),
+            memory_override_max_bytes: Some(18 * GIBIBYTE),
+        };
+        assert!(
+            resolve_memory_max(&tightened, Some(20 * GIBIBYTE)).is_err(),
+            "a previously observed cap must be revalidated after policy changes"
+        );
+    }
+
+    #[test]
+    fn recovery_web_scope_preserves_worker_override_headroom_and_fails_closed() {
+        let resources = AgentResourcesConfig {
+            memory_max_bytes: Some(12 * GIBIBYTE),
+            memory_override_max_bytes: Some(48 * GIBIBYTE),
+        };
+        let web_scope = 56 * GIBIBYTE;
+        assert_eq!(
+            resolve_memory_max(&resources, None).unwrap(),
+            Some(12 * GIBIBYTE)
+        );
+        assert_eq!(
+            clamp_advertised_override_ceiling(48 * GIBIBYTE, web_scope),
+            Some(48 * GIBIBYTE)
+        );
+        assert_eq!(
+            resolve_memory_max(&resources, Some(48 * GIBIBYTE)).unwrap(),
+            Some(48 * GIBIBYTE)
+        );
+        assert_eq!(
+            resolve_recovery_service_memory_max(&resources, web_scope, 60 * GIBIBYTE).unwrap(),
+            web_scope
+        );
+        assert!(validate_effective_ceiling(48 * GIBIBYTE, web_scope).is_ok());
+
+        for too_small in [40 * GIBIBYTE, 48 * GIBIBYTE] {
+            assert!(
+                resolve_recovery_service_memory_max(&resources, too_small, 60 * GIBIBYTE).is_err()
+            );
+        }
+        for host_bound in [56 * GIBIBYTE, 55 * GIBIBYTE] {
+            assert!(
+                resolve_recovery_service_memory_max(&resources, web_scope, host_bound).is_err()
+            );
+        }
+        for invalid in [0, 56 * GIBIBYTE + 1, u64::MAX] {
+            assert!(
+                resolve_recovery_service_memory_max(&resources, invalid, 60 * GIBIBYTE).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn requests_cannot_enable_or_raise_a_default_only_policy() {
+        let disabled = AgentResourcesConfig::default();
+        assert!(resolve_memory_max(&disabled, Some(GIBIBYTE)).is_err());
+        let default_only = AgentResourcesConfig {
+            memory_max_bytes: Some(16 * GIBIBYTE),
+            memory_override_max_bytes: None,
+        };
+        assert_eq!(
+            resolve_memory_max(&default_only, Some(16 * GIBIBYTE)).unwrap(),
+            Some(16 * GIBIBYTE)
+        );
+        assert!(resolve_memory_max(&default_only, Some(8 * GIBIBYTE)).is_err());
+        assert!(resolve_memory_max(&default_only, Some(24 * GIBIBYTE)).is_err());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn fake_probe_receives_fixed_exact_argv_and_builds_safe_unique_scope() {
@@ -595,6 +828,26 @@ mod tests {
         assert!(validate_effective_ceiling(2048, 1024).is_err());
         assert!(validate_effective_ceiling(1, 0).is_err());
         assert!(validate_effective_ceiling(u64::MAX, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn advertised_override_ceiling_is_strict_whole_gib_and_host_clamped() {
+        assert_eq!(
+            clamp_advertised_override_ceiling(24 * GIBIBYTE, 10 * GIBIBYTE),
+            Some(9 * GIBIBYTE)
+        );
+        assert_eq!(
+            clamp_advertised_override_ceiling(8 * GIBIBYTE, 10 * GIBIBYTE),
+            Some(8 * GIBIBYTE)
+        );
+        assert_eq!(
+            clamp_advertised_override_ceiling(24 * GIBIBYTE, 10 * GIBIBYTE + 1),
+            Some(10 * GIBIBYTE)
+        );
+        assert_eq!(
+            clamp_advertised_override_ceiling(24 * GIBIBYTE, GIBIBYTE),
+            None
+        );
     }
 
     #[cfg(target_os = "linux")]
