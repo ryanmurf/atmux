@@ -47,6 +47,11 @@ const projectFileContents = new Map();
 const projectFileVersions = new Map();
 const LONG_KERNEL_VERSION = "k".repeat(160);
 const LONG_OS_VERSION = "o".repeat(160);
+// Mirrors a real coordinator health line: a single unwrappable run longer
+// than any phone is wide.
+const LONG_MACHINE_HEALTH = "machine clue is unreachable at https://192.168.0.140:7345: "
+  + "error sending request for url (https://192.168.0.140:7345/api/v1/sessions): "
+  + "client error (Connect): connection refused";
 
 function fixtureProjectFile(paneId) {
   if (!projectFileContents.has(paneId)) {
@@ -87,6 +92,7 @@ function mockOverviewMachines() {
       },
     },
     { id: "midnight", label: "Midnight", kind: "remote", online: true, sessions: 2 },
+    { id: "clue", label: "Clue", kind: "remote", online: false, sessions: 0, health: LONG_MACHINE_HEALTH },
   ];
 }
 
@@ -1621,7 +1627,35 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     const machineLabels = await cdp.evaluate(
       "[...document.querySelectorAll('.machine-label')].map((node) => node.textContent)",
     );
-    assert.deepEqual(machineLabels, ["Tron", "Midnight"]);
+    assert.deepEqual(machineLabels, ["Tron", "Midnight", "Clue"]);
+    // An unwrappable rail line (an offline machine's long health message) must
+    // not widen the body's grid column past the phone. It used to: the implicit
+    // `auto` column grew to the rail's min-content, and `overflow: hidden` then
+    // clipped the topbar and rail at the right edge with no way to scroll.
+    const landingFit = await cdp.evaluate(`(() => {
+      const width = (selector) => Math.round(document.querySelector(selector).getBoundingClientRect().width);
+      const rail = document.querySelector('.rail');
+      const status = [...document.querySelectorAll('.machine-header')]
+        .find((node) => node.querySelector('.machine-label')?.textContent === 'Clue')
+        .querySelector('.machine-status');
+      return {
+        innerWidth,
+        topbar: width('.topbar'),
+        workspace: width('.workspace'),
+        rail: width('.rail'),
+        railOverflow: rail.scrollWidth - rail.clientWidth,
+        statusRight: Math.round(status.getBoundingClientRect().right),
+        statusTruncated: status.scrollWidth > status.clientWidth,
+        statusText: status.textContent,
+      };
+    })()`);
+    assert.equal(landingFit.topbar, landingFit.innerWidth, JSON.stringify(landingFit));
+    assert.equal(landingFit.workspace, landingFit.innerWidth, JSON.stringify(landingFit));
+    assert.equal(landingFit.rail, landingFit.innerWidth, JSON.stringify(landingFit));
+    assert.ok(landingFit.railOverflow <= 0, JSON.stringify(landingFit));
+    assert.ok(landingFit.statusRight <= landingFit.innerWidth, JSON.stringify(landingFit));
+    assert.equal(landingFit.statusTruncated, true, JSON.stringify(landingFit));
+    assert.equal(landingFit.statusText, `Offline · ${LONG_MACHINE_HEALTH}`);
     await cdp.evaluate(`(() => {
       [...document.querySelectorAll('.machine-header')]
         .find((node) => node.querySelector('.machine-label')?.textContent === 'Tron')
