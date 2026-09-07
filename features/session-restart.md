@@ -23,8 +23,8 @@ Status: implementation active
 - [x] Focused Rust and browser tests
 - [ ] Disposable tmux integration test for Claude and Codex
 - [ ] Midnight and Max live verification
-- [ ] Fable/Claude Max review
-- [ ] Independent security review
+- [x] Fable/Claude Max review
+- [x] Independent security review
 
 ## Verification evidence
 
@@ -32,5 +32,8 @@ Status: implementation active
   the legacy Claude route rejects Codex before any tmux operation.
 - Route tests cover local Codex dispatch and offline federated restart behavior.
 - Browser tests cover Claude/Codex capability gating and confirmation. New clients send only the
-  confirmed pane process identity to `/restart-instance`; the owner rechecks it under the mutation
-  gate and again immediately before respawn. Older owner versions fail closed on the new route.
+  confirmed `instance_id` and `restart_token` to `/restart-instance`. The token includes pane/native
+  PIDs and a stable OS process creation stamp. The owner rechecks both under the mutation gate and
+  again immediately before respawn. Older owner versions fail closed on the new route.
+- Opening Actions refreshes capabilities; a rejected restart clears its stale confirmation so a new
+  attempt requires a fresh user confirmation. Independent security and Fable reviews approved.

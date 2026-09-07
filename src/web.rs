@@ -135,6 +135,7 @@ struct RestartCurrentAgentRequest {}
 #[serde(deny_unknown_fields)]
 struct RestartAgentInstanceRequest {
     instance_id: String,
+    restart_token: String,
 }
 
 /// Deliberately empty: callers choose only the owning machine. The owner runs
@@ -1190,7 +1191,7 @@ async fn restart_agent_instance(
     ensure_origin(&headers, &state.allowed_origins)?;
     state
         .control
-        .restart_agent_instance(&id, &request.instance_id)
+        .restart_agent_instance(&id, &request.instance_id, &request.restart_token)
         .await
         .map_err(|error| ApiError::from_control(&error))?;
     Ok(Json(OkResponse { ok: true }))
@@ -3530,17 +3531,29 @@ mod tests {
             status_of(&app, "POST", path, Some("{}")).await,
             StatusCode::UNPROCESSABLE_ENTITY
         );
+        let missing_token =
+            serde_json::json!({"instance_id": format!("pane-v1-{}", "a".repeat(64))}).to_string();
         assert_eq!(
-            status_of(&app, "POST", path, Some(r#"{"instance_id":"invalid"}"#)).await,
+            status_of(&app, "POST", path, Some(&missing_token)).await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                path,
+                Some(r#"{"instance_id":"invalid","restart_token":"invalid"}"#)
+            )
+            .await,
             StatusCode::BAD_REQUEST
         );
         let stale =
-            serde_json::json!({"instance_id": format!("pane-v1-{}", "a".repeat(64))}).to_string();
+            serde_json::json!({"instance_id": format!("pane-v1-{}", "a".repeat(64)), "restart_token": format!("restart-v1-{}", "a".repeat(64))}).to_string();
         assert_eq!(
             status_of(&app, "POST", path, Some(&stale)).await,
             StatusCode::CONFLICT
         );
-        let unknown = serde_json::json!({"instance_id": format!("pane-v1-{}", "a".repeat(64)), "command":"touch unwanted"}).to_string();
+        let unknown = serde_json::json!({"instance_id": format!("pane-v1-{}", "a".repeat(64)), "restart_token": format!("restart-v1-{}", "a".repeat(64)), "command":"touch unwanted"}).to_string();
         assert_eq!(
             status_of(&app, "POST", path, Some(&unknown)).await,
             StatusCode::UNPROCESSABLE_ENTITY

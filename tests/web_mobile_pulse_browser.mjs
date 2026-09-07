@@ -20,6 +20,9 @@ const launchSessionRequests = [];
 const launchDirectoryMutationRequests = [];
 const launchBrowserChildren = new Set();
 let failLiveModels = false;
+let restartCapabilityReady = false;
+let restartCapabilityToken = "restart-v1-" + "a".repeat(64);
+const restartRequests = [];
 let launchOptionsDelayMs = 0;
 let launchResponseDelayMs = 0;
 let launchDirectoryMutationDelayMs = 0;
@@ -433,7 +436,19 @@ function mockApi(url, response, request) {
         { id: "terra-high", label: "Terra · high", switchable: true },
         { id: "sol-fast", label: "Sol · xhigh · fast", switchable: true },
       ],
-      note: null, resume_available: false, resume_note: null,
+      note: null, resume_available: restartCapabilityReady, resume_note: null,
+      restart_token: restartCapabilityReady ? restartCapabilityToken : null,
+    });
+    return true;
+  }
+  if (/^\/api\/v1\/panes\/[^/]+\/restart-instance$/.test(pathname) && request.method === "POST") {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      restartRequests.push({ pathname, body: JSON.parse(body) });
+      restartCapabilityToken = "restart-v1-" + "b".repeat(64);
+      errorJson(response, 409, "agent process changed after restart confirmation");
     });
     return true;
   }
@@ -3147,6 +3162,9 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     })()`);
     emitOverviewPatch([mockSession("tron", "%100", "codex-main", "working", {
       agent: "codex", profile: "codex-max", path: "/workspace", command: "codex",
+      // The preceding Files fixture uses a legacy summary without an
+      // instance ID; this status-only change must keep that same identity.
+      instance_id: null,
     })]);
     transcriptFixture = transcript(20, 80, "third-transcript");
     await waitFor(
@@ -4208,6 +4226,158 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     transcriptFixture = null;
     paneSnapshotContent = "";
     launchMachinesUnavailable = false;
+    paneStreams.clear();
+    overviewStreams.clear();
+  }
+});
+
+test("Actions refreshes restart readiness and a failed confirmation cannot reuse its binding", { timeout: 60_000 }, async () => {
+  const profileDirectory = await mkdtemp(join(tmpdir(), "atmux-restart-browser-"));
+  let server;
+  let chrome;
+  let cdp;
+  let testError = null;
+  restartCapabilityReady = false;
+  restartCapabilityToken = "restart-v1-" + "a".repeat(64);
+  restartRequests.length = 0;
+  try {
+    const started = await startServer();
+    server = started.server;
+    const browser = await launchChrome(profileDirectory);
+    chrome = browser.chrome;
+    cdp = await openCdp(browser.browserSocket, "about:blank");
+    await cdp.send("Page.enable");
+    await cdp.send("Page.navigate", { url: `http://127.0.0.1:${started.port}/?session=tron~%25100` });
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('agent-name')?.textContent === 'codex-main' && document.getElementById('quick-resume-note').textContent === 'Session restart is unavailable'"),
+      "initial unavailable restart capability did not load",
+    );
+    restartCapabilityReady = true;
+    await cdp.evaluate("document.getElementById('quick-actions-open').click(); true");
+    await waitFor(
+      () => cdp.evaluate("!document.getElementById('quick-resume').disabled"),
+      "Actions did not refresh a now-ready agent",
+    );
+    await cdp.evaluate("document.getElementById('quick-resume').click(); document.getElementById('resume-confirm').click(); true");
+    await waitFor(
+      () => cdp.evaluate("!document.getElementById('resume-dialog').open && document.getElementById('toast').textContent.includes('process changed') && !document.getElementById('resume-confirm').disabled"),
+      "failed restart confirmation did not close with feedback",
+    );
+    assert.equal(restartRequests.length, 1);
+    assert.equal(restartRequests[0].body.restart_token, "restart-v1-" + "a".repeat(64));
+    await cdp.evaluate("document.getElementById('resume-confirm').click(); true");
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+    assert.equal(restartRequests.length, 1, "the failed confirmation retained a reusable binding");
+    await cdp.evaluate("document.getElementById('quick-actions-open').click(); true");
+    await waitFor(() => cdp.evaluate("!document.getElementById('quick-resume').disabled"), "fresh confirmation capability did not load");
+    await cdp.evaluate("document.getElementById('quick-resume').click(); document.getElementById('resume-confirm').click(); true");
+    await waitFor(() => restartRequests.length === 2, "freshly confirmed restart request did not arrive");
+    assert.equal(restartRequests[1].body.restart_token, "restart-v1-" + "b".repeat(64));
+  } catch (error) {
+    testError = error;
+    throw error;
+  } finally {
+    try { await cleanupBrowserHarness({ cdp, chrome, server, profileDirectory }); }
+    catch (cleanupError) {
+      if (!testError) throw cleanupError;
+      console.error(cleanupError);
+    }
+    restartCapabilityReady = false;
+    paneStreams.clear();
+    overviewStreams.clear();
+  }
+});
+
+test("raw downloads reject replaced pane output and retired callbacks while retaining known offline output", { timeout: 60_000 }, async () => {
+  const profileDirectory = await mkdtemp(join(tmpdir(), "atmux-output-browser-"));
+  let server;
+  let chrome;
+  let cdp;
+  let testError = null;
+  try {
+    const started = await startServer();
+    server = started.server;
+    const browser = await launchChrome(profileDirectory);
+    chrome = browser.chrome;
+    cdp = await openCdp(browser.browserSocket, "about:blank");
+    await cdp.send("Page.enable");
+    await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: `
+      window.__reviewPaneStreams = [];
+      window.__heldSnapshots = [];
+      const NativeEventSource = EventSource;
+      window.EventSource = class extends NativeEventSource {
+        constructor(url) {
+          super(url);
+          this.paneStream = url.includes('/panes/');
+          this.callbacks = new Map();
+          if (this.paneStream) window.__reviewPaneStreams.push(this);
+        }
+        addEventListener(type, callback, options) {
+          this.callbacks.set(type, callback);
+          super.addEventListener(type, (event) => {
+            if (this.paneStream && type === 'pane.snapshot' && window.__holdPaneSnapshots) {
+              window.__heldSnapshots.push(() => callback(event));
+            } else callback(event);
+          }, options);
+        }
+      };
+      const create = URL.createObjectURL.bind(URL);
+      URL.createObjectURL = (blob) => { window.__exportBlob = blob; return create(blob); };
+      HTMLAnchorElement.prototype.click = function() { window.__exportFilename = this.download; };
+    ` });
+    paneSnapshotContent = "OLD PROCESS OUTPUT";
+    await cdp.send("Page.navigate", { url: `http://127.0.0.1:${started.port}/?session=tron~%25100` });
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('pane')?.textContent === 'OLD PROCESS OUTPUT'"),
+      "original pane output missing",
+    );
+    await cdp.evaluate("window.__holdPaneSnapshots = true; true");
+    paneSnapshotContent = "NEW PROCESS OUTPUT";
+    emitOverviewPatch([mockSession("tron", "%100", "replacement-agent", "waiting", {
+      instance_id: "pane-v1-" + "f".repeat(64), agent: "codex",
+    })]);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('agent-name').textContent === 'replacement-agent' && window.__heldSnapshots.length > 0"),
+      "replacement instance did not request a fresh output snapshot",
+    );
+    const replaced = await cdp.evaluate(`(() => {
+      const retired = window.__reviewPaneStreams[0];
+      retired.callbacks.get('pane.snapshot')({ data: JSON.stringify({ revision: 77, content: 'LATE OLD OUTPUT' }) });
+      retired.callbacks.get('pane.removed')({ data: '{}' });
+      document.getElementById('quick-actions-open').click();
+      document.getElementById('quick-download-output').click();
+      return {
+        pane: document.getElementById('pane').textContent,
+        selected: new URL(location.href).searchParams.get('session'),
+        exported: Boolean(window.__exportBlob),
+        feedback: document.getElementById('toast').textContent,
+      };
+    })()`);
+    assert.deepEqual(replaced, {
+      pane: "", selected: "tron~%100", exported: false, feedback: "No raw output is available yet",
+    });
+    await cdp.evaluate("window.__holdPaneSnapshots = false; window.__heldSnapshots.splice(0).forEach((release) => release()); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('pane').textContent === 'NEW PROCESS OUTPUT'"),
+      "replacement snapshot did not render",
+    );
+    const downloaded = await cdp.evaluate(`(async () => {
+      const current = window.__reviewPaneStreams.at(-1);
+      current.callbacks.get('pane.error')({ data: JSON.stringify({ error: 'Owner offline', kind: 'offline' }) });
+      document.getElementById('quick-download-output').click();
+      return { filename: window.__exportFilename, output: await window.__exportBlob.text() };
+    })()`);
+    assert.deepEqual(downloaded, { filename: "atmux-replacement-agent-output.txt", output: "NEW PROCESS OUTPUT\n" });
+  } catch (error) {
+    testError = error;
+    throw error;
+  } finally {
+    try { await cleanupBrowserHarness({ cdp, chrome, server, profileDirectory }); }
+    catch (cleanupError) {
+      if (!testError) throw cleanupError;
+      console.error(cleanupError);
+    }
+    paneSnapshotContent = "";
     paneStreams.clear();
     overviewStreams.clear();
   }

@@ -2565,6 +2565,7 @@ test("agent restart action is capability-gated for Claude and Codex", () => {
   const ready = {
     pane_id: claude.id,
     resume_available: true,
+    restart_token: "restart-v1-" + "a".repeat(64),
     resume_note: null,
   };
   assert.deepEqual(agentRestartState(claude, ready, true, null), {
@@ -2621,7 +2622,7 @@ test("agent restart uses a confirmation and never sends browser-supplied session
   assert.match(markup, /Any in-flight work is terminated/);
   assert.match(markup, /Custom launch flags that are not configured in atmux are not preserved/);
   assert.match(handler, /encodeURIComponent\(target\)\}\/restart-instance/);
-  assert.match(handler, /body: JSON\.stringify\(\{ instance_id: confirmed\.instance_id \}\)/);
+  assert.match(handler, /body: JSON\.stringify\(\{ instance_id: confirmed\.instance_id, restart_token: confirmed\.restart_token \}\)/);
   assert.doesNotMatch(handler, /session_id:\s*[^,}]+/);
   assert.doesNotMatch(handler, /dangerously-skip-permissions/);
   assert.doesNotMatch(source, /CLAUDE_CONFIG_DIR/);

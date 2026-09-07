@@ -2310,7 +2310,8 @@ function pickerOptions(choices, current) {
 function agentRestartState(session, capabilities, online, resumingPaneId, composerSending = false) {
   const isRestartableAgent = session?.agent === "claude" || session?.agent === "codex";
   const matches = capabilities?.pane_id === session?.id;
-  const available = matches && capabilities?.resume_available === true;
+  const available = matches && capabilities?.resume_available === true
+    && /^restart-v1-[a-f0-9]{64}$/.test(capabilities?.restart_token || "");
   const note = matches && typeof capabilities?.resume_note === "string" ? capabilities.resume_note : "";
   const restarting = Boolean(resumingPaneId);
   return {
@@ -2329,15 +2330,26 @@ function followsLiveTail(element, tolerance = 16) {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= tolerance;
 }
 
-function agentRestartRequest(session) {
+function agentRestartRequest(session, capabilities) {
   if (!session?.id || !/^pane-v1-[a-f0-9]{64}$/.test(session.instance_id || "")) return null;
-  return { id: session.id, instance_id: session.instance_id };
+  if (capabilities?.pane_id !== session.id
+      || !/^restart-v1-[a-f0-9]{64}$/.test(capabilities?.restart_token || "")) return null;
+  return { id: session.id, instance_id: session.instance_id, restart_token: capabilities.restart_token };
 }
 
 function paneOutputDownload(session, lines) {
   if (!session?.id || !Array.isArray(lines) || !lines.length) return null;
   const name = String(session.name || "agent").replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 100);
   return { filename: `atmux-${name}-output.txt`, content: lines.join("\n") + "\n" };
+}
+
+function paneOutputBinding(session) {
+  return session?.id ? { id: session.id, instance_id: session.instance_id || null } : null;
+}
+
+function paneOutputMatchesSession(binding, session) {
+  return Boolean(binding && session?.id && binding.id === session.id
+    && binding.instance_id === (session.instance_id || null));
 }
 
 /// Decides how a transcript redraw treats the reader. A pane with no laid-out
@@ -2693,6 +2705,8 @@ if (typeof module !== "undefined" && module.exports) {
     attachmentSelectionMatches,
     agentMenuUrl,
     appRoute,
+    paneOutputBinding,
+    paneOutputMatchesSession,
     overviewConnectionPresentation,
     createOverviewStream,
     selectedAgentUrl,
@@ -2986,6 +3000,7 @@ function initialize() {
     selected: initialRoute.view === "session" ? initialRoute.id : null,
     selectedMachine: initialRoute.view === "machine" ? initialRoute.id : null,
     paneLines: [],
+    paneOutputBinding: null,
     paneRevision: 0,
     overviewSource: null,
     paneSource: null,
@@ -3253,6 +3268,12 @@ function initialize() {
     state.revision = result.revision;
     if (Array.isArray(data.machines) && data.machines.length) state.machines = data.machines;
     bindComposerDraftToSelection();
+    const selected = state.sessions.get(state.selected);
+    if (selected && !paneOutputMatchesSession(paneOutputBinding(previousSessions.get(state.selected)), selected)) {
+      // A reused pane ID is a new output owner. Retire the old stream before
+      // any of its queued callbacks can populate or export the replacement.
+      connectPane(false);
+    }
     setHealth(data.health);
     reconcileSelection();
     render();
@@ -3310,6 +3331,7 @@ function initialize() {
     if (resetProject) resetProjectView();
     state.paneSource = null;
     state.paneLines = [];
+    state.paneOutputBinding = null;
     state.paneRevision = 0;
     state.paneError = null;
     state.panePointerDown = false;
@@ -3338,7 +3360,9 @@ function initialize() {
     state.transcriptPoll = null;
     pane.textContent = "";
     conversation.replaceChildren();
-    if (!state.selected || document.hidden) return;
+    const selected = state.sessions.get(state.selected);
+    if (!selected || document.hidden) return;
+    const binding = paneOutputBinding(selected);
     void refreshModels(state.selected);
     // The branch belongs in the agent header, so discover it in the
     // background without making the reader open the Git tab first.
@@ -3348,9 +3372,13 @@ function initialize() {
     state.transcriptPoll = setInterval(() => scheduleTranscript(0), 2500);
     const source = new EventSource(`/api/v1/panes/${encodeURIComponent(state.selected)}/events`);
     state.paneSource = source;
+    const current = () => state.paneSource === source
+      && paneOutputMatchesSession(binding, state.sessions.get(state.selected));
     source.addEventListener("pane.snapshot", (event) => {
+      if (!current()) return;
       const data = parseEvent(event); if (!data) return;
       state.paneLines = contentToLines(data.content);
+      state.paneOutputBinding = binding;
       state.paneRevision = data.revision;
       state.paneError = null;
       drawPane(true);
@@ -3359,7 +3387,12 @@ function initialize() {
       render();
     });
     source.addEventListener("pane.patch", (event) => {
+      if (!current()) return;
       const data = parseEvent(event); if (!data) return;
+      if (!paneOutputMatchesSession(state.paneOutputBinding, selected)) {
+        connectPane(false);
+        return;
+      }
       const result = applyPanePatch(state.paneLines, state.paneRevision, data);
       if (!result.applied) {
         $("stream-state").textContent = "Resyncing…";
@@ -3374,23 +3407,26 @@ function initialize() {
       $("stream-state").textContent = "Live";
     });
     source.addEventListener("pane.removed", () => {
+      if (!current()) return;
       forgetComposerDraft(selectedComposerDraftIdentity(), true);
       selectSession(null, "replace");
     });
     // A failure on the owning machine belongs to this pane, not to the local
     // tmux monitor, so it never touches the global health alert.
     source.addEventListener("pane.error", (event) => {
+      if (!current()) return;
       const data = parseEvent(event); if (!data) return;
       state.paneError = data;
       $("stream-state").textContent = paneErrorLabel(data.kind);
       render();
     });
     source.addEventListener("protocol.error", (event) => {
+      if (!current()) return;
       state.paneError = { error: event.data || "stream protocol error", kind: "protocol" };
       $("stream-state").textContent = paneErrorLabel("protocol");
       render();
     });
-    source.onerror = () => { $("stream-state").textContent = "Reconnecting…"; };
+    source.onerror = () => { if (current()) $("stream-state").textContent = "Reconnecting…"; };
   }
 
   async function refreshModels(paneId) {
@@ -7237,6 +7273,12 @@ function initialize() {
   $("quick-actions-open").addEventListener("click", () => {
     const dialog = $("quick-actions-dialog");
     if (!dialog.open) {
+      const paneId = state.selected;
+      // Readiness and the native process token may have changed since the
+      // pane opened. Keep restart unavailable until this fresh read settles.
+      state.paneModels = null;
+      render();
+      if (paneId) void refreshModels(paneId);
       $("quick-copy-link-status").hidden = true;
       dialog.showModal();
       $("quick-actions-open").setAttribute("aria-expanded", "true");
@@ -7284,7 +7326,9 @@ function initialize() {
     void compactSelectedAgent();
   });
   $("quick-download-output").addEventListener("click", () => {
-    const snapshot = paneOutputDownload(state.sessions.get(state.selected), state.paneLines);
+    const selected = state.sessions.get(state.selected);
+    const snapshot = paneOutputMatchesSession(state.paneOutputBinding, selected)
+      ? paneOutputDownload(selected, state.paneLines) : null;
     if (!snapshot) { toast("No raw output is available yet"); return; }
     const url = URL.createObjectURL(new Blob([snapshot.content], { type: "text/plain;charset=utf-8" }));
     const link = document.createElement("a");
@@ -7310,7 +7354,7 @@ function initialize() {
       toast(view.status || "Session restart is unavailable");
       return;
     }
-    state.pendingResumeId = agentRestartRequest(session);
+    state.pendingResumeId = agentRestartRequest(session, state.paneModels);
     if (!state.pendingResumeId) {
       toast("Refresh this agent before restarting; its process identity is unavailable");
       return;
@@ -7812,11 +7856,13 @@ function initialize() {
     try {
       await request(`/api/v1/panes/${encodeURIComponent(target)}/restart-instance`, {
         method: "POST",
-        body: JSON.stringify({ instance_id: confirmed.instance_id }),
+        body: JSON.stringify({ instance_id: confirmed.instance_id, restart_token: confirmed.restart_token }),
       });
       $("resume-dialog").close();
       toast("Agent session restarted");
     } catch (error) {
+      state.pendingResumeId = null;
+      $("resume-dialog").close();
       toast(error.message);
     } finally {
       state.resumingPaneId = null;
@@ -8760,6 +8806,7 @@ function initialize() {
       persistBoundComposerDraft(true);
       state.overviewSource?.close();
       state.paneSource?.close();
+      state.paneSource = null;
       state.overviewConnection = "paused";
       stopPulseRefresh();
       stopPulseEvents();

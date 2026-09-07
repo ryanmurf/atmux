@@ -66,6 +66,7 @@ test("mobile navigation persists preferences and session actions retain the sele
   const paneStreams = new Set();
   const mutations = [];
   const restartRequests = [];
+  const modelRequests = [];
   const paneContent = "first line\nsecond line ✓";
   const instance = (digit) => `pane-v1-${digit.repeat(64)}`;
   const machines = [
@@ -104,10 +105,11 @@ test("mobile navigation persists preferences and session actions retain the sele
     }
     if (/^\/api\/v1\/panes\/[^/]+\/models$/.test(path)) {
       const paneId = decodeURIComponent(path.split("/")[4]);
+      modelRequests.push(paneId);
       const session = sessions.find((session) => session.id === paneId);
       response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
         pane_id: paneId, harness: session.agent, models: [], model_options: [], effort_options: [],
-        resume_available: true, resume_note: null,
+        resume_available: true, resume_note: null, restart_token: "restart-v1-" + "c".repeat(64),
       }));
       return;
     }
@@ -246,7 +248,12 @@ test("mobile navigation persists preferences and session actions retain the sele
     assert.equal(downloaded.type, "text/plain;charset=utf-8");
     assert.equal(downloaded.filename, "atmux-zebra-output.txt");
 
-    await cdp.evaluate("document.getElementById('quick-actions-open').click(); document.getElementById('quick-resume').click()");
+    const modelsBeforeActions = modelRequests.length;
+    await cdp.evaluate("document.getElementById('quick-actions-open').click()");
+    await waitFor(() => cdp.evaluate("!document.getElementById('quick-resume').disabled"), "Actions refreshed restart capability");
+    assert.ok(modelRequests.length > modelsBeforeActions, "Actions issues a fresh capability read");
+    assert.equal(modelRequests.at(-1), "local~%2");
+    await cdp.evaluate("document.getElementById('quick-resume').click()");
     assert.equal(await cdp.evaluate("document.getElementById('resume-dialog').open"), true);
     sessions = sessions.map((session) => session.name === "zebra" ? { ...session, name: "replacement", instance_id: instance("e") } : session);
     revision += 1;
@@ -254,9 +261,17 @@ test("mobile navigation persists preferences and session actions retain the sele
     await waitFor(() => cdp.evaluate("document.getElementById('agent-name').textContent === 'replacement'"), "process replacement while confirmation open");
     await cdp.evaluate("document.getElementById('resume-confirm').click()");
     await waitFor(() => restartRequests.length === 1, "generation-bound restart request");
-    assert.deepEqual(restartRequests, [{ path: "/api/v1/panes/local~%252/restart-instance", instance_id: instance("d") }]);
+    assert.deepEqual(restartRequests, [{ path: "/api/v1/panes/local~%252/restart-instance", instance_id: instance("d"), restart_token: "restart-v1-" + "c".repeat(64) }]);
     await waitFor(() => cdp.evaluate("document.getElementById('toast').textContent.includes('process changed')"), "owner generation rejection");
-    assert.equal(await cdp.evaluate("document.getElementById('resume-dialog').open"), true, "owner rejection does not claim a successful restart");
+    assert.equal(await cdp.evaluate("document.getElementById('resume-dialog').open"), false, "owner rejection closes the stale confirmation");
+    await cdp.evaluate("document.getElementById('resume-confirm').click()");
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+    assert.equal(restartRequests.length, 1, "a rejected binding cannot be submitted again");
+    await cdp.evaluate("document.getElementById('quick-actions-open').click()");
+    await waitFor(() => cdp.evaluate("!document.getElementById('quick-resume').disabled"), "replacement capability can be fetched again");
+    await cdp.evaluate("document.getElementById('quick-resume').click()");
+    assert.equal(await cdp.evaluate("document.getElementById('resume-dialog').open"), true, "replacement requires a new confirmation");
+    await cdp.evaluate("document.getElementById('resume-dialog').close()");
   } finally {
     cdp?.socket.close();
     if (chrome?.pid && chrome.exitCode === null && chrome.signalCode === null) {

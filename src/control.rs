@@ -346,6 +346,15 @@ pub struct PaneModels {
     /// Human-safe explanation when an in-place agent restart is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_note: Option<String>,
+    /// Owner-issued binding for the exact process shown by this snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_token: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RestartBinding {
+    instance_id: String,
+    restart_token: String,
 }
 
 /// Data-only model switch request. Every id must match an owner-reported,
@@ -2451,6 +2460,7 @@ impl ControlPlane {
                     (
                         Tmux.model_observation(&observed_pane, agent, &content),
                         agent_restart_capability(&profiles, &status, &session),
+                        agent_restart_token(&session),
                     )
                 })
                 .await
@@ -2459,7 +2469,7 @@ impl ControlPlane {
                         &anyhow::Error::new(error).context("a model observation task panicked"),
                     )
                 })?;
-                let (observation, resume) = observed;
+                let (observation, resume, restart_token) = observed;
                 let mut models = model_capabilities(
                     self.local_identity(&pane_id),
                     agent,
@@ -2469,6 +2479,7 @@ impl ControlPlane {
                 );
                 models.resume_available = resume.available;
                 models.resume_note = resume.note;
+                models.restart_token = restart_token;
                 Ok(Some(models))
             }
             Target::Remote {
@@ -3200,14 +3211,26 @@ impl ControlPlane {
     ///
     /// Rejects malformed or stale identities before mutation and propagates
     /// the same provider readiness errors as `restart_current_agent`.
-    pub async fn restart_agent_instance(&self, id: &str, instance_id: &str) -> Result<()> {
-        if !valid_pane_identity(instance_id) {
-            return Err(bad_request("invalid pane instance id"));
+    pub async fn restart_agent_instance(
+        &self,
+        id: &str,
+        instance_id: &str,
+        restart_token: &str,
+    ) -> Result<()> {
+        if !valid_pane_identity(instance_id) || !valid_restart_token(restart_token) {
+            return Err(bad_request("invalid restart process binding"));
         }
-        self.restart_agent(id, Some(instance_id.to_owned())).await
+        self.restart_agent(
+            id,
+            Some(RestartBinding {
+                instance_id: instance_id.to_owned(),
+                restart_token: restart_token.to_owned(),
+            }),
+        )
+        .await
     }
 
-    async fn restart_agent(&self, id: &str, expected: Option<String>) -> Result<()> {
+    async fn restart_agent(&self, id: &str, expected: Option<RestartBinding>) -> Result<()> {
         match self.resolve(id)? {
             Target::Local {
                 pane_id,
@@ -3215,8 +3238,17 @@ impl ControlPlane {
                 agent: AgentKind::Claude,
                 ..
             } => {
-                validate_expected_pane_instance(expected.as_deref(), &instance_id)?;
-                return self.resume_claude_bound(&pane_id, expected).await;
+                validate_expected_pane_instance(
+                    expected
+                        .as_ref()
+                        .map(|binding| binding.instance_id.as_str()),
+                    &instance_id,
+                )?;
+                // Keep the second resolution owner-scoped even if the local
+                // pane disappears and a remote node has the same bare id.
+                return self
+                    .resume_claude_bound(&composite_id(&self.inner.local_id, &pane_id), expected)
+                    .await;
             }
             Target::Local {
                 pane_id,
@@ -3224,7 +3256,12 @@ impl ControlPlane {
                 agent: AgentKind::Codex,
                 ..
             } => {
-                validate_expected_pane_instance(expected.as_deref(), &instance_id)?;
+                validate_expected_pane_instance(
+                    expected
+                        .as_ref()
+                        .map(|binding| binding.instance_id.as_str()),
+                    &instance_id,
+                )?;
                 self.restart_local_codex(pane_id, expected).await?;
             }
             Target::Local { .. } => {
@@ -3239,13 +3276,18 @@ impl ControlPlane {
                 ..
             } => {
                 self.ensure_online(&machine.id)?;
-                validate_expected_pane_instance(expected.as_deref(), &instance_id)?;
+                validate_expected_pane_instance(
+                    expected
+                        .as_ref()
+                        .map(|binding| binding.instance_id.as_str()),
+                    &instance_id,
+                )?;
                 let (action, body) = expected.map_or_else(
                     || ("restart", serde_json::json!({})),
-                    |instance_id| {
+                    |binding| {
                         (
                             "restart-instance",
-                            serde_json::json!({ "instance_id": instance_id }),
+                            serde_json::json!({ "instance_id": binding.instance_id, "restart_token": binding.restart_token }),
                         )
                     },
                 );
@@ -3261,7 +3303,11 @@ impl ControlPlane {
         Ok(())
     }
 
-    async fn restart_local_codex(&self, pane_id: String, expected: Option<String>) -> Result<()> {
+    async fn restart_local_codex(
+        &self,
+        pane_id: String,
+        expected: Option<RestartBinding>,
+    ) -> Result<()> {
         #[cfg(test)]
         if self.inner.deny_local_agent_restart {
             self.inner
@@ -3283,7 +3329,7 @@ impl ControlPlane {
                     &prompt_lock,
                     expected_generation,
                     &resources,
-                    expected.as_deref(),
+                    expected.as_ref(),
                 )
             })
             .await,
@@ -3308,7 +3354,7 @@ impl ControlPlane {
         self.resume_claude_bound(id, None).await
     }
 
-    async fn resume_claude_bound(&self, id: &str, expected: Option<String>) -> Result<()> {
+    async fn resume_claude_bound(&self, id: &str, expected: Option<RestartBinding>) -> Result<()> {
         match self.resolve(id)? {
             Target::Local { pane_id, agent, .. } => {
                 // Reject from the already-resolved control-plane snapshot
@@ -3348,7 +3394,7 @@ impl ControlPlane {
                             .state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        validate_live_pane_instance(&pane_id, expected.as_deref())?;
+                        validate_live_pane_instance(&pane_id, expected.as_ref().map(|binding| binding.instance_id.as_str()))?;
                         if !resume_request_is_current(&guard, expected_generation) {
                             return Err(ResumeRejected(
                                 "this pane changed after the relaunch was requested; review it and try again"
@@ -3358,12 +3404,17 @@ impl ControlPlane {
                         }
                         let (session, resume, claude_program) =
                             fresh_claude_resume_target(&pane_id, &status, capture_lines)?;
+                        validate_restart_binding(expected.as_ref(), &session)?;
                         let scope = systemd_scope::prepare_override(
                             &resources,
                             session.memory_max_bytes,
                             &pane_id,
                         )?;
-                        validate_live_pane_instance(&pane_id, expected.as_deref())?;
+                        if expected.is_some() {
+                            let (latest, _, _) = fresh_claude_resume_target(&pane_id, &status, capture_lines)?;
+                            validate_restart_binding(expected.as_ref(), &latest)?;
+                        }
+                        validate_live_pane_instance(&pane_id, expected.as_ref().map(|binding| binding.instance_id.as_str()))?;
                         begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
                         Tmux::resume_claude(
                             &pane_id,
@@ -3382,6 +3433,11 @@ impl ControlPlane {
             Target::Remote {
                 machine, pane_id, ..
             } => {
+                if expected.is_some() {
+                    return Err(conflict(
+                        "the confirmed local Claude pane is no longer available",
+                    ));
+                }
                 self.ensure_online(&machine.id)?;
                 machine
                     .post_json(
@@ -4387,6 +4443,7 @@ fn model_capabilities(
         note,
         resume_available: false,
         resume_note: None,
+        restart_token: None,
     }
 }
 
@@ -4424,6 +4481,7 @@ fn settled_model_capabilities(
     );
     settled.resume_available = resume.available;
     settled.resume_note = resume.note;
+    settled.restart_token = agent_restart_token(&restarted_session);
     settled
 }
 
@@ -4585,14 +4643,17 @@ fn restart_local_codex_blocking(
     prompt_lock: &PaneMutationGate,
     expected_generation: u64,
     resources: &crate::config::AgentResourcesConfig,
-    expected: Option<&str>,
+    expected: Option<&RestartBinding>,
 ) -> Result<()> {
     let _process_lock = auto_update::PaneProcessLock::acquire(pane_id)?;
     let mut guard = prompt_lock
         .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    validate_live_pane_instance(pane_id, expected)?;
+    validate_live_pane_instance(
+        pane_id,
+        expected.map(|binding| binding.instance_id.as_str()),
+    )?;
     if !resume_request_is_current(&guard, expected_generation) {
         return Err(ResumeRejected(
             "this pane changed after the restart was requested; review it and try again".to_owned(),
@@ -4602,6 +4663,7 @@ fn restart_local_codex_blocking(
     let session = control
         .fresh_cli_update_session(pane_id)
         .ok_or_else(|| ResumeRejected("this pane no longer exists".to_owned()))?;
+    validate_restart_binding(expected, &session)?;
     if session.agent != AgentKind::Codex {
         return Err(ResumeRejected("this pane is no longer running Codex".to_owned()).into());
     }
@@ -4638,7 +4700,30 @@ fn restart_local_codex_blocking(
         .into());
     }
     let scope = systemd_scope::prepare_override(resources, session.memory_max_bytes, pane_id)?;
-    validate_live_pane_instance(pane_id, expected)?;
+    if expected.is_some() {
+        let latest = control
+            .fresh_cli_update_session(pane_id)
+            .ok_or_else(|| ResumeRejected("this pane no longer exists".to_owned()))?;
+        validate_restart_binding(expected, &latest)?;
+        if latest.agent != AgentKind::Codex
+            || latest.status != AgentStatus::Waiting
+            || !crate::status::automation_idle(
+                latest.agent,
+                &latest.content,
+                &latest.title,
+                &control.inner.config.status,
+            )
+        {
+            return Err(ResumeRejected(
+                "Codex is no longer at an empty top-level prompt".to_owned(),
+            )
+            .into());
+        }
+    }
+    validate_live_pane_instance(
+        pane_id,
+        expected.map(|binding| binding.instance_id.as_str()),
+    )?;
     begin_pane_mutation(pane_id, prompt_lock, &mut guard)?;
     Tmux::resume_after_cli_update(
         pane_id,
@@ -4704,6 +4789,101 @@ fn begin_pane_mutation(
 ) -> Result<()> {
     Tmux::advance_pane_mutation_sequence(pane_id)?;
     mark_gate_mutated(gate, state);
+    Ok(())
+}
+
+/// `agent_started_ms` is an approximate `now - ps etime` and drifts on every
+/// scan. Bind destructive restart confirmation to the OS creation stamp instead.
+fn agent_restart_token(session: &Session) -> Option<String> {
+    let stamp = native_process_start_stamp(session.agent_pid?)?;
+    restart_token_from_stamp(session, &stamp)
+}
+
+fn restart_token_from_stamp(session: &Session, stamp: &str) -> Option<String> {
+    let agent_pid = session.agent_pid.filter(|pid| *pid > 0)?;
+    if !valid_pane_identity(&session.pane_identity) || session.pane_pid == 0 || stamp.is_empty() {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    hash.update(session.pane_identity.as_bytes());
+    hash.update(session.pane_pid.to_be_bytes());
+    hash.update(agent_pid.to_be_bytes());
+    hash.update(stamp.as_bytes());
+    Some(format!("restart-v1-{:x}", hash.finalize()))
+}
+
+#[cfg(target_os = "linux")]
+fn native_process_start_stamp(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    linux_process_start_ticks(&stat).map(|ticks| format!("linux:{ticks}"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_start_ticks(stat: &str) -> Option<u64> {
+    // comm (field 2) may contain spaces and parentheses; everything after its
+    // final ')' starts at field 3, putting starttime (field 22) at index 19.
+    let (_, fields) = stat.rsplit_once(')')?;
+    fields
+        .split_whitespace()
+        .nth(19)?
+        .parse::<u64>()
+        .ok()
+        .filter(|ticks| *ticks > 0)
+}
+
+#[cfg(target_os = "macos")]
+fn native_process_start_stamp(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let output = std::process::Command::new("ps")
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = std::str::from_utf8(&output.stdout).ok()?.trim();
+    if text.is_empty()
+        || text.len() > 64
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b' ' || byte == b':')
+    {
+        return None;
+    }
+    Some(format!("macos:{text}"))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn native_process_start_stamp(_pid: u32) -> Option<String> {
+    None
+}
+
+fn valid_restart_token(token: &str) -> bool {
+    token.strip_prefix("restart-v1-").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
+}
+
+fn validate_restart_binding(expected: Option<&RestartBinding>, session: &Session) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    validate_expected_pane_instance(Some(&expected.instance_id), &session.pane_identity)?;
+    if agent_restart_token(session).as_deref() != Some(expected.restart_token.as_str()) {
+        return Err(conflict(
+            "agent process changed after restart confirmation; refresh and try again",
+        ));
+    }
     Ok(())
 }
 
@@ -6887,7 +7067,7 @@ mod tests {
             control.apply_refresh(vec![test_session("synthetic", "%1", content)]);
             let stale = format!("pane-v1-{}", "a".repeat(64));
             let error = control
-                .restart_agent_instance("%1", &stale)
+                .restart_agent_instance("%1", &stale, &format!("restart-v1-{}", "a".repeat(64)))
                 .await
                 .unwrap_err();
             assert_eq!(error_kind(&error), ErrorKind::Conflict);
@@ -6899,7 +7079,11 @@ mod tests {
                 0
             );
             let invalid = control
-                .restart_agent_instance("%1", "untrusted")
+                .restart_agent_instance(
+                    "%1",
+                    "untrusted",
+                    &format!("restart-v1-{}", "a".repeat(64)),
+                )
                 .await
                 .unwrap_err();
             assert_eq!(error_kind(&invalid), ErrorKind::BadRequest);
@@ -6910,6 +7094,194 @@ mod tests {
     fn restart_preserves_conflicts_from_live_identity_check() {
         let error = local_agent_restart(Ok(Err(conflict("pane was replaced")))).unwrap_err();
         assert_eq!(error_kind(&error), ErrorKind::Conflict);
+    }
+
+    #[test]
+    fn restart_tokens_bind_pane_and_native_process_creation_without_elapsed_time_drift() {
+        let mut pane = test_session("agent", "%1", "Claude Code v2.1.227");
+        pane.pane_identity = format!("pane-v1-{}", "a".repeat(64));
+        pane.pane_pid = 10;
+        pane.agent_pid = Some(11);
+        pane.agent_started_ms = Some(1_000);
+        let token = restart_token_from_stamp(&pane, "linux:9000").unwrap();
+        assert!(valid_restart_token(&token));
+        pane.agent_started_ms = Some(1_900);
+        assert_eq!(
+            restart_token_from_stamp(&pane, "linux:9000").unwrap(),
+            token
+        );
+        for changed in [
+            {
+                let mut changed = pane.clone();
+                changed.pane_identity = format!("pane-v1-{}", "b".repeat(64));
+                changed
+            },
+            {
+                let mut changed = pane.clone();
+                changed.pane_pid += 1;
+                changed
+            },
+            {
+                let mut changed = pane.clone();
+                changed.agent_pid = Some(12);
+                changed
+            },
+        ] {
+            assert_ne!(
+                restart_token_from_stamp(&changed, "linux:9000").unwrap(),
+                token
+            );
+        }
+        assert_ne!(
+            restart_token_from_stamp(&pane, "linux:9001").unwrap(),
+            token,
+            "PID reuse changes its OS creation stamp"
+        );
+        assert!(restart_token_from_stamp(&pane, "").is_none());
+        pane.pane_pid = 0;
+        assert!(restart_token_from_stamp(&pane, "linux:9000").is_none());
+        pane.pane_pid = 10;
+        pane.agent_pid = None;
+        assert!(restart_token_from_stamp(&pane, "linux:9000").is_none());
+        pane.agent_pid = Some(0);
+        assert!(restart_token_from_stamp(&pane, "linux:9000").is_none());
+        pane.agent_pid = Some(11);
+        pane.pane_identity.clear();
+        assert!(restart_token_from_stamp(&pane, "linux:9000").is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn native_restart_creation_stamp_is_stable_and_binding_rejects_replacements() {
+        let pid = std::process::id();
+        let stamp = native_process_start_stamp(pid)
+            .expect("the test process must have an OS creation stamp");
+        assert_eq!(
+            native_process_start_stamp(pid).as_deref(),
+            Some(stamp.as_str())
+        );
+        assert!(native_process_start_stamp(0).is_none());
+        assert!(native_process_start_stamp(u32::MAX).is_none());
+        let mut pane = test_session("agent", "%1", "OpenAI Codex (v0.153.4)");
+        pane.pane_identity = format!("pane-v1-{}", "a".repeat(64));
+        pane.pane_pid = 10;
+        pane.agent_pid = Some(pid);
+        let expected = RestartBinding {
+            instance_id: pane.pane_identity.clone(),
+            restart_token: agent_restart_token(&pane).unwrap(),
+        };
+        assert!(validate_restart_binding(Some(&expected), &pane).is_ok());
+        pane.pane_pid = 11;
+        assert_eq!(
+            error_kind(&validate_restart_binding(Some(&expected), &pane).unwrap_err()),
+            ErrorKind::Conflict
+        );
+        pane.agent_pid = None;
+        assert_eq!(
+            error_kind(&validate_restart_binding(Some(&expected), &pane).unwrap_err()),
+            ErrorKind::Conflict
+        );
+        assert!(
+            validate_restart_binding(None, &pane).is_ok(),
+            "legacy unbound routes remain compatible"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_restart_start_stamp_handles_spaces_and_parentheses_in_process_names() {
+        let mut fields = vec!["S"; 20];
+        fields[19] = "123456";
+        assert_eq!(
+            linux_process_start_ticks(&format!("99 (native (agent) runner) {}", fields.join(" "))),
+            Some(123_456)
+        );
+        assert!(linux_process_start_ticks("99 (native) S 1 2").is_none());
+        fields[19] = "0";
+        assert!(linux_process_start_ticks(&format!("99 (native) {}", fields.join(" "))).is_none());
+    }
+
+    #[tokio::test]
+    async fn bound_local_claude_restart_cannot_fall_through_to_a_remote_pane() {
+        let control = test_control(&["gpu-box"]);
+        control.apply_machine_sessions(
+            "gpu-box",
+            vec![remote_summary("gpu-box", "%1", "remote", "aaaa")],
+            None,
+        );
+        let binding = RestartBinding {
+            instance_id: format!("pane-v1-{}", "a".repeat(64)),
+            restart_token: format!("restart-v1-{}", "b".repeat(64)),
+        };
+        let local = composite_id(&control.inner.local_id, "%1");
+        let error = control
+            .resume_claude_bound(&local, Some(binding.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error_kind(&error), ErrorKind::NotFound);
+        let error = control
+            .resume_claude_bound("%1", Some(binding))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error_kind(&error),
+            ErrorKind::Conflict,
+            "even an accidentally bare bound delegation must never forward legacy resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_binding_is_forwarded_exactly_and_old_owners_never_get_a_legacy_fallback() {
+        use axum::{Json, Router, extract::OriginalUri, http::StatusCode};
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let router = Router::new().fallback(
+            move |OriginalUri(uri): OriginalUri, Json(body): Json<serde_json::Value>| {
+                let recorded = recorded.clone();
+                async move {
+                    recorded.lock().unwrap().push((uri.path().to_owned(), body));
+                    StatusCode::NOT_FOUND
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let control = test_control(&["gpu-box"]);
+        control.inner.machines.write().unwrap().insert(
+            "gpu-box".to_owned(),
+            Arc::new(
+                RemoteMachine::from_config(&crate::config::MachineConfig {
+                    id: "gpu-box".to_owned(),
+                    label: None,
+                    url: format!("http://{address}"),
+                    token_env: None,
+                    token_file: None,
+                })
+                .unwrap(),
+            ),
+        );
+        control.apply_machine_sessions(
+            "gpu-box",
+            vec![remote_summary("gpu-box", "%1", "remote", "aaaa")],
+            None,
+        );
+        let instance = format!("pane-v1-{}", "a".repeat(64));
+        let token = format!("restart-v1-{}", "b".repeat(64));
+        let result = control
+            .restart_agent_instance("gpu-box~%1", &instance, &token)
+            .await;
+        server.abort();
+        assert!(result.is_err());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(
+                "/api/v1/panes/%251/restart-instance".to_owned(),
+                serde_json::json!({ "instance_id": instance, "restart_token": token })
+            )]
+        );
     }
 
     #[tokio::test]

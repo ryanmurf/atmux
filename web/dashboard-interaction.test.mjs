@@ -9,6 +9,8 @@ const {
   selectedAgentUrl,
   copySelectedAgentLink,
   agentSearchShortcut,
+  paneOutputBinding,
+  paneOutputMatchesSession,
 } = require("./app.js");
 
 function overviewHarness({ accept = () => true } = {}) {
@@ -173,4 +175,17 @@ test("Escape clears a focused search once, then leaves it without affecting othe
   assert.equal(agentSearchShortcut(key("Escape", { id: "filter", value: "" })), "blur");
   assert.equal(agentSearchShortcut(key("Escape", { id: "message", value: "Draft" })), null);
   assert.equal(agentSearchShortcut(key("Escape", { id: "filter", value: "Codex" }), { dialogOpen: true }), null);
+});
+
+test("raw output ownership requires the same pane and captures its instance independently", () => {
+  const session = { id: "tron~%1", instance_id: "pane-v1-" + "a".repeat(64) };
+  const binding = paneOutputBinding(session);
+  assert.equal(paneOutputMatchesSession(binding, session), true);
+  assert.equal(paneOutputMatchesSession(binding, { ...session, machine: "tron", online: false }), true);
+  assert.equal(paneOutputMatchesSession(binding, { ...session, id: "midnight~%1" }), false);
+  session.instance_id = "pane-v1-" + "b".repeat(64);
+  assert.equal(paneOutputMatchesSession(binding, session), false);
+  assert.equal(paneOutputMatchesSession(null, session), false);
+  assert.equal(paneOutputMatchesSession(binding, null), false);
+  assert.equal(paneOutputBinding(null), null);
 });

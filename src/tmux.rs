@@ -3868,6 +3868,15 @@ mod tests {
             modes: Vec::new(),
         };
         let error = Tmux::with_socket_for_test(&probe.socket, || {
+            // Keep this disposable server alive after the rejected launch
+            // exits, so the follow-up has-session check is deterministic.
+            Tmux::output([
+                "new-session",
+                "-d",
+                "-s",
+                "exit-cleanup-canary",
+                "/bin/sleep 2147483647",
+            ])?;
             Tmux::launch(
                 "agent",
                 &probe.directory,
@@ -4337,6 +4346,180 @@ mod tests {
                 "11111111-1111-1111-1111-111111111111",
             ]
         );
+    }
+
+    #[test]
+    #[ignore = "uses its own disposable tmux server; run explicitly with --ignored --test-threads=1"]
+    fn disposable_native_restart_preserves_pane_session_and_effective_arguments() {
+        let probe = disposable_tmux("native-restart");
+        fs::create_dir(&probe.directory).unwrap();
+        let project = probe.directory.join("project 'quoted;");
+        let config_dir = probe.directory.join("config 'quoted;");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&config_dir).unwrap();
+        Tmux::with_socket_for_test(&probe.socket, || {
+            Tmux::check()?;
+            let canary = start_disposable_restart_session("restart-canary")?;
+            let canary_pid = Tmux::output(["display-message", "-p", "-t", &canary, "#{pane_pid}"])?;
+            let server_pid = Tmux::output(["display-message", "-p", "#{pid}"])?;
+            for harness in [
+                crate::auto_update::Harness::Claude,
+                crate::auto_update::Harness::Codex,
+            ] {
+                assert_disposable_native_restart(&probe, &project, &config_dir, harness)?;
+                assert_eq!(
+                    Tmux::output(["display-message", "-p", "#{pid}"])?,
+                    server_pid
+                );
+                assert_eq!(
+                    Tmux::output(["display-message", "-p", "-t", &canary, "#{pane_pid}"])?,
+                    canary_pid
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn assert_disposable_native_restart(
+        probe: &DisposableTmux,
+        project: &Path,
+        config_dir: &Path,
+        harness: crate::auto_update::Harness,
+    ) -> Result<()> {
+        let name = harness.name();
+        let config_key = if harness == crate::auto_update::Harness::Claude {
+            "CLAUDE_CONFIG_DIR"
+        } else {
+            "CODEX_HOME"
+        };
+        let launcher = probe.directory.join(name);
+        // Recorder fixtures exercise the real tmux mutation and production
+        // invocation builders without running a credentialed native CLI or
+        // overriding the trusted-launcher resolver's owner home boundary.
+        fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nrecording_tmp=\"$0.argv.tmp.$$\"\nprintf '%s\\n' \"${config_key}\" \"$PWD\" \"$@\" > \"$recording_tmp\"\n/bin/mv \"$recording_tmp\" \"$0.argv\"\nsleep 30\n"
+            ),
+        )?;
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700))?;
+        let pane_id = start_disposable_restart_session(name)?;
+        let format = "#{session_id}\t#{window_id}\t#{pane_id}\t#{pane_pid}";
+        let before = Tmux::output(["display-message", "-p", "-t", &pane_id, format])?;
+        let saved = "11111111-2222-4333-8444-555555555555";
+        let literal_profile = "work 'profile; $(false)";
+        let (invocation, expected) = if harness == crate::auto_update::Harness::Claude {
+            (
+                claude_resume_invocation(&launcher, config_dir, saved)?,
+                vec![
+                    CLAUDE_SKIP_PERMISSIONS_FLAG,
+                    CLAUDE_PERMISSION_MODE_FLAG,
+                    CLAUDE_BYPASS_PERMISSIONS_MODE,
+                    "--resume",
+                    saved,
+                ],
+            )
+        } else {
+            let profile = AgentProfile {
+                name: "Codex restart fixture".to_owned(),
+                harness: "codex".to_owned(),
+                command: launcher.to_string_lossy().into_owned(),
+                args: vec!["--profile".to_owned(), literal_profile.to_owned()],
+                env: BTreeMap::from([(
+                    "CODEX_HOME".to_owned(),
+                    config_dir.to_string_lossy().into_owned(),
+                )]),
+                inherit_discovered: false,
+                claude_relaunch_permissions: None,
+                modes: Vec::new(),
+            };
+            let mode = ProfileMode {
+                id: "fixture".to_owned(),
+                label: None,
+                model: "gpt-5.6-sol".to_owned(),
+                effort: Some("xhigh".to_owned()),
+                service_tier: Some("fast".to_owned()),
+            };
+            (
+                build_native_relaunch_invocation(
+                    &profile,
+                    &mode,
+                    harness,
+                    crate::auto_update::resume_arguments(harness, saved)?,
+                )?,
+                vec![
+                    "--profile",
+                    literal_profile,
+                    "--model",
+                    "gpt-5.6-sol",
+                    "-c",
+                    "model_reasoning_effort=\"xhigh\"",
+                    "-c",
+                    "service_tier=\"fast\"",
+                    "resume",
+                    saved,
+                ],
+            )
+        };
+        let scope =
+            systemd_scope::prepare(&AgentResourcesConfig::default(), "native-restart-fixture")?;
+        let invocation = scope.wrap(invocation)?;
+        let command = escape_tmux_argument(&shell_words::join(invocation)).into_owned();
+        let directory = escape_tmux_argument(project.to_str().unwrap());
+        publish_scope_metadata(&pane_id, &scope)?;
+        Tmux::output(respawn_pane_args(&pane_id, &directory, &command))?;
+        assert_native_restart_recording(
+            &probe.directory.join(format!("{name}.argv")),
+            config_dir,
+            project,
+            &expected,
+        )?;
+        let after = Tmux::output(["display-message", "-p", "-t", &pane_id, format])?;
+        let old = before.split('\t').collect::<Vec<_>>();
+        let new = after.split('\t').collect::<Vec<_>>();
+        assert_eq!(
+            &old[..3],
+            &new[..3],
+            "restart must retain session, window, and pane"
+        );
+        assert_ne!(old[3], new[3], "restart must replace the agent process");
+        Tmux.kill(name)?;
+        Ok(())
+    }
+
+    fn start_disposable_restart_session(name: &str) -> Result<String> {
+        Tmux::output([
+            "new-session",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-s",
+            name,
+            "/bin/sleep 2147483647",
+        ])
+    }
+
+    fn assert_native_restart_recording(
+        recording: &Path,
+        config_dir: &Path,
+        project: &Path,
+        expected: &[&str],
+    ) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !recording.exists() {
+            if Instant::now() >= deadline {
+                bail!("native restart fixture did not record argv");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let recorded = fs::read_to_string(recording)?;
+        let lines = recorded.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], config_dir.to_str().unwrap());
+        assert_eq!(Path::new(lines[1]).canonicalize()?, project.canonicalize()?);
+        assert_eq!(&lines[2..], expected);
+        Ok(())
     }
 
     #[test]
