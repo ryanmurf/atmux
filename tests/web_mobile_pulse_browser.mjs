@@ -1976,7 +1976,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       compactInComposer: document.getElementById('compact') !== null,
     })`);
     assert.equal(quickActions.modelControl, true, JSON.stringify(quickActions));
-    assert.deepEqual(quickActions.actions, ["Duplicate agent", "Relaunch & resume", "Compact", "Ctrl+B ×2", "Interrupt", "Kill agent"]);
+    assert.deepEqual(quickActions.actions, ["Duplicate agent", "Copy agent link", "Restart session", "Compact", "Download raw output", "Ctrl+B ×2", "Interrupt", "Kill agent"]);
     assert.equal(quickActions.compactInComposer, false, JSON.stringify(quickActions));
 
     const keyLayout = await cdp.evaluate(`(() => ({
@@ -4208,6 +4208,123 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     transcriptFixture = null;
     paneSnapshotContent = "";
     launchMachinesUnavailable = false;
+    paneStreams.clear();
+    overviewStreams.clear();
+  }
+});
+
+test("dashboard reconnect preserves the pane and draft, and link/search actions report their outcomes", { timeout: 60_000 }, async () => {
+  const profileDirectory = await mkdtemp(join(tmpdir(), "atmux-interaction-browser-"));
+  let server;
+  let chrome;
+  let cdp;
+  let testError = null;
+  try {
+    const started = await startServer();
+    server = started.server;
+    const browser = await launchChrome(profileDirectory);
+    chrome = browser.chrome;
+    cdp = await openCdp(browser.browserSocket, "about:blank");
+    await cdp.send("Page.enable");
+    await cdp.send("Page.navigate", { url: `http://127.0.0.1:${started.port}/?session=tron~%25100` });
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('overview-status')?.textContent === 'Live' && !document.getElementById('agent-view').hidden"),
+      "interaction test overview did not become live",
+    );
+    await cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.value = 'Unsent draft survives overview retry';
+      input.setSelectionRange(3, 9);
+      input.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    })()`);
+    const originalPaneStreams = new Set(paneStreams);
+    for (const response of overviewStreams) response.end();
+    await waitFor(
+      () => cdp.evaluate("!document.getElementById('overview-notice').hidden && !document.getElementById('overview-retry').disabled"),
+      "disconnected overview did not expose retry",
+    );
+    const offline = await cdp.evaluate(`(() => ({
+      note: document.getElementById('overview-note').textContent,
+      bannerHeight: document.getElementById('health-alert').getBoundingClientRect().height,
+      overflowX: document.documentElement.scrollWidth - innerWidth,
+      selected: new URL(location.href).searchParams.get('session'),
+      draft: document.getElementById('message').value,
+    }))()`);
+    assert.match(offline.note, /disconnected/);
+    assert.ok(offline.bannerHeight > 0, JSON.stringify(offline));
+    assert.ok(offline.overflowX <= 1, JSON.stringify(offline));
+    assert.equal(offline.selected, "tron~%100");
+    assert.equal(offline.draft, "Unsent draft survives overview retry");
+    await cdp.evaluate("document.getElementById('overview-retry').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('overview-status').textContent === 'Live' && document.getElementById('health-alert').hidden"),
+      "manual retry did not restore live overview",
+    );
+    assert.equal(await cdp.evaluate("document.getElementById('message').value"), offline.draft);
+    assert.equal(await cdp.evaluate("document.getElementById('message').selectionStart"), 3);
+    assert.equal(await cdp.evaluate("new URL(location.href).searchParams.get('session')"), offline.selected);
+    for (const stream of originalPaneStreams) assert.ok(paneStreams.has(stream), "overview retry replaced a pane stream");
+
+    await cdp.evaluate(`(() => {
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+        async writeText() { throw new Error('permission denied'); },
+      } });
+      document.getElementById('quick-actions-open').click();
+      document.getElementById('quick-copy-link').click();
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('quick-copy-link-status').textContent.includes('Could not copy')"),
+      "clipboard denial was not reported",
+    );
+    assert.equal(await cdp.evaluate("document.getElementById('quick-actions-dialog').open"), true);
+    await cdp.evaluate(`(() => {
+      navigator.clipboard.writeText = async (value) => { window.__copiedAgentLink = value; };
+      document.getElementById('quick-copy-link').click();
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('quick-copy-link-status').textContent.includes('Link copied')"),
+      "successful clipboard write was not reported",
+    );
+    assert.equal(new URL(await cdp.evaluate("window.__copiedAgentLink")).searchParams.get("session"), "tron~%100");
+    await cdp.evaluate("document.getElementById('quick-actions-dialog').close(); true");
+
+    await cdp.send("Emulation.setDeviceMetricsOverride", { width: 1100, height: 800, deviceScaleFactor: 1, mobile: false });
+    const shortcuts = await cdp.evaluate(`(() => {
+      const filter = document.getElementById('filter');
+      const key = (target, value) => {
+        const event = new KeyboardEvent('keydown', { key: value, bubbles: true, cancelable: true });
+        target.dispatchEvent(event);
+        return event.defaultPrevented;
+      };
+      document.getElementById('rail-toggle').click();
+      const focused = key(document.body, '/') && document.activeElement === filter;
+      const expanded = !document.body.classList.contains('rail-collapsed');
+      filter.value = 'tron';
+      filter.dispatchEvent(new InputEvent('input', { bubbles: true }));
+      key(filter, 'Escape');
+      const cleared = filter.value === '' && document.activeElement === filter;
+      key(filter, 'Escape');
+      const blurred = document.activeElement !== filter;
+      const message = document.getElementById('message');
+      message.focus();
+      const typingUntouched = !key(message, '/') && document.activeElement === message;
+      document.getElementById('quick-actions-open').click();
+      const dialogUntouched = !key(document.body, '/') && document.activeElement !== filter;
+      document.getElementById('quick-actions-dialog').close();
+      return { focused, expanded, cleared, blurred, typingUntouched, dialogUntouched };
+    })()`);
+    assert.deepEqual(shortcuts, {
+      focused: true, expanded: true, cleared: true, blurred: true, typingUntouched: true, dialogUntouched: true,
+    });
+  } catch (error) {
+    testError = error;
+    throw error;
+  } finally {
+    try { await cleanupBrowserHarness({ cdp, chrome, server, profileDirectory }); }
+    catch (cleanupError) {
+      if (!testError) throw cleanupError;
+      console.error(cleanupError);
+    }
     paneStreams.clear();
     overviewStreams.clear();
   }

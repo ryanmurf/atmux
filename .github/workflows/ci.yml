@@ -33,9 +33,9 @@ jobs:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: node --check web/app.js
-      - run: node --test web/app.test.mjs
+      - run: node --test web/*.test.mjs tests/navigation.test.mjs
       - name: Run browser integration tests
-        run: node --test tests/web_mobile_pulse_browser.mjs
+        run: node --test tests/web_mobile_pulse_browser.mjs tests/navigation_browser.mjs tests/mobile_viewport_browser.mjs
         timeout-minutes: 3
       - name: Install Quick Talk browser prerequisites
         run: sudo apt-get update && sudo apt-get install -y tmux

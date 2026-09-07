@@ -87,7 +87,7 @@ const {
   launchMachines,
   imageFilesFromTransfer,
   machineStatusLabel,
-  claudeResumeState,
+  agentRestartState,
   modelPickerState,
   pickerOptions,
   markdownBlocks,
@@ -1069,7 +1069,6 @@ test("mobile controls stay compact and horizontally reachable so the pane gets t
   assert.match(html, /id="quick-agent-model"/);
   assert.match(html, /id="quick-compact"/);
   assert.doesNotMatch(html, /id="compact"/);
-  assert.doesNotMatch(source, /window\.scrollTo\(/);
   assert.doesNotMatch(source, /pinMobileDocument/);
   assert.doesNotMatch(source, /classList\.toggle\("composer-focused"/);
   assert.doesNotMatch(source, /messageInput\.addEventListener\("focus", syncMobileViewport/);
@@ -1093,11 +1092,10 @@ test("the mobile app box tracks the layout viewport so the iOS keyboard cannot s
   assert.match(sync[0], /const height = window\.innerHeight;/);
   assert.doesNotMatch(sync[0], /visualViewport/);
 
-  // Reacting to visual viewport events would reintroduce the keyboard height,
-  // and writing styles mid keyboard animation is what the reverted transform
-  // attempt did.
-  assert.doesNotMatch(code, /visualViewport\?\.addEventListener/);
-  assert.doesNotMatch(code, /visualViewport\.offsetTop/);
+  // Recovery observes a settled viewport but must not size/transform the app
+  // from it. The focus/keyboard/zoom guards and event flow are exercised in
+  // mobile-viewport.test.mjs.
+  assert.match(code, /installMobileViewportRecovery\(\{\s*window, document, isMobile: mobileViewportActive, syncViewport: syncMobileViewport/);
   assert.doesNotMatch(code, /style\.transform/);
   assert.doesNotMatch(css, /translateY\(/);
 
@@ -2387,9 +2385,8 @@ test("composite ids survive URL encoding for pane routes", () => {
   assert.doesNotMatch(encodeURIComponent("gpu-box~%3"), /%2F/i);
 });
 
-test("machine grouping and offline handling are wired into the rendered dashboard", () => {
+test("offline handling is wired into the rendered dashboard", () => {
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
-  assert.match(source, /groupSessionsByMachine\(visible, state\.machines\)/);
   assert.match(source, /machine: \$\("launch-machine"\)\.value \|\| null/);
   // Controls are disabled rather than silently failing against an offline node.
   assert.match(source, /\$\(id\)\.disabled = !controllable/);
@@ -2563,30 +2560,32 @@ test("pickerOptions surfaces an unconfigured running value without offering it",
   ]);
 });
 
-test("Claude resume action is capability-gated and protects active work", () => {
+test("agent restart action is capability-gated for Claude and Codex", () => {
   const claude = { id: "tron~%7", agent: "claude" };
   const ready = {
     pane_id: claude.id,
     resume_available: true,
     resume_note: null,
   };
-  assert.deepEqual(claudeResumeState(claude, ready, true, null), {
+  assert.deepEqual(agentRestartState(claude, ready, true, null), {
     visible: true,
     available: true,
     disabled: false,
-    status: "Ready to relaunch the saved conversation",
+    status: "Ready to restart this session",
   });
   const working = {
     pane_id: claude.id,
     resume_available: false,
     resume_note: "Claude is working; wait or interrupt before relaunching",
   };
-  const view = claudeResumeState(claude, working, true, null);
+  const view = agentRestartState(claude, working, true, null);
   assert.equal(view.visible, true);
   assert.equal(view.disabled, true);
   assert.match(view.status, /working/);
-  assert.equal(claudeResumeState(claude, ready, true, claude.id).disabled, true);
-  assert.equal(claudeResumeState({ id: "%8", agent: "codex" }, ready, true, null).visible, false);
+  assert.equal(agentRestartState(claude, ready, true, claude.id).disabled, true);
+  const codex = { id: "%8", agent: "codex" };
+  assert.equal(agentRestartState(codex, { ...ready, pane_id: codex.id }, true, null).visible, true);
+  assert.equal(agentRestartState({ id: "%9", agent: "other" }, ready, true, null).visible, false);
 });
 
 test("model switch captures the pane id before awaiting and routes one control at a time", () => {
@@ -2609,7 +2608,7 @@ test("model switch captures the pane id before awaiting and routes one control a
   }
 });
 
-test("Claude resume uses a confirmation and never sends browser-supplied session data", () => {
+test("agent restart uses a confirmation and never sends browser-supplied session data", () => {
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
   const markup = readFileSync(new URL("./index.html", import.meta.url), "utf8");
   const handler = source.slice(
@@ -2618,13 +2617,15 @@ test("Claude resume uses a confirmation and never sends browser-supplied session
   );
   assert.match(markup, /id="quick-resume"/);
   assert.match(markup, /id="resume-dialog"/);
+  assert.match(markup, /Restart agent session/);
   assert.match(markup, /Any in-flight work is terminated/);
   assert.match(markup, /Custom launch flags that are not configured in atmux are not preserved/);
-  assert.match(handler, /encodeURIComponent\(target\)\}\/resume/);
-  assert.match(handler, /body: JSON\.stringify\(\{\}\)/);
+  assert.match(handler, /encodeURIComponent\(target\)\}\/restart-instance/);
+  assert.match(handler, /body: JSON\.stringify\(\{ instance_id: confirmed\.instance_id \}\)/);
   assert.doesNotMatch(handler, /session_id:\s*[^,}]+/);
   assert.doesNotMatch(handler, /dangerously-skip-permissions/);
   assert.doesNotMatch(source, /CLAUDE_CONFIG_DIR/);
+  assert.doesNotMatch(source, /CODEX_HOME/);
 });
 
 test("Tron Quick Resume is confirmed and sends no browser command or path", () => {

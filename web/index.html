@@ -15,17 +15,39 @@
     <button id="rail-toggle" class="rail-toggle subtle" type="button" aria-controls="session-rail" aria-expanded="true" title="Collapse agent list" aria-label="Collapse agent list">‹</button>
     <div class="brand"><img class="brand-logo" src="/atmux-logo.jpg" alt=""><span class="brand-wordmark">atmux</span><small>agent control plane</small></div>
     <div id="counts" class="counts" aria-label="Agent summary">Connecting…</div>
+    <span id="overview-status" class="overview-status" role="status" aria-label="Live update connection">Connecting…</span>
     <button id="pulse-open" class="subtle topbar-action" type="button" aria-pressed="false">Usage</button>
     <button id="recovery-open" class="subtle topbar-action" type="button" hidden>Quick resume</button>
     <button id="launch-open" class="primary" type="button">New agent</button>
   </header>
 
-  <div id="health-alert" class="health-alert" role="alert" hidden></div>
+  <div id="health-alert" class="health-alert" hidden>
+    <span id="health-message" role="alert" hidden></span>
+    <span id="overview-notice" class="overview-notice" hidden><span id="overview-note" role="status"></span><button id="overview-retry" class="subtle" type="button">Retry connection</button></span>
+  </div>
 
   <div class="workspace">
     <nav id="session-rail" class="rail" aria-label="Agent sessions">
-      <label class="search-label" for="filter">Filter agents</label>
-      <input id="filter" type="search" placeholder="Name, path, harness…" autocomplete="off">
+      <label class="search-label" for="filter">Filter agents <kbd class="search-shortcut" aria-hidden="true">/</kbd></label>
+      <input id="filter" type="search" placeholder="Name, path, harness…" autocomplete="off" aria-keyshortcuts="/ Escape" title="Press / to search agents. Escape clears the search; press again to leave it.">
+      <div class="rail-filters" aria-label="Agent filters">
+        <select id="filter-status" aria-label="Filter agent status">
+          <option value="">All states</option>
+          <option value="working">Working</option>
+          <option value="waiting">Waiting</option>
+          <option value="other">Other</option>
+        </select>
+        <select id="filter-harness" aria-label="Filter agent harness">
+          <option value="">All harnesses</option>
+          <option value="claude">Claude</option>
+          <option value="codex">Codex</option>
+          <option value="other">Other</option>
+        </select>
+      </div>
+      <div class="rail-filter-summary">
+        <span id="filter-summary" role="status"></span>
+        <button id="filter-clear" class="subtle" type="button" hidden>Clear filters</button>
+      </div>
       <button id="update-all-open" class="rail-update-all subtle" type="button" hidden></button>
       <ul id="sessions" class="session-list"></ul>
       <p id="empty" class="empty" hidden>No matching sessions.</p>
@@ -212,10 +234,10 @@
 
   <dialog id="resume-dialog" aria-labelledby="resume-dialog-title">
     <form class="dialog-form">
-      <h2 id="resume-dialog-title">Relaunch Claude &amp; resume?</h2>
-      <p>atmux will stop this Claude process and resume its saved conversation with the current Claude launcher.</p>
+      <h2 id="resume-dialog-title">Restart agent session?</h2>
+      <p>atmux will stop this agent process and resume its saved conversation with the current native launcher in the same tmux session.</p>
       <p>Any in-flight work is terminated. Custom launch flags that are not configured in atmux are not preserved.</p>
-      <div class="dialog-actions"><button type="button" class="subtle dialog-cancel">Cancel</button><button id="resume-confirm" class="primary" type="button">Relaunch &amp; resume</button></div>
+      <div class="dialog-actions"><button type="button" class="subtle dialog-cancel">Cancel</button><button id="resume-confirm" class="primary" type="button">Restart session</button></div>
     </form>
   </dialog>
 
@@ -261,13 +283,16 @@
       </fieldset>
       <div class="quick-actions-grid">
         <button id="quick-duplicate" class="subtle" type="button">Duplicate agent</button>
-        <button id="quick-resume" class="subtle" type="button" hidden>Relaunch &amp; resume</button>
+        <button id="quick-copy-link" class="subtle" type="button">Copy agent link</button>
+        <button id="quick-resume" class="subtle" type="button" hidden>Restart session</button>
         <button id="quick-compact" class="subtle" type="button">Compact</button>
+        <button id="quick-download-output" class="subtle" type="button">Download raw output</button>
         <button id="quick-tmux-prefix-twice" class="subtle" type="button">Ctrl+B ×2</button>
         <button id="quick-interrupt" class="subtle" type="button">Interrupt</button>
         <button id="quick-kill-open" class="danger" type="button">Kill agent</button>
       </div>
       <p id="quick-resume-note" class="dialog-note" role="status" hidden></p>
+      <p id="quick-copy-link-status" class="dialog-note" role="status" aria-live="polite" hidden></p>
     </form>
   </dialog>
 

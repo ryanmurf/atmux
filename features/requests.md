@@ -61,6 +61,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Use Up/Down to browse previously sent comments | `completed/agent-interaction-controls.md` | Completed |
 | Plain Enter sends; Ctrl/Command+Enter inserts a newline | `completed/composer-keyboard-behavior.md` | Completed |
 | Switch the model of a running Claude or Codex pane from the web UI | `model-switching.md` | Implementation active |
+| Restart a running Claude or Codex tmux session in place and resume its conversation | `session-restart.md` | Implementation active |
 | Paste, drop, or choose images in the web composer and deliver them to either Claude or Codex | `completed/image-attachments.md` | Completed |
 | Use the atmux logo saved in Midnight's Downloads folder as the browser branding | `completed/image-attachments.md` | Completed |
 
@@ -68,6 +69,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 
 | Request | Feature record | Status |
 | --- | --- | --- |
+| Collapse individual nodes and implement, review, test, build, and deploy ten dashboard improvements using agents | `dashboard-improvements.md` | Implementation tested; review and rollout active |
 | Use Claude and Codex session logs as the conversation display | `completed/claude-codex-transcripts.md` | Completed |
 | Support old/unlabeled Claude CLI storage and profile directories such as `~/.claude-max` | `completed/claude-codex-transcripts.md` | Completed |
 | Render agent output as safe native Markdown with links and highlighted, expandable code blocks | `completed/claude-codex-transcripts.md` | Completed |

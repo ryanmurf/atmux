@@ -338,12 +338,12 @@ pub struct PaneModels {
     #[serde(default)]
     pub fast_supported: bool,
     pub note: Option<String>,
-    /// Whether the owning node can safely restart this exact Claude pane with
-    /// its current launcher and native saved conversation. The configuration
-    /// root and Claude session id remain server-side.
+    /// Whether the owning node can safely restart this exact Claude or Codex
+    /// pane with its current launcher and native saved conversation. The
+    /// configuration root and provider session id remain server-side.
     #[serde(default)]
     pub resume_available: bool,
-    /// Human-safe explanation when a Claude resume action is unavailable.
+    /// Human-safe explanation when an in-place agent restart is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_note: Option<String>,
 }
@@ -792,12 +792,12 @@ struct Inner {
     /// the owning node; it never hands a node a version, URL, or path.
     updater: Arc<SelfUpdater>,
     /// Unit-test controls use synthetic pane records. If a regression crosses
-    /// the Claude-resume validation boundary, stop at this in-memory seam
+    /// the native-restart validation boundary, stop at this in-memory seam
     /// rather than consulting the developer's default tmux server.
     #[cfg(test)]
-    deny_local_claude_resume: bool,
+    deny_local_agent_restart: bool,
     #[cfg(test)]
-    local_claude_resume_attempts: AtomicU64,
+    local_agent_restart_attempts: AtomicU64,
     /// Synthetic live pane generations for owner-local message race tests.
     #[cfg(test)]
     test_message_live_instances: Mutex<HashMap<String, Option<String>>>,
@@ -933,9 +933,9 @@ impl ControlPlane {
                 recovery,
                 updater,
                 #[cfg(test)]
-                deny_local_claude_resume: false,
+                deny_local_agent_restart: false,
                 #[cfg(test)]
-                local_claude_resume_attempts: AtomicU64::new(0),
+                local_agent_restart_attempts: AtomicU64::new(0),
                 #[cfg(test)]
                 test_message_live_instances: Mutex::new(HashMap::new()),
             }),
@@ -1965,23 +1965,7 @@ impl ControlPlane {
         ProfileMode,
         crate::transcript::NativeResumeTarget,
     )> {
-        if session.agent != update_agent(harness) {
-            return None;
-        }
-        let profile =
-            profile_for_session(&self.inner.config.profiles, session.agent, &session.profile)?
-                .clone();
-        let observation = Tmux.model_observation(&session.pane_id, session.agent, &session.content);
-        let service_tier = Tmux::cli_update_service_tier(&session.pane_id).ok()?;
-        // A model/effort/fast switch applied on its own leaves no configured
-        // mode recorded, so the pane's own recorded controls stand in for one.
-        let recorded = match observation.mode {
-            Some(_) => None,
-            None => Tmux::recorded_pane_mode(&session.pane_id).ok()?,
-        };
-        let mode = preflight_mode(&profile, &observation, recorded, service_tier.as_deref())?;
-        let target = crate::transcript::native_resume_target(session)?;
-        Some((profile, mode, target))
+        native_restart_preflight(&self.inner.config.profiles, session, harness)
     }
 
     async fn refresh(&self) -> Result<()> {
@@ -2461,11 +2445,12 @@ impl ControlPlane {
                 let observed_pane = pane_id.clone();
                 let profile = session.profile.clone();
                 let content = session.content.clone();
+                let profiles = self.inner.config.profiles.clone();
+                let status = self.inner.config.status.clone();
                 let observed = tokio::task::spawn_blocking(move || {
-                    let claude_program = crate::config::resume_claude_program();
                     (
                         Tmux.model_observation(&observed_pane, agent, &content),
-                        claude_resume_capability(&session, claude_program.as_deref()),
+                        agent_restart_capability(&profiles, &status, &session),
                     )
                 })
                 .await
@@ -3191,6 +3176,122 @@ impl ControlPlane {
         }
     }
 
+    /// Restarts an eligible Claude or Codex pane in place with the current
+    /// native launcher and its own saved conversation.
+    ///
+    /// Every launch value is freshly derived on the owning machine. The
+    /// browser cannot select a session id, configuration root, executable, or
+    /// raw command line, and the existing tmux pane is respawned rather than
+    /// replacing its session or server.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict unless the pane passes its provider-specific
+    /// readiness checks and can be unambiguously tied to its native saved
+    /// conversation. Other agent panes are rejected, and owner/offline
+    /// failures propagate for federated panes.
+    pub async fn restart_current_agent(&self, id: &str) -> Result<()> {
+        self.restart_agent(id, None).await
+    }
+
+    /// Restarts only the process generation confirmed by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed or stale identities before mutation and propagates
+    /// the same provider readiness errors as `restart_current_agent`.
+    pub async fn restart_agent_instance(&self, id: &str, instance_id: &str) -> Result<()> {
+        if !valid_pane_identity(instance_id) {
+            return Err(bad_request("invalid pane instance id"));
+        }
+        self.restart_agent(id, Some(instance_id.to_owned())).await
+    }
+
+    async fn restart_agent(&self, id: &str, expected: Option<String>) -> Result<()> {
+        match self.resolve(id)? {
+            Target::Local {
+                pane_id,
+                instance_id,
+                agent: AgentKind::Claude,
+                ..
+            } => {
+                validate_expected_pane_instance(expected.as_deref(), &instance_id)?;
+                return self.resume_claude_bound(&pane_id, expected).await;
+            }
+            Target::Local {
+                pane_id,
+                instance_id,
+                agent: AgentKind::Codex,
+                ..
+            } => {
+                validate_expected_pane_instance(expected.as_deref(), &instance_id)?;
+                self.restart_local_codex(pane_id, expected).await?;
+            }
+            Target::Local { .. } => {
+                return Err(bad_request(
+                    "only Claude and Codex panes can restart a saved conversation",
+                ));
+            }
+            Target::Remote {
+                machine,
+                pane_id,
+                instance_id,
+                ..
+            } => {
+                self.ensure_online(&machine.id)?;
+                validate_expected_pane_instance(expected.as_deref(), &instance_id)?;
+                let (action, body) = expected.map_or_else(
+                    || ("restart", serde_json::json!({})),
+                    |instance_id| {
+                        (
+                            "restart-instance",
+                            serde_json::json!({ "instance_id": instance_id }),
+                        )
+                    },
+                );
+                machine
+                    .post_json(
+                        &format!("/api/v1/panes/{}/{action}", encode_segment(&pane_id)),
+                        &body,
+                    )
+                    .await
+                    .map_err(|error| upstream(&error))?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn restart_local_codex(&self, pane_id: String, expected: Option<String>) -> Result<()> {
+        #[cfg(test)]
+        if self.inner.deny_local_agent_restart {
+            self.inner
+                .local_agent_restart_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(internal(&anyhow::anyhow!(
+                "synthetic test control blocked a local Codex restart"
+            )));
+        }
+        let prompt_lock = self.prompt_lock(&pane_id);
+        let expected_generation = prompt_lock.generation.load(Ordering::Acquire);
+        let resources = self.inner.config.agent_resources;
+        let live_control = self.clone();
+        local_agent_restart(
+            tokio::task::spawn_blocking(move || {
+                restart_local_codex_blocking(
+                    &live_control,
+                    &pane_id,
+                    &prompt_lock,
+                    expected_generation,
+                    &resources,
+                    expected.as_deref(),
+                )
+            })
+            .await,
+        )?;
+        self.inner.refresh_now.notify_one();
+        Ok(())
+    }
+
     /// Restarts an eligible, non-working Claude pane in place with the current
     /// `claude` launcher and its own native saved conversation.
     ///
@@ -3204,6 +3305,10 @@ impl ControlPlane {
     /// tied to one live Claude session log, and propagates owner/offline
     /// failures for federated panes.
     pub async fn resume_current_claude(&self, id: &str) -> Result<()> {
+        self.resume_claude_bound(id, None).await
+    }
+
+    async fn resume_claude_bound(&self, id: &str, expected: Option<String>) -> Result<()> {
         match self.resolve(id)? {
             Target::Local { pane_id, agent, .. } => {
                 // Reject from the already-resolved control-plane snapshot
@@ -3217,9 +3322,9 @@ impl ControlPlane {
                     ));
                 }
                 #[cfg(test)]
-                if self.inner.deny_local_claude_resume {
+                if self.inner.deny_local_agent_restart {
                     self.inner
-                        .local_claude_resume_attempts
+                        .local_agent_restart_attempts
                         .fetch_add(1, Ordering::Relaxed);
                     return Err(internal(&anyhow::anyhow!(
                         "synthetic test control blocked a local Claude resume"
@@ -3236,13 +3341,14 @@ impl ControlPlane {
                 let status = self.inner.config.status.clone();
                 let capture_lines = self.inner.config.general.preview_lines;
                 let resources = self.inner.config.agent_resources;
-                local_claude_resume(
+                local_agent_restart(
                     tokio::task::spawn_blocking(move || {
                         let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
                         let mut guard = prompt_lock
                             .state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        validate_live_pane_instance(&pane_id, expected.as_deref())?;
                         if !resume_request_is_current(&guard, expected_generation) {
                             return Err(ResumeRejected(
                                 "this pane changed after the relaunch was requested; review it and try again"
@@ -3257,6 +3363,7 @@ impl ControlPlane {
                             session.memory_max_bytes,
                             &pane_id,
                         )?;
+                        validate_live_pane_instance(&pane_id, expected.as_deref())?;
                         begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
                         Tmux::resume_claude(
                             &pane_id,
@@ -4308,8 +4415,13 @@ fn settled_model_capabilities(
         Tmux.model_observation(pane_id, agent, &after),
         &inner.config.profiles,
     );
-    let resume =
-        claude_resume_capability(session, crate::config::resume_claude_program().as_deref());
+    let mut restarted_session = session.clone();
+    restarted_session.content = after;
+    let resume = agent_restart_capability(
+        &inner.config.profiles,
+        &inner.config.status,
+        &restarted_session,
+    );
     settled.resume_available = resume.available;
     settled.resume_note = resume.note;
     settled
@@ -4369,42 +4481,176 @@ fn capability_note(
 }
 
 #[derive(Default)]
-struct ClaudeResumeCapability {
+struct AgentRestartCapability {
     available: bool,
     note: Option<String>,
+}
+
+fn agent_restart_capability(
+    profiles: &[AgentProfile],
+    status: &crate::config::StatusConfig,
+    session: &Session,
+) -> AgentRestartCapability {
+    match session.agent {
+        AgentKind::Claude => {
+            claude_resume_capability(session, crate::config::resume_claude_program().as_deref())
+        }
+        AgentKind::Codex => codex_restart_capability(profiles, status, session),
+        AgentKind::Other => AgentRestartCapability::default(),
+    }
 }
 
 fn claude_resume_capability(
     session: &Session,
     claude_program: Option<&Path>,
-) -> ClaudeResumeCapability {
+) -> AgentRestartCapability {
     if session.agent != AgentKind::Claude {
-        return ClaudeResumeCapability::default();
+        return AgentRestartCapability::default();
     }
     if session.status == AgentStatus::Working {
-        return ClaudeResumeCapability {
+        return AgentRestartCapability {
             available: false,
             note: Some("Claude is working; wait or interrupt before relaunching".to_owned()),
         };
     }
     if claude_program.is_none() {
-        return ClaudeResumeCapability {
+        return AgentRestartCapability {
             available: false,
             note: Some("The current Claude launcher is unavailable on this machine".to_owned()),
         };
     }
     if crate::transcript::claude_resume_target(session).is_none() {
-        return ClaudeResumeCapability {
+        return AgentRestartCapability {
             available: false,
             note: Some(
                 "This Claude pane cannot be safely matched to one saved conversation".to_owned(),
             ),
         };
     }
-    ClaudeResumeCapability {
+    AgentRestartCapability {
         available: true,
         note: None,
     }
+}
+
+fn codex_restart_capability(
+    profiles: &[AgentProfile],
+    status: &crate::config::StatusConfig,
+    session: &Session,
+) -> AgentRestartCapability {
+    if session.status != AgentStatus::Waiting
+        || !crate::status::automation_idle(session.agent, &session.content, &session.title, status)
+    {
+        return AgentRestartCapability {
+            available: false,
+            note: Some(if session.status == AgentStatus::Working {
+                "Codex is working; wait or interrupt before restarting".to_owned()
+            } else {
+                "Codex is not at a confirmed empty top-level prompt".to_owned()
+            }),
+        };
+    }
+    let launcher = auto_update::current_launcher(UpdateHarness::Codex);
+    let Some(launcher) = launcher else {
+        return AgentRestartCapability {
+            available: false,
+            note: Some("The current Codex launcher is unavailable on this machine".to_owned()),
+        };
+    };
+    let Some((profile, _, _)) = native_restart_preflight(profiles, session, UpdateHarness::Codex)
+    else {
+        return AgentRestartCapability {
+            available: false,
+            note: Some(
+                "This Codex pane cannot be safely matched to its configured controls and saved conversation"
+                    .to_owned(),
+            ),
+        };
+    };
+    if !profile_bound_to_native(&profile, UpdateHarness::Codex, &launcher) {
+        return AgentRestartCapability {
+            available: false,
+            note: Some("This Codex profile is not bound to the current native launcher".to_owned()),
+        };
+    }
+    AgentRestartCapability {
+        available: true,
+        note: None,
+    }
+}
+
+fn restart_local_codex_blocking(
+    control: &ControlPlane,
+    pane_id: &str,
+    prompt_lock: &PaneMutationGate,
+    expected_generation: u64,
+    resources: &crate::config::AgentResourcesConfig,
+    expected: Option<&str>,
+) -> Result<()> {
+    let _process_lock = auto_update::PaneProcessLock::acquire(pane_id)?;
+    let mut guard = prompt_lock
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    validate_live_pane_instance(pane_id, expected)?;
+    if !resume_request_is_current(&guard, expected_generation) {
+        return Err(ResumeRejected(
+            "this pane changed after the restart was requested; review it and try again".to_owned(),
+        )
+        .into());
+    }
+    let session = control
+        .fresh_cli_update_session(pane_id)
+        .ok_or_else(|| ResumeRejected("this pane no longer exists".to_owned()))?;
+    if session.agent != AgentKind::Codex {
+        return Err(ResumeRejected("this pane is no longer running Codex".to_owned()).into());
+    }
+    if session.status != AgentStatus::Waiting
+        || !crate::status::automation_idle(
+            session.agent,
+            &session.content,
+            &session.title,
+            &control.inner.config.status,
+        )
+    {
+        let message = if session.status == AgentStatus::Working {
+            "Codex is working; wait or interrupt before restarting"
+        } else {
+            "Codex is not at a confirmed empty top-level prompt"
+        };
+        return Err(ResumeRejected(message.to_owned()).into());
+    }
+    let launcher = auto_update::current_launcher(UpdateHarness::Codex).ok_or_else(|| {
+        ResumeRejected("the current Codex launcher is unavailable on this machine".to_owned())
+    })?;
+    let (profile, mode, target) = control
+        .cli_update_preflight_for_session(&session, UpdateHarness::Codex)
+        .ok_or_else(|| {
+            ResumeRejected(
+                "this Codex pane cannot be safely matched to its configured controls and saved conversation"
+                    .to_owned(),
+            )
+        })?;
+    if !profile_bound_to_native(&profile, UpdateHarness::Codex, &launcher) {
+        return Err(ResumeRejected(
+            "this Codex profile is not bound to the current native launcher".to_owned(),
+        )
+        .into());
+    }
+    let scope = systemd_scope::prepare_override(resources, session.memory_max_bytes, pane_id)?;
+    validate_live_pane_instance(pane_id, expected)?;
+    begin_pane_mutation(pane_id, prompt_lock, &mut guard)?;
+    Tmux::resume_after_cli_update(
+        pane_id,
+        &session.path,
+        &launcher,
+        UpdateHarness::Codex,
+        &profile,
+        &mode,
+        &target,
+        scope,
+    )?;
+    Ok(())
 }
 
 /// Re-reads one exact pane while its mutation gate is held, then derives the
@@ -4514,6 +4760,34 @@ fn profile_for_session<'a>(
         profile.harness.eq_ignore_ascii_case(&harness)
             && profile.name.eq_ignore_ascii_case(profile_name)
     })
+}
+
+/// Resolves the configured controls and native saved conversation needed to
+/// replace one pane without replaying its raw tmux start command.
+fn native_restart_preflight(
+    profiles: &[AgentProfile],
+    session: &Session,
+    harness: UpdateHarness,
+) -> Option<(
+    AgentProfile,
+    ProfileMode,
+    crate::transcript::NativeResumeTarget,
+)> {
+    if session.agent != update_agent(harness) {
+        return None;
+    }
+    let profile = profile_for_session(profiles, session.agent, &session.profile)?.clone();
+    let observation = Tmux.model_observation(&session.pane_id, session.agent, &session.content);
+    let service_tier = Tmux::cli_update_service_tier(&session.pane_id).ok()?;
+    // A model/effort/fast switch applied on its own leaves no configured mode,
+    // so the pane's recorded controls stand in for one.
+    let recorded = match observation.mode {
+        Some(_) => None,
+        None => Tmux::recorded_pane_mode(&session.pane_id).ok()?,
+    };
+    let mode = preflight_mode(&profile, &observation, recorded, service_tier.as_deref())?;
+    let target = crate::transcript::native_resume_target(session)?;
+    Some((profile, mode, target))
 }
 
 /// The exact mode a pane is running, taken from the configured mode it still
@@ -4797,7 +5071,7 @@ fn local_model_switch<T>(
     }
 }
 
-fn local_claude_resume(
+fn local_agent_restart(
     joined: std::result::Result<Result<()>, tokio::task::JoinError>,
 ) -> Result<()> {
     match joined {
@@ -4809,9 +5083,10 @@ fn local_claude_resume(
         {
             Err(conflict(format!("{error:#}")))
         }
+        Ok(Err(error)) if error_kind(&error) != ErrorKind::Internal => Err(error),
         Ok(Err(error)) => Err(internal(&error)),
         Err(error) => Err(internal(
-            &anyhow::Error::new(error).context("a Claude resume task panicked"),
+            &anyhow::Error::new(error).context("an agent restart task panicked"),
         )),
     }
 }
@@ -5476,8 +5751,8 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
                 },
             )
             .expect("the default self-update policy must be valid"),
-            deny_local_claude_resume: true,
-            local_claude_resume_attempts: AtomicU64::new(0),
+            deny_local_agent_restart: true,
+            local_agent_restart_attempts: AtomicU64::new(0),
             test_message_live_instances: Mutex::new(HashMap::new()),
         }),
     }
@@ -6578,11 +6853,63 @@ mod tests {
         assert_eq!(
             control
                 .inner
-                .local_claude_resume_attempts
+                .local_agent_restart_attempts
                 .load(Ordering::Relaxed),
             0,
             "a non-Claude target must be rejected before the tmux mutation seam",
         );
+    }
+
+    #[tokio::test]
+    async fn synthetic_codex_restart_reaches_only_the_guarded_native_restart_seam() {
+        let control = test_control(&[]);
+        control.apply_refresh(vec![test_session(
+            "synthetic-codex",
+            "%1",
+            "OpenAI Codex (v0.147.0)",
+        )]);
+        let error = control.restart_current_agent("%1").await.unwrap_err();
+        assert_eq!(error_kind(&error), ErrorKind::Internal);
+        assert_eq!(
+            control
+                .inner
+                .local_agent_restart_attempts
+                .load(Ordering::Relaxed),
+            1,
+            "a Codex target must reach the guarded owner-local restart seam",
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_confirmation_rejects_recycled_pane_before_mutation() {
+        for content in ["OpenAI Codex (v0.153.4)", "Claude Code v2.1.227"] {
+            let control = test_control(&[]);
+            control.apply_refresh(vec![test_session("synthetic", "%1", content)]);
+            let stale = format!("pane-v1-{}", "a".repeat(64));
+            let error = control
+                .restart_agent_instance("%1", &stale)
+                .await
+                .unwrap_err();
+            assert_eq!(error_kind(&error), ErrorKind::Conflict);
+            assert_eq!(
+                control
+                    .inner
+                    .local_agent_restart_attempts
+                    .load(Ordering::Relaxed),
+                0
+            );
+            let invalid = control
+                .restart_agent_instance("%1", "untrusted")
+                .await
+                .unwrap_err();
+            assert_eq!(error_kind(&invalid), ErrorKind::BadRequest);
+        }
+    }
+
+    #[test]
+    fn restart_preserves_conflicts_from_live_identity_check() {
+        let error = local_agent_restart(Ok(Err(conflict("pane was replaced")))).unwrap_err();
+        assert_eq!(error_kind(&error), ErrorKind::Conflict);
     }
 
     #[tokio::test]
@@ -7242,13 +7569,23 @@ mod tests {
     }
 
     #[test]
+    fn codex_restart_capability_requires_the_empty_top_level_prompt() {
+        let mut pane = session("OpenAI Codex (v0.153.4)\nmodel: gpt-5.4");
+        pane.agent = AgentKind::Codex;
+        pane.status = AgentStatus::Waiting;
+        let capability = codex_restart_capability(&[], &Config::default().status, &pane);
+        assert!(!capability.available);
+        assert!(capability.note.unwrap().contains("empty top-level prompt"));
+    }
+
+    #[test]
     fn execution_side_launcher_recheck_is_a_conflict() {
         let joined = Ok(Err(anyhow::Error::new(
             crate::tmux::ClaudeResumeUnavailable(
                 "the current Claude launcher is unavailable on this machine".to_owned(),
             ),
         )));
-        let error = local_claude_resume(joined).unwrap_err();
+        let error = local_agent_restart(joined).unwrap_err();
         assert_eq!(error_kind(&error), ErrorKind::Conflict);
     }
 

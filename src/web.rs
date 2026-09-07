@@ -122,11 +122,20 @@ struct LegacySpecialKeyRequest {
 #[serde(deny_unknown_fields)]
 struct UpdateActionRequest {}
 
-/// Deliberately empty: the owning node derives the Claude config root and
-/// native session id itself, never from a browser request.
+/// Deliberately empty: the owning node derives the agent launcher, config
+/// root, configured controls, and native session id, never from a browser
+/// request.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ResumeCurrentClaudeRequest {}
+struct RestartCurrentAgentRequest {}
+
+/// A process identity is mandatory on this route; older nodes cannot silently
+/// ignore it because this action has its own endpoint.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestartAgentInstanceRequest {
+    instance_id: String,
+}
 
 /// Deliberately empty: callers choose only the owning machine. The owner runs
 /// its one compiled-in recovery script with no browser-supplied path or args.
@@ -825,6 +834,11 @@ fn routes(state: WebState) -> Router {
         .route("/api/v1/panes/{id}/git", get(pane_git))
         .route("/api/v1/panes/{id}/models", get(pane_models))
         .route("/api/v1/panes/{id}/model", post(switch_model))
+        .route("/api/v1/panes/{id}/restart", post(restart_current_agent))
+        .route(
+            "/api/v1/panes/{id}/restart-instance",
+            post(restart_agent_instance),
+        )
         .route("/api/v1/panes/{id}/resume", post(resume_current_claude))
         .route("/api/v1/panes/{id}/events", get(pane_events))
         .route("/api/v1/panes/{id}/messages", post(send_message))
@@ -1137,7 +1151,7 @@ async fn resume_current_claude(
     State(state): State<WebState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(_request): Json<ResumeCurrentClaudeRequest>,
+    Json(_request): Json<RestartCurrentAgentRequest>,
 ) -> Result<Json<OkResponse>, ApiError> {
     ensure_origin(&headers, &state.allowed_origins)?;
     state
@@ -1148,8 +1162,38 @@ async fn resume_current_claude(
     Ok(Json(OkResponse { ok: true }))
 }
 
+async fn restart_current_agent(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(_request): Json<RestartCurrentAgentRequest>,
+) -> Result<Json<OkResponse>, ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    state
+        .control
+        .restart_current_agent(&id)
+        .await
+        .map_err(|error| ApiError::from_control(&error))?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
 async fn machines(State(state): State<WebState>) -> Json<Vec<MachineSummary>> {
     Json(state.control.machines())
+}
+
+async fn restart_agent_instance(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<RestartAgentInstanceRequest>,
+) -> Result<Json<OkResponse>, ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    state
+        .control
+        .restart_agent_instance(&id, &request.instance_id)
+        .await
+        .map_err(|error| ApiError::from_control(&error))?;
+    Ok(Json(OkResponse { ok: true }))
 }
 
 async fn quick_resume_status(
@@ -3426,6 +3470,17 @@ mod tests {
             "non-Claude panes cannot use the Claude resume route"
         );
         assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/%254294967295/restart",
+                Some("{}"),
+            )
+            .await,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a Codex restart reaches the guarded owner-local restart seam"
+        );
+        assert_eq!(
             status_of(&app, "GET", "/api/v1/panes/gpu-box~%251/models", None,).await,
             StatusCode::SERVICE_UNAVAILABLE
         );
@@ -3448,6 +3503,47 @@ mod tests {
             )
             .await,
             StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                "POST",
+                "/api/v1/panes/gpu-box~%251/restart",
+                Some("{}"),
+            )
+            .await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_instance_route_requires_identity_and_rejects_stale_confirmation() {
+        let control = crate::control::test_control(&[]);
+        control.apply_refresh(vec![crate::control::test_session(
+            "synthetic-codex",
+            "%4294967295",
+            "OpenAI Codex (v0.153.4)",
+        )]);
+        let (app, _shutdown) = real_app(control);
+        let path = "/api/v1/panes/%254294967295/restart-instance";
+        assert_eq!(
+            status_of(&app, "POST", path, Some("{}")).await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            status_of(&app, "POST", path, Some(r#"{"instance_id":"invalid"}"#)).await,
+            StatusCode::BAD_REQUEST
+        );
+        let stale =
+            serde_json::json!({"instance_id": format!("pane-v1-{}", "a".repeat(64))}).to_string();
+        assert_eq!(
+            status_of(&app, "POST", path, Some(&stale)).await,
+            StatusCode::CONFLICT
+        );
+        let unknown = serde_json::json!({"instance_id": format!("pane-v1-{}", "a".repeat(64)), "command":"touch unwanted"}).to_string();
+        assert_eq!(
+            status_of(&app, "POST", path, Some(&unknown)).await,
+            StatusCode::UNPROCESSABLE_ENTITY
         );
     }
 

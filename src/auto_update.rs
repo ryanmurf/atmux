@@ -1170,6 +1170,14 @@ pub(crate) async fn inspect(harness: Harness) -> Result<Option<ExecutableIdentit
     }))
 }
 
+/// Resolves the current trusted owner-local native launcher without running it.
+///
+/// Explicit pane restarts use the same launcher boundary as maintenance, but
+/// do not need a version probe or an update check before respawning a pane.
+pub(crate) fn current_launcher(harness: Harness) -> Option<PathBuf> {
+    resolve_launcher(harness)
+}
+
 /// Runs one fixed vendor updater, then records the independently resolved
 /// executable identity. "Changed" is based on the binary digest, not updater
 /// exit text or a mutable symlink path.

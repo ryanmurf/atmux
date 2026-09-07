@@ -48,6 +48,8 @@ const LAUNCH_DIRECTORY_STORAGE_KEY = "atmux.launch-directories";
 const FILE_READER_STORAGE_KEY = "atmux.file-reader-preferences";
 const CONVERSATION_VISIBILITY_STORAGE_KEY = "atmux.conversation-visibility";
 const COMPOSER_DRAFT_STORAGE_KEY = "atmux.composer-drafts.v1";
+const NAVIGATION_STORAGE_KEY = "atmux.navigation.v1";
+const MAX_NAVIGATION_PREFERENCES = 256;
 const MAX_COMPOSER_DRAFT_ENTRIES = 64;
 const MAX_COMPOSER_DRAFT_TOMBSTONES = 256;
 const MAX_COMPOSER_DRAFT_STORAGE_CHARS = 512 * 1024;
@@ -584,6 +586,61 @@ function groupSessionsByMachine(sessions, machines) {
     groups.get(id).sessions.push(session);
   }
   return [...groups.values()];
+}
+
+/// Favorites belong to an actual pane incarnation, never a reusable tmux id.
+function favoriteSessionKey(session, localMachineId = "local") {
+  if (!session || !MACHINE_ID_PATTERN.test(sessionMachineId(session, localMachineId))) return null;
+  const identity = composerDraftIdentity(session, localMachineId);
+  return identity?.persistent ? identity.key : null;
+}
+
+function navigationPreferences(raw) {
+  let value = raw;
+  if (typeof raw === "string") {
+    if (raw.length > 64 * 1024) return { collapsed: [], favorites: [] };
+    try { value = JSON.parse(raw); } catch { value = null; }
+  }
+  const bounded = (items, valid) => [...new Set((Array.isArray(items) ? items : [])
+    .filter((item) => typeof item === "string" && valid(item)))].slice(-MAX_NAVIGATION_PREFERENCES);
+  return {
+    collapsed: bounded(value?.collapsed, (item) => MACHINE_ID_PATTERN.test(item)),
+    favorites: bounded(value?.favorites, (item) =>
+      PERSISTENT_COMPOSER_DRAFT_KEY_PATTERN.test(item)
+      && MACHINE_ID_PATTERN.test(composerDraftMachine(item) || "")),
+  };
+}
+
+/// Filters reveal matching children without changing a saved collapsed node.
+/// Pinning changes order only within that child's owning machine.
+function navigationView(sessions, machines, options = {}) {
+  const query = String(options.query || "").trim().toLowerCase();
+  const status = ["working", "waiting", "other"].includes(options.status) ? options.status : "";
+  const harness = ["claude", "codex", "other"].includes(options.harness) ? options.harness : "";
+  const filtering = Boolean(query || status || harness);
+  const localMachineId = machines.find((machine) => machine.kind === "local")?.id || "local";
+  const machineLabels = new Map(machines.map((machine) => [machine.id, machine.label || machine.id]));
+  const favorites = new Set(options.favorites || []);
+  const collapsed = new Set(options.collapsed || []);
+  const visible = sessions.filter((session) => {
+    const machineId = sessionMachineId(session, localMachineId);
+    const searchable = [session.name, session.path, session.agent, session.profile, machineId, machineLabels.get(machineId)]
+      .filter(Boolean).join(" ").toLowerCase();
+    return (!query || searchable.includes(query))
+      && (!status || session.status === status)
+      && (!harness || session.agent === harness);
+  });
+  const groups = groupSessionsByMachine(visible, machines)
+    .filter((group) => group.sessions.length > 0 || !filtering)
+    .map((group) => ({
+      ...group,
+      filtering,
+      collapsed: !filtering && collapsed.has(group.machine.id),
+      sessions: group.sessions.sort((left, right) =>
+        Number(favorites.has(favoriteSessionKey(right, localMachineId)))
+        - Number(favorites.has(favoriteSessionKey(left, localMachineId)))),
+    }));
+  return { groups, filtering, matchedCount: visible.length, totalCount: sessions.length };
 }
 
 function formatRelativeTime(timestamp, now) {
@@ -2250,26 +2307,37 @@ function pickerOptions(choices, current) {
   return options;
 }
 
-function claudeResumeState(session, capabilities, online, resumingPaneId, composerSending = false) {
-  const isClaude = session?.agent === "claude";
+function agentRestartState(session, capabilities, online, resumingPaneId, composerSending = false) {
+  const isRestartableAgent = session?.agent === "claude" || session?.agent === "codex";
   const matches = capabilities?.pane_id === session?.id;
   const available = matches && capabilities?.resume_available === true;
   const note = matches && typeof capabilities?.resume_note === "string" ? capabilities.resume_note : "";
   const restarting = Boolean(resumingPaneId);
   return {
-    visible: isClaude,
+    visible: isRestartableAgent,
     available,
     disabled: !online || restarting || composerSending || !available,
-    status: !isClaude ? ""
+    status: !isRestartableAgent ? ""
       : !online ? "Machine offline"
-        : restarting ? (resumingPaneId === session?.id ? "Relaunching Claude…" : "Another Claude relaunch is in progress")
-          : !matches ? "Checking resume…"
-            : note || (available ? "Ready to relaunch the saved conversation" : "Claude resume is unavailable"),
+        : restarting ? (resumingPaneId === session?.id ? "Restarting agent…" : "Another agent restart is in progress")
+          : !matches ? "Checking restart…"
+            : note || (available ? "Ready to restart this session" : "Session restart is unavailable"),
   };
 }
 
 function followsLiveTail(element, tolerance = 16) {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= tolerance;
+}
+
+function agentRestartRequest(session) {
+  if (!session?.id || !/^pane-v1-[a-f0-9]{64}$/.test(session.instance_id || "")) return null;
+  return { id: session.id, instance_id: session.instance_id };
+}
+
+function paneOutputDownload(session, lines) {
+  if (!session?.id || !Array.isArray(lines) || !lines.length) return null;
+  const name = String(session.name || "agent").replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 100);
+  return { filename: `atmux-${name}-output.txt`, content: lines.join("\n") + "\n" };
 }
 
 /// Decides how a transcript redraw treats the reader. A pane with no laid-out
@@ -2446,6 +2514,127 @@ function formatDecimal(value) {
 
 const ATMUX_HISTORY_VIEW = "atmuxView";
 
+function overviewConnectionPresentation(connection) {
+  const states = {
+    live: { label: "Live", note: "", retry: false },
+    connecting: { label: "Connecting…", note: "Connecting to live updates…", retry: false },
+    reconnecting: { label: "Reconnecting…", note: "Live updates disconnected. Showing the last received state.", retry: true },
+    stale: { label: "Updates delayed", note: "Live updates are delayed. Showing the last received state.", retry: true },
+    paused: { label: "Paused", note: "", retry: false },
+  };
+  return states[connection] || states.stale;
+}
+
+// An open socket is not proof that we have an authoritative overview. Each
+// connection must deliver its initial snapshot, including native SSE retries.
+// Idle streams have no visible heartbeat, so only the initial snapshot times
+// out; unchanged fleets must not be mistaken for disconnected ones.
+function createOverviewStream({
+  createSource,
+  onConnection,
+  onOverview,
+  onProtocolError,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+}) {
+  const source = createSource();
+  let closed = false;
+  let hasSnapshot = false;
+  let snapshotTimer = null;
+  const cancelSnapshotTimer = () => {
+    if (snapshotTimer !== null) clearTimer(snapshotTimer);
+    snapshotTimer = null;
+  };
+  const waitForSnapshot = () => {
+    cancelSnapshotTimer();
+    snapshotTimer = setTimer(() => {
+      snapshotTimer = null;
+      if (!closed && !hasSnapshot) onConnection("stale");
+    }, 15_000);
+  };
+  onConnection("connecting");
+  waitForSnapshot();
+  source.onopen = () => {
+    if (closed) return;
+    hasSnapshot = false;
+    onConnection("connecting");
+    waitForSnapshot();
+  };
+  const receive = (event, snapshot) => {
+    if (closed) return;
+    if (!snapshot && !hasSnapshot) {
+      onConnection("stale");
+      return;
+    }
+    const accepted = onOverview(event);
+    // A revision gap may have replaced this connection during onOverview.
+    if (closed) return;
+    if (!accepted) {
+      onConnection("stale");
+      return;
+    }
+    hasSnapshot = true;
+    cancelSnapshotTimer();
+    onConnection("live");
+  };
+  source.addEventListener("sessions.snapshot", (event) => receive(event, true));
+  source.addEventListener("sessions.patch", (event) => receive(event, false));
+  source.addEventListener("protocol.error", (event) => {
+    if (closed) return;
+    hasSnapshot = false;
+    cancelSnapshotTimer();
+    onProtocolError(event);
+    onConnection("stale");
+  });
+  source.onerror = () => {
+    if (closed) return;
+    hasSnapshot = false;
+    cancelSnapshotTimer();
+    onConnection("reconnecting");
+  };
+  return {
+    close() {
+      closed = true;
+      cancelSnapshotTimer();
+      source.close();
+    },
+  };
+}
+
+function selectedAgentUrl(urlValue, sessionId) {
+  if (typeof sessionId !== "string" || !sessionId) return null;
+  const url = agentMenuUrl(urlValue);
+  url.searchParams.set("session", sessionId);
+  return url.toString();
+}
+
+async function copySelectedAgentLink(urlValue, sessionId, clipboard) {
+  const url = selectedAgentUrl(urlValue, sessionId);
+  if (!url) throw new Error("Select an agent before copying its link.");
+  if (typeof clipboard?.writeText !== "function") {
+    throw new Error("Clipboard access is unavailable. Copy this page’s address from the browser.");
+  }
+  try {
+    await clipboard.writeText(url);
+  } catch {
+    throw new Error("Could not copy the link. Allow clipboard access or copy this page’s address from the browser.");
+  }
+  return url;
+}
+
+function agentSearchShortcut(event, { dialogOpen = false, searchVisible = true } = {}) {
+  if (!event || event.defaultPrevented || event.isComposing || event.repeat
+      || event.ctrlKey || event.metaKey || event.altKey || dialogOpen) return null;
+  const target = event.target;
+  if (event.key === "Escape" && target?.id === "filter") {
+    return target.value ? "clear" : "blur";
+  }
+  if (event.key !== "/" || !searchVisible) return null;
+  if (target?.isContentEditable
+      || target?.closest?.("input, textarea, select, [role='textbox'], [contenteditable]:not([contenteditable='false']), #conversation, #pane")) return null;
+  return "focus";
+}
+
 function appRoute(urlValue) {
   const url = urlValue instanceof URL ? urlValue : new URL(String(urlValue), "https://atmux.invalid/");
   const session = url.searchParams.get("session");
@@ -2504,6 +2693,11 @@ if (typeof module !== "undefined" && module.exports) {
     attachmentSelectionMatches,
     agentMenuUrl,
     appRoute,
+    overviewConnectionPresentation,
+    createOverviewStream,
+    selectedAgentUrl,
+    copySelectedAgentLink,
+    agentSearchShortcut,
     remainingAttachmentsAfterDelivery,
     arrayBufferToBase64,
     applyPanePatch,
@@ -2543,6 +2737,9 @@ if (typeof module !== "undefined" && module.exports) {
     fleetUpdatePollDelay,
     updateConfirmCopy,
     groupSessionsByMachine,
+    favoriteSessionKey,
+    navigationPreferences,
+    navigationView,
     machineCanCheck,
     machineCanRollback,
     machineCanUpdate,
@@ -2627,7 +2824,9 @@ if (typeof module !== "undefined" && module.exports) {
     sessionDeletePath,
     modelPickerState,
     pickerOptions,
-    claudeResumeState,
+    agentRestartState,
+    agentRestartRequest,
+    paneOutputDownload,
     followsLiveTail,
     stickyBottomState,
     STICKY_BOTTOM_TOLERANCE,
@@ -2669,10 +2868,75 @@ if (typeof module !== "undefined" && module.exports) {
     utf8ByteLength,
     validateImageSelection,
     validContentHash,
+    installMobileViewportRecovery,
   };
 }
 
 if (typeof document !== "undefined") initialize();
+
+// WebKit can leave its reveal scroll behind after dismissing the keyboard or
+// restoring a tab, including an offset with document.scrollTop already at zero.
+// Observe the visual viewport only to recover that settled state. It must never
+// supply the app's height or compete with the browser revealing a focused field.
+function installMobileViewportRecovery({ window, document, isMobile, syncViewport }) {
+  let settleTimer = null;
+  const viewport = window.visualViewport;
+  const listeners = [];
+  const listen = (target, event, callback) => {
+    if (!target?.addEventListener) return;
+    target.addEventListener(event, callback, { passive: true });
+    listeners.push(() => target.removeEventListener(event, callback));
+  };
+  const cancel = () => {
+    window.clearTimeout(settleTimer);
+    settleTimer = null;
+  };
+  const editableFocused = () => {
+    const focused = document.activeElement;
+    return focused?.isContentEditable
+      || focused?.matches?.("input, textarea, select, [contenteditable]:not([contenteditable='false'])");
+  };
+  const recover = () => {
+    settleTimer = null;
+    if (document.hidden || !isMobile() || editableFocused()) return;
+    syncViewport();
+    if (!viewport) return;
+    // A reduced visual viewport still belongs to the keyboard (or pinch zoom).
+    // Wait for the full layout height instead of guessing keyboard dimensions.
+    if (!Number.isFinite(window.innerHeight) || window.innerHeight <= 0
+        || !Number.isFinite(viewport.height) || !Number.isFinite(viewport.scale)
+        || Math.abs(viewport.scale - 1) > 0.01
+        || viewport.height < window.innerHeight - 2) return;
+    const root = document.scrollingElement || document.documentElement;
+    const shifted = Math.abs(window.scrollY || 0) > 1
+      || Math.abs(root.scrollTop || 0) > 1
+      || Math.abs(viewport.offsetTop || 0) > 1
+      || document.body.getBoundingClientRect().top < -1;
+    if (!shifted) return;
+    // Only the outer document is pinned. Rail, transcript, file reader, and
+    // dialog scroll positions remain owned by their respective panels.
+    root.scrollTop = 0;
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+  };
+  const schedule = () => {
+    cancel();
+    if (document.hidden) return;
+    // Keyboard/toolbar events can arrive before the paint animation finishes.
+    // Coalesce them and re-check focus/scale/height when the viewport settles.
+    settleTimer = window.setTimeout(recover, 350);
+  };
+  listen(viewport, "resize", schedule);
+  listen(viewport, "scroll", schedule);
+  listen(window, "resize", schedule);
+  listen(window, "orientationchange", schedule);
+  listen(window, "pageshow", schedule);
+  listen(window, "pagehide", cancel);
+  listen(document, "focusout", schedule);
+  listen(document, "focusin", cancel);
+  listen(document, "visibilitychange", schedule);
+  schedule();
+  return () => { cancel(); listeners.forEach((remove) => remove()); };
+}
 
 function initialize() {
   const pageUrl = new URL(location.href);
@@ -2713,6 +2977,7 @@ function initialize() {
     storedComposerDraftValue,
   );
   const storedComposerDrafts = storedComposerDraftState.drafts;
+  const storedNavigation = navigationPreferences(readLocalStorage(NAVIGATION_STORAGE_KEY));
   const requestedPulseAccount = pulseAccountId(pageUrl.searchParams.get("pulseAccount"));
   const state = {
     revision: 0,
@@ -2728,6 +2993,10 @@ function initialize() {
     statusPresentations: new Map(),
     statusTimer: null,
     filter: "",
+    statusFilter: "",
+    harnessFilter: "",
+    collapsedMachines: new Set(storedNavigation.collapsed),
+    favoriteSessions: new Set(storedNavigation.favorites),
     health: null,
     pendingSelectionName: null,
     launchOptions: null,
@@ -2903,7 +3172,9 @@ function initialize() {
     }
     const height = window.innerHeight;
     if (Number.isFinite(height) && height > 0) {
-      document.documentElement.style.setProperty("--app-height", `${Math.floor(height)}px`);
+      if (document.documentElement.style.getPropertyValue("--app-height") !== `${Math.floor(height)}px`) {
+        document.documentElement.style.setProperty("--app-height", `${Math.floor(height)}px`);
+      }
       revealFocusedLaunchMemoryControl();
     }
   }
@@ -2911,6 +3182,9 @@ function initialize() {
   window.addEventListener("resize", syncMobileViewport, { passive: true });
   window.addEventListener("orientationchange", syncMobileViewport, { passive: true });
   syncMobileViewport();
+  installMobileViewportRecovery({
+    window, document, isMobile: mobileViewportActive, syncViewport: syncMobileViewport,
+  });
 
   if (state.pulseOpen) {
     state.selected = null;
@@ -2943,7 +3217,7 @@ function initialize() {
       // may already be wrong. Reconnect for an authoritative snapshot instead
       // of merging into a gap.
       connectOverview();
-      return;
+      return false;
     }
     mergeComposerDraftState(
       state.composerDrafts,
@@ -2982,6 +3256,7 @@ function initialize() {
     setHealth(data.health);
     reconcileSelection();
     render();
+    return true;
   }
 
   function machineOf(session) {
@@ -2993,25 +3268,18 @@ function initialize() {
 
   function connectOverview() {
     state.overviewSource?.close();
-    state.overviewConnection = "connecting";
-    renderCounts();
-    const source = new EventSource("/api/v1/events");
-    state.overviewSource = source;
-    source.onopen = () => {
-      state.overviewConnection = "live";
-      renderCounts();
-    };
-    source.addEventListener("sessions.snapshot", (event) => {
-      const data = parseEvent(event); if (data) applyOverview(data);
+    state.overviewSource = createOverviewStream({
+      createSource: () => new EventSource("/api/v1/events"),
+      onConnection(connection) {
+        state.overviewConnection = connection;
+        renderCounts();
+      },
+      onOverview(event) {
+        const data = parseEvent(event);
+        return data ? applyOverview(data) : false;
+      },
+      onProtocolError: (event) => setHealth(event.data || "stream protocol error"),
     });
-    source.addEventListener("sessions.patch", (event) => {
-      const data = parseEvent(event); if (data) applyOverview(data);
-    });
-    source.addEventListener("protocol.error", (event) => setHealth(event.data || "stream protocol error"));
-    source.onerror = () => {
-      state.overviewConnection = "reconnecting";
-      renderCounts();
-    };
   }
 
   function resetProjectView() {
@@ -4364,9 +4632,10 @@ function initialize() {
     const normalized = typeof message === "string" && message.trim() ? message.trim() : null;
     if (state.health === normalized) return;
     state.health = normalized;
-    const alert = $("health-alert");
+    const alert = $("health-message");
     alert.textContent = normalized ? `tmux monitor: ${normalized}` : "";
     alert.hidden = !normalized;
+    renderOverviewConnection();
   }
 
   function reconcileSelection() {
@@ -4580,13 +4849,20 @@ function initialize() {
     renderUpdateAll();
     renderAttachments();
 
-    const query = state.filter.toLowerCase();
-    const visible = sessions.filter((session) =>
-      !query || `${session.name} ${session.path} ${session.agent} ${session.profile || ""} ${sessionMachineId(session)}`.toLowerCase().includes(query));
-    const groups = groupSessionsByMachine(visible, state.machines)
-      .filter((group) => group.sessions.length > 0 || !query);
-    reconcileRows(groups);
-    $("empty").hidden = visible.length > 0;
+    const navigation = navigationView(sessions, state.machines, {
+      query: state.filter,
+      status: state.statusFilter,
+      harness: state.harnessFilter,
+      collapsed: state.collapsedMachines,
+      favorites: state.favoriteSessions,
+    });
+    reconcileRows(navigation.groups);
+    $("filter-clear").hidden = !navigation.filtering;
+    $("filter-summary").textContent = navigation.filtering
+      ? `${navigation.matchedCount} of ${navigation.totalCount} agents`
+      : `${navigation.totalCount} agent${navigation.totalCount === 1 ? "" : "s"}`;
+    $("empty").hidden = navigation.matchedCount > 0;
+    $("empty").textContent = navigation.filtering ? "No agents match these filters." : "No agent sessions yet.";
 
     const selected = state.sessions.get(state.selected);
     const selectedMachine = state.machines.find((machine) => machine.id === state.selectedMachine) || null;
@@ -4629,10 +4905,10 @@ function initialize() {
     launch.hidden = !launchCommand;
     launch.textContent = launchCommand ? `tmux: ${launchCommand}` : "";
     renderModelControl(selected, controllable);
-    renderClaudeResumeAction(selected, controllable);
+    renderAgentRestartAction(selected, controllable);
     const resuming = Boolean(state.resumingPaneId);
     const preparingDuplicate = Boolean(state.duplicatingPaneId);
-    for (const id of ["interrupt", "kill-open", "attach", "quick-actions-open", "quick-duplicate", "quick-compact", "quick-interrupt", "quick-kill-open"]) $(id).disabled = !controllable || state.composerSending || resuming || preparingDuplicate;
+    for (const id of ["interrupt", "kill-open", "attach", "quick-duplicate", "quick-compact", "quick-interrupt", "quick-kill-open"]) $(id).disabled = !controllable || state.composerSending || resuming || preparingDuplicate;
     const keyTarget = paneSpecialKeyDelivery(selected, "enter");
     const keyTargetId = paneSpecialKeyTarget(keyTarget);
     const queuedKeys = keyTargetId
@@ -4727,10 +5003,10 @@ function initialize() {
     select.disabled = disabled;
   }
 
-  function renderClaudeResumeAction(session, controllable) {
+  function renderAgentRestartAction(session, controllable) {
     const button = $("quick-resume");
     const note = $("quick-resume-note");
-    const view = claudeResumeState(
+    const view = agentRestartState(
       session,
       state.paneModels,
       controllable,
@@ -4747,9 +5023,28 @@ function initialize() {
   function createMachineNode(machine) {
     const li = document.createElement("li");
     li.className = "machine-row";
+    const heading = document.createElement("div");
+    heading.className = "machine-heading";
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "machine-toggle";
+    toggle.dataset.machineId = machine.id;
+    toggle.dataset.machineAction = "collapse";
+    const children = document.createElement("ul");
+    children.className = "machine-sessions";
+    children.id = `machine-sessions-${encodeURIComponent(machine.id)}`;
+    toggle.setAttribute("aria-controls", children.id);
+    toggle.addEventListener("click", () => {
+      if (state.collapsedMachines.has(machine.id)) state.collapsedMachines.delete(machine.id);
+      else state.collapsedMachines.add(machine.id);
+      saveNavigationPreferences();
+      render();
+    });
     const header = document.createElement("button");
     header.type = "button";
     header.className = "machine-header";
+    header.dataset.machineId = machine.id;
+    header.dataset.machineAction = "details";
     header.addEventListener("click", () => selectMachine(machine.id));
     const dot = textSpan("", "machine-dot");
     dot.setAttribute("aria-hidden", "true");
@@ -4758,15 +5053,26 @@ function initialize() {
     pill.hidden = true;
     const status = textSpan("", "machine-status");
     header.append(dot, label, pill, status);
-    li.append(header);
-    return { li, header, dot, label, pill, status, machineId: machine.id };
+    heading.append(toggle, header);
+    li.append(heading, children);
+    return { li, header, toggle, children, dot, label, pill, status, machineId: machine.id };
   }
 
-  function updateMachineNode(node, machine) {
+  function updateMachineNode(node, group) {
+    const { machine, collapsed, filtering } = group;
     const online = isMachineControllable(machine);
+    const label = machine.label || machine.id;
+    node.toggle.textContent = collapsed ? "›" : "⌄";
+    node.toggle.setAttribute("aria-expanded", String(!collapsed));
+    node.toggle.setAttribute("aria-label", `${collapsed ? "Expand" : "Collapse"} ${label} agents`);
+    node.toggle.disabled = filtering;
+    node.toggle.title = filtering ? "Matching agents are expanded while filters are active" : `${collapsed ? "Expand" : "Collapse"} ${label} agents`;
+    node.children.hidden = collapsed;
+    node.children.setAttribute("aria-label", `${label} agents`);
     node.header.className = `machine-header ${online ? "online" : "offline"}${state.selectedMachine === machine.id ? " selected" : ""}`;
+    node.header.title = `View ${label} details`;
     node.dot.textContent = online ? "◉" : "○";
-    node.label.textContent = machine.label || machine.id;
+    node.label.textContent = label;
     const pill = machineUpdatePill(state.fleetUpdates.get(machine.id));
     node.pill.textContent = pill;
     node.pill.hidden = !pill;
@@ -4781,64 +5087,75 @@ function initialize() {
   /// Reconciles machine headers and session buttons in place. Nodes are reused
   /// so streaming updates never destroy focus or scroll position.
   function reconcileRows(groups) {
-    const desired = [];
-    for (const group of groups) {
-      desired.push({ kind: "machine", key: `m:${group.machine.id}`, machine: group.machine });
-      for (const session of group.sessions) {
-        desired.push({ kind: "session", key: `s:${session.id}`, session });
-      }
-    }
-    const keys = new Set(desired.map((row) => row.key));
-    const focusedId = document.activeElement?.dataset?.sessionId;
-    const focusedAction = document.activeElement?.dataset?.sessionAction;
+    const focused = document.activeElement;
     let cursor = sessionList.firstElementChild;
-    for (const row of desired) {
-      let node;
-      if (row.kind === "machine") {
-        node = machineNodes.get(row.machine.id);
-        if (!node) {
-          node = createMachineNode(row.machine);
-          machineNodes.set(row.machine.id, node);
-        }
-        updateMachineNode(node, row.machine);
-      } else {
-        node = sessionNodes.get(row.session.id);
-        if (!node) {
-          node = createSessionNode(row.session.id);
-          sessionNodes.set(row.session.id, node);
-        }
-        updateSessionNode(node, row.session);
+    for (const group of groups) {
+      let node = machineNodes.get(group.machine.id);
+      if (!node) {
+        node = createMachineNode(group.machine);
+        machineNodes.set(group.machine.id, node);
       }
-      node.li.dataset.rowKey = row.key;
+      updateMachineNode(node, group);
+      node.li.dataset.machineId = group.machine.id;
       if (node.li === cursor) cursor = cursor.nextElementSibling;
       else sessionList.insertBefore(node.li, cursor);
+      let childCursor = node.children.firstElementChild;
+      for (const session of group.sessions) {
+        let child = sessionNodes.get(session.id);
+        if (!child) {
+          child = createSessionNode(session.id);
+          sessionNodes.set(session.id, child);
+        }
+        updateSessionNode(child, session);
+        child.li.dataset.rowKey = session.id;
+        if (child.li === childCursor) childCursor = childCursor.nextElementSibling;
+        else node.children.insertBefore(child.li, childCursor);
+      }
+      const childIds = new Set(group.sessions.map((session) => session.id));
+      for (const child of [...node.children.children]) {
+        if (!childIds.has(child.dataset.rowKey)) child.remove();
+      }
     }
+    const machineIds = new Set(groups.map((group) => group.machine.id));
     for (const child of [...sessionList.children]) {
-      if (!keys.has(child.dataset.rowKey)) child.remove();
+      if (!machineIds.has(child.dataset.machineId)) child.remove();
     }
     for (const id of sessionNodes.keys()) {
       if (!state.sessions.has(id)) sessionNodes.delete(id);
     }
+    const localMachineId = state.machines.find((machine) => machine.kind === "local")?.id || "local";
+    const liveMachineIds = new Set([
+      ...state.machines.map((machine) => machine.id),
+      ...[...state.sessions.values()].map((session) => sessionMachineId(session, localMachineId)),
+    ]);
     for (const id of machineNodes.keys()) {
-      if (!state.machines.some((machine) => machine.id === id)) machineNodes.delete(id);
+      if (!liveMachineIds.has(id)) machineNodes.delete(id);
     }
-    const focusedNode = focusedId && sessionNodes.get(focusedId);
-    const focused = focusedAction === "delete" ? focusedNode?.deleteButton : focusedNode?.button;
-    if (focused?.isConnected && document.activeElement !== focused) focused.focus({ preventScroll: true });
+    if (focused?.isConnected && !focused.closest("[hidden]")
+        && document.activeElement !== focused) focused.focus({ preventScroll: true });
   }
 
   function renderCounts(sessions = [...state.sessions.values()]) {
+    renderOverviewConnection();
     const counts = $("counts");
-    if (state.overviewConnection !== "live") {
-      counts.textContent = state.overviewConnection === "connecting" ? "Connecting…" : "Reconnecting…";
-      return;
-    }
     const working = sessions.filter((item) => item.status === "working").length;
     const waiting = sessions.filter((item) => item.status === "waiting").length;
     counts.replaceChildren(
       textSpan(`● ${working} working`, "count-working"),
       textSpan(`◆ ${waiting} waiting`, "count-waiting"),
     );
+  }
+
+  function renderOverviewConnection() {
+    const view = overviewConnectionPresentation(state.overviewConnection);
+    const status = $("overview-status");
+    status.textContent = view.label;
+    status.dataset.connection = state.overviewConnection;
+    const notice = $("overview-notice");
+    notice.hidden = !view.retry;
+    $("overview-note").textContent = view.note;
+    $("overview-retry").disabled = !view.retry;
+    $("health-alert").hidden = !state.health && !view.retry;
   }
 
   function renderMachineDetail(machine) {
@@ -4999,6 +5316,21 @@ function initialize() {
     const sub = textSpan("", "session-sub");
     copy.append(name, sub);
     button.append(dot, copy);
+    const pinButton = document.createElement("button");
+    pinButton.type = "button";
+    pinButton.className = "session-pin";
+    pinButton.dataset.sessionId = id;
+    pinButton.dataset.sessionAction = "pin";
+    pinButton.addEventListener("click", () => {
+      const session = state.sessions.get(id);
+      const localMachineId = state.machines.find((machine) => machine.kind === "local")?.id || "local";
+      const key = favoriteSessionKey(session, localMachineId);
+      if (!key) return;
+      if (state.favoriteSessions.has(key)) state.favoriteSessions.delete(key);
+      else state.favoriteSessions.add(key);
+      saveNavigationPreferences();
+      render();
+    });
     const deleteButton = document.createElement("button");
     deleteButton.type = "button";
     deleteButton.className = "session-delete";
@@ -5007,8 +5339,8 @@ function initialize() {
     deleteButton.textContent = "🗑";
     deleteButton.title = "Kill this session";
     deleteButton.addEventListener("click", () => openKillDialog(id));
-    li.append(button, deleteButton);
-    return { li, button, deleteButton, dot, name, sub };
+    li.append(button, pinButton, deleteButton);
+    return { li, button, pinButton, deleteButton, dot, name, sub };
   }
 
   function updateSessionNode(node, session) {
@@ -5017,6 +5349,14 @@ function initialize() {
     node.button.setAttribute("aria-current", selected ? "true" : "false");
     const folder = sessionFolderLabel(session);
     const profile = sessionProfileLabel(session);
+    const localMachineId = state.machines.find((machine) => machine.kind === "local")?.id || "local";
+    const favoriteKey = favoriteSessionKey(session, localMachineId);
+    const pinned = Boolean(favoriteKey && state.favoriteSessions.has(favoriteKey));
+    node.pinButton.textContent = pinned ? "★" : "☆";
+    node.pinButton.setAttribute("aria-pressed", String(pinned));
+    node.pinButton.setAttribute("aria-label", `${pinned ? "Unpin" : "Pin"} ${session.name}`);
+    node.pinButton.disabled = !favoriteKey;
+    node.pinButton.title = favoriteKey ? `${pinned ? "Unpin" : "Pin"} ${session.name}` : "Pinning requires a current agent owner";
     node.button.setAttribute("aria-label", [session.name, folder, profile, session.status, session.agent].filter(Boolean).join(", "));
     node.deleteButton.setAttribute("aria-label", `Kill ${session.name}`);
     node.deleteButton.disabled = !isMachineControllable(machineOf(session));
@@ -6203,7 +6543,52 @@ function initialize() {
   }
 
   $("filter").addEventListener("input", (event) => { state.filter = event.target.value; render(); });
+  $("filter-status").addEventListener("change", (event) => { state.statusFilter = event.target.value; render(); });
+  $("filter-harness").addEventListener("change", (event) => { state.harnessFilter = event.target.value; render(); });
+  $("filter-clear").addEventListener("click", () => {
+    state.filter = "";
+    state.statusFilter = "";
+    state.harnessFilter = "";
+    for (const id of ["filter", "filter-status", "filter-harness"]) $(id).value = "";
+    render();
+    $("filter").focus({ preventScroll: true });
+  });
+
+  function saveNavigationPreferences() {
+    const preferences = navigationPreferences({
+      collapsed: [...state.collapsedMachines],
+      favorites: [...state.favoriteSessions],
+    });
+    state.collapsedMachines = new Set(preferences.collapsed);
+    state.favoriteSessions = new Set(preferences.favorites);
+    if (!writeLocalStorage(NAVIGATION_STORAGE_KEY, JSON.stringify(preferences))) {
+      toast("Navigation preferences apply for this page; browser storage is unavailable.");
+    }
+  }
   $("rail-toggle").addEventListener("click", () => setRailCollapsed(!state.railCollapsed));
+  document.addEventListener("keydown", (event) => {
+    const action = agentSearchShortcut(event, {
+      dialogOpen: Boolean(document.querySelector("dialog[open]")),
+      searchVisible: !mobileViewportActive() || !document.body.classList.contains("has-selection"),
+    });
+    if (!action) return;
+    event.preventDefault();
+    const filter = $("filter");
+    if (action === "focus") {
+      setRailCollapsed(false);
+      filter.focus({ preventScroll: true });
+      filter.select();
+    } else if (action === "clear") {
+      filter.value = "";
+      state.filter = "";
+      render();
+    } else {
+      filter.blur();
+    }
+  });
+  $("overview-retry").addEventListener("click", () => {
+    if (!$("overview-retry").disabled) connectOverview();
+  });
   $("pulse-open").addEventListener("click", () => selectPulse(!state.pulseOpen));
   function stopRecoveryPolling() {
     if (state.recoveryPoll !== null) clearTimeout(state.recoveryPoll);
@@ -6852,12 +7237,30 @@ function initialize() {
   $("quick-actions-open").addEventListener("click", () => {
     const dialog = $("quick-actions-dialog");
     if (!dialog.open) {
+      $("quick-copy-link-status").hidden = true;
       dialog.showModal();
       $("quick-actions-open").setAttribute("aria-expanded", "true");
     }
   });
   $("quick-actions-dialog").addEventListener("close", () => {
     $("quick-actions-open").setAttribute("aria-expanded", "false");
+  });
+  $("quick-copy-link").addEventListener("click", async () => {
+    const session = state.sessions.get(state.selected);
+    if (!session) return;
+    const button = $("quick-copy-link");
+    const status = $("quick-copy-link-status");
+    button.disabled = true;
+    status.hidden = false;
+    status.textContent = "Copying link…";
+    try {
+      await copySelectedAgentLink(location.href, session.id, navigator.clipboard);
+      status.textContent = `Link copied for ${session.name}.`;
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
   });
   $("quick-duplicate").addEventListener("click", () => {
     const session = state.sessions.get(state.selected);
@@ -6880,9 +7283,23 @@ function initialize() {
     $("quick-actions-dialog").close();
     void compactSelectedAgent();
   });
-  function openResumeDialog() {
+  $("quick-download-output").addEventListener("click", () => {
+    const snapshot = paneOutputDownload(state.sessions.get(state.selected), state.paneLines);
+    if (!snapshot) { toast("No raw output is available yet"); return; }
+    const url = URL.createObjectURL(new Blob([snapshot.content], { type: "text/plain;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = snapshot.filename;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30_000);
+    $("quick-actions-dialog").close();
+    toast("Raw output download started");
+  });
+  function openRestartDialog() {
     const session = state.sessions.get(state.selected);
-    const view = claudeResumeState(
+    const view = agentRestartState(
       session,
       state.paneModels,
       isMachineControllable(machineOf(session)),
@@ -6890,14 +7307,18 @@ function initialize() {
       state.composerSending,
     );
     if (!session || !view.available || view.disabled) {
-      toast(view.status || "Claude resume is unavailable");
+      toast(view.status || "Session restart is unavailable");
       return;
     }
-    state.pendingResumeId = session.id;
+    state.pendingResumeId = agentRestartRequest(session);
+    if (!state.pendingResumeId) {
+      toast("Refresh this agent before restarting; its process identity is unavailable");
+      return;
+    }
     $("quick-actions-dialog").close();
     $("resume-dialog").showModal();
   }
-  $("quick-resume").addEventListener("click", openResumeDialog);
+  $("quick-resume").addEventListener("click", openRestartDialog);
   for (const [quickId, actionId] of [["quick-tmux-prefix-twice", "tmux-prefix-twice"], ["quick-interrupt", "interrupt"], ["quick-kill-open", "kill-open"]]) {
     $(quickId).addEventListener("click", () => {
       if ($(quickId).disabled) return;
@@ -7381,19 +7802,20 @@ function initialize() {
   });
 
   $("resume-confirm").addEventListener("click", async () => {
-    const target = state.pendingResumeId;
-    if (!target || state.resumingPaneId) return;
+    const confirmed = state.pendingResumeId;
+    if (!confirmed || state.resumingPaneId) return;
+    const target = confirmed.id;
     const button = $("resume-confirm");
     state.resumingPaneId = target;
     button.disabled = true;
     render();
     try {
-      await request(`/api/v1/panes/${encodeURIComponent(target)}/resume`, {
+      await request(`/api/v1/panes/${encodeURIComponent(target)}/restart-instance`, {
         method: "POST",
-        body: JSON.stringify({}),
+        body: JSON.stringify({ instance_id: confirmed.instance_id }),
       });
       $("resume-dialog").close();
-      toast("Claude relaunched and resumed");
+      toast("Agent session restarted");
     } catch (error) {
       toast(error.message);
     } finally {

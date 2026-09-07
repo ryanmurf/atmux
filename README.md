@@ -60,8 +60,15 @@ Open <http://127.0.0.1:7345>. The dashboard can:
 
 - stream agent status and the selected pane;
 - send literal multiline messages;
-- interrupt or kill a session; and
+- interrupt, restart, or kill a session; and
 - launch configured profiles in configured project directories.
+
+Use the arrow beside a machine to collapse its agents; the machine name still
+opens its details. Stars pin agents within their machine. The list remembers
+collapsed groups and pins in this browser, and its text, state, and harness
+filters temporarily reveal matching agents. Press `/` to search on a keyboard.
+Actions also offers Copy agent link and Download raw output. A connection
+notice provides Retry when live updates are interrupted.
 
 The web server polls tmux once regardless of how many interfaces are connected. Browser clients receive change-only
 Server-Sent Events: compact overview patches on one stream and line-level patches for only the
@@ -133,7 +140,7 @@ Zero, systemd's `u64::MAX` infinity sentinel, and a limit at or above the
 smaller of host `MemTotal` and any inherited cgroup-v2 `memory.max` are
 rejected: a configured value must be a real per-worker cap. `atmux doctor`
 performs the same bounded, collected probe and prints the configured byte
-limit. Each normal launch, saved-conversation launch, explicit Claude resume,
+limit. Each normal launch, saved-conversation launch, explicit agent restart,
 maintenance relaunch, and checked-in recovery path receives a unique
 `atmux-tmux-spawn-*.scope`; the foreground scope runner preserves the pane's
 terminal I/O while the whole descendant process tree shares the limit.
@@ -159,7 +166,7 @@ that is lower than the configured policy it labels both values; it never
 presents the configured ceiling as currently accepted capacity.
 
 Duplicate and normal saved-conversation launches carry an explicitly selected
-cap. An in-place Claude resume or automatic CLI-maintenance relaunch preserves
+cap. An in-place agent restart or automatic CLI-maintenance relaunch preserves
 the exact observed pane cap only while the current owner policy still permits
 it. atmux deliberately does not mutate a live worker's cgroup: a changed limit
 applies only to a new process generation, avoiding a runtime reduction below
@@ -239,7 +246,7 @@ identity on the next poll.
 Relaunches are sequential and require a fresh exact
 top-level empty composer, native saved-session mapping, profile/config store,
 model, effort, and fast-tier mode. Every local message, model change, interrupt,
-explicit resume, auto-compact, and maintenance relaunch uses the same
+explicit restart, auto-compact, and maintenance relaunch uses the same
 owner-local per-pane OS lock plus a durable tmux mutation sequence, so briefly
 overlapping old/new web processes cannot race. Working, approval, unknown,
 wrapper, Grok, and unmapped panes fail closed.
@@ -535,7 +542,7 @@ token_env = "ATMUX_NODE_TOKEN"
 
 The dashboard groups sessions under a header per machine showing its label, online state, agent
 count, and — when a machine is unreachable — the reason and how long ago it was last seen. Output,
-send, interrupt, launch, and stop all route to the owning machine. The launcher gains a machine
+send, interrupt, restart, launch, and stop all route to the owning machine. The launcher gains a machine
 picker whose projects and profiles come from that machine.
 
 ### Identity
@@ -1109,7 +1116,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 cargo +1.88 check --locked
 node --check web/app.js
-node --test web/app.test.mjs
+node --test web/*.test.mjs tests/navigation.test.mjs
+node --test tests/web_mobile_pulse_browser.mjs tests/navigation_browser.mjs tests/mobile_viewport_browser.mjs
 ```
 
 Contributions are welcome. Please keep tmux mutations explicit and preserve the zero-hook default experience.
