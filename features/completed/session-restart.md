@@ -1,6 +1,6 @@
 # In-place agent session restart
 
-Status: implementation active
+Status: deployed and runtime-verified 2026-09-07
 
 ## Acceptance criteria
 
@@ -21,8 +21,8 @@ Status: implementation active
 
 - [x] Implementation
 - [x] Focused Rust and browser tests
-- [ ] Disposable tmux integration test for Claude and Codex
-- [ ] Midnight and Max live verification
+- [x] Disposable tmux integration test for Claude and Codex
+- [x] Midnight and Max live verification
 - [x] Fable/Claude Max review
 - [x] Independent security review
 
@@ -37,3 +37,10 @@ Status: implementation active
   again immediately before respawn. Older owner versions fail closed on the new route.
 - Opening Actions refreshes capabilities; a rejected restart clears its stale confirmation so a new
   attempt requires a fresh user confirmation. Independent security and Fable reviews approved.
+- The disposable native restart integration verifies real in-place respawn for both providers with
+  recorder launchers and exact saved ID/config/cwd/model/effort/Fast arguments. It leaves its canary
+  process and server/session/window/pane identities untouched and replaces only the target PID.
+- Runtime commit `fbb2bff` is deployed on Tron, Max, Midnight, Clue, and coordinator revision 27.
+  Live authenticated checks verify stable native process stamps, captured output, and stale-request
+  rejection on all four owners without manually restarting live agents. Deployment details and
+  the pre-existing Midnight maintenance observation are in `../dashboard-improvements.md`.
