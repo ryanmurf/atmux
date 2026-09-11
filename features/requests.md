@@ -26,6 +26,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Merge every supported Claude Pulse feature into atmux as native Rust functionality | `claude-pulse-rust-merge.md` | Management/UI slice implemented and tested; overall merge active |
 | Open Usage as a Pulse-style dashboard without requiring a numeric account ID | `pulse-dashboard-experience.md` | Implementation active |
 | Collect and report Pulse data from the one atmux binary on each box | `single-binary-pulse-rollout.md` | Implementation active |
+| Update model costs and add new models while keeping Fast separate | `model-pricing-refresh.md` | Catalog implemented and locally tested; deployment/review pending |
 
 ## Projects, agents, and profiles
 
@@ -59,6 +60,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Send special terminal input such as Ctrl+B twice | `completed/agent-interaction-controls.md` | Completed |
 | Add a compact-command shortcut | `completed/agent-interaction-controls.md` | Completed |
 | Use Up/Down to browse previously sent comments | `completed/agent-interaction-controls.md` | Completed |
+| Fix Up-arrow input history after the composer draft regression | `composer-history-navigation.md` | Implemented and browser-tested; deployment/review pending |
 | Plain Enter sends; Ctrl/Command+Enter inserts a newline | `completed/composer-keyboard-behavior.md` | Completed |
 | Switch the model of a running Claude or Codex pane from the web UI | `model-switching.md` | Implementation active |
 | Restart a running Claude or Codex tmux session in place and resume its conversation | `completed/session-restart.md` | Completed and deployed |
@@ -69,6 +71,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 
 | Request | Feature record | Status |
 | --- | --- | --- |
+| Collapse mixed tool/error rows, show metrics on every entry, and add Conversation totals | `conversation-metrics-and-grouping.md` | Implemented locally; deployment/review pending |
 | Collapse individual nodes and implement, review, test, build, and deploy ten dashboard improvements using agents | `dashboard-improvements.md` | Deployed and verified; physical iPhone retest pending |
 | Use Claude and Codex session logs as the conversation display | `completed/claude-codex-transcripts.md` | Completed |
 | Support old/unlabeled Claude CLI storage and profile directories such as `~/.claude-max` | `completed/claude-codex-transcripts.md` | Completed |

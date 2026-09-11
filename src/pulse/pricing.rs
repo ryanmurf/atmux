@@ -13,11 +13,11 @@ use super::{
     store::{PricingRule, Store},
 };
 
-pub const PRICING_AS_OF: &str = "2026-07-10";
+pub const PRICING_AS_OF: &str = "2026-09-07";
 pub const ANTHROPIC_PRICING_SOURCE: &str =
     "https://platform.claude.com/docs/en/about-claude/pricing";
 pub const OPENAI_PRICING_SOURCE: &str = "https://developers.openai.com/api/docs/pricing";
-pub const DEEPSEEK_PRICING_SOURCE: &str = "https://api-docs.deepseek.com/quick_start/pricing";
+pub const DEEPSEEK_PRICING_SOURCE: &str = "https://api-docs.deepseek.com/quick_start/pricing/";
 pub const GEMINI_PRICING_SOURCE: &str = "https://ai.google.dev/gemini-api/docs/pricing";
 
 /// The five independently billed token classes, in USD per million tokens.
@@ -81,47 +81,91 @@ pub struct ResolvedPricing {
 
 /// Returns the single built-in pricing table and its primary-source provenance.
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn authoritative_pricing() -> Vec<AuthoritativePricingRule> {
-    let anthropic = [
+    let mut rules = Vec::new();
+    anthropic_pricing(&mut rules);
+    openai_pricing(&mut rules);
+    deepseek_pricing(&mut rules);
+    gemini_pricing(&mut rules);
+    rules
+}
+
+fn anthropic_pricing(rules: &mut Vec<AuthoritativePricingRule>) {
+    for specification in [
+        spec("claude-fable-5-1", 10.0, 50.0, 12.5, 20.0, 0.25),
+        spec("claude-mythos-5-1", 10.0, 50.0, 12.5, 20.0, 0.25),
         spec("claude-fable-5", 10.0, 50.0, 12.5, 20.0, 1.0),
         spec("claude-mythos-5", 10.0, 50.0, 12.5, 20.0, 1.0),
-        spec("claude-opus-4", 5.0, 25.0, 6.25, 10.0, 0.5),
+        spec("claude-opus-5", 5.0, 25.0, 6.25, 10.0, 0.5),
+        spec("claude-opus-4-8", 5.0, 25.0, 6.25, 10.0, 0.5),
+        spec("claude-opus-4-7", 5.0, 25.0, 6.25, 10.0, 0.5),
+        spec("claude-opus-4-6", 5.0, 25.0, 6.25, 10.0, 0.5),
+        spec("claude-opus-4-5", 5.0, 25.0, 6.25, 10.0, 0.5),
+        spec("claude-opus-4", 15.0, 75.0, 18.75, 30.0, 1.5),
+        spec("claude-sonnet-5", 2.0, 10.0, 2.5, 4.0, 0.2),
         spec("claude-sonnet-4", 3.0, 15.0, 3.75, 6.0, 0.3),
         spec("claude-haiku-4", 1.0, 5.0, 1.25, 2.0, 0.1),
-    ];
-    let mut rules = anthropic
-        .into_iter()
-        .map(|specification| {
-            priced_rule(
+        spec("claude-3-5-haiku", 0.8, 4.0, 1.0, 1.6, 0.08),
+    ] {
+        for (settings, multiplier) in [(&[][..], 1.0), (&[("service_tier", "batch")][..], 0.5)] {
+            rules.push(priced_rule(
                 Vendor::AnthropicOauth,
-                specification,
-                &[],
+                specification.scaled(multiplier, multiplier),
+                settings,
                 ANTHROPIC_PRICING_SOURCE,
-            )
-        })
-        .collect::<Vec<_>>();
-    rules.push(priced_rule(
-        Vendor::AnthropicOauth,
-        spec("claude-fable-5", 5.0, 25.0, 6.25, 10.0, 0.5),
-        &[("service_tier", "batch")],
-        ANTHROPIC_PRICING_SOURCE,
-    ));
-    rules.push(priced_rule(
-        Vendor::AnthropicOauth,
-        spec("claude-opus-4", 2.5, 12.5, 3.125, 5.0, 0.25),
-        &[("service_tier", "batch")],
-        ANTHROPIC_PRICING_SOURCE,
-    ));
+            ));
+        }
+        // Claude reports actual delivered speed separately from service_tier.
+        if matches!(specification.model, "claude-opus-5" | "claude-opus-4-8") {
+            rules.push(priced_rule(
+                Vendor::AnthropicOauth,
+                specification.scaled(2.0, 2.0),
+                &[("speed", "fast")],
+                ANTHROPIC_PRICING_SOURCE,
+            ));
+        }
+    }
+}
 
+fn openai_pricing(rules: &mut Vec<AuthoritativePricingRule>) {
+    // The provider publishes one cache-write rate, with no TTL distinction.
+    // Apply it to either write bucket; don't invent a one-hour surcharge.
     for specification in [
-        spec("gpt-5.5-pro", 30.0, 180.0, 0.0, 0.0, 0.0),
+        spec("gpt-6-astra", 10.0, 50.0, 12.5, 12.5, 1.0),
+        spec("gpt-5.6-sol", 4.0, 20.0, 5.0, 5.0, 0.4),
+        spec("gpt-5.6-terra", 2.0, 12.0, 2.5, 2.5, 0.2),
+        spec("gpt-5.6-luna", 0.2, 1.2, 0.25, 0.25, 0.02),
+    ] {
+        for (tier, multiplier) in [
+            (None, 1.0),
+            (Some("batch"), 0.5),
+            (Some("flex"), 0.5),
+            (Some("fast"), 2.0),
+            (Some("priority"), 2.0),
+        ] {
+            let settings = tier
+                .map(|tier| ("service_tier", tier))
+                .into_iter()
+                .collect::<Vec<_>>();
+            openai_context_rules(
+                rules,
+                specification.scaled(multiplier, multiplier),
+                &settings,
+            );
+        }
+    }
+    for specification in [
         spec("gpt-5.5", 5.0, 30.0, 0.0, 0.0, 0.5),
+        spec("gpt-5.4", 2.5, 15.0, 0.0, 0.0, 0.25),
+    ] {
+        openai_context_rules(rules, specification, &[]);
+    }
+    for specification in [
+        // No cached-input discount is not the same as free cached input.
+        spec("gpt-5.5-pro", 30.0, 180.0, 0.0, 0.0, 30.0),
         spec("gpt-5.4-nano", 0.2, 1.25, 0.0, 0.0, 0.02),
         spec("gpt-5.4-mini", 0.75, 4.5, 0.0, 0.0, 0.075),
-        spec("gpt-5.4", 2.5, 15.0, 0.0, 0.0, 0.25),
         spec("gpt-5.3-codex", 1.75, 14.0, 0.0, 0.0, 0.175),
-        spec("gpt-5.3-codex-spark", 1.75, 14.0, 0.0, 0.0, 0.175),
     ] {
         rules.push(priced_rule(
             Vendor::OpenaiCodex,
@@ -130,17 +174,41 @@ pub fn authoritative_pricing() -> Vec<AuthoritativePricingRule> {
             OPENAI_PRICING_SOURCE,
         ));
     }
-    rules.push(priced_rule(
-        Vendor::OpenaiCodex,
+    openai_context_rules(
+        rules,
         spec("gpt-5.5", 2.5, 15.0, 0.0, 0.0, 0.25),
         &[("service_tier", "batch")],
+    );
+}
+
+fn openai_context_rules(
+    rules: &mut Vec<AuthoritativePricingRule>,
+    specification: RateSpec,
+    settings: &[(&str, &str)],
+) {
+    rules.push(priced_rule(
+        Vendor::OpenaiCodex,
+        specification,
+        settings,
         OPENAI_PRICING_SOURCE,
     ));
+    let mut long_settings = settings.to_vec();
+    long_settings.push(("context_tier", "long"));
+    rules.push(priced_rule(
+        Vendor::OpenaiCodex,
+        specification.scaled(2.0, 1.5),
+        &long_settings,
+        OPENAI_PRICING_SOURCE,
+    ));
+}
 
+fn deepseek_pricing(rules: &mut Vec<AuthoritativePricingRule>) {
+    // Daily grains cannot reconstruct the request's UTC billing hour. Use peak
+    // unless the ingesting collector explicitly supplies billing_period.
     for specification in [
-        spec("deepseek-v4-pro", 0.435, 0.87, 0.0, 0.0, 0.003_625),
-        spec("deepseek-v4-flash", 0.14, 0.28, 0.0, 0.0, 0.0028),
-        spec("deepseek", 0.14, 0.28, 0.0, 0.0, 0.0028),
+        spec("deepseek-v4-pro", 1.32, 3.96, 0.0, 0.0, 0.044),
+        spec("deepseek-v4-flash", 0.44, 1.32, 0.0, 0.0, 0.014),
+        spec("deepseek-v4-flash-vision-exp", 0.44, 1.32, 0.0, 0.0, 0.014),
     ] {
         rules.push(priced_rule(
             Vendor::DeepseekBalance,
@@ -148,14 +216,46 @@ pub fn authoritative_pricing() -> Vec<AuthoritativePricingRule> {
             &[],
             DEEPSEEK_PRICING_SOURCE,
         ));
+        rules.push(priced_rule(
+            Vendor::DeepseekBalance,
+            specification.scaled(0.5, 0.5),
+            &[("billing_period", "off_peak")],
+            DEEPSEEK_PRICING_SOURCE,
+        ));
     }
+}
 
+fn gemini_pricing(rules: &mut Vec<AuthoritativePricingRule>) {
+    // Promotional rates for 3.6/3.7/3.8 Flash run through 2026-12-31.
+    // Cache storage is time-based and is NOT a token cache-write charge.
+    for model in ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"] {
+        let specification = spec(model, 0.75, 3.75, 0.0, 0.0, 0.075);
+        for (tier, multiplier) in [
+            (None, 1.0),
+            (Some("batch"), 0.5),
+            (Some("flex"), 0.5),
+            (Some("priority"), 1.8),
+        ] {
+            let settings = tier
+                .map(|tier| ("service_tier", tier))
+                .into_iter()
+                .collect::<Vec<_>>();
+            rules.push(priced_rule(
+                Vendor::Gemini,
+                specification.scaled(multiplier, multiplier),
+                &settings,
+                GEMINI_PRICING_SOURCE,
+            ));
+        }
+    }
     for specification in [
         spec("gemini-3.1-pro", 2.0, 12.0, 0.0, 0.0, 0.2),
         spec("gemini-3.5-flash", 1.5, 9.0, 0.0, 0.0, 0.15),
+        spec("gemini-3.5-flash-lite", 0.3, 2.5, 0.0, 0.0, 0.03),
+        spec("gemini-3.1-flash-lite", 0.25, 1.5, 0.0, 0.0, 0.025),
         spec("gemini-2.5-pro", 1.25, 10.0, 0.0, 0.0, 0.125),
         spec("gemini-2.5-flash", 0.3, 2.5, 0.0, 0.0, 0.03),
-        spec("gemini-3-flash", 1.5, 9.0, 0.0, 0.0, 0.15),
+        spec("gemini-3-flash", 0.5, 3.0, 0.0, 0.0, 0.05),
     ] {
         rules.push(priced_rule(
             Vendor::Gemini,
@@ -164,19 +264,27 @@ pub fn authoritative_pricing() -> Vec<AuthoritativePricingRule> {
             GEMINI_PRICING_SOURCE,
         ));
     }
-    rules.push(priced_rule(
-        Vendor::Antigravity,
-        spec("antigravity-unknown", 2.0, 12.0, 0.0, 0.0, 0.2),
-        &[],
-        GEMINI_PRICING_SOURCE,
-    ));
-    rules
 }
 
 #[derive(Clone, Copy)]
 struct RateSpec {
     model: &'static str,
     rate: PricingRate,
+}
+
+impl RateSpec {
+    fn scaled(self, input: f64, output: f64) -> Self {
+        Self {
+            model: self.model,
+            rate: PricingRate {
+                input: self.rate.input * input,
+                output: self.rate.output * output,
+                cache_write_5m: self.rate.cache_write_5m * input,
+                cache_write_1h: self.rate.cache_write_1h * input,
+                cache_read: self.rate.cache_read * input,
+            },
+        }
+    }
 }
 
 const fn spec(
@@ -249,16 +357,18 @@ pub async fn seed_authoritative_pricing(store: &dyn Store) -> PulseResult<usize>
     Ok(rules.len())
 }
 
-/// Completes a possibly partially seeded store table with built-in rows, while
-/// letting a validated stored row replace the same stable key.
+/// Completes a possibly partially seeded store table with current built-ins.
+/// Built-ins replace stale seeded copies; custom default keys and account
+/// overrides remain intact. Retired, unsupported estimates are not exposed.
 #[must_use]
 pub fn effective_default_pricing(stored: &[PricingRule]) -> Vec<PricingRule> {
-    let mut rules = authoritative_pricing()
-        .into_iter()
-        .map(|item| (item.rule.key.clone(), item.rule))
+    let mut rules = stored
+        .iter()
+        .filter(|rule| !unpriced_builtin_model(&rule.model_pattern))
+        .map(|rule| (rule.key.clone(), rule.clone()))
         .collect::<BTreeMap<_, _>>();
-    for rule in stored {
-        rules.insert(rule.key.clone(), rule.clone());
+    for item in authoritative_pricing() {
+        rules.insert(item.rule.key.clone(), item.rule);
     }
     rules.into_values().collect()
 }
@@ -300,8 +410,17 @@ fn resolve_pricing_inner(
     if let Some(rule) = select_rule(overrides, vendor, model, &target) {
         return resolved(rule, PricingOrigin::AccountOverride);
     }
-    if let Some(rule) = select_rule(defaults, vendor, model, &target) {
-        return resolved(rule, PricingOrigin::AuthoritativeDefault);
+    // Spark has no published API price. Never inherit the ordinary Codex
+    // prefix's rate (including the unsupported row persisted by old builds).
+    if !unpriced_builtin_model(model) {
+        let model = if model.eq_ignore_ascii_case("gpt-5.6") {
+            "gpt-5.6-sol"
+        } else {
+            model
+        };
+        if let Some(rule) = select_rule(defaults, vendor, model, &target) {
+            return resolved(rule, PricingOrigin::AuthoritativeDefault);
+        }
     }
     ResolvedPricing {
         rate: PricingRate::fallback(),
@@ -309,6 +428,13 @@ fn resolve_pricing_inner(
         origin: PricingOrigin::Fallback,
         rule_key: None,
     }
+}
+
+fn unpriced_builtin_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.starts_with("gpt-5.3-codex-spark")
+        || model == "deepseek"
+        || model == "antigravity-unknown"
 }
 
 fn resolved(rule: &PricingRule, origin: PricingOrigin) -> ResolvedPricing {
@@ -540,9 +666,188 @@ mod tests {
     }
 
     #[test]
+    fn september_catalog_rates_and_aliases_match_published_prices() {
+        let defaults = effective_default_pricing(&[]);
+        for specification in [
+            spec("gpt-6-astra", 10.0, 50.0, 12.5, 12.5, 1.0),
+            spec("gpt-5.6-sol", 4.0, 20.0, 5.0, 5.0, 0.4),
+            spec("gpt-5.6", 4.0, 20.0, 5.0, 5.0, 0.4),
+            spec("gpt-5.6-terra", 2.0, 12.0, 2.5, 2.5, 0.2),
+            spec("gpt-5.6-luna", 0.2, 1.2, 0.25, 0.25, 0.02),
+            spec("claude-fable-5-1-20260827", 10.0, 50.0, 12.5, 20.0, 0.25),
+            spec("claude-mythos-5-1", 10.0, 50.0, 12.5, 20.0, 0.25),
+            spec("claude-fable-5", 10.0, 50.0, 12.5, 20.0, 1.0),
+            spec("claude-opus-5", 5.0, 25.0, 6.25, 10.0, 0.5),
+            spec("claude-opus-4-1-20250805", 15.0, 75.0, 18.75, 30.0, 1.5),
+            spec("claude-opus-4-5", 5.0, 25.0, 6.25, 10.0, 0.5),
+            spec("claude-sonnet-5", 2.0, 10.0, 2.5, 4.0, 0.2),
+            spec("gemini-3.8-flash", 0.75, 3.75, 0.0, 0.0, 0.075),
+            spec("gemini-3.7-flash", 0.75, 3.75, 0.0, 0.0, 0.075),
+            spec("gemini-3.6-flash", 0.75, 3.75, 0.0, 0.0, 0.075),
+            spec("gemini-3.5-flash-lite", 0.3, 2.5, 0.0, 0.0, 0.03),
+            spec("gemini-3.1-flash-lite", 0.25, 1.5, 0.0, 0.0, 0.025),
+            spec("gemini-3-flash-preview", 0.5, 3.0, 0.0, 0.0, 0.05),
+            spec("deepseek-v4-pro", 1.32, 3.96, 0.0, 0.0, 0.044),
+            spec("deepseek-v4-flash", 0.44, 1.32, 0.0, 0.0, 0.014),
+            spec("deepseek-v4-flash-vision-exp", 0.44, 1.32, 0.0, 0.0, 0.014),
+        ] {
+            let actual = resolve_pricing(
+                specification.model,
+                &AgentSettings::default(),
+                &defaults,
+                &[],
+            );
+            assert!(actual.known, "{}", specification.model);
+            assert_eq!(actual.rate, specification.rate, "{}", specification.model);
+        }
+        // The exact gpt-5.6 alias must not price every future 5.6 variant as Sol.
+        assert!(
+            !resolve_pricing(
+                "gpt-5.6-unlisted",
+                &AgentSettings::default(),
+                &defaults,
+                &[]
+            )
+            .known
+        );
+    }
+
+    #[test]
+    fn fast_priority_and_long_context_prices_are_independent_of_effort() {
+        let defaults = effective_default_pricing(&[]);
+        for model in [
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ] {
+            let base = resolve_pricing(model, &AgentSettings::default(), &defaults, &[]).rate;
+            for (tier, multiplier) in [
+                ("fast", 2.0),
+                ("priority", 2.0),
+                ("batch", 0.5),
+                ("flex", 0.5),
+            ] {
+                let mut settings = AgentSettings {
+                    service_tier: Some(tier.to_owned()),
+                    effort: Some("ultra".to_owned()),
+                    ..AgentSettings::default()
+                };
+                let short = resolve_pricing(model, &settings, &defaults, &[]).rate;
+                assert_close(short.input, base.input * multiplier);
+                assert_close(short.output, base.output * multiplier);
+                assert_close(short.cache_read, base.cache_read * multiplier);
+                assert_close(short.cache_write_5m, base.cache_write_5m * multiplier);
+                settings
+                    .additional
+                    .insert("context_tier".to_owned(), "long".to_owned());
+                let long = resolve_pricing(model, &settings, &defaults, &[]).rate;
+                assert_close(long.input, short.input * 2.0);
+                assert_close(long.output, short.output * 1.5);
+                assert_close(long.cache_read, short.cache_read * 2.0);
+                assert_close(long.cache_write_1h, short.cache_write_1h * 2.0);
+            }
+        }
+    }
+
+    #[test]
+    fn provider_specific_speed_and_billing_period_are_honored() {
+        let defaults = effective_default_pricing(&[]);
+        let mut settings = AgentSettings::default();
+        settings
+            .additional
+            .insert("speed".to_owned(), "fast".to_owned());
+        for model in ["claude-opus-5", "claude-opus-4-8"] {
+            let fast = resolve_pricing(model, &settings, &defaults, &[]);
+            assert_close(fast.rate.input, 10.0);
+            assert_close(fast.rate.cache_read, 1.0);
+        }
+        // Opus 4.6 falls back to standard speed at the provider.
+        assert_close(
+            resolve_pricing("claude-opus-4-6", &settings, &defaults, &[])
+                .rate
+                .input,
+            5.0,
+        );
+        settings
+            .additional
+            .insert("billing_period".to_owned(), "off_peak".to_owned());
+        assert_close(
+            resolve_pricing("deepseek-v4-pro", &settings, &defaults, &[])
+                .rate
+                .input,
+            0.66,
+        );
+        settings.service_tier = Some("priority".to_owned());
+        assert_close(
+            resolve_pricing("gemini-3.8-flash", &settings, &defaults, &[])
+                .rate
+                .input,
+            1.35,
+        );
+    }
+
+    #[test]
+    fn stale_defaults_are_refreshed_without_losing_custom_rules_or_overrides() {
+        let mut stale = authoritative_pricing()
+            .into_iter()
+            .find(|item| item.rule.key == "deepseek-v4-pro")
+            .unwrap()
+            .rule;
+        stale.input_per_million_usd = 0.435;
+        let mut custom = stale.clone();
+        custom.key = "custom-model".to_owned();
+        custom.model_pattern = "custom-model".to_owned();
+        let defaults = effective_default_pricing(&[stale.clone(), custom.clone()]);
+        assert!(defaults.contains(&custom));
+        let settings = AgentSettings::default();
+        assert_close(
+            resolve_pricing("deepseek-v4-pro", &settings, &defaults, &[])
+                .rate
+                .input,
+            1.32,
+        );
+        let overridden = resolve_pricing("deepseek-v4-pro", &settings, &defaults, &[stale]);
+        assert_close(overridden.rate.input, 0.435);
+        assert_eq!(overridden.origin, PricingOrigin::AccountOverride);
+    }
+
+    #[test]
+    fn spark_and_unidentified_models_are_not_authoritatively_priced() {
+        let mut obsolete = authoritative_pricing()
+            .into_iter()
+            .find(|item| item.rule.key == "gpt-5.3-codex")
+            .unwrap()
+            .rule;
+        let settings = AgentSettings::default();
+        for model in [
+            "gpt-5.3-codex-spark",
+            "gpt-5.3-codex-spark-preview",
+            "deepseek",
+            "antigravity-unknown",
+        ] {
+            obsolete.key = model.to_owned();
+            obsolete.model_pattern = model.to_owned();
+            let defaults = effective_default_pricing(&[obsolete.clone()]);
+            assert!(!defaults.iter().any(|rule| rule.model_pattern == model));
+            assert!(!resolve_pricing(model, &settings, &defaults, &[]).known);
+            assert!(!resolve_pricing(model, &settings, &[obsolete.clone()], &[]).known);
+            assert_eq!(
+                resolve_pricing(model, &settings, &defaults, &[obsolete.clone()]).origin,
+                PricingOrigin::AccountOverride
+            );
+        }
+    }
+
+    #[test]
     fn authoritative_table_is_valid_and_source_attributed() {
         let rules = authoritative_pricing();
         assert!(rules.len() >= 20);
+        let keys = rules
+            .iter()
+            .map(|item| &item.rule.key)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(keys.len(), rules.len(), "stable rule keys must be unique");
         for item in rules {
             item.rule.validate().expect("valid rule");
             assert!(item.source_url.starts_with("https://"));

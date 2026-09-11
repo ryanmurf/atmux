@@ -174,6 +174,107 @@ fn page() -> PageRequest {
     }
 }
 
+async fn all_pricing(api: &PulseApi, account: i64) -> Vec<atmux::pulse::api::PublicPricingRule> {
+    let mut rows = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = api
+            .pricing(
+                account,
+                PageRequest {
+                    cursor,
+                    limit: Some(25),
+                },
+            )
+            .await
+            .unwrap();
+        rows.extend(page.items);
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            return rows;
+        }
+        assert!(rows.len() <= 10_000, "pricing pagination must terminate");
+    }
+}
+
+#[tokio::test]
+async fn pricing_catalog_refreshes_stale_defaults_and_preserves_account_overrides() {
+    use atmux::pulse::pricing::{authoritative_pricing, seed_authoritative_pricing};
+
+    let test = TestStore::new().await;
+    test.seed().await;
+    let mut stale = authoritative_pricing()
+        .into_iter()
+        .find(|item| item.rule.key == "deepseek-v4-pro")
+        .unwrap()
+        .rule;
+    stale.input_per_million_usd = 0.435;
+    test.store
+        .upsert_pricing_default(stale.clone())
+        .await
+        .unwrap();
+    test.store
+        .upsert_pricing_override(account(1), stale)
+        .await
+        .unwrap();
+    let mut spark = pricing_rule("gpt-5.3-codex-spark", 1.75);
+    spark.model_pattern = spark.key.clone();
+    test.store.upsert_pricing_default(spark).await.unwrap();
+    let api = test.api();
+    let before = all_pricing(&api, 1).await;
+    assert!(
+        before.len() > 100,
+        "catalog exercises multiple bounded pages"
+    );
+    assert!(
+        !before
+            .iter()
+            .any(|row| row.rule.model_pattern == "gpt-5.3-codex-spark")
+    );
+    for model in [
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "gemini-3.8-flash",
+    ] {
+        assert!(before.iter().any(|row| row.rule.key == model), "{model}");
+    }
+    let current = before
+        .iter()
+        .find(|row| {
+            row.scope == atmux::pulse::api::PricingScope::Default
+                && row.rule.key == "deepseek-v4-pro"
+        })
+        .unwrap();
+    assert!((current.rule.input_per_million_usd - 1.32).abs() < f64::EPSILON);
+    let count = seed_authoritative_pricing(test.store.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(
+        seed_authoritative_pricing(test.store.as_ref())
+            .await
+            .unwrap(),
+        count
+    );
+    assert_eq!(
+        all_pricing(&api, 1).await,
+        before,
+        "reseed is idempotent and agrees with read-time pricing"
+    );
+    let overrides = test.store.list_pricing_overrides(account(1)).await.unwrap();
+    assert_eq!(overrides.len(), 1);
+    assert!((overrides[0].input_per_million_usd - 0.435).abs() < f64::EPSILON);
+    assert!(
+        all_pricing(&api, 2)
+            .await
+            .iter()
+            .all(|row| row.scope == atmux::pulse::api::PricingScope::Default)
+    );
+}
+
 fn pricing_rule(key: &str, input: f64) -> PricingRule {
     PricingRule {
         key: key.to_owned(),
@@ -334,8 +435,8 @@ async fn account_scoping_blocks_profile_idor_and_redacts_local_references() {
             .unwrap()
             .is_empty()
     );
-    let pricing = api.pricing(1, page()).await.unwrap();
-    assert!(pricing.items.iter().any(|entry| {
+    let pricing = all_pricing(&api, 1).await;
+    assert!(pricing.iter().any(|entry| {
         entry.scope == atmux::pulse::api::PricingScope::Override && entry.rule.key == "account-one"
     }));
     assert!(
@@ -1051,13 +1152,13 @@ async fn pricing_delete_reverts_to_seeded_default_with_rest_mcp_and_idor_parity(
         .await
         .is_err()
     );
-    let account_one_pricing = api.pricing(1, page()).await.unwrap();
-    assert!(account_one_pricing.items.iter().any(|entry| {
+    let account_one_pricing = all_pricing(&api, 1).await;
+    assert!(account_one_pricing.iter().any(|entry| {
         entry.scope == atmux::pulse::api::PricingScope::Default
             && entry.rule.key == "gpt-seeded"
             && (entry.rule.input_per_million_usd - 3.0).abs() < f64::EPSILON
     }));
-    assert!(!account_one_pricing.items.iter().any(|entry| {
+    assert!(!account_one_pricing.iter().any(|entry| {
         entry.scope == atmux::pulse::api::PricingScope::Override && entry.rule.key == "gpt-seeded"
     }));
     assert_eq!(

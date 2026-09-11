@@ -92,6 +92,7 @@ const {
   pickerOptions,
   markdownBlocks,
   messageFitsByteLimit,
+  messageHistoryDirection,
   moveMessageHistory,
   paneTypingText,
   paneSpecialKeyDelivery,
@@ -110,6 +111,9 @@ const {
   conversationVisibilityPreferenceJson,
   loadConversationVisibilityPreferences,
   saveConversationVisibilityPreferences,
+  toolRunTokens,
+  transcriptTokenSummary,
+  conversationMetricsSummary,
   fileReferenceBlock,
   insertComposerReference,
   nextFileLineSelection,
@@ -352,6 +356,8 @@ test("sticky bottom pins within tolerance and offers the jump pill above it", ()
 
 test("tool-group anchor membership is bounded and malformed hints fail closed", () => {
   assert.deepEqual(transcriptAnchorMembers('["exec-1","exec-2"]'), ["exec-1", "exec-2"]);
+  const longestRun = Array.from({ length: 240 }, (_, index) => `exec-${index}`);
+  assert.deepEqual(transcriptAnchorMembers(JSON.stringify(longestRun)), longestRun);
   for (const invalid of [
     null,
     "",
@@ -360,7 +366,7 @@ test("tool-group anchor membership is bounded and malformed hints fail closed", 
     '[]',
     '[1]',
     '[""]',
-    JSON.stringify(Array.from({ length: 25 }, (_, index) => `exec-${index}`)),
+    JSON.stringify(Array.from({ length: 241 }, (_, index) => `exec-${index}`)),
     JSON.stringify(["x".repeat(513)]),
     "[" + " ".repeat(128 * 1024) + "]",
   ]) assert.deepEqual(transcriptAnchorMembers(invalid), []);
@@ -608,7 +614,7 @@ test("conversation filtering happens before exec grouping and never counts hidde
     human: false, internal: true,
   }));
   assert.deepEqual(withoutHuman.map((item) => item.kind), ["tool-group", "item", "item"]);
-  assert.equal(toolGroupSummary(withoutHuman[0]), "exec ×3");
+  assert.equal(toolGroupSummary(withoutHuman[0]), "exec ×3 · tokens —");
   assert.deepEqual(withoutHuman[0].messages.map(({ id }) => id), ["exec-1", "exec-2", "exec-3"]);
   const agentOnly = compactTranscriptItems(filterTranscriptMessages(messages, {
     human: false, internal: false,
@@ -640,7 +646,7 @@ test("conversation filter controls are recoverable, accessible, and text-only", 
   assert.match(css, /@media \(max-width: 720px\)[\s\S]*\.conversation-filter-options input \{[^}]*width: 22px;[^}]*height: 22px;/s);
 });
 
-test("adjacent low-signal coordination calls collapse without crossing prose or error boundaries", () => {
+test("mixed coordination calls and errors collapse without crossing prose", () => {
   const tool = (id, toolName, toolOutput = null) => ({
     id, kind: "tool", role: "tool", tool_name: toolName, tool_input: `{ "id": "${id}" }`, tool_output: toolOutput,
   });
@@ -658,14 +664,12 @@ test("adjacent low-signal coordination calls collapse without crossing prose or 
   ];
   const compacted = compactTranscriptItems(messages);
   assert.deepEqual(compacted.map((item) => item.kind), [
-    "item", "tool-group", "item", "item", "tool-group", "item", "item",
+    "item", "tool-group", "item", "tool-run",
   ]);
   assert.deepEqual(compacted[1].messages.map((item) => item.id), ["wait-1", "send-1", "follow-1"]);
-  assert.deepEqual(compacted[4].messages.map((item) => item.id), ["wait-2", "list-1"]);
+  assert.deepEqual(compacted[3].messages.map((item) => item.id), ["error", "wait-2", "list-1", "exec", "wait-single"]);
   assert.equal(compacted[2].message.id, "agent");
-  assert.equal(compacted[3].message.id, "error");
-  assert.equal(compacted[5].message.id, "exec");
-  assert.equal(compacted[6].message.id, "wait-single");
+  assert.match(coordinationGroupSummary(compacted[3]), /1 error/);
 });
 
 test("adjacent exec variants collapse as exec ×4 without crossing narrative or failures", () => {
@@ -686,7 +690,7 @@ test("adjacent exec variants collapse as exec ×4 without crossing narrative or 
   assert.deepEqual(compacted.map((item) => item.kind), ["item", "tool-group", "item", "item"]);
   assert.deepEqual(compacted[1].messages.map((item) => item.id), ["exec-1", "exec-2", "exec-3", "exec-4"]);
   assert.deepEqual(compacted[1].counts, [{ name: "exec", count: 4 }]);
-  assert.equal(toolGroupSummary(compacted[1]), "exec ×4");
+  assert.equal(toolGroupSummary(compacted[1]), "exec ×4 · tokens —");
   assert.equal(compacted[0].message.markdown, "Human plan stays visible");
   assert.equal(compacted[2].message.markdown, "Agent interpretation stays visible");
   assert.equal(compacted[3].message.id, "exec-error");
@@ -722,10 +726,9 @@ test("exec failures and unknown output fail open while safe statuses stay compat
     "repeat:exec:pending", "repeat:exec:pending",
   ]);
   const compacted = compactTranscriptItems(messages);
-  assert.deepEqual(compacted.map((item) => item.kind), [
-    "item", "item", "item", "item", "item", "item", "item", "item", "tool-group",
-  ]);
-  assert.equal(toolGroupSummary(compacted.at(-1)), "exec ×2");
+  assert.deepEqual(compacted.map((item) => item.kind), ["tool-run"]);
+  assert.equal(coordinationGroupSummary(compacted[0]), "exec ×10 · 4 errors · tokens —");
+  assert.deepEqual(compacted[0].messages, messages);
 });
 
 test("meaningful non-exec tools never collapse even when repeated", () => {
@@ -749,7 +752,7 @@ test("meaningful non-exec tools never collapse even when repeated", () => {
   );
 });
 
-test("meaningful results, approvals, and lifecycle tools always remain visible", () => {
+test("approval requests remain separate while lifecycle tools can fold together", () => {
   const tool = (id, name, output) => ({ id, kind: "tool", role: "tool", tool_name: name, tool_output: output });
   const protectedItems = [
     tool("meaningful", "wait_agent", "Agent completed the migration and verified the deployment."),
@@ -761,7 +764,10 @@ test("meaningful results, approvals, and lifecycle tools always remain visible",
   assert.deepEqual(protectedItems.map((item) => coordinationResultSignal(item)), [
     "meaningful", "approval", "status", "status",
   ]);
-  assert.ok(compactTranscriptItems(protectedItems).every((item) => item.kind === "item"));
+  const items = compactTranscriptItems(protectedItems);
+  assert.deepEqual(items.map((item) => item.kind), ["item", "item", "tool-run"]);
+  assert.equal(items[1].message.id, "approval");
+  assert.deepEqual(items[2].messages, protectedItems.slice(2));
 });
 
 test("coordination status JSON fails closed for unknown and negative states", () => {
@@ -789,17 +795,22 @@ test("coordination status JSON fails closed for unknown and negative states", ()
   assert.deepEqual(unsafe.map(coordinationResultSignal), [
     "error", "error", "error", "error", "error", "error", "error", "meaningful", "meaningful",
   ]);
-  assert.ok(compactTranscriptItems(unsafe).every((item) => item.kind === "item"));
+  assert.match(coordinationGroupSummary(compactTranscriptItems(unsafe)[0]), /7 errors/);
 });
 
-test("coordination groups are bounded at 24 and preserve every call in exact order", () => {
+test("long runs stay one row while explicit lower bounds preserve every call in order", () => {
   const calls = Array.from({ length: 49 }, (_, index) => ({
     id: `wait-${index}`, kind: "tool", role: "tool", tool_name: "wait_agent",
   }));
-  const groups = compactTranscriptItems(calls);
+  assert.equal(compactTranscriptItems(calls).length, 1);
+  const groups = compactTranscriptItems(calls, 24);
   assert.deepEqual(groups.map((group) => group.messages.length), [24, 23, 2]);
   assert.deepEqual(groups.flatMap((group) => group.messages.map((item) => item.id)), calls.map((item) => item.id));
   assert.ok(groups.every((group) => group.messages.length >= 2 && group.messages.length <= 24));
+  const oversized = Array.from({ length: 481 }, (_, index) => ({ ...calls[0], id: `bounded-${index}` }));
+  const bounded = compactTranscriptItems(oversized);
+  assert.deepEqual(bounded.map((group) => group.messages.length), [240, 239, 2]);
+  assert.deepEqual(bounded.flatMap((group) => group.messages), oversized);
 });
 
 test("repeated default-collapsed tool calls fold into one keyed row with summed usage", () => {
@@ -815,14 +826,13 @@ test("repeated default-collapsed tool calls fold into one keyed row with summed 
     tool("grep-1", "Grep", { tool_output: "match" }),
   ];
   const items = compactTranscriptItems(messages);
-  assert.deepEqual(items.map((item) => item.kind), ["item", "tool-run", "item", "tool-run"]);
+  assert.deepEqual(items.map((item) => item.kind), ["item", "tool-run"]);
   // The key comes from the first entry so the reading anchor survives a redraw.
-  assert.equal(items[1].id, "tool-run:bash-1");
-  assert.deepEqual(items[1].messages.map((item) => item.id), ["bash-1", "bash-2", "bash-3"]);
-  assert.equal(items[2].message.id, "bash-4", "an error result keeps its own row");
-  assert.equal(toolRunGroupSummary(items[1]), "Bash ×3 · 12.3k in · 1.1k out");
+  assert.equal(items[1].id, "tool-group:bash-1");
+  assert.deepEqual(items[1].messages, messages.slice(1));
+  assert.equal(toolRunGroupSummary(items[1]), "Tools ×7 · 1 error · 12.3k in · 1.1k out");
   assert.equal(coordinationGroupSummary(items[1]), toolRunGroupSummary(items[1]));
-  assert.equal(toolRunGroupSummary(items[3]), "Tools ×3");
+  assert.equal(toolRunGroupSummary({ messages: messages.slice(5) }), "Tools ×3 · tokens —");
   assert.equal(toolDisplayName(messages[6]), "Edit");
   assert.deepEqual([1, 999, 1_000, 12_345, 1_500_000].map(formatTokenCount), ["1", "999", "1k", "12.3k", "1.5M"]);
   assert.equal(collapsibleToolRun({ role: "assistant", markdown: "prose" }), false);
@@ -895,7 +905,49 @@ test("tool summaries normalize namespaces and expose per-tool counts", () => {
   const [group] = compactTranscriptItems(messages);
   assert.equal(normalizedToolName(messages[0]), "wait_agent");
   assert.equal(normalizedToolName(messages[1]), "send_message");
-  assert.equal(toolGroupSummary(group), "3 internal calls · wait_agent ×2 · send_message ×1");
+  assert.equal(toolGroupSummary(group), "3 internal calls · wait_agent ×2 · send_message ×1 · tokens —");
+});
+
+test("the screenshot's mixed result, coordination and error rows fold into one summary", () => {
+  const messages = [
+    ["exec", "result"], ["send_message", "sent"], ["exec", "Error: failed"],
+    ["exec", "result"], ["exec", "Process exited with code 1"], ["followup_task", "A useful reply"],
+  ].map(([tool_name, tool_output], id) => ({ id: String(id), kind: "tool", tool_name, tool_output, input_tokens: 100, output_tokens: 10 }));
+  const [group] = compactTranscriptItems(messages);
+  assert.deepEqual(group.messages, messages);
+  assert.equal(coordinationGroupSummary(group), "Tools ×6 · 2 errors · 600 in · 60 out");
+  assert.equal(compactTranscriptItems(messages.slice(0, 2)).length, 1);
+  const pending = ["first", "second"].map((id) => ({ id, kind: "tool", tool_name: "exec", tool_output: "running" }));
+  const failed = [{ ...pending[0], tool_output: "Error: failed" }, pending[1]];
+  assert.equal(compactTranscriptItems(pending)[0].id, compactTranscriptItems(failed)[0].id, "result classification must not reset expansion");
+});
+
+test("eight exec errors and results from the second screenshot become one row before Agent prose", () => {
+  const calls = Array.from({ length: 8 }, (_, index) => ({
+    id: `example-${index}`, kind: "tool", tool_name: "exec",
+    tool_output: index === 3 ? "result" : "Error: failed",
+  }));
+  const prose = { id: "agent", role: "assistant", markdown: "Next response" };
+  const items = compactTranscriptItems([...calls, prose]);
+  assert.equal(items.length, 2);
+  assert.equal(coordinationGroupSummary(items[0]), "exec ×8 · 7 errors · tokens —");
+  assert.deepEqual(items[0].messages, calls);
+  assert.equal(items[1].message, prose);
+});
+
+test("token metrics distinguish missing, zero, partial and invalid recorded usage", () => {
+  assert.equal(toolRunTokens([{}, { input_tokens: null, output_tokens: "9" }, { input_tokens: true }]), null);
+  assert.equal(transcriptTokenSummary([]), "tokens —");
+  assert.equal(transcriptTokenSummary([{ input_tokens: 0, output_tokens: 0 }], true), "0 in · 0 out · 0 total tokens");
+  assert.equal(transcriptTokenSummary([{ input_tokens: 10, output_tokens: -1 }]), "10 in · — out");
+  assert.equal(transcriptTokenSummary([{ input_tokens: NaN, output_tokens: Infinity }]), "tokens —");
+  assert.equal(transcriptTokenSummary([{ input_tokens: Number.MAX_SAFE_INTEGER }, { input_tokens: 1 }]), "tokens —");
+  assert.equal(conversationMetricsSummary({ available: false, messages: [{ input_tokens: 999 }] }), "");
+  const transcript = { available: true, truncated: true, messages: [
+    { role: "user" }, { role: "assistant", input_tokens: 1000, output_tokens: 200 },
+    { kind: "tool", tool_name: "exec", tool_output: "Error: failed", input_tokens: 500, output_tokens: 50 },
+  ] };
+  assert.equal(conversationMetricsSummary(transcript), "Loaded totals (partial) · 2 messages · 1 tools · 1.5k in · 250 out · 1.8k total tokens · 1 errors");
 });
 
 test("coordination compaction stays inside Conversation and uses text-only DOM rendering", () => {
@@ -1239,6 +1291,39 @@ test("message history moves through sent comments and restores the draft", () =>
   assert.equal(moveMessageHistory(history, 1, "down"), history.length);
   assert.equal(moveMessageHistory(history, history.length, "down"), null);
   assert.equal(moveMessageHistory([], 0, "up"), null);
+});
+
+test("history arrows work from single-line drafts and keep traversing recalled multiline messages", () => {
+  const up = { key: "ArrowUp" };
+  const down = { key: "ArrowDown" };
+  assert.equal(messageHistoryDirection(up), "up");
+  for (const position of [0, 4, 9]) {
+    const input = { value: "one liner", selectionStart: position, selectionEnd: position };
+    assert.equal(messageHistoryDirection(up, input), "up");
+    assert.equal(messageHistoryDirection(down, input), "down");
+  }
+  const multiline = { value: "first\nmiddle\nlast", selectionStart: 8, selectionEnd: 8 };
+  assert.equal(messageHistoryDirection(up, multiline), null);
+  assert.equal(messageHistoryDirection(down, multiline), null);
+  assert.equal(messageHistoryDirection(up, { ...multiline, selectionStart: 3, selectionEnd: 3 }), "up");
+  assert.equal(messageHistoryDirection(down, { ...multiline, selectionStart: 14, selectionEnd: 14 }), "down");
+  assert.equal(messageHistoryDirection(up, { ...multiline, browsing: true }), "up");
+  assert.equal(messageHistoryDirection(down, { ...multiline, browsing: true }), "down");
+  assert.equal(messageHistoryDirection(up, { ...multiline, fromPane: true }), "up");
+});
+
+test("history arrows do not intercept selections, modifier shortcuts, composition, or other keys", () => {
+  for (const key of ["ArrowUp", "ArrowDown"]) {
+    for (const modifier of ["ctrlKey", "metaKey", "altKey", "shiftKey", "isComposing"]) {
+      assert.equal(messageHistoryDirection({ key, [modifier]: true }, { browsing: true }), null);
+    }
+    assert.equal(messageHistoryDirection({ key }, {
+      value: "selected text", selectionStart: 0, selectionEnd: 8, browsing: true,
+    }), null);
+  }
+  assert.equal(messageHistoryDirection({ key: "ArrowLeft" }), null);
+  assert.equal(messageHistoryDirection({ key: "Enter" }), null);
+  assert.equal(messageHistoryDirection(null), null);
 });
 
 test("live pane selections hold streaming redraws only for ranges touching the pane", () => {

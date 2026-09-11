@@ -136,6 +136,11 @@ textarea { resize: vertical; min-height: 74px; max-height: 220px; }
 .terminal-shell { position: relative; min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: #060b0e; }
 .terminal-title { min-height: 38px; display: flex; align-items: center; gap: 8px; padding: 4px 8px 4px 10px; border-bottom: 1px solid var(--line); background: var(--panel); }
 .terminal-title h2 { margin: 0; font-size: 13px; }
+.terminal-header { min-width: 0; }
+.conversation-metrics { padding: 5px 10px; border-bottom: 1px solid var(--line); background: var(--panel); color: var(--muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.entry-metrics { display: inline-block; margin-left: 10px; color: var(--muted); font-size: 10px; font-weight: 400; letter-spacing: normal; text-transform: none; }
+.tool-card.has-errors { border-color: #855b40; }
+.tool-card.has-errors > summary { color: #efb481; }
 .terminal-title > span { margin-left: auto; color: var(--muted); font-size: 12px; }
 .view-switch { min-width: 0; display: flex; gap: 3px; margin-left: 5px; padding: 2px; overflow-x: auto; border: 1px solid var(--line); border-radius: 7px; background: #091115; scrollbar-width: none; }
 .view-switch::-webkit-scrollbar { display: none; }

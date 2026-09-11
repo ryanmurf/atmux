@@ -28,6 +28,7 @@ use super::{
     ingest::{IngestTokenManager, IngestTokenSummary},
     invalidation::{PulseInvalidationHub, PulseInvalidationSubscription},
     model::{MAX_PROFILE_POLL_MINUTES, MIN_PROFILE_POLL_MINUTES},
+    pricing::effective_default_pricing,
     reports::{
         MAX_REPORT_DAYS, ReportDrill, ReportGranularity, ReportRange, TokenReportRequest,
         context_pace, token_report, usage_pace,
@@ -561,7 +562,8 @@ impl PulseApi {
         page: PageRequest,
     ) -> PulseResult<Page<PublicPricingRule>> {
         let account = self.account(account)?;
-        let mut rows = bounded_rows(self.store.list_pricing_defaults().await?, "default pricing")?
+        let defaults = bounded_rows(self.store.list_pricing_defaults().await?, "default pricing")?;
+        let mut rows = effective_default_pricing(&defaults)
             .into_iter()
             .map(|rule| PublicPricingRule {
                 scope: PricingScope::Default,

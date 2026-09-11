@@ -127,6 +127,7 @@
         <p id="agent-offline" class="agent-offline" role="status" hidden></p>
 
         <section class="terminal-shell" aria-labelledby="pane-heading">
+          <div class="terminal-header">
           <div class="terminal-title">
             <h2 id="pane-heading">Conversation</h2>
             <div class="view-switch" role="tablist" aria-label="Session display">
@@ -139,6 +140,8 @@
               <span>Show</span><span id="conversation-filters-indicator" class="conversation-filters-indicator">All</span>
             </button>
             <span id="stream-state">Connecting…</span>
+          </div>
+          <div id="conversation-metrics" class="conversation-metrics" aria-label="Loaded conversation totals" title="Recorded usage in the loaded transcript, including entries hidden by Show filters. Not lifetime session usage or current context size. Missing usage is not treated as zero." hidden></div>
           </div>
           <div id="conversation" class="conversation" role="tabpanel" aria-live="polite" aria-labelledby="conversation-view" tabindex="0" title="Start typing to message this agent"></div>
           <button id="conversation-jump" class="conversation-jump" type="button" hidden>↓ New messages</button>

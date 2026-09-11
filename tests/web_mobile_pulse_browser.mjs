@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { extname, join, resolve } from "node:path";
@@ -3215,9 +3215,8 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.ok(Math.abs(rawAfterViewNavigation.bottom - rawAfterViewNavigation.terminalBottom) <= 1, JSON.stringify(rawAfterViewNavigation));
     await cdp.evaluate("document.getElementById('conversation-view').click(); true");
 
-    // Conversation mode compacts only adjacent, low-signal coordination calls.
-    // Prose and meaningful/error results remain prominent, and expanding a
-    // compact run restores every original tool card without moving the reader.
+    // Conversation folds mixed tools into bounded runs. Errors stay visible
+    // in the outer summary, and expansion restores every original card.
     transcriptFixture = {
       available: true,
       source: "codex",
@@ -3270,15 +3269,13 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       ],
     };
     await waitFor(
-      () => cdp.evaluate("document.querySelectorAll('#conversation .tool-call-group:not(.tool-run-group)').length === 4"),
+      () => cdp.evaluate("document.querySelectorAll('#conversation .tool-call-group').length === 2"),
       "internal tool runs did not collapse on mobile",
       5_000,
     );
     const compactTools = await cdp.evaluate(`(() => {
       const conversation = document.getElementById('conversation');
-      // Folded runs of ordinary tool cards are a separate row type; these
-      // assertions are about the internal exec/coordination groups.
-      const groups = [...conversation.querySelectorAll('.tool-call-group:not(.tool-run-group)')];
+      const groups = [...conversation.querySelectorAll('.tool-call-group')];
       const first = groups[0];
       const bounds = conversation.getBoundingClientRect();
       conversation.scrollTop += first.getBoundingClientRect().top - bounds.top - 18;
@@ -3293,21 +3290,21 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
           && conversation.textContent.includes('Latest human follow-up remains visible'),
         agentVisible: conversation.textContent.includes('Agent explanation remains visible')
           && conversation.textContent.includes('This prose splits coordination runs'),
-        errorSummary: conversation.querySelector('[data-transcript-id="tool-wait-error"] > summary')?.textContent,
-        cancelledSummary: conversation.querySelector('[data-transcript-id="tool-wait-cancelled"] > summary')?.textContent,
+        errorSummary: conversation.querySelector('[data-transcript-id="tool-wait-error"] .tool-label')?.textContent,
+        cancelledSummary: conversation.querySelector('[data-transcript-id="tool-wait-cancelled"] .tool-label')?.textContent,
         malformedStatusSummaries: ['numeric', 'boolean', 'null'].map((suffix) =>
-          conversation.querySelector('[data-transcript-id="tool-wait-' + suffix + '"] > summary')?.textContent),
+          conversation.querySelector('[data-transcript-id="tool-wait-' + suffix + '"] .tool-label')?.textContent),
         meaningfulSeparate: Boolean(conversation.querySelector('[data-transcript-id="tool-wait-meaningful"]')),
-        execErrorSummary: conversation.querySelector('[data-transcript-id="tool-exec-error"] > summary')?.textContent,
+        execErrorSummary: conversation.querySelector('[data-transcript-id="tool-exec-error"] .tool-label')?.textContent,
         execBoundarySummaries: ['timeout', 'ok-after-timeout', 'json-error', 'json-ok', 'process-error']
-          .map((suffix) => conversation.querySelector('[data-transcript-id="tool-exec-' + suffix + '"] > summary')?.textContent),
-        splitToolsSeparate: [
+          .map((suffix) => conversation.querySelector('[data-transcript-id="tool-exec-' + suffix + '"] .tool-label')?.textContent),
+        mixedToolsGrouped: [
           'tool-exec-split-1', 'tool-patch-split', 'tool-exec-split-2',
           'tool-apply-1', 'tool-apply-2', 'tool-web-1', 'tool-web-2', 'tool-plan-1', 'tool-plan-2',
         ]
           .every((id) => {
             const node = conversation.querySelector('[data-transcript-id="' + id + '"]');
-            return Boolean(node) && !node.closest('.tool-call-group:not(.tool-run-group)');
+            return Boolean(node?.closest('.tool-call-group'));
           }),
         fileReaderPreferences: localStorage.getItem('atmux.file-reader-preferences'),
         markupInjected: Boolean(conversation.querySelector('img, script')),
@@ -3320,7 +3317,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.deepEqual(compactTools.order, ["tool-wait-1", "tool-wait-2", "tool-send-1"]);
     assert.ok(compactTools.groupSummaries[0].includes("wait_agent ×2"), JSON.stringify(compactTools));
     assert.ok(compactTools.groupSummaries[0].includes("send_message ×1"), JSON.stringify(compactTools));
-    assert.ok(compactTools.groupSummaries.includes("exec ×4"), JSON.stringify(compactTools));
+    assert.ok(compactTools.groupSummaries.includes("Tools ×29 · 9 errors · tokens —"), JSON.stringify(compactTools));
     assert.equal(compactTools.humanVisible, true, JSON.stringify(compactTools));
     assert.equal(compactTools.agentVisible, true, JSON.stringify(compactTools));
     assert.equal(compactTools.errorSummary, "wait_agent · error", JSON.stringify(compactTools));
@@ -3333,7 +3330,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.deepEqual(compactTools.execBoundarySummaries, [
       "exec · error", "exec · result", "exec_command · error", "exec_command · result", "exec · error",
     ], JSON.stringify(compactTools));
-    assert.equal(compactTools.splitToolsSeparate, true, JSON.stringify(compactTools));
+    assert.equal(compactTools.mixedToolsGrouped, true, JSON.stringify(compactTools));
     assert.equal(compactTools.fileReaderPreferences, '{"wrap":true,"size":"small"}');
     assert.equal(compactTools.markupInjected, false, JSON.stringify(compactTools));
     assert.equal(compactTools.escapedInputVisible, true, JSON.stringify(compactTools));
@@ -3341,8 +3338,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
 
     const expandedExec = await cdp.evaluate(`(() => {
       const conversation = document.getElementById('conversation');
-      const group = [...conversation.querySelectorAll('.tool-call-group:not(.tool-run-group)')]
-        .find((node) => node.querySelector(':scope > summary').textContent === 'exec ×4');
+      const group = conversation.querySelector('[data-transcript-id="tool-group:tool-exec-1"]');
       const summary = group.querySelector(':scope > summary');
       summary.click();
       return new Promise((resolve) => requestAnimationFrame(() => resolve({
@@ -3355,8 +3351,8 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       })));
     })()`);
     assert.equal(expandedExec.open, true, JSON.stringify(expandedExec));
-    assert.equal(expandedExec.label, "exec ×4; 4 calls and results");
-    assert.deepEqual(expandedExec.order, ["tool-exec-1", "tool-exec-2", "tool-exec-3", "tool-exec-4"]);
+    assert.equal(expandedExec.label, "Tools ×29 · 9 errors · tokens —; 29 calls and results");
+    assert.deepEqual(expandedExec.order, transcriptFixture.messages.filter((message) => message.kind === "tool").slice(3).map((message) => message.id));
     assert.equal(expandedExec.inputVisible, true, JSON.stringify(expandedExec));
     assert.equal(expandedExec.resultVisible, true, JSON.stringify(expandedExec));
     assert.equal(expandedExec.markupInjected, false, JSON.stringify(expandedExec));
@@ -3387,7 +3383,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       base_revision: 999, revision: 1_000, start_line: 0, delete_lines: 0, lines: [],
     })}\n\n`);
     await waitFor(
-      () => cdp.evaluate("document.getElementById('stream-state').textContent === 'Live' && document.querySelectorAll('#conversation .tool-call-group:not(.tool-run-group):not([data-old-generation])').length === 4"),
+      () => cdp.evaluate("document.getElementById('stream-state').textContent === 'Live' && document.querySelectorAll('#conversation .tool-call-group:not([data-old-generation])').length === 2"),
       "same-pane reconnect did not replace the old tool group generation",
       5_000,
     );
@@ -3403,11 +3399,11 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
         before,
         after: conversation.scrollTop,
         oldConnected: Boolean(document.querySelector('[data-old-generation]')),
-        groupCount: document.querySelectorAll('#conversation .tool-call-group:not(.tool-run-group)').length,
+        groupCount: document.querySelectorAll('#conversation .tool-call-group').length,
       };
     })()`);
     assert.equal(staleExpansionResult.oldConnected, false, JSON.stringify(staleExpansionResult));
-    assert.equal(staleExpansionResult.groupCount, 4, JSON.stringify(staleExpansionResult));
+    assert.equal(staleExpansionResult.groupCount, 2, JSON.stringify(staleExpansionResult));
     assert.ok(Math.abs(staleExpansionResult.after - staleExpansionResult.before) <= 1, JSON.stringify({ staleExpansionSetup, staleExpansionResult }));
 
     // Conversation visibility is a same-row mobile control. Agent prose can
@@ -3477,7 +3473,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       return {
         humans: conversation.querySelectorAll('[data-transcript-visibility="human"]').length,
         agents: conversation.querySelectorAll('[data-transcript-visibility="agent"]').length,
-        groups: conversation.querySelectorAll('.tool-call-group:not(.tool-run-group)').length,
+        groups: conversation.querySelectorAll('.tool-call-group').length,
         targetOffset: target.getBoundingClientRect().top - bounds.top,
         indicator: document.getElementById('conversation-filters-indicator').textContent,
         active: document.getElementById('conversation-filters-open').classList.contains('active'),
@@ -3486,7 +3482,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     })()`);
     assert.equal(humanHidden.humans, 0, JSON.stringify(humanHidden));
     assert.ok(humanHidden.agents > 0, JSON.stringify(humanHidden));
-    assert.equal(humanHidden.groups, 4, JSON.stringify(humanHidden));
+    assert.equal(humanHidden.groups, 2, JSON.stringify(humanHidden));
     assert.ok(Math.abs(humanHidden.targetOffset - filterReadingAnchor.offset) <= 1, JSON.stringify({ filterReadingAnchor, humanHidden }));
     assert.equal(humanHidden.indicator, "1 off", JSON.stringify(humanHidden));
     assert.equal(humanHidden.active, true, JSON.stringify(humanHidden));
@@ -3725,7 +3721,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       };
     })()`);
     assert.deepEqual(mergedGroupAnchorAfter.members, ["anchor-exec-1", "anchor-exec-2", "anchor-exec-3"]);
-    assert.equal(mergedGroupAnchorAfter.summary, "exec ×3", JSON.stringify(mergedGroupAnchorAfter));
+    assert.equal(mergedGroupAnchorAfter.summary, "exec ×3 · tokens —", JSON.stringify(mergedGroupAnchorAfter));
     assert.equal(mergedGroupAnchorAfter.oldOuterGone, true, JSON.stringify(mergedGroupAnchorAfter));
     assert.ok(Math.abs(mergedGroupAnchorAfter.offset - mergedGroupAnchorBefore.offset) <= 1, JSON.stringify({
       mergedGroupAnchorBefore, mergedGroupAnchorAfter,
@@ -4378,6 +4374,249 @@ test("raw downloads reject replaced pane output and retired callbacks while reta
       console.error(cleanupError);
     }
     paneSnapshotContent = "";
+    paneStreams.clear();
+    overviewStreams.clear();
+  }
+});
+
+test("conversation groups mixed errors and shows per-entry and filter-independent totals on mobile", { timeout: 60_000 }, async () => {
+  const profileDirectory = await mkdtemp(join(tmpdir(), "atmux-conversation-metrics-"));
+  overviewRevision = 1;
+  transcriptFixture = {
+    available: true, source: "codex", changed: true, truncated: true, content_hash: "metrics-first",
+    messages: [
+      { id: "human", role: "user", markdown: "Check these tools" },
+      ...[
+        ["exec", "result"], ["send_message", "sent"], ["exec", "Error: failed"],
+        ["exec", "<script>unsafe</script>"], ["exec", "Process exited with code 1"], ["followup_task", "A useful reply"],
+      ].map(([tool_name, tool_output], index) => ({
+        id: `mixed-${index}`, role: "tool", kind: "tool", tool_name, tool_output,
+        input_tokens: 1000, output_tokens: 100,
+      })),
+      { id: "assistant", role: "assistant", markdown: "Here is the result", input_tokens: 500, output_tokens: 50 },
+      { id: "approval", role: "tool", kind: "tool", tool_name: "exec", tool_output: "Approval required before continuing" },
+    ],
+  };
+  let server;
+  let chrome;
+  let cdp;
+  let testError = null;
+  try {
+    const started = await startServer();
+    server = started.server;
+    const browser = await launchChrome(profileDirectory);
+    chrome = browser.chrome;
+    cdp = await openCdp(browser.browserSocket, "about:blank");
+    await cdp.send("Page.enable");
+    await cdp.send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+    await cdp.send("Page.navigate", { url: `http://127.0.0.1:${started.port}/?session=tron~%25100` });
+    await waitFor(() => cdp.evaluate("document.querySelector('#conversation .tool-run-group') !== null"), "mixed screenshot tools did not group");
+    const readMetrics = () => cdp.evaluate("document.getElementById('conversation-metrics').textContent");
+    const originalTotals = await readMetrics();
+    assert.equal(originalTotals, "Loaded totals (partial) · 2 messages · 7 tools · 6.5k in · 650 out · 7.2k total tokens · 2 errors");
+    const initial = await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      const group = conversation.querySelector('.tool-run-group');
+      return {
+        groups: conversation.querySelectorAll('.tool-call-group').length,
+        open: group.open,
+        summary: group.querySelector('summary').textContent,
+        metrics: [...conversation.querySelectorAll('.entry-metrics')].map((node) => node.textContent),
+        approvalSeparate: !conversation.querySelector('[data-transcript-id="approval"]').closest('.tool-call-group'),
+        errorVisible: group.classList.contains('has-errors'),
+        top: document.getElementById('conversation-metrics').getBoundingClientRect().bottom <= conversation.getBoundingClientRect().top,
+        overflow: document.documentElement.scrollWidth - innerWidth,
+        injected: Boolean(conversation.querySelector('script, img')),
+      };
+    })()`);
+    assert.equal(initial.groups, 1);
+    assert.equal(initial.open, false);
+    assert.equal(initial.summary, "Tools ×6 · 2 errors · 6k in · 600 out");
+    assert.deepEqual(initial.metrics, ["tokens —", ...Array(6).fill("1k in · 100 out"), "500 in · 50 out", "tokens —"]);
+    assert.equal(initial.approvalSeparate, true);
+    assert.equal(initial.errorVisible, true);
+    assert.equal(initial.top, true);
+    assert.ok(initial.overflow <= 1);
+    assert.equal(initial.injected, false);
+    if (process.env.ATMUX_CONVERSATION_SCREENSHOT) {
+      const capture = await cdp.send("Page.captureScreenshot", { format: "png" });
+      await writeFile(process.env.ATMUX_CONVERSATION_SCREENSHOT, Buffer.from(capture.data, "base64"));
+    }
+    await cdp.evaluate("document.querySelector('#conversation .tool-run-group > summary').click()");
+    assert.equal(await cdp.evaluate("document.querySelector('#conversation .tool-run-group').open"), true);
+    assert.equal(await readMetrics(), originalTotals, "expansion double-counted tokens");
+    transcriptFixture = { ...transcriptFixture, content_hash: "metrics-updated", messages: [...transcriptFixture.messages,
+      { id: "assistant-new", role: "assistant", markdown: "New reply", input_tokens: 100, output_tokens: 10 },
+    ] };
+    await waitFor(() => cdp.evaluate("document.getElementById('conversation').textContent.includes('New reply')"), "metrics did not refresh");
+    assert.equal(await cdp.evaluate("document.querySelector('#conversation .tool-run-group').open"), true, "refresh lost expansion");
+    const updatedTotals = await readMetrics();
+    assert.match(updatedTotals, /6.6k in · 660 out · 7.3k total tokens/);
+    await cdp.evaluate(`(() => {
+      document.getElementById('conversation-filters-open').click();
+      document.getElementById('conversation-show-internal').click();
+      document.querySelector('#conversation-filters-dialog .primary').click();
+    })()`);
+    assert.equal(await readMetrics(), updatedTotals, "Show filters changed totals");
+    assert.equal(await cdp.evaluate("document.querySelectorAll('#conversation .tool-card').length"), 0);
+    await cdp.evaluate("document.getElementById('raw-view').click()");
+    assert.equal(await cdp.evaluate("document.getElementById('conversation-metrics').hidden"), true);
+    await cdp.evaluate("document.getElementById('conversation-view').click()");
+    assert.equal(await cdp.evaluate("document.getElementById('conversation-metrics').hidden"), false);
+    // Ryan's second screenshot: seven failures and one ordinary exec result
+    // must be one row, with the following Agent prose outside that disclosure.
+    transcriptFixture = {
+      available: true, source: "codex", changed: true, truncated: false, content_hash: "metrics-exec-eight",
+      messages: [
+        ...Array.from({ length: 8 }, (_, index) => ({
+          id: `eight-${index}`, role: "tool", kind: "tool", tool_name: "exec",
+          tool_output: index === 3 ? "result" : "Error: failed",
+        })),
+        { id: "eight-agent", role: "assistant", markdown: "Agent prose stays outside" },
+      ],
+    };
+    await cdp.evaluate(`(() => {
+      document.getElementById('conversation-filters-open').click();
+      document.getElementById('conversation-filters-reset').click();
+      document.querySelector('#conversation-filters-dialog .primary').click();
+    })()`);
+    await waitFor(() => cdp.evaluate("document.querySelector('#conversation .tool-call-group > summary')?.textContent === 'exec ×8 · 7 errors · tokens —'"), "second screenshot did not become one exec row");
+    assert.equal(await cdp.evaluate("document.querySelectorAll('#conversation .tool-call-group').length"), 1);
+    assert.equal(await cdp.evaluate("document.querySelector('#conversation .tool-call-group').open"), false);
+    assert.equal(await cdp.evaluate("Boolean(document.querySelector('#conversation > [data-transcript-id=\"eight-agent\"]'))"), true);
+    transcriptFixture = { available: false, source: "codex", changed: false, messages: [] };
+    await cdp.evaluate("document.querySelector('.session-button[data-session-id=\"midnight~%5\"]').click()");
+    assert.equal(await readMetrics(), "", "previous session totals survived selection change");
+  } catch (error) {
+    testError = error;
+    throw error;
+  } finally {
+    try { await cleanupBrowserHarness({ cdp, chrome, server, profileDirectory }); }
+    catch (cleanupError) { if (!testError) throw cleanupError; }
+    transcriptFixture = null;
+    paneStreams.clear();
+    overviewStreams.clear();
+  }
+});
+
+test("composer input history survives successful sends and stays scoped to the session", { timeout: 60_000 }, async () => {
+  const profileDirectory = await mkdtemp(join(tmpdir(), "atmux-history-browser-"));
+  messageRequests.length = 0;
+  messageResponseDelayMs = 0;
+  nextMessageFailurePane = null;
+  overviewRevision = 1;
+  let server;
+  let chrome;
+  let cdp;
+  let testError = null;
+  try {
+    const started = await startServer();
+    server = started.server;
+    const browser = await launchChrome(profileDirectory);
+    chrome = browser.chrome;
+    cdp = await openCdp(browser.browserSocket, "about:blank");
+    await cdp.send("Page.enable");
+    await cdp.send("Page.navigate", { url: `http://127.0.0.1:${started.port}/?session=tron~%25100` });
+    await waitFor(
+      () => cdp.evaluate("document.readyState === 'complete' && document.getElementById('agent-name').textContent === 'codex-main' && !document.getElementById('message').disabled"),
+      "history test composer did not become available",
+    );
+    const value = () => cdp.evaluate("document.getElementById('message').value");
+    const draft = (text, position = text.length) => cdp.evaluate(`(() => {
+      const input = document.getElementById('message');
+      input.focus();
+      input.value = ${JSON.stringify(text)};
+      input.setSelectionRange(${position}, ${position});
+      input.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    })()`);
+    const arrow = async (key) => {
+      const keyCode = key === "ArrowUp" ? 38 : 40;
+      await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", key, code: key, windowsVirtualKeyCode: keyCode });
+      await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key, code: key, windowsVirtualKeyCode: keyCode });
+    };
+    const send = async (text) => {
+      await draft(text);
+      const before = messageRequests.length;
+      await cdp.evaluate("document.getElementById('send').click()");
+      await waitFor(() => messageRequests.length === before + 1, "history fixture did not receive the message");
+      await waitFor(
+        () => cdp.evaluate("!document.getElementById('send').disabled && document.getElementById('message').value === ''"),
+        "successful send did not finish clearing the draft",
+      );
+    };
+    const select = async (id) => {
+      await cdp.evaluate(`document.querySelector('.session-button[data-session-id="${id}"]').click()`);
+      await waitFor(() => cdp.evaluate("!document.getElementById('message').disabled"), "selected composer is disabled");
+    };
+    const first = "first message";
+    const second = "second message\nwith multiple lines";
+    await send(first);
+    await send(second);
+    await draft("");
+    await arrow("ArrowUp");
+    assert.equal(await value(), second, "successful draft cleanup must retain sent-message history");
+    await draft("unfinished draft");
+    await arrow("ArrowUp");
+    assert.equal(await value(), second, "successful draft cleanup must retain the newest sent message");
+    await arrow("ArrowUp");
+    assert.equal(await value(), first, "repeated Up must browse past a recalled multiline message");
+    await arrow("ArrowUp");
+    assert.equal(await value(), first, "Up stops at the oldest message");
+    await arrow("ArrowDown");
+    assert.equal(await value(), second);
+    await arrow("ArrowDown");
+    assert.equal(await value(), "unfinished draft", "Down restores the original unsent draft");
+
+    await draft("first line\nmiddle line\nlast line", 14);
+    await arrow("ArrowUp");
+    assert.equal(await value(), "first line\nmiddle line\nlast line", "editing a middle line must not recall history");
+    await draft("first line\nlast line", 3);
+    await arrow("ArrowUp");
+    assert.equal(await value(), second, "Up on the first line recalls history without requiring Home");
+
+    await select("midnight~%5");
+    assert.equal(await value(), "", "another session must not inherit the selected history entry");
+    await send("only for Midnight");
+    await arrow("ArrowUp");
+    assert.equal(await value(), "only for Midnight");
+    await select("tron~%100");
+    await draft("");
+    await arrow("ArrowUp");
+    assert.equal(await value(), second, "switching sessions must retain each session's own history");
+
+    nextMessageFailurePane = "tron~%100";
+    await draft("failed message stays a draft");
+    const beforeFailure = messageRequests.length;
+    await cdp.evaluate("document.getElementById('send').click()");
+    await waitFor(() => messageRequests.length === beforeFailure + 1, "failed message was not attempted");
+    await waitFor(() => cdp.evaluate("!document.getElementById('send').disabled"), "failed send did not settle");
+    assert.equal(await value(), "failed message stays a draft");
+    await arrow("ArrowUp");
+    assert.equal(await value(), second, "failed sends must neither clear history nor become sent entries");
+    await arrow("ArrowDown");
+    assert.equal(await value(), "failed message stays a draft");
+
+    emitOverviewPatch([mockSession("tron", "%100", "replacement-history-agent", "waiting", {
+      instance_id: "pane-v1-" + "f".repeat(64), agent: "codex",
+    })]);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('agent-name').textContent === 'replacement-history-agent' && !document.getElementById('message').disabled"),
+      "replacement pane did not become available",
+    );
+    await draft("");
+    await arrow("ArrowUp");
+    assert.equal(await value(), "", "a reused pane ID must not inherit another process's history");
+    assert.equal(messageRequests.length, 4, "browsing history must never submit a message");
+  } catch (error) {
+    testError = error;
+    throw error;
+  } finally {
+    try { await cleanupBrowserHarness({ cdp, chrome, server, profileDirectory }); }
+    catch (cleanupError) {
+      if (!testError) throw cleanupError;
+      console.error(cleanupError);
+    }
+    nextMessageFailurePane = null;
     paneStreams.clear();
     overviewStreams.clear();
   }

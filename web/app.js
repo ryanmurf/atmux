@@ -23,10 +23,9 @@ const LIVE_TAIL_TOLERANCE = 2;
 // its own rounding, so the reader counts as parked at the tail well before the
 // scroll offset matches exactly.
 const STICKY_BOTTOM_TOLERANCE = 24;
-const MAX_COLLAPSED_TOOL_RUN = 24;
-// A pair of adjacent tool cards still reads as two steps; a longer run is the
-// repetition the reader wants folded away.
-const MIN_COLLAPSED_TOOL_RUN = 3;
+// One uninterrupted run stays one row, up to the server's transcript limit.
+const MAX_COLLAPSED_TOOL_RUN = 240;
+const MIN_COLLAPSED_TOOL_RUN = 2;
 // Bare URLs only: markdown links are already tokenized, and the closing set is
 // trimmed afterwards so surrounding prose never joins the address.
 const AUTOLINK_PATTERN = /https?:\/\/[^\s<>"'`]+/gi;
@@ -899,6 +898,25 @@ function moveMessageHistory(history, index, direction) {
     : entries.length;
   if (direction === "up") return Math.max(0, current - 1);
   return current < entries.length ? current + 1 : null;
+}
+
+/// Keep arrows available for editing multiline drafts, but let consecutive
+/// history keys traverse recalled messages regardless of the caret position.
+function messageHistoryDirection(event, {
+  value = "", selectionStart = value.length, selectionEnd = selectionStart,
+  browsing = false, fromPane = false,
+} = {}) {
+  if (!event || event.isComposing || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return null;
+  const direction = event.key === "ArrowUp" ? "up" : event.key === "ArrowDown" ? "down" : null;
+  if (!direction) return null;
+  if (!fromPane) {
+    if (selectionStart !== selectionEnd) return null;
+    if (!browsing) {
+      if (direction === "up" && value.slice(0, selectionStart).includes("\n")) return null;
+      if (direction === "down" && value.slice(selectionEnd).includes("\n")) return null;
+    }
+  }
+  return direction;
 }
 
 function filterDirectories(directories, query, limit = MAX_LAUNCH_DIRECTORY_SUGGESTIONS) {
@@ -2100,12 +2118,11 @@ function compactTranscriptItems(messages, maxRun = MAX_COLLAPSED_TOOL_RUN) {
   const source = Array.isArray(messages) ? messages : [];
   const boundedMax = Math.max(2, Math.min(Number.isInteger(maxRun) ? maxRun : MAX_COLLAPSED_TOOL_RUN, MAX_COLLAPSED_TOOL_RUN));
   for (let index = 0; index < source.length;) {
-    const groupKey = internalToolGroupKey(source[index]);
-    if (!groupKey) {
+    if (!collapsibleToolRun(source[index])) {
       items.push({ kind: "item", message: source[index] }); index += 1; continue;
     }
     let end = index;
-    while (end < source.length && internalToolGroupKey(source[end]) === groupKey) end += 1;
+    while (end < source.length && collapsibleToolRun(source[end])) end += 1;
     let cursor = index;
     while (cursor < end) {
       const remaining = end - cursor;
@@ -2115,8 +2132,12 @@ function compactTranscriptItems(messages, maxRun = MAX_COLLAPSED_TOOL_RUN) {
       }
       const grouped = source.slice(cursor, cursor + size);
       const firstId = String(grouped[0]?.id || cursor);
+      const groupKey = internalToolGroupKey(grouped[0]);
+      const kind = groupKey && grouped.every((message) => internalToolGroupKey(message) === groupKey)
+        ? "tool-group" : "tool-run";
       items.push({
-        kind: "tool-group",
+        kind,
+        // Result updates may change the group style, never its expansion key.
         id: `tool-group:${firstId}`,
         messages: grouped,
         counts: coordinationToolCounts(grouped),
@@ -2125,17 +2146,14 @@ function compactTranscriptItems(messages, maxRun = MAX_COLLAPSED_TOOL_RUN) {
     }
     index = end;
   }
-  return groupRepeatedTools(items);
+  return items;
 }
 
-/// A tool card is collapsed on arrival, so a long run of them is a wall of
-/// closed rows. Errors and approvals keep their own row: they are the ones a
-/// reader is scanning for, and the exec-aware signal is what recognizes a
-/// failed command whose text still reads like a benign status.
+/// Mixed tools, meaningful results and errors still belong to the same run.
+/// Errors remain visible in the outer summary. Approvals keep their own row.
 function collapsibleToolRun(item) {
   return transcriptItemKind(item) === "tool"
-    && !COLLAPSIBLE_COORDINATION_TOOLS.has(normalizedToolName(item))
-    && !["error", "approval"].includes(toolResultSignal(item));
+    && toolResultSignal(item) !== "approval";
 }
 
 function toolDisplayName(item) {
@@ -2145,16 +2163,43 @@ function toolDisplayName(item) {
 }
 
 function toolRunTokens(messages) {
-  let input = 0;
-  let output = 0;
-  let known = false;
-  for (const message of messages || []) {
-    for (const [field, add] of [["input_tokens", (n) => { input += n; }], ["output_tokens", (n) => { output += n; }]]) {
-      const value = Number(message?.[field]);
-      if (Number.isFinite(value) && value > 0) { add(value); known = true; }
+  const totals = {};
+  for (const [field, key] of [["input_tokens", "input"], ["output_tokens", "output"]]) {
+    let sum = null;
+    for (const message of messages || []) {
+      const value = message?.[field];
+      if (!Number.isSafeInteger(value) || value < 0) continue;
+      sum = (sum ?? 0) + value;
+      if (!Number.isSafeInteger(sum)) { sum = null; break; }
     }
+    totals[key] = sum;
   }
-  return known ? { input, output } : null;
+  return totals.input === null && totals.output === null ? null : totals;
+}
+
+function transcriptTokenSummary(messages, includeTotal = false) {
+  const tokens = toolRunTokens(messages);
+  if (!tokens) return "tokens —";
+  const count = (value) => value === null ? "—" : formatTokenCount(value);
+  const parts = [`${count(tokens.input)} in`, `${count(tokens.output)} out`];
+  const total = tokens.input === null || tokens.output === null ? null : tokens.input + tokens.output;
+  if (includeTotal && Number.isSafeInteger(total)) parts.push(`${formatTokenCount(total)} total tokens`);
+  return parts.join(" · ");
+}
+
+function transcriptErrorCount(messages) {
+  return messages.filter((message) => transcriptItemKind(message) === "tool"
+    && toolResultSignal(message) === "error").length;
+}
+
+function conversationMetricsSummary(transcript) {
+  const messages = transcript?.available && Array.isArray(transcript.messages) ? transcript.messages : [];
+  if (!messages.length) return "";
+  const tools = messages.filter((message) => transcriptItemKind(message) === "tool").length;
+  const errors = transcriptErrorCount(messages);
+  return [transcript.truncated ? "Loaded totals (partial)" : "Loaded totals",
+    `${messages.length - tools} messages`, `${tools} tools`, transcriptTokenSummary(messages, true),
+    errors ? `${errors} errors` : ""].filter(Boolean).join(" · ");
 }
 
 function formatTokenCount(value) {
@@ -2167,10 +2212,13 @@ function formatTokenCount(value) {
 
 function toolRunGroupSummary(group) {
   const messages = group?.messages || [];
-  const names = new Set(messages.map(toolDisplayName));
-  const parts = [`${names.size === 1 ? [...names][0] : "Tools"} ×${messages.length}`];
-  const tokens = toolRunTokens(messages);
-  if (tokens) parts.push(`${formatTokenCount(tokens.input)} in · ${formatTokenCount(tokens.output)} out`);
+  const names = new Set(messages.map(normalizedToolName));
+  const name = names.size === 1
+    ? (names.has("exec") ? "exec" : toolDisplayName(messages[0])) : "Tools";
+  const parts = [`${name} ×${messages.length}`];
+  const errors = transcriptErrorCount(messages);
+  if (errors) parts.push(`${errors} ${errors === 1 ? "error" : "errors"}`);
+  parts.push(transcriptTokenSummary(messages));
   return parts.join(" · ");
 }
 
@@ -2209,9 +2257,9 @@ function coordinationGroupSummary(group) {
 function toolGroupSummary(group) {
   const calls = group?.messages?.length || 0;
   const counts = group?.counts || [];
-  if (counts.length === 1) return `${counts[0].name} ×${calls}`;
   const labels = counts.map(({ name, count }) => `${name} ×${count}`).join(" · ");
-  return `${calls} internal calls · ${labels}`;
+  const label = counts.length === 1 ? `${counts[0].name} ×${calls}` : `${calls} internal calls · ${labels}`;
+  return `${label} · ${transcriptTokenSummary(group?.messages || [])}`;
 }
 
 function dictationDelivery(paneId, prefix, finalText) {
@@ -2785,6 +2833,7 @@ if (typeof module !== "undefined" && module.exports) {
     systemMetricLines,
     markdownBlocks,
     messageFitsByteLimit,
+    messageHistoryDirection,
     moveMessageHistory,
     paneTypingText,
     paneSpecialKeyDelivery,
@@ -2869,6 +2918,9 @@ if (typeof module !== "undefined" && module.exports) {
     groupRepeatedTools,
     toolDisplayName,
     toolRunGroupSummary,
+    toolRunTokens,
+    transcriptTokenSummary,
+    conversationMetricsSummary,
     formatTokenCount,
     linkifyTokens,
     trimmedAutolink,
@@ -3360,6 +3412,7 @@ function initialize() {
     state.transcriptPoll = null;
     pane.textContent = "";
     conversation.replaceChildren();
+    renderConversationMetrics();
     const selected = state.sessions.get(state.selected);
     if (!selected || document.hidden) return;
     const binding = paneOutputBinding(selected);
@@ -3503,6 +3556,7 @@ function initialize() {
         || Boolean(state.transcript.error);
       state.transcriptHash = next.hash;
       state.transcript = next.transcript;
+      renderConversationMetrics();
       if (shouldDraw) drawConversation();
       renderViewMode();
     } catch (error) {
@@ -3525,7 +3579,11 @@ function initialize() {
     const suffix = resultSignal === "error" ? "error"
       : resultSignal === "approval" ? "approval required"
         : message.tool_output ? "result" : "";
-    summary.textContent = [name, suffix].filter(Boolean).join(" · ");
+    const label = document.createElement("span");
+    label.className = "tool-label";
+    label.textContent = [name, suffix].filter(Boolean).join(" · ");
+    summary.append(label, document.createTextNode(" "), renderEntryMetrics(message));
+    details.classList.toggle("has-errors", resultSignal === "error");
     details.append(summary);
     const body = document.createElement("div");
     body.className = "tool-body";
@@ -3543,6 +3601,7 @@ function initialize() {
   function renderToolGroup(group, expandedTools) {
     const details = document.createElement("details");
     details.className = "tool-card tool-call-group";
+    details.classList.toggle("has-errors", transcriptErrorCount(group.messages) > 0);
     if (group.kind === "tool-run") details.classList.add("tool-run-group");
     details.dataset.transcriptId = group.id;
     details.dataset.transcriptMembers = JSON.stringify(
@@ -3585,6 +3644,20 @@ function initialize() {
 
   function conversationMeasurable() {
     return !conversation.hidden && conversation.clientHeight > 0;
+  }
+
+  function renderEntryMetrics(message) {
+    const metrics = document.createElement("span");
+    metrics.className = "entry-metrics";
+    metrics.textContent = transcriptTokenSummary([message]);
+    metrics.title = "Recorded model-request tokens, counted once on one entry per request. Input includes cached tokens. — means no separate usage was recorded for this entry.";
+    return metrics;
+  }
+
+  function renderConversationMetrics() {
+    const metrics = $("conversation-metrics");
+    metrics.textContent = conversationMetricsSummary(state.transcript);
+    metrics.hidden = state.viewMode !== "conversation" || !metrics.textContent;
   }
 
   /// Landing on the newest message has to survive late layout. The agent view
@@ -3685,6 +3758,7 @@ function initialize() {
       article.dataset.transcriptVisibility = visibility;
       const label = document.createElement("header");
       label.textContent = transcriptRoleLabel(message);
+      label.append(document.createTextNode(" "), renderEntryMetrics(message));
       const body = document.createElement("div");
       body.className = "markdown-body";
       body.append(markdownFragment(message.markdown));
@@ -4581,6 +4655,7 @@ function initialize() {
     }
     pane.hidden = !raw;
     conversation.hidden = !conversationMode;
+    renderConversationMetrics();
     $("conversation-filters-open").hidden = !conversationMode;
     filesPanel.hidden = !files;
     gitPanel.hidden = !git;
@@ -6563,17 +6638,18 @@ function initialize() {
   }
 
   function handlesMessageHistoryKey(event, fromPane = false) {
-    if (event.isComposing || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return false;
-    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return false;
     const input = $("message");
-    if (!fromPane) {
-      const start = input.selectionStart ?? input.value.length;
-      const end = input.selectionEnd ?? start;
-      if (start !== end) return false;
-      if (event.key === "ArrowUp" && start !== 0) return false;
-      if (event.key === "ArrowDown" && end !== input.value.length) return false;
-    }
-    const handled = browseMessageHistory(event.key === "ArrowUp" ? "up" : "down");
+    const identity = selectedComposerDraftIdentity();
+    const start = input.selectionStart ?? input.value.length;
+    const direction = messageHistoryDirection(event, {
+      value: input.value,
+      selectionStart: start,
+      selectionEnd: input.selectionEnd ?? start,
+      browsing: Boolean(identity && state.messageHistoryNavigation?.draftKey === identity.key),
+      fromPane,
+    });
+    if (!direction) return false;
+    const handled = browseMessageHistory(direction);
     if (handled && fromPane) input.focus({ preventScroll: true });
     return handled;
   }
@@ -6973,9 +7049,13 @@ function initialize() {
     if (!identity) return false;
     const removed = state.composerDrafts.delete(identity.key);
     const tombstoned = removed && recordComposerDraftTombstone(identity);
-    state.messageHistory.delete(identity.key);
-    if (state.messageHistoryNavigation?.draftKey === identity.key) {
-      state.messageHistoryNavigation = null;
+    // A delivered message clears its draft, not the sent-message history.
+    // Only retiring the pane (removal/replacement) discards both.
+    if (detach) {
+      state.messageHistory.delete(identity.key);
+      if (state.messageHistoryNavigation?.draftKey === identity.key) {
+        state.messageHistoryNavigation = null;
+      }
     }
     state.optimisticComposerClears.delete(identity.key);
     if (detach && state.composerDraftIdentity?.key === identity.key) {

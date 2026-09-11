@@ -826,6 +826,40 @@ mod tests {
         assert_eq!(bounded.total.tokens_in, 1_000_000);
     }
 
+    #[tokio::test]
+    async fn new_model_cache_prices_flow_through_reports_and_preserve_overrides_on_reseed() {
+        use crate::pulse::pricing::{authoritative_pricing, seed_authoritative_pricing};
+
+        let database = TestStore::new().await;
+        seed_identity(&database.store, account(1), "one@example.test").await;
+        let mut usage = grain(account(1), 1_000_000, "2026-08-08");
+        usage.model = "claude-fable-5-1".to_owned();
+        usage.cache_read = 1_000_000;
+        database.store.upsert_token_grain(usage).await.unwrap();
+        let report = token_report(&database.store, request(account(1)))
+            .await
+            .unwrap();
+        assert_close(report.total.cost_usd, 10.25);
+        assert_eq!(report.fallback_priced_rows, 0);
+        let mut custom = authoritative_pricing()
+            .into_iter()
+            .find(|item| item.rule.key == "claude-fable-5-1")
+            .unwrap()
+            .rule;
+        custom.input_per_million_usd = 1.0;
+        database
+            .store
+            .upsert_pricing_override(account(1), custom)
+            .await
+            .unwrap();
+        seed_authoritative_pricing(&database.store).await.unwrap();
+        let report = token_report(&database.store, request(account(1)))
+            .await
+            .unwrap();
+        assert_close(report.total.cost_usd, 1.25);
+        assert_eq!(report.total.cache_read, 1_000_000);
+    }
+
     #[test]
     fn report_total_overflow_is_rejected() {
         let mut totals = ReportTotals::default();

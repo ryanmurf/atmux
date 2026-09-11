@@ -7,7 +7,7 @@
 //! server-side.
 
 use std::{
-    collections::{HashSet, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     env, fs,
     hash::{Hash, Hasher},
     io::{Read, Seek, SeekFrom, Write},
@@ -733,8 +733,31 @@ fn first_json_values(path: &Path, limit: usize) -> Option<Vec<Value>> {
     )
 }
 
+fn claude_request_usage(log: &LogTail) -> HashMap<String, (u64, u64)> {
+    // Streaming content blocks can repeat the same model-request usage. Keep
+    // its final counters and charge one visible entry, not every JSONL record.
+    let mut request_usage: HashMap<String, (u64, u64)> = HashMap::new();
+    for value in json_lines(&log.bytes) {
+        if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if let (Some(id), Some((input, output))) = (claude_request_id(&value), claude_usage(&value))
+        {
+            request_usage
+                .entry(id.to_owned())
+                .and_modify(|usage| {
+                    usage.0 = usage.0.max(input);
+                    usage.1 = usage.1.max(output);
+                })
+                .or_insert((input, output));
+        }
+    }
+    request_usage
+}
+
 fn parse_claude(log: &LogTail) -> (Vec<TranscriptMessage>, bool) {
     let mut messages = Vec::new();
+    let mut request_usage = claude_request_usage(log);
     for value in json_lines(&log.bytes) {
         // A subagent's own inner turns are intentionally skipped: the parent
         // log already carries the notification the subagent reported back.
@@ -747,9 +770,22 @@ fn parse_claude(log: &LogTail) -> (Vec<TranscriptMessage>, bool) {
         let Some(content) = value.pointer("/message/content") else {
             continue;
         };
-        // One native record is one API request, so its usage must be spent on
-        // the first entry it produces rather than repeated per content block.
-        let mut usage = claude_usage(&value);
+        let visible = content.as_str().is_some_and(|text| !text.trim().is_empty())
+            || content.as_array().is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    block.get("type").and_then(Value::as_str) == Some("tool_use")
+                        || (block.get("type").and_then(Value::as_str) == Some("text")
+                            && block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .is_some_and(|text| !text.trim().is_empty()))
+                })
+            });
+        let mut usage = if let Some(id) = claude_request_id(&value) {
+            visible.then(|| request_usage.remove(id)).flatten()
+        } else {
+            claude_usage(&value)
+        };
         match role {
             Some("user") => {
                 push_claude_user(&mut messages, &value, content, id, timestamp, usage.take());
@@ -954,16 +990,23 @@ fn claude_subagent_name(value: &Value) -> Option<String> {
     })
 }
 
-/// Native usage for one request. Cache reads and writes are still context the
-/// request paid for, so the browser sees the same input total the CLI reports.
+fn claude_request_id(value: &Value) -> Option<&str> {
+    value
+        .pointer("/message/id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && id.len() <= MAX_ITEM_ID_BYTES)
+}
+
+/// Native usage for one request, including cached input.
 fn claude_usage(value: &Value) -> Option<(u64, u64)> {
     let usage = value.pointer("/message/usage")?;
-    let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
-    let input = field("input_tokens")
-        .saturating_add(field("cache_creation_input_tokens"))
-        .saturating_add(field("cache_read_input_tokens"));
-    let output = field("output_tokens");
-    (input > 0 || output > 0).then_some((input, output))
+    let optional = |key: &str| usage.get(key).map_or(Some(0), Value::as_u64);
+    let input = usage
+        .get("input_tokens")?
+        .as_u64()?
+        .checked_add(optional("cache_creation_input_tokens")?)?
+        .checked_add(optional("cache_read_input_tokens")?)?;
+    Some((input, usage.get("output_tokens")?.as_u64()?))
 }
 
 fn claude_user_text(value: &Value) -> Option<String> {
@@ -975,8 +1018,16 @@ fn claude_user_text(value: &Value) -> Option<String> {
 }
 
 fn parse_codex(log: &LogTail) -> (Vec<TranscriptMessage>, bool) {
-    let mut messages = Vec::new();
+    let mut messages: Vec<TranscriptMessage> = Vec::new();
+    let mut pending_usage_entry = None;
+    let mut last_usage_total = None;
     for value in json_lines(&log.bytes) {
+        apply_codex_usage_event(
+            &value,
+            &mut messages,
+            &mut pending_usage_entry,
+            &mut last_usage_total,
+        );
         if value.get("type").and_then(Value::as_str) != Some("response_item") {
             continue;
         }
@@ -998,6 +1049,9 @@ fn parse_codex(log: &LogTail) -> (Vec<TranscriptMessage>, bool) {
                 if role == Some("user") && is_injected_user_context(&markdown) {
                     continue;
                 }
+                if role == Some("user") {
+                    pending_usage_entry = None;
+                }
                 push_message(
                     &mut messages,
                     role.unwrap_or_default(),
@@ -1006,6 +1060,9 @@ fn parse_codex(log: &LogTail) -> (Vec<TranscriptMessage>, bool) {
                     timestamp,
                     EntryMeta::default(),
                 );
+                if role == Some("assistant") && pending_usage_entry.is_none() {
+                    pending_usage_entry = messages.last().map(|message| message.id.clone());
+                }
             }
             Some("function_call" | "custom_tool_call") => {
                 let input = if payload_type == Some("function_call") {
@@ -1027,6 +1084,9 @@ fn parse_codex(log: &LogTail) -> (Vec<TranscriptMessage>, bool) {
                     timestamp,
                     EntryMeta::default(),
                 );
+                if pending_usage_entry.is_none() {
+                    pending_usage_entry = messages.last().map(|message| message.id.clone());
+                }
             }
             Some("function_call_output" | "custom_tool_call_output") => {
                 attach_tool_output(
@@ -1041,38 +1101,91 @@ fn parse_codex(log: &LogTail) -> (Vec<TranscriptMessage>, bool) {
         }
     }
     if !messages.iter().any(|message| message.kind == "message") {
-        for value in json_lines(&log.bytes) {
-            if value.get("type").and_then(Value::as_str) != Some("event_msg") {
-                continue;
-            }
-            let event_type = value.pointer("/payload/type").and_then(Value::as_str);
-            let role = match event_type {
-                Some("user_message") => "user",
-                Some("agent_message") => "assistant",
-                _ => continue,
-            };
-            let Some(markdown) = value
-                .pointer("/payload/message")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .filter(|text| !text.trim().is_empty())
-            else {
-                continue;
-            };
-            if role == "user" && is_injected_user_context(&markdown) {
-                continue;
-            }
-            push_message(
-                &mut messages,
-                role,
-                markdown,
-                None,
-                value.get("timestamp").and_then(Value::as_str),
-                EntryMeta::default(),
-            );
-        }
+        append_codex_event_messages(log, &mut messages);
     }
     (messages, false)
+}
+
+fn append_codex_event_messages(log: &LogTail, messages: &mut Vec<TranscriptMessage>) {
+    for value in json_lines(&log.bytes) {
+        if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+            continue;
+        }
+        let event_type = value.pointer("/payload/type").and_then(Value::as_str);
+        let role = match event_type {
+            Some("user_message") => "user",
+            Some("agent_message") => "assistant",
+            _ => continue,
+        };
+        let Some(markdown) = value
+            .pointer("/payload/message")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .filter(|text| !text.trim().is_empty())
+        else {
+            continue;
+        };
+        if role == "user" && is_injected_user_context(&markdown) {
+            continue;
+        }
+        push_message(
+            messages,
+            role,
+            markdown,
+            None,
+            value.get("timestamp").and_then(Value::as_str),
+            EntryMeta::default(),
+        );
+    }
+}
+
+fn apply_codex_usage_event(
+    value: &Value,
+    messages: &mut [TranscriptMessage],
+    pending: &mut Option<String>,
+    last_total: &mut Option<(u64, u64)>,
+) {
+    if value.get("type").and_then(Value::as_str) == Some("compacted") {
+        *pending = None;
+        *last_total = None;
+    }
+    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return;
+    }
+    match value.pointer("/payload/type").and_then(Value::as_str) {
+        Some("token_count") => {
+            let total = codex_usage_pair(value.pointer("/payload/info/total_token_usage"));
+            // Repeated status/rate-limit events must not charge the previous
+            // request again or steal the next call's usage.
+            if total.is_some() && total == *last_total {
+                return;
+            }
+            if total.is_some() {
+                *last_total = total;
+            }
+            if let Some(id) = pending.take()
+                && let Some((input, output)) =
+                    codex_usage_pair(value.pointer("/payload/info/last_token_usage"))
+                && let Some(message) = messages.iter_mut().find(|message| message.id == id)
+            {
+                message.input_tokens = Some(input);
+                message.output_tokens = Some(output);
+            }
+        }
+        Some("task_started" | "task_complete" | "user_message") => {
+            *pending = None;
+        }
+        _ => {}
+    }
+}
+
+fn codex_usage_pair(usage: Option<&Value>) -> Option<(u64, u64)> {
+    let usage = usage?;
+    // Cached input and reasoning output are already included in these totals.
+    Some((
+        usage.get("input_tokens")?.as_u64()?,
+        usage.get("output_tokens")?.as_u64()?,
+    ))
 }
 
 fn content_text(content: Option<&Value>, block_type: &str) -> Option<String> {
@@ -1693,6 +1806,138 @@ mod tests {
             starts_mid_line: false,
             read_capped: false,
         }
+    }
+
+    #[test]
+    fn claude_streamed_request_usage_is_counted_once_with_final_counters() {
+        let record = |uuid: &str, content: Value, output: u64| {
+            serde_json::json!({
+                "type": "assistant", "uuid": uuid, "message": {
+                    "id": "request-1", "role": "assistant", "content": content,
+                    "usage": {"input_tokens": 100, "cache_read_input_tokens": 900,
+                        "cache_creation_input_tokens": 50, "output_tokens": output}
+                }
+            })
+            .to_string()
+        };
+        let source = [
+            record(
+                "thinking",
+                serde_json::json!([{"type":"thinking","thinking":"hidden"}]),
+                1,
+            ),
+            record(
+                "text",
+                serde_json::json!([{"type":"text","text":"Working"}]),
+                5,
+            ),
+            record(
+                "tool",
+                serde_json::json!([{"type":"tool_use","id":"call","name":"Bash","input":{}}]),
+                20,
+            ),
+        ]
+        .join("\n");
+        let (messages, _) = parse_claude(&tail(&source));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].input_tokens, Some(1050));
+        assert_eq!(messages[0].output_tokens, Some(20));
+        assert_eq!(messages[1].input_tokens, None);
+        assert_eq!(messages[1].output_tokens, None);
+    }
+
+    #[test]
+    fn transcript_usage_preserves_zero_and_rejects_invalid_or_overflowed_counters() {
+        let usage = |value: Value| claude_usage(&serde_json::json!({"message":{"usage":value}}));
+        assert_eq!(
+            usage(serde_json::json!({"input_tokens":0,"output_tokens":0})),
+            Some((0, 0))
+        );
+        assert_eq!(usage(serde_json::json!({"output_tokens":1})), None);
+        assert_eq!(
+            usage(serde_json::json!({"input_tokens":1,"output_tokens":-1})),
+            None
+        );
+        assert_eq!(
+            usage(
+                serde_json::json!({"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":null})
+            ),
+            None
+        );
+        assert_eq!(
+            usage(
+                serde_json::json!({"input_tokens":u64::MAX,"output_tokens":1,"cache_read_input_tokens":1})
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_request_tokens_attach_once_without_recounting_cached_or_duplicate_usage() {
+        let call = |id: &str| {
+            serde_json::json!({"type":"response_item","payload":{
+                "type":"function_call","call_id":id,"name":"exec","arguments":"{}"
+            }})
+            .to_string()
+        };
+        let usage = |total: u64, input: u64, output: u64| {
+            serde_json::json!({
+                "type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"input_tokens":total,"output_tokens":total},
+                    "last_token_usage":{"input_tokens":input,"cached_input_tokens":900,
+                        "output_tokens":output,"reasoning_output_tokens":20}
+                }}
+            })
+            .to_string()
+        };
+        let source = [
+            usage(100, 9999, 9999), // The preceding request is outside this tail.
+            call("first"), call("same-request"), usage(110, 1000, 50),
+            call("next"), usage(110, 1000, 50), // Rate-limit refresh, not a new request.
+            usage(120, 500, 25),
+            call("malformed"),
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":-1,"output_tokens":5}}}}"#.to_owned(),
+            call("zero"), usage(130, 0, 0),
+        ].join("\n");
+        let (messages, _) = parse_codex(&tail(&source));
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[0].input_tokens, Some(1000));
+        assert_eq!(messages[0].output_tokens, Some(50));
+        assert_eq!(messages[1].input_tokens, None);
+        assert_eq!(messages[2].input_tokens, Some(500));
+        assert_eq!(messages[2].output_tokens, Some(25));
+        assert_eq!(messages[3].input_tokens, None);
+        assert_eq!(messages[4].input_tokens, Some(0));
+        assert_eq!(
+            messages
+                .iter()
+                .filter_map(|message| message.input_tokens)
+                .sum::<u64>(),
+            1500
+        );
+    }
+
+    #[test]
+    fn codex_usage_never_crosses_a_user_or_compact_boundary() {
+        let source = concat!(
+            r#"{"type":"response_item","payload":{"type":"function_call","call_id":"old","name":"exec"}}"#,
+            "\n",
+            r#"{"type":"compacted"}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":99,"output_tokens":2}}}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","id":"user","content":[{"type":"input_text","text":"hello"}]}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":50,"output_tokens":1}}}}"#,
+            "\n",
+        );
+        let (messages, _) = parse_codex(&tail(source));
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.input_tokens.is_none())
+        );
     }
 
     #[test]

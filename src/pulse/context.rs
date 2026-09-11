@@ -40,6 +40,7 @@ const MODEL_LIMITS: &[(&str, u64)] = &[
     ("claude-fable-5-1m", LARGE_CONTEXT_LIMIT),
     ("claude-fable-5", LARGE_CONTEXT_LIMIT),
     ("claude-mythos-5", LARGE_CONTEXT_LIMIT),
+    ("claude-opus-5", LARGE_CONTEXT_LIMIT),
     ("claude-opus-4-8[1m]", LARGE_CONTEXT_LIMIT),
     ("claude-opus-4-8-1m", LARGE_CONTEXT_LIMIT),
     ("claude-opus-4-8", LARGE_CONTEXT_LIMIT),
@@ -50,6 +51,7 @@ const MODEL_LIMITS: &[(&str, u64)] = &[
     ("claude-opus-4-5", DEFAULT_CONTEXT_LIMIT),
     ("claude-opus-4-1", DEFAULT_CONTEXT_LIMIT),
     ("claude-opus-4", DEFAULT_CONTEXT_LIMIT),
+    ("claude-sonnet-5", LARGE_CONTEXT_LIMIT),
     ("claude-sonnet-4-6", LARGE_CONTEXT_LIMIT),
     ("claude-sonnet-4-5", DEFAULT_CONTEXT_LIMIT),
     ("claude-sonnet-4-1", DEFAULT_CONTEXT_LIMIT),
@@ -583,7 +585,11 @@ mod tests {
     fn model_limits_are_specific_and_case_insensitive() {
         for model in [
             "claude-fable-5",
+            "claude-fable-5-1",
             "CLAUDE-MYTHOS-5",
+            "claude-mythos-5-1",
+            "claude-opus-5",
+            "CLAUDE-SONNET-5",
             "claude-opus-4-8-20260601",
             "claude-opus-4-7[1m]",
             "claude-sonnet-4-6",
