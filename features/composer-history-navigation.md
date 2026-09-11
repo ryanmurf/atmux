@@ -48,5 +48,15 @@ Passing verification:
   of embedded browser assets.
 - `node --check web/app.js` and `git diff --check`.
 
-No deployment or service restart has been performed for this fix. Keep this
-record active until the remaining project gates are complete.
+Deployed on 2026-09-10 in runtime commit
+`6c9fe8d1c7550cba1d5f37958025b91862cbeda4`, alongside conversation metrics and
+pricing. The public coordinator (Helm revision 28) and Tron, Max, Clue, and
+Midnight run the new build. Embedded asset and owner-health checks passed;
+existing tmux sessions and non-web processes were preserved. The final combined
+suite passed 160 JavaScript tests and 9 browser tests. No synthetic live messages
+were sent to users' agents to exercise history; the actual send/arrow behavior
+was tested in the disposable browser fixture described above. Live end-to-end
+interaction and reviewer gates remain open, so keep this record active.
+
+See [the rollout record](conversation-metrics-and-grouping.md#deployment--2026-09-10)
+for build, verification, and rollback details.

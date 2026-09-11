@@ -1,6 +1,7 @@
 # Conversation grouping and metrics
 
-Status: implemented, tested and release-built locally; deployment/review pending.
+Status: deployed fleet-wide on 2026-09-10; live smoke checks passed. Full native
+Conversation verification on Clue and reviewer approval remain pending.
 
 ## Request
 
@@ -69,4 +70,56 @@ and put totals at the top of Conversation.
 - [ ] Integration/live verification on every affected platform
 - [ ] Frozen-snapshot Fable/Claude Max and independent security review
 
-No commit, service restart or deployment performed for this request.
+## Deployment — 2026-09-10
+
+Ryan explicitly requested deployment. Runtime commit
+`6c9fe8d1c7550cba1d5f37958025b91862cbeda4` includes this change, the
+[input-history fix](composer-history-navigation.md), and the
+[pricing refresh](model-pricing-refresh.md). No independent reviewer approval is
+claimed; these feature records remain active.
+
+- Built and installed Linux x86_64 on Tron and Max, native Linux ARM64 on Clue,
+  and native macOS ARM64 on Midnight. All four owners report online with no
+  health error. The final native binaries were checked against the embedded
+  web assets; Clue and Midnight additionally passed all 29 transcript tests.
+- Built the public coordinator from the committed source archive with locked
+  Rust 1.88 dependencies. Deployed Helm revision **28**, image
+  `localhost:32000/atmux@sha256:5b44b028b4bdddee7e2a36d0502e61cd5f0e0d83d388e19a13fdb15e90cedde7`.
+  Pod `atmux-web-65fbc9c774-dhqw8` is 3/3 Ready with zero restarts.
+- Reviewed the Helm render: only the application and init-container image
+  references changed. Gateway, OAuth2 Proxy, authentication, routes, storage,
+  and credentials are unchanged. Chart regression/security tests passed.
+- Authenticated read-only checks verified exact `app.js`, `app.css`, and
+  `index.html` bytes, all 105 pricing rules, and representative new default
+  rates. Anonymous dashboard and spoofed-identity API requests still receive
+  login redirects (302).
+- Live native conversations expose measured entries on Max (116), Midnight
+  (201), and Tron (60), within their bounded transcript samples. Clue's one
+  existing agent still has the previously diagnosed unavailable native
+  Conversation mapping. Its parser tests and runtime smoke checks pass, but
+  that known mapping issue prevents a complete live Conversation check there.
+  No agent was restarted to mask it.
+- All 49 previously visible sessions remain visible. Before/after tmux
+  snapshots preserve all 55 pane identities and every non-web pane process ID.
+  Only web services were restarted. Tron retains server PID 1116719 and socket
+  `/tmp/tmux-1000/default`; Midnight retains protected server PID 26474 and
+  `/private/tmp/tmux-501/default`.
+- Midnight was restarted only through the Aqua login session's
+  `launchctl kickstart -k gui/$(id -u)/dev.herodevs.atmux-web`. Its existing
+  LaunchAgent was backed up and given its required, previously absent
+  `WorkingDirectory=/Users/ryan/IdeaProjects/atmux`; program arguments are
+  unchanged. The new process's actual working directory was verified.
+
+Rollback: public coordinator Helm revision **27** remains available. Previous
+native binaries were retained as `atmux.rollback-6c9fe8d` beside each deployed
+executable (Tron/Max/Midnight: `target/release`; Clue: `~/.local/bin`). Midnight's
+LaunchAgent backup is `dev.herodevs.atmux-web.plist.rollback-6c9fe8d` beside the
+plist. Rollbacks must use each existing service restart mechanism and preserve
+Midnight's protected tmux server/socket.
+
+Fresh committed source was staged at
+`/Users/ryan/IdeaProjects/atmux/.deploy-6c9fe8d-tOGQ9U` on Midnight and
+`/home/ubuntu/atmux-build-6c9fe8d-zaJyBZ` on Clue; existing source and unrelated
+local files were not overwritten. Deployment values, reviewed manifests,
+before/after pane snapshots, and metadata-only verification reports are retained
+under `/mnt/data/herodevs-agents/atmux-metrics-*` on Tron.

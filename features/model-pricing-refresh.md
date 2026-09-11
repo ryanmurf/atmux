@@ -70,8 +70,18 @@ and the Codex explicit-null tier-reset parser fix need that migration first.
 - [ ] Live integration on every affected platform.
 - [ ] Fable/Claude Max and independent security review of the frozen snapshot.
 
-No service restart or fleet deployment is included in this refresh. This record
-stays active until the remaining project gates are completed.
+Deployed fleet-wide on 2026-09-10 in runtime commit
+`6c9fe8d1c7550cba1d5f37958025b91862cbeda4`, including public coordinator Helm
+revision 28 and native builds on Tron, Max, Clue, and Midnight. An authenticated
+read-only check paginated all 105 pricing rules and verified the new standard
+default rates for Astra, Sol, Terra, Luna, and Sonnet 5. All owners are healthy;
+no schema or stored token-grain migration was performed. The shared catalog/API
+suite passed before release; this rollout did not independently exercise every
+native owner's billing/report path. Live integration and reviewer gates remain
+open, so this record stays active.
+
+See [the rollout record](conversation-metrics-and-grouping.md#deployment--2026-09-10)
+for build, verification, and rollback details.
 
 Local evidence:
 
