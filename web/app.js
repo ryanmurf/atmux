@@ -1908,6 +1908,84 @@ function reduceTranscript(current, data) {
   };
 }
 
+/// One request at a time: activity cannot postpone an already scheduled read
+/// or invalidate a slow response. The next idle poll starts after completion,
+/// while activity during a read coalesces into one bounded follow-up.
+function createTranscriptPoller({
+  load,
+  onData,
+  onError,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+  now = Date.now,
+  intervalMs = 2500,
+  minRefreshMs = 750,
+  timeoutMs = 15_000,
+}) {
+  let closed = false;
+  let timer = null;
+  let due = Infinity;
+  let controller = null;
+  let timeout = null;
+  let pending = false;
+  let lastStarted = -Infinity;
+
+  function schedule(delay = 300) {
+    if (closed) return;
+    if (controller) { pending = true; return; }
+    const next = Math.max(now() + delay, lastStarted + minRefreshMs);
+    if (timer !== null && due <= next) return;
+    if (timer !== null) clearTimer(timer);
+    due = next;
+    timer = setTimer(() => { void refresh(); }, Math.max(0, next - now()));
+  }
+
+  async function refresh() {
+    timer = null;
+    due = Infinity;
+    if (closed) return;
+    controller = new AbortController();
+    const active = controller;
+    let timedOut = false;
+    lastStarted = now();
+    const deadline = new Promise((_, reject) => {
+      timeout = setTimer(() => {
+        timedOut = true;
+        active.abort();
+        reject(new Error("Conversation update timed out; retrying automatically."));
+      }, timeoutMs);
+    });
+    try {
+      const data = await Promise.race([load(active.signal), deadline]);
+      if (!closed) onData(data);
+    } catch (error) {
+      if (!closed) onError(timedOut
+        ? new Error("Conversation update timed out; retrying automatically.") : error);
+    } finally {
+      clearTimer(timeout);
+      timeout = null;
+      controller = null;
+      if (!closed) {
+        const delay = pending ? minRefreshMs : intervalMs;
+        pending = false;
+        schedule(delay);
+      }
+    }
+  }
+
+  return {
+    schedule,
+    close() {
+      closed = true;
+      if (timer !== null) clearTimer(timer);
+      if (timeout !== null) clearTimer(timeout);
+      timer = null;
+      timeout = null;
+      controller?.abort();
+    },
+  };
+}
+
 /// A Claude Code subagent writes its prompts and reports back with the user
 /// role. Labelling those "You" credits the operator with an agent's words, so
 /// the subagent is named ahead of the visibility bucket it shares with the
@@ -2884,6 +2962,7 @@ if (typeof module !== "undefined" && module.exports) {
     reconcileSessions,
     reduceOverview,
     reduceTranscript,
+    createTranscriptPoller,
     sessionDeletePath,
     modelPickerState,
     pickerOptions,
@@ -3091,7 +3170,6 @@ function initialize() {
     paneExpectedScrollTop: null,
     transcript: { available: false, source: "agent", messages: [], truncated: false, error: null },
     transcriptHash: "",
-    transcriptTimer: null,
     transcriptPoll: null,
     transcriptRequest: 0,
     transcriptPointerDown: false,
@@ -3380,6 +3458,7 @@ function initialize() {
 
   function connectPane(resetProject = true) {
     state.paneSource?.close();
+    stopTranscriptPolling();
     if (resetProject) resetProjectView();
     state.paneSource = null;
     state.paneLines = [];
@@ -3406,10 +3485,6 @@ function initialize() {
     state.transcriptUnseen = false;
     state.transcriptDrawnHash = "";
     renderTranscriptJump();
-    clearTimeout(state.transcriptTimer);
-    clearInterval(state.transcriptPoll);
-    state.transcriptTimer = null;
-    state.transcriptPoll = null;
     pane.textContent = "";
     conversation.replaceChildren();
     renderConversationMetrics();
@@ -3421,8 +3496,7 @@ function initialize() {
     // background without making the reader open the Git tab first.
     void loadGitSummary();
     $("stream-state").textContent = "Connecting…";
-    scheduleTranscript(0);
-    state.transcriptPoll = setInterval(() => scheduleTranscript(0), 2500);
+    startTranscriptPolling();
     const source = new EventSource(`/api/v1/panes/${encodeURIComponent(state.selected)}/events`);
     state.paneSource = source;
     const current = () => state.paneSource === source
@@ -3535,35 +3609,49 @@ function initialize() {
   }
 
   function scheduleTranscript(delay = 300) {
-    clearTimeout(state.transcriptTimer);
-    if (!state.selected || document.hidden) return;
-    state.transcriptTimer = setTimeout(() => { void refreshTranscript(); }, delay);
+    state.transcriptPoll?.schedule(delay);
   }
 
-  async function refreshTranscript() {
+  function stopTranscriptPolling() {
+    state.transcriptPoll?.close();
+    state.transcriptPoll = null;
+    state.transcriptRequest += 1;
+  }
+
+  function startTranscriptPolling() {
     const paneId = state.selected;
-    if (!paneId) return;
-    const generation = ++state.transcriptRequest;
-    const suffix = state.transcriptHash ? `?known_hash=${encodeURIComponent(state.transcriptHash)}` : "";
-    try {
-      const data = await request(`/api/v1/panes/${encodeURIComponent(paneId)}/transcript${suffix}`);
-      if (state.selected !== paneId || generation !== state.transcriptRequest) return;
-      const next = reduceTranscript(state.transcript, data);
-      const shouldDraw = next.transcript.messages !== state.transcript.messages
-        || next.transcript.available !== state.transcript.available
-        || next.transcript.source !== state.transcript.source
-        || next.transcript.truncated !== state.transcript.truncated
-        || Boolean(state.transcript.error);
-      state.transcriptHash = next.hash;
-      state.transcript = next.transcript;
-      renderConversationMetrics();
-      if (shouldDraw) drawConversation();
-      renderViewMode();
-    } catch (error) {
-      if (state.selected !== paneId || generation !== state.transcriptRequest) return;
-      state.transcript.error = error.message;
-      drawConversation();
-    }
+    const selected = state.sessions.get(paneId);
+    if (state.transcriptPoll || !selected || document.hidden || state.viewMode !== "conversation") return;
+    const binding = paneOutputBinding(selected);
+    const current = () => state.selected === paneId
+      && paneOutputMatchesSession(binding, state.sessions.get(paneId));
+    state.transcriptPoll = createTranscriptPoller({
+      load(signal) {
+        const suffix = state.transcriptHash ? `?known_hash=${encodeURIComponent(state.transcriptHash)}` : "";
+        return request(`/api/v1/panes/${encodeURIComponent(paneId)}/transcript${suffix}`, { signal });
+      },
+      onData(data) {
+        if (!current()) return;
+        state.transcriptRequest += 1;
+        const next = reduceTranscript(state.transcript, data);
+        const shouldDraw = next.transcript.messages !== state.transcript.messages
+          || next.transcript.available !== state.transcript.available
+          || next.transcript.source !== state.transcript.source
+          || next.transcript.truncated !== state.transcript.truncated
+          || Boolean(state.transcript.error);
+        state.transcriptHash = next.hash;
+        state.transcript = next.transcript;
+        renderConversationMetrics();
+        if (shouldDraw) drawConversation();
+        renderViewMode();
+      },
+      onError(error) {
+        if (!current()) return;
+        state.transcript.error = error.message;
+        drawConversation();
+      },
+    });
+    scheduleTranscript(0);
   }
 
   function renderToolCard(message, expandedTools, grouped = false) {
@@ -4607,6 +4695,8 @@ function initialize() {
       }
     }
     state.viewMode = next;
+    if (next === "conversation") startTranscriptPolling();
+    else stopTranscriptPolling();
     renderViewMode();
     return true;
   }
@@ -4844,10 +4934,7 @@ function initialize() {
     updateSelectionHistory(url, historyMode, changed);
     state.paneSource?.close();
     state.paneSource = null;
-    clearTimeout(state.transcriptTimer);
-    clearInterval(state.transcriptPoll);
-    state.transcriptTimer = null;
-    state.transcriptPoll = null;
+    stopTranscriptPolling();
     render();
     return true;
   }
@@ -4873,10 +4960,7 @@ function initialize() {
     updateSelectionHistory(url, historyMode, changed);
     state.paneSource?.close();
     state.paneSource = null;
-    clearTimeout(state.transcriptTimer);
-    clearInterval(state.transcriptPoll);
-    state.transcriptTimer = null;
-    state.transcriptPoll = null;
+    stopTranscriptPolling();
     if (state.pulseOpen) {
       void loadPulseAccounts();
       if (state.pulseAccount && state.pulseAccountsLoaded) {
@@ -8887,6 +8971,7 @@ function initialize() {
       state.overviewSource?.close();
       state.paneSource?.close();
       state.paneSource = null;
+      stopTranscriptPolling();
       state.overviewConnection = "paused";
       stopPulseRefresh();
       stopPulseEvents();
@@ -8925,6 +9010,8 @@ function initialize() {
     }
   });
   window.addEventListener("pagehide", () => { persistBoundComposerDraft(true); });
+  window.addEventListener("pagehide", stopTranscriptPolling);
+  window.addEventListener("pageshow", startTranscriptPolling);
 
   render();
   connectOverview();

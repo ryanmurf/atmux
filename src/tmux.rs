@@ -3424,14 +3424,17 @@ impl ProcessTable {
         &self,
         root: u32,
         kind: AgentKind,
-        mut rank_process: impl FnMut(&str, AgentKind) -> u8,
+        mut rank_process: impl FnMut(u32, &str, AgentKind) -> u8,
     ) -> Option<(u32, Option<u64>)> {
         let (pid, (_, elapsed, _), _) = self
             .entries
             .iter()
+            // Do not inspect unrelated processes (or their executable paths)
+            // once per pane. Only descendants can own this conversation.
+            .filter(|(pid, _)| self.descends_from(**pid, root))
             .filter_map(|(pid, entry)| {
-                let rank = rank_process(&entry.2, kind);
-                (self.descends_from(*pid, root) && rank > 0).then_some((*pid, entry, rank))
+                let rank = rank_process(*pid, &entry.2, kind);
+                (rank > 0).then_some((*pid, entry, rank))
             })
             .max_by_key(|(pid, _, rank)| (*rank, self.depth_from(*pid, root)))?;
         let started = elapsed.and_then(|elapsed| {
@@ -3484,16 +3487,17 @@ fn parse_elapsed(value: &str) -> Option<Duration> {
 
 #[cfg(test)]
 fn command_is_agent_process(command: &str, kind: AgentKind) -> bool {
-    agent_process_rank(command, kind) > 0
+    agent_process_rank(0, command, kind) > 0
 }
 
-fn agent_process_rank(command: &str, kind: AgentKind) -> u8 {
+fn agent_process_rank(pid: u32, command: &str, kind: AgentKind) -> u8 {
     let home = env::var_os("HOME").map(PathBuf::from);
     agent_process_rank_in(
         command,
         kind,
         home.as_deref(),
         rustix::process::geteuid().as_raw(),
+        Some(pid).filter(|pid| *pid > 0),
     )
 }
 
@@ -3502,6 +3506,7 @@ fn agent_process_rank_in(
     kind: AgentKind,
     home: Option<&Path>,
     expected_uid: u32,
+    live_pid: Option<u32>,
 ) -> u8 {
     let words = shell_words::split(command)
         .unwrap_or_else(|_| command.split_whitespace().map(str::to_owned).collect());
@@ -3519,7 +3524,9 @@ fn agent_process_rank_in(
         // pane's transcript identity.
         AgentKind::Claude
             if home.is_some_and(|home| {
-                native_claude_version_executable_in(executable_path, home, expected_uid)
+                native_claude_version_path_in(executable_path, home, expected_uid, |path| {
+                    live_pid.is_some_and(|pid| running_executable_matches(pid, path, expected_uid))
+                })
             }) =>
         {
             3
@@ -3543,7 +3550,20 @@ fn agent_process_rank_in(
     }
 }
 
+#[cfg(test)]
 fn native_claude_version_executable_in(executable: &str, home: &Path, expected_uid: u32) -> bool {
+    native_claude_version_path_in(executable, home, expected_uid, |_| false)
+}
+
+/// An updater may unlink an old executable while its agent is still running.
+/// Accept only that missing leaf, never a missing/untrusted parent or an argv
+/// lookalike: the kernel's live executable path and process owner must agree.
+fn native_claude_version_path_in(
+    executable: &str,
+    home: &Path,
+    expected_uid: u32,
+    verify_unlinked: impl FnOnce(&Path) -> bool,
+) -> bool {
     let path = Path::new(executable);
     let Some(version) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -3565,36 +3585,74 @@ fn native_claude_version_executable_in(executable: &str, home: &Path, expected_u
         return false;
     }
 
-    for (component, expect_directory) in [
-        (home, true),
-        (local.as_path(), true),
-        (share.as_path(), true),
-        (claude.as_path(), true),
-        (versions.as_path(), true),
-        (expected.as_path(), false),
-    ] {
+    for component in [home, &local, &share, &claude, &versions] {
         let Ok(metadata) = fs::symlink_metadata(component) else {
             return false;
         };
         if metadata.file_type().is_symlink()
             || metadata.uid() != expected_uid
-            || (expect_directory && !metadata.is_dir())
-            || (!expect_directory
-                && (!metadata.is_file() || metadata.permissions().mode() & 0o111 == 0))
+            || !metadata.is_dir()
+            || metadata.permissions().mode() & 0o022 != 0
         {
             return false;
         }
     }
 
-    let (Ok(canonical_home), Ok(canonical_versions), Ok(canonical_executable)) = (
-        home.canonicalize(),
-        versions.canonicalize(),
-        expected.canonicalize(),
-    ) else {
+    let (Ok(canonical_home), Ok(canonical_versions)) =
+        (home.canonicalize(), versions.canonicalize())
+    else {
         return false;
     };
-    canonical_versions == canonical_home.join(".local/share/claude/versions")
-        && canonical_executable == canonical_versions.join(version)
+    if canonical_versions != canonical_home.join(".local/share/claude/versions") {
+        return false;
+    }
+    match fs::symlink_metadata(&expected) {
+        Ok(metadata) => {
+            metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == expected_uid
+                && metadata.permissions().mode() & 0o111 != 0
+                && metadata.permissions().mode() & 0o022 == 0
+                && expected
+                    .canonicalize()
+                    .is_ok_and(|path| path == canonical_versions.join(version))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => verify_unlinked(&expected),
+        Err(_) => false,
+    }
+}
+
+fn running_executable_matches(pid: u32, expected: &Path, expected_uid: u32) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let pid = Pid::from_u32(pid);
+    // macOS can retain a lexical ancestor alias (e.g. /var versus /private/var)
+    // in its kernel exec path. Accept only the already-validated install path
+    // or its canonical-parent equivalent, without following a missing leaf.
+    let canonical = expected
+        .parent()
+        .and_then(|parent| Some(parent.canonicalize().ok()?.join(expected.file_name()?)));
+    let mut system = System::new();
+    // Target just this PID, without task scans, metrics, argv, or environment.
+    // sysinfo reads the native executable identity, including unlinked Linux
+    // images; no process-provided command string is accepted as proof.
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_exe(UpdateKind::Always)
+            .with_user(UpdateKind::Always),
+    );
+    system.process(pid).is_some_and(|process| {
+        process
+            .exe()
+            .is_some_and(|path| path == expected || canonical.as_deref() == Some(path))
+            && process.user_id().is_some_and(|uid| **uid == expected_uid)
+            && process
+                .effective_user_id()
+                .is_some_and(|uid| **uid == expected_uid)
+    })
 }
 
 #[cfg(test)]
@@ -3631,6 +3689,15 @@ mod tests {
             let home = root.join("home");
             let versions = home.join(".local/share/claude/versions");
             fs::create_dir_all(&versions).unwrap();
+            for directory in [
+                &home,
+                &home.join(".local"),
+                &home.join(".local/share"),
+                &home.join(".local/share/claude"),
+                &versions,
+            ] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+            }
             let executable = versions.join(version);
             fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -5705,6 +5772,185 @@ mod tests {
     }
 
     #[test]
+    fn process_ranking_only_inspects_the_selected_panes_descendants() {
+        let table = ProcessTable {
+            entries: HashMap::from([
+                (10, (1, None, "sh".to_owned())),
+                (11, (10, None, "claude".to_owned())),
+                (12, (1, None, "unrelated".to_owned())),
+            ]),
+        };
+        let mut inspected = Vec::new();
+        let found = table.agent_process_under_ranked(10, AgentKind::Claude, |pid, _, _| {
+            inspected.push(pid);
+            u8::from(pid == 11)
+        });
+        inspected.sort_unstable();
+        assert_eq!(inspected, [10, 11]);
+        assert_eq!(found.map(|value| value.0), Some(11));
+    }
+
+    /// Opt-in production diagnosis. Uses only display-message, ps/native
+    /// process inspection, and bounded log reads: no tmux creation, metadata
+    /// writes, input injection, or agent/service restarts.
+    #[test]
+    #[ignore = "requires ATMUX_LIVE_CONVERSATION_PANE on an existing owner"]
+    fn live_conversation_maps_selected_pane_without_mutation() {
+        let pane_id = env::var("ATMUX_LIVE_CONVERSATION_PANE").unwrap();
+        assert!(
+            pane_id.strip_prefix('%').is_some_and(|id| {
+                !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        );
+        let format =
+            "#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_start_command}";
+        let inspect = || Tmux::output(["display-message", "-p", "-t", &pane_id, format]).unwrap();
+        let before = inspect();
+        let fields = before.trim_end().splitn(4, '\t').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 4);
+        let root_pid = fields[0].parse().unwrap();
+        let kind = match env::var("ATMUX_LIVE_CONVERSATION_AGENT").as_deref() {
+            Ok("codex") => AgentKind::Codex,
+            Ok("claude") | Err(_) => AgentKind::Claude,
+            _ => panic!("unsupported live check agent kind"),
+        };
+        let (pid, started) = ProcessTable::load()
+            .agent_process_under(root_pid, kind)
+            .expect("live pane must have one detected native agent process");
+        let session = Session {
+            name: "read-only live check".to_owned(),
+            attached: false,
+            windows: 1,
+            activity: 0,
+            window_index: 0,
+            pane_index: 0,
+            pane_id,
+            pane_pid: root_pid,
+            pane_identity: String::new(),
+            agent_pid: Some(pid),
+            agent_started_ms: started,
+            path: PathBuf::from(fields[1]),
+            command: fields[2].to_owned(),
+            launch_command: launch_command_label(fields[3]),
+            title: String::new(),
+            content: String::new(),
+            content_hash: 0,
+            agent: kind,
+            profile: "Default".to_owned(),
+            resume_lease: None,
+            systemd_scope: None,
+            memory_max_bytes: None,
+            status: AgentStatus::Waiting,
+        };
+        let transcript = crate::transcript::read(&session, None).unwrap();
+        assert!(
+            transcript.available,
+            "live native conversation mapping is unavailable"
+        );
+        let count = transcript.messages.as_ref().map_or(0, Vec::len);
+        assert!(count > 0, "mapped native log has no visible entries");
+        assert!(
+            before
+                == Tmux::output(["display-message", "-p", "-t", &session.pane_id, format]).unwrap(),
+            "live pane identity changed during read-only verification"
+        );
+        eprintln!(
+            "Read-only live Conversation: source={}, pid={pid}, entries={count}, truncated={}",
+            transcript.source, transcript.truncated
+        );
+    }
+
+    #[test]
+    #[ignore = "private child process fixture for the unlinked executable test"]
+    fn conversation_process_fixture() {
+        use std::io::Read as _;
+
+        if env::var("ATMUX_TEST_CONVERSATION_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+        let _ = std::io::stdin().read(&mut [0_u8]);
+    }
+
+    #[test]
+    fn unlinked_claude_requires_kernel_identity_not_just_matching_argv() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let fixture = NativeClaudeFixture::new("unlinked", "2.1.251");
+        let uid = rustix::process::geteuid().as_raw();
+        let test_executable = env::current_exe().unwrap();
+        // Use our own native binary, not a renamed multicall coreutils binary
+        // or a platform-signed macOS system executable with launch restrictions.
+        fs::copy(&test_executable, &fixture.executable).unwrap();
+        fs::set_permissions(&fixture.executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let spawn = |program: &Path| {
+            ChildGuard(
+                Command::new(program)
+                    .arg0(&fixture.executable)
+                    .args([
+                        "--exact",
+                        "tmux::tests::conversation_process_fixture",
+                        "--ignored",
+                    ])
+                    .env("ATMUX_TEST_CONVERSATION_CHILD", "1")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        };
+        let child = spawn(&fixture.executable);
+        // argv[0] can be forged, unlike the kernel's executable identity.
+        let lookalike = spawn(&test_executable);
+        fs::remove_file(&fixture.executable).unwrap();
+        let command =
+            shell_words::join([fixture.executable.to_string_lossy().as_ref(), "--ignored"]);
+        let rank =
+            |pid| agent_process_rank_in(&command, AgentKind::Claude, Some(&fixture.home), uid, pid);
+        assert!(!native_claude_version_executable_in(
+            &fixture.executable.to_string_lossy(),
+            &fixture.home,
+            uid
+        ));
+        assert_eq!(rank(None), 0);
+        assert_eq!(rank(Some(lookalike.0.id())), 0);
+        assert!(
+            native_claude_version_path_in(
+                &fixture.executable.to_string_lossy(),
+                &fixture.home,
+                uid,
+                |_| true
+            ),
+            "canonical install parents must remain trusted after unlink"
+        );
+        assert!(
+            running_executable_matches(child.0.id(), &fixture.executable, uid),
+            "kernel must retain the executable path and owner after unlink"
+        );
+        assert_eq!(rank(Some(child.0.id())), 3);
+        assert!(!running_executable_matches(
+            child.0.id(),
+            &fixture.executable,
+            uid.wrapping_add(1)
+        ));
+
+        // An unsafe replacement is not equivalent to an updater removing the
+        // old file; never bypass the normal file/parent validation for it.
+        std::os::unix::fs::symlink("/bin/sleep", &fixture.executable).unwrap();
+        assert_eq!(rank(Some(child.0.id())), 0);
+        fs::remove_file(&fixture.executable).unwrap();
+        fs::set_permissions(&fixture.versions, fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(rank(Some(child.0.id())), 0);
+        fs::set_permissions(&fixture.versions, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(rank(Some(child.0.id())), 3);
+    }
+
+    #[test]
     fn native_versioned_claude_process_wins_below_a_resume_wrapper() {
         let fixture = NativeClaudeFixture::new("resume-wrapper", "2.1.241");
         let uid = rustix::process::geteuid().as_raw();
@@ -5734,8 +5980,8 @@ mod tests {
         };
         assert_eq!(
             table
-                .agent_process_under_ranked(20, AgentKind::Claude, |command, kind| {
-                    agent_process_rank_in(command, kind, Some(&fixture.home), uid)
+                .agent_process_under_ranked(20, AgentKind::Claude, |_, command, kind| {
+                    agent_process_rank_in(command, kind, Some(&fixture.home), uid, None)
                 })
                 .map(|value| value.0),
             Some(22)

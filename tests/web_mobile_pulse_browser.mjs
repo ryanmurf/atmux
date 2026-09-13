@@ -12,6 +12,8 @@ const CDP_COMMAND_TIMEOUT_MS = 15_000;
 const CHROME_START_TIMEOUT_MS = 30_000;
 const CLEANUP_TIMEOUT_MS = 5_000;
 let transcriptFixture = null;
+let transcriptResponseDelayMs = 0;
+const transcriptRequests = [];
 let paneSnapshotContent = "";
 const paneStreams = new Set();
 const overviewStreams = new Set();
@@ -252,7 +254,14 @@ function mockApi(url, response, request) {
     return true;
   }
   if (/^\/api\/v1\/panes\/[^/]+\/transcript$/.test(pathname)) {
-    json(response, transcriptFixture || { available: false, source: "codex", changed: false, messages: [] });
+    const observed = { pane: decodeURIComponent(pathname.split("/")[4]), hash: url.searchParams.get("known_hash"), closed: false };
+    transcriptRequests.push(observed);
+    // Capture at request time so retired, slow responses can be tested.
+    const payload = structuredClone(transcriptFixture || { available: false, source: "codex", changed: false, messages: [] });
+    let timer;
+    response.once("close", () => { observed.closed = true; clearTimeout(timer); });
+    if (transcriptResponseDelayMs) timer = setTimeout(() => json(response, payload), transcriptResponseDelayMs);
+    else json(response, payload);
     return true;
   }
   if (/^\/api\/v1\/panes\/[^/]+\/files$/.test(pathname)) {
@@ -3171,10 +3180,9 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       () => cdp.evaluate("document.getElementById('agent-meta').textContent.includes('working')"),
       "overview churn did not render while Raw was visible",
     );
-    await waitFor(
-      () => cdp.evaluate("document.querySelector('[data-transcript-id=\"message-99\"]') !== null"),
-      "transcript churn did not render while Raw was visible",
-      5_000,
+    assert.equal(
+      await cdp.evaluate("document.querySelector('[data-transcript-id=\"message-99\"]') !== null"),
+      false, "hidden Conversation should defer refresh until the reader returns",
     );
     const rawAfterRenderChurn = await cdp.evaluate(`(() => {
       const pane = document.getElementById('pane');
@@ -3189,6 +3197,11 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     // following. Raw output keeps streaming while its DOM is hidden, so the
     // reader's state-level offset must survive that hidden redraw too.
     await cdp.evaluate("document.getElementById('conversation-view').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.querySelector('[data-transcript-id=\"message-99\"]') !== null"),
+      "Conversation did not catch up after leaving Raw",
+      5_000,
+    );
     emitPanePatch({
       base_revision: 2,
       revision: 3,
@@ -4494,6 +4507,101 @@ test("conversation groups mixed errors and shows per-entry and filter-independen
     try { await cleanupBrowserHarness({ cdp, chrome, server, profileDirectory }); }
     catch (cleanupError) { if (!testError) throw cleanupError; }
     transcriptFixture = null;
+    paneStreams.clear();
+    overviewStreams.clear();
+  }
+});
+
+test("Conversation accepts slow reads, survives continuous output and pauses outside its view", { timeout: 60_000 }, async () => {
+  const profileDirectory = await mkdtemp(join(tmpdir(), "atmux-conversation-refresh-"));
+  overviewRevision = 1;
+  transcriptRequests.length = 0;
+  transcriptResponseDelayMs = 3200;
+  const fixture = (text, hash) => ({
+    available: true, source: "claude", changed: true, truncated: false, content_hash: hash,
+    messages: [{ id: hash, role: "assistant", markdown: text, input_tokens: 100, output_tokens: 10 }],
+  });
+  transcriptFixture = fixture("Slow conversation loaded", "slow-first");
+  let server, chrome, cdp, patches;
+  let testError = null;
+  try {
+    const started = await startServer();
+    server = started.server;
+    const browser = await launchChrome(profileDirectory);
+    chrome = browser.chrome;
+    cdp = await openCdp(browser.browserSocket, "about:blank");
+    await cdp.send("Page.enable");
+    await cdp.send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+    await cdp.send("Page.navigate", { url: `http://127.0.0.1:${started.port}/?session=midnight~%255` });
+    await waitFor(() => transcriptRequests.length > 0, "Conversation did not request its first read");
+    let revision = 1;
+    patches = setInterval(() => {
+      emitPanePatch({ base_revision: revision, revision: ++revision, start_line: 0, delete_lines: 0, lines: [] });
+    }, 100);
+    await waitFor(() => cdp.evaluate("document.getElementById('conversation').textContent.includes('Slow conversation loaded')"), "slow reads were continually superseded", 10_000);
+    assert.equal(transcriptRequests.length, 1, "slow reads must not overlap");
+
+    transcriptResponseDelayMs = 0;
+    transcriptFixture = fixture("Continuous output still refreshes", "streaming");
+    await waitFor(() => cdp.evaluate("document.getElementById('conversation').textContent.includes('Continuous output still refreshes')"), "pane patches starved Conversation refresh");
+    assert.equal(transcriptRequests[1].hash, "slow-first", "known hash was not reused");
+    clearInterval(patches);
+    patches = null;
+    await cdp.evaluate("document.getElementById('raw-view').click()");
+    const rawRequests = transcriptRequests.length;
+    await new Promise((resolve) => setTimeout(resolve, 2800));
+    assert.equal(transcriptRequests.length, rawRequests, "hidden Conversation kept polling");
+
+    // Start a slow old response, then switch to another owner. It must be
+    // aborted, and must not populate the replacement or block its first read.
+    transcriptResponseDelayMs = 3200;
+    transcriptFixture = fixture("Retired owner must never appear", "retired");
+    await cdp.evaluate("document.getElementById('conversation-view').click()");
+    await waitFor(() => transcriptRequests.length > rawRequests, "Conversation did not resume immediately");
+    const oldRequest = transcriptRequests.at(-1);
+    transcriptFixture = fixture("New selected owner", "replacement");
+    transcriptResponseDelayMs = 0;
+    await cdp.evaluate("document.querySelector('.session-button[data-session-id=\"tron~%100\"]').click()");
+    await waitFor(() => cdp.evaluate("document.getElementById('conversation').textContent.includes('New selected owner')"), "retired request blocked new owner");
+    await waitFor(() => oldRequest.closed, "retired read was not aborted");
+    assert.equal(transcriptRequests.at(-1).hash, null, "old owner's hash leaked into new selection");
+
+    // Reusing the same pane ID with a different process generation must retire
+    // its pending response just as changing to another pane does.
+    const beforeReplacement = transcriptRequests.length;
+    transcriptResponseDelayMs = 3200;
+    transcriptFixture = fixture("Retired generation must never appear", "retired-generation");
+    await cdp.evaluate("document.getElementById('raw-view').click(); document.getElementById('conversation-view').click()");
+    await waitFor(() => transcriptRequests.length > beforeReplacement, "generation test did not start a pending read");
+    const replacedRequest = transcriptRequests.at(-1);
+    transcriptResponseDelayMs = 0;
+    transcriptFixture = fixture("Replacement generation", "new-generation");
+    emitOverviewPatch([mockSession("tron", "%100", "codex-main", "waiting", {
+      agent: "codex", instance_id: "pane-v1-" + "f".repeat(64),
+    })]);
+    await waitFor(() => cdp.evaluate("document.getElementById('conversation').textContent.includes('Replacement generation')"), "same-pane replacement retained its predecessor's request");
+    await waitFor(() => replacedRequest.closed, "replaced generation's read was not aborted");
+    assert.equal(transcriptRequests.at(-1).hash, null, "old generation's hash leaked into replacement");
+
+    await cdp.evaluate("window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }))");
+    const hiddenRequests = transcriptRequests.length;
+    await new Promise((resolve) => setTimeout(resolve, 3300));
+    assert.equal(transcriptRequests.length, hiddenRequests, "background page kept polling");
+    assert.equal(await cdp.evaluate("document.getElementById('conversation').textContent.includes('Retired owner')"), false);
+    assert.equal(await cdp.evaluate("document.getElementById('conversation').textContent.includes('Retired generation')"), false);
+    transcriptFixture = fixture("Returned from background", "visible-again");
+    await cdp.evaluate("window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }))");
+    await waitFor(() => cdp.evaluate("document.getElementById('conversation').textContent.includes('Returned from background')"), "foreground page did not resume Conversation");
+  } catch (error) {
+    testError = error;
+    throw error;
+  } finally {
+    clearInterval(patches);
+    try { await cleanupBrowserHarness({ cdp, chrome, server, profileDirectory }); }
+    catch (cleanupError) { if (!testError) throw cleanupError; }
+    transcriptFixture = null;
+    transcriptResponseDelayMs = 0;
+    transcriptRequests.length = 0;
     paneStreams.clear();
     overviewStreams.clear();
   }

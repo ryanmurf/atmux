@@ -74,6 +74,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Collapse mixed tool/error rows, show metrics on every entry, and add Conversation totals | `conversation-metrics-and-grouping.md` | Deployed fleet-wide; live metrics verified except existing Clue mapping issue; review pending |
 | Collapse individual nodes and implement, review, test, build, and deploy ten dashboard improvements using agents | `dashboard-improvements.md` | Deployed and verified; physical iPhone retest pending |
 | Use Claude and Codex session logs as the conversation display | `completed/claude-codex-transcripts.md` | Completed |
+| Make Conversation reliable after agent updates and during slow or continuous output | `conversation-reliability.md` | Implemented and tested; Midnight support-issues live read verified; deployment/review pending |
 | Support old/unlabeled Claude CLI storage and profile directories such as `~/.claude-max` | `completed/claude-codex-transcripts.md` | Completed |
 | Render agent output as safe native Markdown with links and highlighted, expandable code blocks | `completed/claude-codex-transcripts.md` | Completed |
 | Show compact, expandable Claude and Codex tool calls and results | `completed/claude-codex-transcripts.md` | Completed |
