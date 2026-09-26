@@ -1646,6 +1646,27 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
         sent_before_stale_edit,
         "an edit for a replaced pane must not cross federation",
     );
+    let taken = control
+        .update_session(
+            "gpu-box~%7",
+            SessionUpdateRequest {
+                name: Some("evaluator".to_owned()),
+                description: Some("must not apply".to_owned()),
+                instance_id: trainer_instance.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_kind(&taken), ErrorKind::Conflict);
+    assert!(
+        format!("{taken:#}").contains("a tmux session named evaluator already exists on gpu-box"),
+        "{taken:#}"
+    );
+    assert_eq!(
+        recorder.lock().unwrap().bodies.len(),
+        sent_before_stale_edit,
+        "a name the owner already reports must be refused before federation",
+    );
     control
         .update_session(
             "gpu-box~%7",

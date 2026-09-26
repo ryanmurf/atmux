@@ -3789,10 +3789,13 @@ impl ControlPlane {
                 machine,
                 pane_id,
                 instance_id,
-                ..
+                name,
             } => {
                 validate_session_update_instance(&request.instance_id, &instance_id)?;
                 self.ensure_online(&machine.id)?;
+                if let Some(requested) = requested_name.filter(|requested| *requested != name) {
+                    self.ensure_remote_session_name_available(&machine.id, &requested)?;
+                }
                 machine
                     .patch_json(
                         &format!("/api/v1/sessions/{}", encode_segment(&pane_id)),
@@ -4076,6 +4079,23 @@ impl ControlPlane {
         {
             return Err(conflict(format!(
                 "a tmux session named {name} already exists"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The owner repeats this check against live tmux. This cached pass exists
+    /// only so the coordinator can explain a taken name, because it relays an
+    /// owner's refusal as a fixed message rather than the owner's own text.
+    fn ensure_remote_session_name_available(&self, machine: &str, name: &str) -> Result<()> {
+        let taken = self
+            .read_state()
+            .remotes
+            .get(machine)
+            .is_some_and(|remote| remote.sessions.iter().any(|session| session.name == name));
+        if taken {
+            return Err(conflict(format!(
+                "a tmux session named {name} already exists on {machine}"
             )));
         }
         Ok(())
