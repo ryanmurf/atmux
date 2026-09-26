@@ -17,6 +17,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -273,9 +274,16 @@ pub(crate) const RESERVED_SERVICE_SESSION: &str = "atmux-web";
 #[derive(Clone, Debug)]
 pub struct Session {
     pub name: String,
+    /// Optional short note set from the dashboard, stored as tmux session
+    /// metadata so it lives and dies with the session itself.
+    pub description: Option<String>,
     pub attached: bool,
     pub windows: u32,
     pub activity: u64,
+    /// Last pane output (`#{window_activity}`). Unlike `activity`, which only
+    /// moves on attached-client input, this also moves when an agent finishes
+    /// a turn, a resumed CLI redraws, or keys arrive through `send-keys`.
+    pub output_activity: u64,
     pub window_index: u32,
     pub pane_index: u32,
     pub pane_id: String,
@@ -316,14 +324,28 @@ pub(crate) struct LivePaneIdentity {
 }
 
 /// Tab-separated fields emitted per pane by `sessions_with_capture`.
-const PANE_FIELDS: usize = 22;
+const PANE_FIELDS: usize = 24;
+
+/// Longest dashboard session description, in characters.
+pub(crate) const MAX_SESSION_DESCRIPTION_CHARS: usize = 120;
+const DESCRIPTION_OPTION: &str = "@atmux_description";
+
+/// How [`Tmux::update_session_metadata`] changes a session's description.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DescriptionUpdate {
+    Keep,
+    Clear,
+    Set(String),
+}
 
 #[derive(Clone, Debug)]
 struct RawPane {
     name: String,
+    description: String,
     attached: bool,
     windows: u32,
     activity: u64,
+    output_activity: u64,
     window_index: u32,
     window_active: bool,
     pane_index: u32,
@@ -530,6 +552,7 @@ impl Tmux {
             "#{session_attached}",
             "#{session_windows}",
             "#{session_activity}",
+            "#{window_activity}",
             "#{window_index}",
             "#{window_active}",
             "#{pane_index}",
@@ -543,6 +566,7 @@ impl Tmux {
             "#{@atmux_identity}",
             "#{@atmux_systemd_scope}",
             "#{@atmux_memory_max_bytes}",
+            "#{@atmux_description}",
             "#{session_name}",
             "#{pane_current_command}",
             "#{pane_start_command}",
@@ -600,9 +624,11 @@ impl Tmux {
                 scope_metadata(&pane.systemd_scope, &pane.memory_max_bytes);
             sessions.push(Session {
                 name: pane.name,
+                description: decode_session_description(&pane.description),
                 attached: pane.attached,
                 windows: pane.windows,
                 activity: pane.activity,
+                output_activity: pane.output_activity,
                 window_index: pane.window_index,
                 pane_index: pane.pane_index,
                 pane_id: pane.pane_id,
@@ -1136,6 +1162,96 @@ impl Tmux {
     /// Returns an error when the session does not exist or tmux rejects the request.
     pub fn kill(&self, name: &str) -> Result<()> {
         Self::output(["kill-session", "-t", &format!("={name}")]).map(|_| ())
+    }
+
+    /// Kills the session that owns one pane. Session names can be changed from
+    /// the dashboard, so a name read from the last refresh may already belong
+    /// to a different session; the pane id cannot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a malformed pane id, a missing pane, or a tmux failure.
+    pub fn kill_pane_session(&self, pane_id: &str) -> Result<()> {
+        if !valid_tmux_pane_id(pane_id) {
+            bail!("invalid tmux pane id");
+        }
+        Self::output(["kill-session", "-t", pane_id]).map(|_| ())
+    }
+
+    /// Renames and/or describes the session that owns one pane in a single
+    /// tmux command list. tmux discards the rest of a list after a failed
+    /// command, so a refused rename leaves the description untouched too.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input, a duplicate name, or a tmux failure.
+    pub fn update_session_metadata(
+        &self,
+        pane_id: &str,
+        name: Option<&str>,
+        description: &DescriptionUpdate,
+    ) -> Result<()> {
+        if !valid_tmux_pane_id(pane_id) {
+            bail!("invalid tmux pane id");
+        }
+        if let Some(name) = name
+            && (name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+        {
+            bail!("invalid tmux session name");
+        }
+        let description = match description {
+            DescriptionUpdate::Set(text) if !valid_session_description(text) => {
+                bail!("invalid session description")
+            }
+            DescriptionUpdate::Set(text) => {
+                DescriptionUpdate::Set(encode_session_description(text))
+            }
+            other => other.clone(),
+        };
+        // `--` keeps a name such as `-dev` from being parsed as flags. Neither
+        // a validated name nor base64url can contain tmux's `;` separator.
+        let result = match (name, &description) {
+            (None, DescriptionUpdate::Keep) => return Ok(()),
+            (Some(name), DescriptionUpdate::Keep) => {
+                Self::output(["rename-session", "-t", pane_id, "--", name])
+            }
+            (None, DescriptionUpdate::Set(value)) => {
+                Self::output(["set-option", "-t", pane_id, DESCRIPTION_OPTION, value])
+            }
+            (None, DescriptionUpdate::Clear) => {
+                Self::output(["set-option", "-u", "-t", pane_id, DESCRIPTION_OPTION])
+            }
+            (Some(name), DescriptionUpdate::Set(value)) => Self::output([
+                "rename-session",
+                "-t",
+                pane_id,
+                "--",
+                name,
+                ";",
+                "set-option",
+                "-t",
+                pane_id,
+                DESCRIPTION_OPTION,
+                value,
+            ]),
+            (Some(name), DescriptionUpdate::Clear) => Self::output([
+                "rename-session",
+                "-t",
+                pane_id,
+                "--",
+                name,
+                ";",
+                "set-option",
+                "-u",
+                "-t",
+                pane_id,
+                DESCRIPTION_OPTION,
+            ]),
+        };
+        result.map(|_| ())
     }
 
     /// Pastes literal text into a pane and optionally submits it.
@@ -2971,25 +3087,54 @@ fn parse_pane(line: &str) -> Option<RawPane> {
         attached: fields[1] == "1",
         windows: fields[2].parse().ok()?,
         activity: fields[3].parse().unwrap_or_default(),
-        window_index: fields[4].parse().unwrap_or_default(),
-        window_active: fields[5] == "1",
-        pane_index: fields[6].parse().unwrap_or_default(),
-        pane_active: fields[7] == "1",
-        pane_pid: fields[8].parse().ok()?,
-        status_override: fields[9].to_owned(),
-        model_override: fields[10].to_owned(),
-        agent_version: fields[11].to_owned(),
-        profile: fields[12].to_owned(),
-        resume_lease: fields[13].to_owned(),
-        pane_identity: fields[14].to_owned(),
-        systemd_scope: fields[15].to_owned(),
-        memory_max_bytes: fields[16].to_owned(),
-        name: fields[17].to_owned(),
-        command: fields[18].to_owned(),
-        start_command: fields[19].to_owned(),
-        path: PathBuf::from(fields[20]),
-        title: fields[21].to_owned(),
+        output_activity: fields[4].parse().unwrap_or_default(),
+        window_index: fields[5].parse().unwrap_or_default(),
+        window_active: fields[6] == "1",
+        pane_index: fields[7].parse().unwrap_or_default(),
+        pane_active: fields[8] == "1",
+        pane_pid: fields[9].parse().ok()?,
+        status_override: fields[10].to_owned(),
+        model_override: fields[11].to_owned(),
+        agent_version: fields[12].to_owned(),
+        profile: fields[13].to_owned(),
+        resume_lease: fields[14].to_owned(),
+        pane_identity: fields[15].to_owned(),
+        systemd_scope: fields[16].to_owned(),
+        memory_max_bytes: fields[17].to_owned(),
+        description: fields[18].to_owned(),
+        name: fields[19].to_owned(),
+        command: fields[20].to_owned(),
+        start_command: fields[21].to_owned(),
+        path: PathBuf::from(fields[22]),
+        title: fields[23].to_owned(),
     })
+}
+
+/// A description is one short line of printable text. Control characters
+/// (tabs and newlines included) are refused rather than rewritten.
+pub(crate) fn valid_session_description(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && value.chars().count() <= MAX_SESSION_DESCRIPTION_CHARS
+        && !value.chars().any(char::is_control)
+}
+
+/// Stored base64url-encoded, so whatever was typed, the value atmux writes
+/// holds neither the pane record's tab/newline separators (see `parse_pane`)
+/// nor tmux's `;` command separator. Anything that fails to decode to a valid
+/// description reads as none.
+fn encode_session_description(value: &str) -> String {
+    URL_SAFE_NO_PAD.encode(value.as_bytes())
+}
+
+fn decode_session_description(value: &str) -> Option<String> {
+    if value.is_empty() || value.len() > MAX_SESSION_DESCRIPTION_CHARS * 8 {
+        return None;
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(value).ok()?;
+    String::from_utf8(bytes)
+        .ok()
+        .filter(|description| valid_session_description(description))
 }
 
 fn scope_metadata(scope: &str, memory_max_bytes: &str) -> (Option<String>, Option<u64>) {
@@ -3780,18 +3925,19 @@ mod tests {
 
     #[test]
     fn parses_tmux_pane() {
-        let line = "%7\t1\t2\t123\t0\t1\t1\t1\t42\twaiting\t\t\t\t\t\t\t\twork\tnode\tenv codex\t/tmp/work\t⠹ work";
+        let line = "%7\t1\t2\t123\t456\t0\t1\t1\t1\t42\twaiting\t\t\t\t\t\t\t\t\twork\tnode\tenv codex\t/tmp/work\t⠹ work";
         let pane = parse_pane(line).unwrap();
         assert_eq!(pane.name, "work");
         assert_eq!(pane.pane_id, "%7");
         assert_eq!(pane.start_command, "env codex");
         assert_eq!(pane.status_override, "waiting");
+        assert_eq!((pane.activity, pane.output_activity), (123, 456));
         assert_eq!(pane.score(), 3);
     }
 
     #[test]
     fn parses_pane_with_empty_status_override() {
-        let line = "%0\t0\t1\t123\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\tsolo\tbash\t\t/tmp\tsolo";
+        let line = "%0\t0\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\t\tsolo\tbash\t\t/tmp\tsolo";
         let pane = parse_pane(line).unwrap();
         assert_eq!(pane.name, "solo");
         assert!(pane.status_override.is_empty());
@@ -3799,7 +3945,7 @@ mod tests {
 
     #[test]
     fn a_tab_in_free_text_pane_fields_cannot_move_the_pane_id() {
-        let line = "%3\t1\t1\t123\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\twork\tnode\tenv codex\t/tmp/work\thijack\t%9\tstopped";
+        let line = "%3\t1\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\t\twork\tnode\tenv codex\t/tmp/work\thijack\t%9\tstopped";
         let pane = parse_pane(line).unwrap();
         assert_eq!(pane.pane_id, "%3");
         assert_eq!(pane.name, "work");
@@ -3819,7 +3965,7 @@ mod tests {
     fn parses_only_well_formed_persistent_resume_leases() {
         let lease = format!("lease-v1-{}", "a".repeat(64));
         let line = format!(
-            "%0\t0\t1\t123\t0\t1\t0\t1\t42\t\t\t\tDefault\t{lease}\t\t\t\tsolo\tcodex\tcodex\t/tmp\tsolo"
+            "%0\t0\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\tDefault\t{lease}\t\t\t\t\tsolo\tcodex\tcodex\t/tmp\tsolo"
         );
         let pane = parse_pane(&line).unwrap();
         assert!(valid_resume_lease(&pane.resume_lease));
@@ -3831,7 +3977,7 @@ mod tests {
     fn parses_scope_metadata_only_as_a_valid_complete_pair() {
         let unit = "atmux-tmux-spawn-12-34-0123456789abcdef.scope";
         let line = format!(
-            "%0\t0\t1\t123\t0\t1\t0\t1\t42\t\t\t\tDefault\t\t\t{unit}\t34359738368\tsolo\tcodex\tcodex\t/tmp\tsolo"
+            "%0\t0\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\tDefault\t\t\t{unit}\t34359738368\t\tsolo\tcodex\tcodex\t/tmp\tsolo"
         );
         let pane = parse_pane(&line).unwrap();
         assert_eq!(
@@ -3844,6 +3990,101 @@ mod tests {
         );
         assert_eq!(scope_metadata(unit, "0"), (None, None));
         assert_eq!(scope_metadata(unit, "not-a-number"), (None, None));
+    }
+
+    #[test]
+    fn session_descriptions_round_trip_only_as_short_single_lines() {
+        let text = "Payments review; phase 2 ✓";
+        let encoded = encode_session_description(text);
+        assert!(!encoded.contains([';', '\t', '\n']));
+        assert_eq!(decode_session_description(&encoded).as_deref(), Some(text));
+        let line = format!(
+            "%0\t0\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\t{encoded}\tsolo\tcodex\tcodex\t/tmp\tsolo"
+        );
+        let pane = parse_pane(&line).unwrap();
+        assert_eq!(pane.name, "solo");
+        assert_eq!(
+            decode_session_description(&pane.description).as_deref(),
+            Some(text)
+        );
+
+        for invalid in ["", " padded", "two\nlines", "tab\there", "bell\u{7}"] {
+            assert!(!valid_session_description(invalid), "{invalid:?}");
+            let smuggled = encode_session_description(invalid);
+            assert_eq!(decode_session_description(&smuggled), None, "{invalid:?}");
+        }
+        let longest = "é".repeat(MAX_SESSION_DESCRIPTION_CHARS);
+        assert!(valid_session_description(&longest));
+        assert!(!valid_session_description(&format!("{longest}e")));
+        assert_eq!(decode_session_description("plain text, not base64"), None);
+        assert_eq!(
+            decode_session_description(&URL_SAFE_NO_PAD.encode([0xff, 0xfe])),
+            None
+        );
+    }
+
+    #[test]
+    fn renames_describes_and_kills_sessions_by_pane_on_an_isolated_server() {
+        let probe = disposable_tmux("rename");
+        Tmux::with_socket_for_test(&probe.socket, || {
+            Tmux::output(["new-session", "-d", "-s", "first", "sleep 30"])?;
+            Tmux::output(["new-session", "-d", "-s", "taken", "sleep 30"])?;
+            let pane = Tmux::output(["list-panes", "-t", "=first", "-F", "#{pane_id}"])?;
+            let find = || -> Result<Session> {
+                Tmux.sessions(&HashMap::new(), &StatusConfig::default())?
+                    .into_iter()
+                    .find(|session| session.pane_id == pane)
+                    .context("renamed pane was not discovered")
+            };
+            let note = "Payments review; phase 2 ✓";
+
+            // A leading dash is a name, not a flag.
+            Tmux.update_session_metadata(
+                &pane,
+                Some("-renamed"),
+                &DescriptionUpdate::Set(note.to_owned()),
+            )?;
+            let session = find()?;
+            assert_eq!(session.name, "-renamed");
+            assert_eq!(session.description.as_deref(), Some(note));
+
+            // tmux drops the rest of the command list, so a refused rename
+            // cannot half-apply the description change sent with it.
+            let refused = Tmux
+                .update_session_metadata(&pane, Some("taken"), &DescriptionUpdate::Clear)
+                .unwrap_err();
+            assert!(format!("{refused:#}").contains("duplicate session"));
+            let session = find()?;
+            assert_eq!(session.name, "-renamed");
+            assert_eq!(session.description.as_deref(), Some(note));
+
+            Tmux.update_session_metadata(&pane, None, &DescriptionUpdate::Clear)?;
+            let session = find()?;
+            assert_eq!(session.name, "-renamed");
+            assert_eq!(session.description, None);
+
+            Tmux::output(["set-option", "-t", &pane, DESCRIPTION_OPTION, "not base64!"])?;
+            assert_eq!(find()?.description, None);
+            assert!(
+                Tmux.update_session_metadata(&pane, Some("bad name"), &DescriptionUpdate::Keep)
+                    .is_err()
+            );
+            assert!(
+                Tmux.update_session_metadata(
+                    &pane,
+                    None,
+                    &DescriptionUpdate::Set("two\nlines".to_owned()),
+                )
+                .is_err()
+            );
+
+            Tmux.kill_pane_session(&pane)?;
+            let remaining = Tmux.sessions(&HashMap::new(), &StatusConfig::default())?;
+            assert!(remaining.iter().all(|session| session.pane_id != pane));
+            assert!(remaining.iter().any(|session| session.name == "taken"));
+            Tmux.kill("taken")
+        })
+        .unwrap();
     }
 
     #[test]
@@ -4284,8 +4525,8 @@ mod tests {
     #[test]
     fn recognized_agent_pane_wins_over_active_shell_pane() {
         let source = concat!(
-            "%1\t0\t1\t123\t0\t1\t0\t1\t41\t\t\t\t\t\t\t\t\twork\tbash\tsh\t/tmp\tshell\n",
-            "%2\t0\t1\t123\t0\t0\t1\t0\t42\t\t\t\t\t\t\t\t\twork\tcodex\tenv codex\t/tmp\tagent\n",
+            "%1\t0\t1\t123\t456\t0\t1\t0\t1\t41\t\t\t\t\t\t\t\t\t\twork\tbash\tsh\t/tmp\tshell\n",
+            "%2\t0\t1\t123\t456\t0\t0\t1\t0\t42\t\t\t\t\t\t\t\t\t\twork\tcodex\tenv codex\t/tmp\tagent\n",
         );
         let selected = select_session_panes(source, &ProcessTable::default());
         let (pane, agent) = selected.get("work").unwrap();
@@ -4297,8 +4538,8 @@ mod tests {
     #[test]
     fn reserved_service_session_is_not_selected() {
         let source = concat!(
-            "%1\t0\t1\t123\t0\t1\t0\t1\t41\t\t\t\t\t\t\t\t\tatmux-web\tbash\tsh\t/tmp\tservice\n",
-            "%2\t0\t1\t123\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\twork\tcodex\tcodex\t/tmp\twork\n",
+            "%1\t0\t1\t123\t456\t0\t1\t0\t1\t41\t\t\t\t\t\t\t\t\t\tatmux-web\tbash\tsh\t/tmp\tservice\n",
+            "%2\t0\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\t\twork\tcodex\tcodex\t/tmp\twork\n",
         );
 
         let selected = select_session_panes(source, &ProcessTable::default());
@@ -5819,9 +6060,11 @@ mod tests {
             .expect("live pane must have one detected native agent process");
         let session = Session {
             name: "read-only live check".to_owned(),
+            description: None,
             attached: false,
             windows: 1,
             activity: 0,
+            output_activity: 0,
             window_index: 0,
             pane_index: 0,
             pane_id,

@@ -1775,9 +1775,11 @@ mod tests {
     fn session(agent: AgentKind, path: PathBuf, pid: u32, started: u64) -> Session {
         Session {
             name: "fixture".to_owned(),
+            description: None,
             attached: false,
             windows: 1,
             activity: 0,
+            output_activity: 0,
             window_index: 0,
             pane_index: 0,
             pane_id: "%1".to_owned(),

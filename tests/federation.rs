@@ -19,7 +19,7 @@ use atmux::{
     config::{Config, MachineConfig},
     control::{
         CloneLaunchRepositoryRequest, ControlPlane, CreateLaunchDirectoryRequest, ErrorKind,
-        LaunchRequest, error_kind,
+        LaunchRequest, SessionUpdateRequest, error_kind,
     },
     machine::MachineKind,
     remote::RemoteMachine,
@@ -526,6 +526,16 @@ async fn kill(State(state): State<Shared>, Path(id): Path<String>, headers: Head
     Json(json!({ "ok": true })).into_response()
 }
 
+async fn update_session(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    record(&state, &headers, &format!("/api/v1/sessions/{id}"), &body);
+    Json(json!({ "ok": true })).into_response()
+}
+
 async fn launch(State(state): State<Shared>, headers: HeaderMap, body: String) -> Response {
     record(&state, &headers, "/api/v1/sessions", &body);
     (StatusCode::CREATED, Json(json!({ "ok": true }))).into_response()
@@ -651,7 +661,7 @@ async fn start_node_with_memory(advertise_memory: bool) -> (SocketAddr, Shared) 
         )
         .route("/api/v1/sessions", post(launch))
         .route("/api/v1/memory-launches/v1", post(launch_with_memory))
-        .route("/api/v1/sessions/{id}", delete(kill))
+        .route("/api/v1/sessions/{id}", delete(kill).patch(update_session))
         .with_state(Arc::clone(&recorder));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -668,6 +678,8 @@ async fn start_legacy_input_node() -> (SocketAddr, Shared) {
         // This intentionally models the prior owner: it would execute the
         // unbound Ctrl+B command here, but knows nothing about /input-keys.
         .route("/api/v1/panes/{id}/special-keys", post(legacy_special_keys))
+        // It can kill sessions but predates renaming them.
+        .route("/api/v1/sessions/{id}", delete(kill))
         .with_state(Arc::clone(&recorder));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -786,6 +798,23 @@ async fn generation_bound_keys_fail_closed_against_a_legacy_owner() {
             seen.bodies,
         );
     }
+
+    let rename = control
+        .update_session(
+            "gpu-box~%7",
+            SessionUpdateRequest {
+                name: Some("renamed".to_owned()),
+                description: None,
+                instance_id: format!("pane-v1-{}", "a".repeat(64)),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_kind(&rename), ErrorKind::Conflict, "{rename:#}");
+    assert!(
+        format!("{rename:#}").contains("update atmux on gpu-box"),
+        "{rename:#}"
+    );
 
     control.tmux_prefix_twice("gpu-box~%7").await.unwrap();
     let seen = recorder.lock().unwrap();
@@ -1599,6 +1628,35 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
     control.interrupt("gpu-box~%7").await.unwrap();
     control.resume_current_claude("gpu-box~%7").await.unwrap();
     control.kill("gpu-box~%8").await.unwrap();
+    let sent_before_stale_edit = recorder.lock().unwrap().bodies.len();
+    let stale_edit = control
+        .update_session(
+            "gpu-box~%7",
+            SessionUpdateRequest {
+                name: Some("stale-rename".to_owned()),
+                description: None,
+                instance_id: format!("pane-v1-{}", "b".repeat(64)),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_kind(&stale_edit), ErrorKind::Conflict);
+    assert_eq!(
+        recorder.lock().unwrap().bodies.len(),
+        sent_before_stale_edit,
+        "an edit for a replaced pane must not cross federation",
+    );
+    control
+        .update_session(
+            "gpu-box~%7",
+            SessionUpdateRequest {
+                name: Some("trainer-renamed".to_owned()),
+                description: Some("Nightly fine-tune".to_owned()),
+                instance_id: trainer_instance.clone(),
+            },
+        )
+        .await
+        .unwrap();
     control
         .launch(LaunchRequest {
             name: "federated-agent".to_owned(),
@@ -1647,6 +1705,21 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
             .any(|path| path == "/api/v1/panes/%7/resume")
     );
     assert!(seen.paths.iter().any(|path| path == "/api/v1/sessions/%8"));
+    let edit = seen
+        .paths
+        .iter()
+        .zip(&seen.bodies)
+        .find(|(path, body)| path.as_str() == "/api/v1/sessions/%7" && !body.is_empty())
+        .map(|(_, body)| serde_json::from_str::<Value>(body).unwrap())
+        .expect("forwarded session edit");
+    assert_eq!(
+        edit,
+        json!({
+            "name": "trainer-renamed",
+            "description": "Nightly fine-tune",
+            "instance_id": trainer_instance,
+        })
+    );
     let sent = seen
         .bodies
         .iter()

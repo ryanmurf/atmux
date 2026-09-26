@@ -623,7 +623,7 @@ function navigationView(sessions, machines, options = {}) {
   const collapsed = new Set(options.collapsed || []);
   const visible = sessions.filter((session) => {
     const machineId = sessionMachineId(session, localMachineId);
-    const searchable = [session.name, session.path, session.agent, session.profile, machineId, machineLabels.get(machineId)]
+    const searchable = [session.name, session.description, session.path, session.agent, session.profile, machineId, machineLabels.get(machineId)]
       .filter(Boolean).join(" ").toLowerCase();
     return (!query || searchable.includes(query))
       && (!status || session.status === status)
@@ -2388,6 +2388,35 @@ function sessionDeletePath(id) {
   return `/api/v1/sessions/${encodeURIComponent(String(id))}`;
 }
 
+const SESSION_NAME_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
+const RESERVED_SERVICE_SESSION = "atmux-web";
+const MAX_SESSION_DESCRIPTION_CHARS = 120;
+
+/// Builds the PATCH body for a rail rename/description edit from the session
+/// captured when the dialog opened, sending only the fields that changed. It
+/// mirrors the owner's checks so a mistake is shown in the dialog at once.
+function sessionEditRequest(session, nameValue, descriptionValue) {
+  if (typeof session?.id !== "string" || !session.id || !PANE_INSTANCE_PATTERN.test(String(session.instance_id || ""))) {
+    return { error: "This session can’t be edited until its machine reports its current agent pane." };
+  }
+  const name = String(nameValue ?? "").trim();
+  const description = String(descriptionValue ?? "").trim();
+  // A session created outside atmux may carry a name atmux would not choose;
+  // only a new name has to follow the launch rules.
+  const renamed = name !== session.name;
+  if (renamed && !SESSION_NAME_PATTERN.test(name)) return { error: "Use 1–100 letters, numbers, - or _ for the name." };
+  if (renamed && name === RESERVED_SERVICE_SESSION) return { error: "That name is reserved for the atmux web service." };
+  if ([...description].length > MAX_SESSION_DESCRIPTION_CHARS) {
+    return { error: `Keep the description to ${MAX_SESSION_DESCRIPTION_CHARS} characters.` };
+  }
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(description)) return { error: "The description must be a single line." };
+  const body = { instance_id: session.instance_id };
+  if (renamed) body.name = name;
+  if (description !== (session.description || "")) body.description = description;
+  if (!("name" in body) && !("description" in body)) return { unchanged: true };
+  return { id: session.id, body };
+}
+
 function modelPickerState(session, capabilities, online, switchingPaneId, composerSending = false) {
   const recognized = session?.agent === "claude" || session?.agent === "codex";
   const matches = capabilities?.pane_id === session?.id;
@@ -2964,6 +2993,7 @@ if (typeof module !== "undefined" && module.exports) {
     reduceTranscript,
     createTranscriptPoller,
     sessionDeletePath,
+    sessionEditRequest,
     modelPickerState,
     pickerOptions,
     agentRestartState,
@@ -3219,6 +3249,7 @@ function initialize() {
     attachmentPaneId: null,
     attachmentInstanceKey: null,
     pendingKillId: null,
+    pendingSessionEdit: null,
     pendingResumeId: null,
     paneModels: null,
     paneModelsRequest: 0,
@@ -5083,6 +5114,9 @@ function initialize() {
     const agentName = $("agent-name");
     agentName.textContent = selected.name;
     agentName.title = launchCommand ? `tmux launch: ${launchCommand}` : "";
+    const agentDescription = $("agent-description");
+    agentDescription.textContent = selected.description || "";
+    agentDescription.hidden = !selected.description;
     renderAgentBranch();
     const folder = sessionFolderLabel(selected);
     const profile = sessionProfileLabel(selected);
@@ -5508,8 +5542,10 @@ function initialize() {
     dot.setAttribute("aria-hidden", "true");
     const copy = document.createElement("span"); copy.className = "session-copy";
     const name = textSpan("", "session-name");
+    const description = textSpan("", "session-description");
+    description.hidden = true;
     const sub = textSpan("", "session-sub");
-    copy.append(name, sub);
+    copy.append(name, description, sub);
     button.append(dot, copy);
     const pinButton = document.createElement("button");
     pinButton.type = "button";
@@ -5534,8 +5570,16 @@ function initialize() {
     deleteButton.textContent = "🗑";
     deleteButton.title = "Kill this session";
     deleteButton.addEventListener("click", () => openKillDialog(id));
-    li.append(button, pinButton, deleteButton);
-    return { li, button, pinButton, deleteButton, dot, name, sub };
+    const editButton = document.createElement("button");
+    editButton.type = "button";
+    editButton.className = "session-edit";
+    editButton.dataset.sessionId = id;
+    editButton.dataset.sessionAction = "edit";
+    editButton.textContent = "✎";
+    editButton.title = "Rename or describe this session";
+    editButton.addEventListener("click", () => openSessionEditDialog(id));
+    li.append(button, pinButton, editButton, deleteButton);
+    return { li, button, pinButton, editButton, deleteButton, dot, name, description, sub };
   }
 
   function updateSessionNode(node, session) {
@@ -5552,11 +5596,17 @@ function initialize() {
     node.pinButton.setAttribute("aria-label", `${pinned ? "Unpin" : "Pin"} ${session.name}`);
     node.pinButton.disabled = !favoriteKey;
     node.pinButton.title = favoriteKey ? `${pinned ? "Unpin" : "Pin"} ${session.name}` : "Pinning requires a current agent owner";
-    node.button.setAttribute("aria-label", [session.name, folder, profile, session.status, session.agent].filter(Boolean).join(", "));
+    node.button.setAttribute("aria-label", [session.name, session.description, folder, profile, session.status, session.agent].filter(Boolean).join(", "));
+    node.editButton.setAttribute("aria-label", `Rename or describe ${session.name}`);
+    node.editButton.disabled = !isMachineControllable(machineOf(session))
+      || !PANE_INSTANCE_PATTERN.test(String(session.instance_id || ""));
     node.deleteButton.setAttribute("aria-label", `Kill ${session.name}`);
     node.deleteButton.disabled = !isMachineControllable(machineOf(session));
     node.dot.textContent = session.status === "working" ? "●" : session.status === "waiting" ? "◆" : "○";
     node.name.textContent = session.name;
+    node.description.textContent = session.description || "";
+    node.description.title = session.description || "";
+    node.description.hidden = !session.description;
     node.sub.textContent = [folder, profile, session.status, session.agent].filter(Boolean).join(" · ");
     node.sub.title = session.path || "";
   }
@@ -7993,6 +8043,47 @@ function initialize() {
     $("kill-dialog").showModal();
   }
 
+  function openSessionEditDialog(id) {
+    const session = state.sessions.get(id);
+    if (!session || !isMachineControllable(machineOf(session))) return;
+    // Bind the edit to the pane generation seen now, not whatever the row
+    // holds by the time Save is pressed.
+    state.pendingSessionEdit = {
+      id: session.id,
+      instance_id: session.instance_id,
+      name: session.name,
+      description: session.description || "",
+    };
+    $("session-edit-current").textContent = session.name;
+    $("session-edit-name").value = session.name;
+    $("session-edit-description").value = session.description || "";
+    const note = $("session-edit-note"); note.textContent = ""; note.hidden = true;
+    $("session-edit-dialog").showModal();
+    $("session-edit-name").focus();
+  }
+
+  $("session-edit-form").addEventListener("input", () => { $("session-edit-note").hidden = true; });
+  $("session-edit-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const pending = state.pendingSessionEdit;
+    if (!pending) return;
+    const note = $("session-edit-note");
+    const showNote = (message) => { note.textContent = message; note.hidden = false; };
+    const edit = sessionEditRequest(pending, $("session-edit-name").value, $("session-edit-description").value);
+    if (edit.error) { showNote(edit.error); return; }
+    if (edit.unchanged) { $("session-edit-dialog").close(); return; }
+    const button = $("session-edit-save");
+    button.disabled = true;
+    try {
+      await request(sessionDeletePath(edit.id), { method: "PATCH", body: JSON.stringify(edit.body) });
+      if (state.pendingSessionEdit === pending) $("session-edit-dialog").close();
+      toast(edit.body.name ? `Renamed ${pending.name} to ${edit.body.name}` : "Description saved");
+    } catch (error) {
+      if (state.pendingSessionEdit === pending) showNote(error.message);
+      else toast(error.message);
+    } finally { button.disabled = false; }
+  });
+
   $("kill-open").addEventListener("click", () => openKillDialog(state.selected));
   $("kill-confirm").addEventListener("click", async () => {
     const target = state.pendingKillId;
@@ -8951,6 +9042,7 @@ function initialize() {
     else dialog?.close();
   }));
   $("kill-dialog").addEventListener("close", () => { state.pendingKillId = null; });
+  $("session-edit-dialog").addEventListener("close", () => { state.pendingSessionEdit = null; });
   $("resume-dialog").addEventListener("close", () => { state.pendingResumeId = null; });
   $("launch-dialog").addEventListener("close", () => {
     const generation = Number($("launch-dialog").dataset.launchGeneration);

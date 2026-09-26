@@ -71,7 +71,7 @@ body.rail-collapsed .rail { visibility: hidden; padding-inline: 0; opacity: 0; b
 input, textarea, select { width: 100%; color: var(--text); background: #0a1115; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
 textarea { resize: vertical; min-height: 74px; max-height: 220px; }
 .session-list { list-style: none; padding: 6px 0 0; margin: 0; }
-.session-row { display: grid; grid-template-columns: minmax(0, 1fr) 30px 30px; align-items: center; gap: 2px; }
+.session-row { display: grid; grid-template-columns: minmax(0, 1fr) 30px 30px 30px; align-items: center; gap: 2px; }
 .session-button { width: 100%; display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 6px; min-height: 42px; padding: 5px 7px; text-align: left; background: transparent; border-color: transparent; }
 @media (hover: hover) and (pointer: fine) { .session-button:hover { background: var(--panel); } }
 .session-button.selected { background: var(--panel-2); border-color: var(--line); }
@@ -81,6 +81,7 @@ textarea { resize: vertical; min-height: 74px; max-height: 220px; }
 .other .session-dot { color: var(--muted); }
 .session-copy { min-width: 0; }
 .session-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; }
+.session-description { display: block; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #c3d3d8; font-size: 12px; }
 .session-sub { display: block; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 11px; }
 .session-delete { width: 30px; min-width: 30px; min-height: 34px; padding: 0; border-color: transparent; color: #b98b90; background: transparent; font-size: 15px; opacity: .58; }
 .session-delete:focus-visible { color: var(--red); opacity: 1; background: #25171a; border-color: #5b3036; }
@@ -89,6 +90,10 @@ textarea { resize: vertical; min-height: 74px; max-height: 220px; }
 .session-pin { width: 30px; min-width: 30px; min-height: 34px; padding: 0; border-color: transparent; background: transparent; color: var(--muted); font-size: 18px; }
 .session-pin[aria-pressed="true"] { color: var(--amber); }
 .session-pin:disabled { opacity: .3; }
+.session-edit { width: 30px; min-width: 30px; min-height: 34px; padding: 0; border-color: transparent; background: transparent; color: var(--muted); font-size: 15px; opacity: .58; }
+.session-edit:focus-visible { color: var(--cyan); opacity: 1; }
+@media (hover: hover) and (pointer: fine) { .session-row:hover .session-edit { color: var(--cyan); opacity: 1; } }
+.session-edit:disabled { visibility: hidden; }
 .empty { padding: 18px 8px; color: var(--muted); }
 
 .detail { min-width: 0; overflow: hidden; }
@@ -101,6 +106,7 @@ textarea { resize: vertical; min-height: 74px; max-height: 220px; }
 .agent-title-row { min-width: 0; display: flex; align-items: center; gap: 8px; }
 .agent-head h1 { margin: 0 0 2px; overflow: hidden; text-overflow: ellipsis; font-size: 18px; }
 .agent-title-row h1 { min-width: 0; }
+.agent-description { margin: 0 0 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #c3d3d8; font-size: 13px; }
 .agent-branch { min-width: 0; max-width: min(45vw, 520px); flex: 0 1 auto; padding: 3px 7px; overflow: hidden; border: 1px solid #315b42; border-radius: 999px; color: #a8e7bc; background: #102219; font: 700 10px/1.3 "SFMono-Regular", Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .agent-head p { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .launch-command { margin-top: 4px !important; color: #bdd1d6; font: 12px/1.4 "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
@@ -318,6 +324,7 @@ dialog::backdrop { background: #000a; }
 .rail-update-all { width: 100%; min-height: 34px; margin-bottom: 6px; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .agent-offline { margin: 0; padding: 8px 11px; border-radius: 7px; background: #3a2a18; color: #f0c48a; font-size: 13px; }
 .dialog-note { margin: 0; color: #e0975f; font-size: 12px; }
+.dialog-form .dialog-hint { margin-top: -8px; font-size: 12px; }
 .launch-directory-control { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
 .launch-directory-control button { min-height: 40px; }
 .launch-directory-suggestions:not([hidden]) { position: absolute; z-index: 20; top: 100%; right: 0; left: 0; max-height: min(300px, 38vh); display: grid; gap: 3px; padding: 5px; overflow-y: auto; overscroll-behavior: contain; touch-action: pan-y; border: 1px solid var(--line); border-radius: 8px; background: #0a1115; box-shadow: 0 12px 28px #000a; }
@@ -519,14 +526,15 @@ dialog::backdrop { background: #000a; }
   .quick-pane-keypad { width: min(100%, 280px); grid-template-columns: repeat(3, 44px) minmax(70px, 1fr); justify-content: center; }
   .quick-pane-keys .dialog-note { text-align: center; }
   .quick-model-control select { font-size: 16px; }
-  .session-button, .session-delete, .session-pin, .machine-toggle { min-height: 44px; }
+  .session-button, .session-delete, .session-pin, .session-edit, .machine-toggle { min-height: 44px; }
   .machine-heading { grid-template-columns: 44px minmax(0, 1fr); }
   .rail-filters select { min-height: 44px; font-size: 16px; }
   .rail-filter-summary button { min-height: 44px; }
   .pulse-token-form, .pulse-token-copy { grid-template-columns: minmax(0, 1fr); }
   .pulse-token-copy button { min-height: 44px; }
-  .session-row { grid-template-columns: minmax(0, 1fr) 44px 44px; }
+  .session-row { grid-template-columns: minmax(0, 1fr) 44px 44px 44px; }
   .session-pin { width: 44px; min-width: 44px; }
+  .session-edit { width: 44px; min-width: 44px; opacity: .9; }
   .session-delete { width: 44px; min-width: 44px; opacity: .9; }
   .composer-row span { display: none; }
   .composer-row { justify-content: flex-end; }
@@ -616,9 +624,10 @@ dialog::backdrop { background: #000a; }
 /* Reserve touch targets in the grid so tapping never expands the destructive
    action over the neighboring session selector. Keyboard focus stays visible. */
 @media (pointer: coarse) {
-  .session-row { grid-template-columns: minmax(0, 1fr) 44px 44px; }
+  .session-row { grid-template-columns: minmax(0, 1fr) 44px 44px 44px; }
   .session-delete { width: 44px; min-width: 44px; min-height: 44px; opacity: .8; }
   .session-pin { width: 44px; min-width: 44px; min-height: 44px; }
+  .session-edit { width: 44px; min-width: 44px; min-height: 44px; opacity: .8; }
   .machine-heading { grid-template-columns: 44px minmax(0, 1fr); }
   .machine-toggle { min-height: 44px; }
   .session-button, .machine-header, .rail-update-all { min-height: 44px; }

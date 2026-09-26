@@ -28,8 +28,8 @@ use crate::{
     control::{
         CloneLaunchRepositoryRequest, ControlPlane, CreateLaunchDirectoryRequest, ErrorKind,
         FleetUpdate, LaunchDirectoryActionResult, LaunchDirectoryListing, LaunchRequest,
-        ModelSwitchRequest, Overview, PaneModels, PaneOutput, ResumableLaunchSessions, error_kind,
-        overview_patch, pane_patch,
+        ModelSwitchRequest, Overview, PaneModels, PaneOutput, ResumableLaunchSessions,
+        SessionUpdateRequest, error_kind, overview_patch, pane_patch,
     },
     discovery,
     machine::{MachineSummary, Secret, resolve_token},
@@ -857,7 +857,7 @@ fn routes(state: WebState) -> Router {
         )
         .route("/api/v1/panes/{id}/input-keys", post(send_input_keys))
         .route("/api/v1/panes/{id}/interrupt", post(interrupt))
-        .route("/api/v1/sessions/{id}", delete(kill))
+        .route("/api/v1/sessions/{id}", delete(kill).patch(update_session))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
@@ -1391,6 +1391,21 @@ async fn kill(
     state
         .control
         .kill(&id)
+        .await
+        .map_err(|error| ApiError::from_control(&error))?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+async fn update_session(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SessionUpdateRequest>,
+) -> Result<Json<OkResponse>, ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    state
+        .control
+        .update_session(&id, request)
         .await
         .map_err(|error| ApiError::from_control(&error))?;
     Ok(Json(OkResponse { ok: true }))
@@ -3087,6 +3102,98 @@ mod tests {
         .unwrap();
         assert_eq!(request.machine.as_deref(), Some("local"));
         assert_eq!(request.instance_id.as_deref(), Some("pane-v1-abc"));
+    }
+
+    #[tokio::test]
+    async fn session_edits_validate_and_bind_to_the_pane_generation_before_tmux() {
+        let control = crate::control::test_control(&[]);
+        let mut session = crate::control::test_session("agent", "%4294967295", "content");
+        let current = format!("pane-v1-{}", "b".repeat(64));
+        session.pane_identity.clone_from(&current);
+        control.apply_refresh(vec![session]);
+        control.test_set_message_live_instance(
+            "%4294967295",
+            Some(format!("pane-v1-{}", "c".repeat(64))),
+        );
+        let (app, _shutdown) = real_app(control);
+        let path = "/api/v1/sessions/%254294967295";
+        let edit = |fields: serde_json::Value| {
+            let mut body = serde_json::json!({ "instance_id": current });
+            body.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            body.to_string()
+        };
+
+        for (body, expected) in [
+            (edit(serde_json::json!({})), StatusCode::BAD_REQUEST),
+            (
+                edit(serde_json::json!({ "name": "bad name" })),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                edit(serde_json::json!({ "name": "atmux-web" })),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                edit(serde_json::json!({ "description": "two\nlines" })),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                edit(serde_json::json!({ "description": "x".repeat(121) })),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                edit(serde_json::json!({ "name": "ok", "command": "touch unwanted" })),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                serde_json::json!({ "name": "no-instance" }).to_string(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                serde_json::json!({
+                    "name": "renamed",
+                    "instance_id": format!("pane-v1-{}", "a".repeat(64)),
+                })
+                .to_string(),
+                StatusCode::CONFLICT,
+            ),
+            // The cached generation matches, but the owner-live seam reports
+            // a same-id replacement, so nothing reaches tmux.
+            (
+                edit(serde_json::json!({ "name": "renamed", "description": "note" })),
+                StatusCode::CONFLICT,
+            ),
+        ] {
+            assert_eq!(
+                status_of(&app, "PATCH", path, Some(&body)).await,
+                expected,
+                "{body}"
+            );
+        }
+        assert_eq!(
+            status_of(
+                &app,
+                "PATCH",
+                "/api/v1/sessions/%25999",
+                Some(&edit(serde_json::json!({ "name": "renamed" }))),
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+
+        let cross_origin = HttpRequest::builder()
+            .method("PATCH")
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "https://attacker.example")
+            .body(Body::from(edit(serde_json::json!({ "name": "renamed" }))))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(cross_origin).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]

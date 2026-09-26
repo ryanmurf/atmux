@@ -70,7 +70,7 @@ test("mobile viewport recovery and touch rail targets in Chromium", { timeout: 4
     <header class="topbar">atmux</header><div class="health-alert" hidden></div>
     <main class="workspace"><aside class="rail"><input id="filter" aria-label="Filter">
       <button class="machine-header">Node</button><ul class="session-list">${Array.from({ length: 40 }, (_, index) => `
-      <li class="session-row"><button class="session-button"><span>◆</span><span class="session-copy"><span class="session-name">Session ${index}</span><span class="session-sub">A saved conversation</span></span></button><button class="session-pin" aria-label="Pin session ${index}">☆</button><button class="session-delete" aria-label="Delete session ${index}">×</button></li>`).join("")}</ul>
+      <li class="session-row"><button class="session-button"><span>◆</span><span class="session-copy"><span class="session-name">Session ${index}</span><span class="session-sub">A saved conversation</span></span></button><button class="session-pin" aria-label="Pin session ${index}">☆</button><button class="session-edit" aria-label="Rename session ${index}">✎</button><button class="session-delete" aria-label="Delete session ${index}">×</button></li>`).join("")}</ul>
     </aside><section class="detail"></section></main><dialog id="dialog"><textarea id="message"></textarea></dialog></body></html>`;
   const server = createServer((request, response) => { response.setHeader("Content-Type", "text/html"); response.end(html); });
   server.listen(0, "127.0.0.1");
@@ -101,7 +101,7 @@ test("mobile viewport recovery and touch rail targets in Chromium", { timeout: 4
       const remove = document.querySelector('.session-delete');
       const rect = (node) => { const r = node.getBoundingClientRect(); return { left: r.left, top: r.top, width: r.width, height: r.height }; };
       return { coarse: matchMedia('(pointer: coarse)').matches, hover: matchMedia('(hover: hover)').matches,
-        button: rect(button), pin: rect(document.querySelector('.session-pin')), remove: rect(remove), node: rect(document.querySelector('.machine-header')),
+        button: rect(button), pin: rect(document.querySelector('.session-pin')), edit: rect(document.querySelector('.session-edit')), remove: rect(remove), node: rect(document.querySelector('.machine-header')),
         background: getComputedStyle(remove).backgroundColor, border: getComputedStyle(remove).borderColor,
         bodyHeight: document.body.getBoundingClientRect().height, viewport: innerHeight,
         overflow: document.documentElement.scrollWidth - innerWidth };
@@ -109,8 +109,8 @@ test("mobile viewport recovery and touch rail targets in Chromium", { timeout: 4
     const before = await cdp.evaluate(geometry);
     assert.equal(before.coarse, true);
     assert.equal(before.hover, false);
-    assert.ok(before.button.height >= 44 && before.pin.width >= 44 && before.remove.width >= 44 && before.remove.height >= 44 && before.node.height >= 44, JSON.stringify(before));
-    assert.ok(before.button.left + before.button.width <= before.pin.left && before.pin.left + before.pin.width <= before.remove.left, "selection, pin, and delete touch targets must not overlap");
+    assert.ok(before.button.height >= 44 && before.pin.width >= 44 && before.edit.width >= 44 && before.edit.height >= 44 && before.remove.width >= 44 && before.remove.height >= 44 && before.node.height >= 44, JSON.stringify(before));
+    assert.ok(before.button.left + before.button.width <= before.pin.left && before.pin.left + before.pin.width <= before.edit.left && before.edit.left + before.edit.width <= before.remove.left, "selection, pin, edit, and delete touch targets must not overlap");
     assert.ok(Math.abs((before.button.top + before.button.height / 2) - (before.remove.top + before.remove.height / 2)) <= 1, "delete must remain centered in the same row as its session");
     assert.ok(Math.abs(before.bodyHeight - before.viewport) < 2 && before.overflow <= 1, JSON.stringify(before));
     await cdp.send("CSS.forcePseudoState", { nodeId, forcedPseudoClasses: ["hover"] });

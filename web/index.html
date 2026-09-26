@@ -105,6 +105,7 @@
               <h1 id="agent-name"></h1>
               <span id="agent-branch" class="agent-branch" hidden></span>
             </div>
+            <p id="agent-description" class="agent-description" hidden></p>
             <p id="agent-meta" class="meta"></p>
             <p id="agent-launch" class="launch-command" hidden></p>
             <div id="model-control" class="model-control" hidden>
@@ -232,6 +233,17 @@
       <h2 id="kill-dialog-title">Kill <span id="kill-name"></span>?</h2>
       <p>This terminates the tmux session and its running agent.</p>
       <div class="dialog-actions"><button type="button" class="subtle dialog-cancel">Cancel</button><button id="kill-confirm" class="danger" type="button">Kill session</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="session-edit-dialog" aria-labelledby="session-edit-title">
+    <form id="session-edit-form" class="dialog-form" novalidate>
+      <h2 id="session-edit-title">Edit <span id="session-edit-current"></span></h2>
+      <label>Session name<input id="session-edit-name" required maxlength="100" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="session-edit-hint"></label>
+      <p id="session-edit-hint" class="dialog-hint">Letters, numbers, - and _. This renames the tmux session itself.</p>
+      <label>Description (optional)<input id="session-edit-description" maxlength="120" autocomplete="off" placeholder="What is this agent working on?"></label>
+      <p id="session-edit-note" class="dialog-note" role="alert" hidden></p>
+      <div class="dialog-actions"><button type="button" class="subtle dialog-cancel">Cancel</button><button id="session-edit-save" class="primary" type="submit">Save</button></div>
     </form>
   </dialog>
 

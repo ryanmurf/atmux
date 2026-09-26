@@ -86,9 +86,10 @@ Click a machine header in the session rail to inspect that machine's live CPU, m
 ### Automatic context compaction
 
 Each atmux node can compact its own inactive Claude and Codex panes. The
-defaults send the literal native `/compact` only when a pane has been waiting
-for more than 15 minutes and its exactly mapped native session log reports more
-than 200,000 current input/context tokens:
+defaults send the literal native `/compact` only when a waiting pane has shown
+no output and received no attached-client input for more than 15 minutes, and
+its exactly mapped native session log reports more than 200,000 current
+input/context tokens:
 
 ```toml
 [auto_compact]
@@ -102,7 +103,9 @@ Claude context is its latest assistant `input_tokens` plus cache creation and
 cache-read input. Codex context is the latest native
 `token_count.info.last_token_usage.input_tokens`; its cumulative usage is not
 used and cached input is not counted twice. Terminal text is never interpreted
-as token data. Missing/ambiguous session identity, malformed or incomplete
+as token data. Idle time starts from the later of tmux's `window_activity` (pane
+output: a finished turn, a resumed CLI's redraw, echoed keys) and
+`session_activity`; the latter alone never moves for dashboard-driven panes. Missing/ambiguous session identity, malformed or incomplete
 usage, active/working panes, and unsupported harnesses all fail closed.
 
 The scheduler runs only on the pane's owning node. It serializes through the

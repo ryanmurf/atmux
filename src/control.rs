@@ -44,8 +44,9 @@ use crate::{
     status::{AgentKind, AgentStatus},
     summary, systemd_scope,
     tmux::{
-        PaneSpecialKey, RESERVED_SERVICE_SESSION, Session, Tmux, UnsupportedModelControl,
-        fast_toggle_verified, known_efforts, known_models, valid_pane_identity,
+        DescriptionUpdate, PaneSpecialKey, RESERVED_SERVICE_SESSION, Session, Tmux,
+        UnsupportedModelControl, fast_toggle_verified, known_efforts, known_models,
+        valid_pane_identity,
     },
     transcript::Transcript,
     workspace::{FileWriteRequest, FilesResponse, GitResponse, WorkspaceErrorKind},
@@ -223,6 +224,9 @@ pub struct SessionSummary {
     #[serde(default)]
     pub machine: String,
     pub name: String,
+    /// Optional short note set from the dashboard; absent from older owners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub pane_id: String,
     pub status: String,
     pub agent: String,
@@ -256,6 +260,7 @@ impl SessionSummary {
             instance_id: session.pane_identity.clone(),
             machine: machine.to_owned(),
             name: session.name.clone(),
+            description: session.description.clone(),
             pane_id: session.pane_id.clone(),
             status: session.status.label().to_owned(),
             agent: session.agent.to_string().to_lowercase(),
@@ -375,6 +380,20 @@ pub struct ModelSwitchRequest {
     pub effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fast: Option<bool>,
+}
+
+/// A dashboard edit of one session's tmux name and/or short description.
+/// Omitted fields keep their current value; an empty description clears it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionUpdateRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Pane generation the caller saw. A pane that has since been replaced is
+    /// refused instead of renaming whatever now holds its tmux id.
+    pub instance_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2627,6 +2646,28 @@ impl ControlPlane {
         validate_live_pane_instance(pane_id, expected)
     }
 
+    /// Owner-live pane generation, or `None` once the pane is gone.
+    #[cfg(not(test))]
+    #[allow(clippy::unused_self)] // Test builds consult the owner-live race seam below.
+    fn live_pane_instance(&self, pane_id: &str) -> Result<Option<String>> {
+        Ok(Tmux::live_pane_identity(pane_id)?.map(|live| live.pane_identity))
+    }
+
+    #[cfg(test)]
+    fn live_pane_instance(&self, pane_id: &str) -> Result<Option<String>> {
+        if let Some(live) = self
+            .inner
+            .test_message_live_instances
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(pane_id)
+            .cloned()
+        {
+            return Ok(live);
+        }
+        Ok(Tmux::live_pane_identity(pane_id)?.map(|live| live.pane_identity))
+    }
+
     #[cfg(test)]
     fn validate_live_message_instance(&self, pane_id: &str, expected: Option<&str>) -> Result<()> {
         if let Some(live) = self
@@ -3700,6 +3741,79 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Renames and/or describes one agent session on its owning machine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input, a replaced pane, a name that is
+    /// already taken, or a failed tmux or owner request.
+    pub async fn update_session(&self, id: &str, request: SessionUpdateRequest) -> Result<()> {
+        let (requested_name, description) = validate_session_update(&request)?;
+        match self.resolve(id)? {
+            Target::Local {
+                pane_id,
+                instance_id,
+                name,
+                ..
+            } => {
+                validate_session_update_instance(&request.instance_id, &instance_id)?;
+                let rename = requested_name.filter(|requested| *requested != name);
+                if let Some(requested) = rename.as_deref() {
+                    self.ensure_launch_name_available(requested)?;
+                }
+                let expected_instance_id = request.instance_id;
+                let live_control = self.clone();
+                local_message_mutation(
+                    tokio::task::spawn_blocking(move || {
+                        let live = live_control
+                            .live_pane_instance(&pane_id)?
+                            .ok_or_else(|| conflict("the session no longer exists"))?;
+                        validate_session_update_instance(&expected_instance_id, &live)?;
+                        Tmux.update_session_metadata(&pane_id, rename.as_deref(), &description)
+                            .map_err(|error| {
+                                if format!("{error:#}").contains("duplicate session") {
+                                    conflict(format!(
+                                        "a tmux session named {} already exists",
+                                        rename.as_deref().unwrap_or_default()
+                                    ))
+                                } else {
+                                    error
+                                }
+                            })
+                    })
+                    .await,
+                )?;
+                self.inner.refresh_now.notify_one();
+            }
+            Target::Remote {
+                machine,
+                pane_id,
+                instance_id,
+                ..
+            } => {
+                validate_session_update_instance(&request.instance_id, &instance_id)?;
+                self.ensure_online(&machine.id)?;
+                machine
+                    .patch_json(
+                        &format!("/api/v1/sessions/{}", encode_segment(&pane_id)),
+                        &request,
+                    )
+                    .await
+                    .map_err(|error| {
+                        if remote::rejected_status(&error) == Some(405) {
+                            conflict(format!(
+                                "update atmux on {} before renaming its sessions",
+                                machine.id
+                            ))
+                        } else {
+                            remote_mutation_error(&error)
+                        }
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Kills one named agent session.
     ///
     /// # Errors
@@ -3709,7 +3823,6 @@ impl ControlPlane {
         match self.resolve(id)? {
             Target::Local {
                 pane_id,
-                name,
                 resume_lease,
                 ..
             } => {
@@ -3722,7 +3835,7 @@ impl ControlPlane {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
-                        Tmux.kill(&name)?;
+                        Tmux.kill_pane_session(&pane_id)?;
                         Ok(())
                     })
                     .await,
@@ -4902,6 +5015,18 @@ fn validate_expected_pane_instance(expected: Option<&str>, actual: &str) -> Resu
     Ok(())
 }
 
+fn validate_session_update_instance(expected: &str, actual: &str) -> Result<()> {
+    if !valid_pane_identity(expected) {
+        return Err(bad_request("invalid pane instance id"));
+    }
+    if expected != actual {
+        return Err(conflict(
+            "the session's agent pane was replaced; reopen it and try again",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_expected_pane_machine(expected: &str, actual: &str) -> Result<()> {
     validate_machine_id(expected).map_err(|_| bad_request("invalid pane machine id"))?;
     if expected != actual {
@@ -5329,6 +5454,7 @@ fn observable_sessions_equal(previous: &[Session], current: &[Session]) -> bool 
 
 fn observable_session_equal(left: &Session, right: &Session) -> bool {
     left.name == right.name
+        && left.description == right.description
         && left.pane_id == right.pane_id
         && left.pane_identity == right.pane_identity
         && left.status == right.status
@@ -5365,6 +5491,7 @@ fn observable_summary_equal(left: &SessionSummary, right: &SessionSummary) -> bo
         && left.instance_id == right.instance_id
         && left.machine == right.machine
         && left.name == right.name
+        && left.description == right.description
         && left.pane_id == right.pane_id
         && left.status == right.status
         && left.agent == right.agent
@@ -5808,6 +5935,33 @@ fn validate_session_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Normalizes a session edit: the name follows launch rules, and the
+/// description is trimmed, with an empty one meaning "clear it".
+fn validate_session_update(
+    request: &SessionUpdateRequest,
+) -> Result<(Option<String>, DescriptionUpdate)> {
+    if request.name.is_none() && request.description.is_none() {
+        return Err(bad_request("provide a new session name or description"));
+    }
+    if let Some(name) = request.name.as_deref() {
+        validate_session_name(name)?;
+    }
+    let description = match request.description.as_deref().map(str::trim) {
+        None => DescriptionUpdate::Keep,
+        Some("") => DescriptionUpdate::Clear,
+        Some(text) if crate::tmux::valid_session_description(text) => {
+            DescriptionUpdate::Set(text.to_owned())
+        }
+        Some(_) => {
+            return Err(bad_request(format!(
+                "session description must be one line of at most {} characters",
+                crate::tmux::MAX_SESSION_DESCRIPTION_CHARS
+            )));
+        }
+    };
+    Ok((request.name.clone(), description))
+}
+
 fn tail_lines(content: &str, lines: usize) -> String {
     let all = content_lines(content);
     let tail = all[all.len().saturating_sub(lines)..].join("\n");
@@ -5947,9 +6101,11 @@ pub(crate) fn test_session(name: &str, pane_id: &str, content: &str) -> Session 
     content.hash(&mut hasher);
     Session {
         name: name.to_owned(),
+        description: None,
         attached: false,
         windows: 1,
         activity: 1,
+        output_activity: 1,
         window_index: 0,
         pane_index: 0,
         pane_id: pane_id.to_owned(),
@@ -5986,6 +6142,7 @@ mod tests {
             instance_id: String::new(),
             machine: LOCAL_MACHINE_ID.to_owned(),
             name: format!("session-{id}"),
+            description: None,
             pane_id: id.to_owned(),
             status: status.to_owned(),
             agent: "codex".to_owned(),
@@ -6040,9 +6197,11 @@ mod tests {
     fn session(content: &str) -> Session {
         Session {
             name: "agent".to_owned(),
+            description: None,
             attached: false,
             windows: 1,
             activity: 1,
+            output_activity: 1,
             window_index: 0,
             pane_index: 0,
             pane_id: "%1".to_owned(),
@@ -6170,6 +6329,7 @@ mod tests {
             instance_id: format!("pane-v1-{}", "a".repeat(64)),
             machine: machine.to_owned(),
             name: name.to_owned(),
+            description: None,
             pane_id: pane.to_owned(),
             status: "working".to_owned(),
             agent: "claude".to_owned(),

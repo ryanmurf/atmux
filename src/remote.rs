@@ -260,6 +260,19 @@ impl RemoteMachine {
             .with_context(|| format!("machine {} returned an unreadable {path} payload", self.id))
     }
 
+    /// Sends a JSON partial update to the node. The rejected HTTP status stays
+    /// downcastable, so an owner too old to know the route reports 405.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for request serialization, a transport failure, or a
+    /// non-success status.
+    pub async fn patch_json<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
+        let encoded = serde_json::to_vec(body).context("failed to encode a federated update")?;
+        self.request(Method::PATCH, path, Some(encoded)).await?;
+        Ok(())
+    }
+
     /// Sends a DELETE command to the node.
     ///
     /// # Errors
@@ -1112,6 +1125,7 @@ mod tests {
             instance_id: String::new(),
             machine: machine.to_owned(),
             name: name.to_owned(),
+            description: None,
             pane_id: pane.to_owned(),
             status: "working".to_owned(),
             agent: "codex".to_owned(),

@@ -33,18 +33,25 @@ pub(crate) fn decide(
     context: &NativeContext,
     existing_marker: Option<&str>,
 ) -> Decision {
+    // tmux's session activity moves only on attached-client input, so a pane
+    // driven through `send-keys` (the dashboard) looks idle for days and would
+    // be compacted seconds after its turn ends. Idle time is measured from the
+    // later of that input and the pane's last output, which moves when a turn
+    // ends, a resumed CLI redraws, or typed keys echo. An unknown or future
+    // output time fails closed.
+    let last_activity = session.activity.max(session.output_activity);
     if !policy.enabled
         || session.status != AgentStatus::Waiting
         || !matches!(session.agent, AgentKind::Claude | AgentKind::Codex)
-        || session.activity == 0
-        || session.activity > now_epoch_seconds
+        || session.output_activity == 0
+        || last_activity > now_epoch_seconds
     {
         return Decision::Skip;
     }
     let Some(inactivity_seconds) = policy.inactivity_minutes.checked_mul(60) else {
         return Decision::Skip;
     };
-    if now_epoch_seconds.saturating_sub(session.activity) <= inactivity_seconds {
+    if now_epoch_seconds.saturating_sub(last_activity) <= inactivity_seconds {
         return Decision::Skip;
     }
 
@@ -130,9 +137,11 @@ mod tests {
     fn session(status: AgentStatus, agent: AgentKind, activity: u64) -> Session {
         Session {
             name: "agent".to_owned(),
+            description: None,
             attached: false,
             windows: 1,
             activity,
+            output_activity: activity,
             window_index: 0,
             pane_index: 0,
             pane_id: "%1".to_owned(),
@@ -203,6 +212,49 @@ mod tests {
                 Decision::Skip
             );
         }
+    }
+
+    #[test]
+    fn idle_time_counts_from_pane_output_not_stale_session_activity() {
+        let policy = enabled_policy();
+        // A dashboard-driven pane: session activity is the server start days
+        // ago, but its turn ended ten seconds ago.
+        let mut just_answered = session(AgentStatus::Waiting, AgentKind::Claude, 1);
+        just_answered.output_activity = 990;
+        assert_eq!(
+            decide(&policy, 1_000, &just_answered, &context(276_751), None),
+            Decision::Skip
+        );
+        assert!(matches!(
+            decide(
+                &policy,
+                990 + 15 * 60 + 1,
+                &just_answered,
+                &context(276_751),
+                None
+            ),
+            Decision::Compact { .. }
+        ));
+
+        // Recent attached-client input still counts, and output time is required.
+        let mut typing = session(AgentStatus::Waiting, AgentKind::Claude, 990);
+        typing.output_activity = 1;
+        assert_eq!(
+            decide(&policy, 1_000, &typing, &context(276_751), None),
+            Decision::Skip
+        );
+        let mut unknown_output = session(AgentStatus::Waiting, AgentKind::Codex, 1);
+        unknown_output.output_activity = 0;
+        assert_eq!(
+            decide(&policy, 1_000_000, &unknown_output, &context(276_751), None),
+            Decision::Skip
+        );
+        let mut future_output = session(AgentStatus::Waiting, AgentKind::Codex, 1);
+        future_output.output_activity = 2_000;
+        assert_eq!(
+            decide(&policy, 1_000, &future_output, &context(276_751), None),
+            Decision::Skip
+        );
     }
 
     #[test]
