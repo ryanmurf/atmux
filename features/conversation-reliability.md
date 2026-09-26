@@ -94,3 +94,11 @@ Restoring native process detection also restores eligibility for the existing
 automatic-compaction policy. Its tmux-only idle clock is a separate confirmed
 bug, so rollout requires Ryan's choice about temporarily disabling atmux-driven
 compaction; no such configuration change is implied by this code fix.
+
+## Deployment — 2026-09-26
+
+Deployed fleet-wide as part of runtime `8d5cd01`. The pending compaction decision was resolved by
+fixing the idle clock instead of disabling compaction ([auto-compact-idle-clock.md](auto-compact-idle-clock.md#deployment--2026-09-26)).
+Live Conversation is available for 37 of 38 agent sessions, including all 17 on Midnight; Tron's
+`dispatch` reports it unavailable and was not restarted. The independent-review gate remains open.
+

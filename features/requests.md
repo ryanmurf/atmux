@@ -59,7 +59,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Ensure raw-pane web sends submit after bracketed paste instead of leaving text in the agent input | `raw-pane-submit-reliability.md` | Implemented and live-tested; review pending |
 | Send special terminal input such as Ctrl+B twice | `completed/agent-interaction-controls.md` | Completed |
 | Add a compact-command shortcut | `completed/agent-interaction-controls.md` | Completed |
-| Stop automatic compaction from firing right after a turn instead of after real idle time | `auto-compact-idle-clock.md` | Implemented and tested on Linux; macOS/review/deploy pending |
+| Stop automatic compaction from firing right after a turn instead of after real idle time | `auto-compact-idle-clock.md` | Deployed fleet-wide 2026-09-26; threshold observation and review pending |
 | Use Up/Down to browse previously sent comments | `completed/agent-interaction-controls.md` | Completed |
 | Fix Up-arrow input history after the composer draft regression | `composer-history-navigation.md` | Deployed fleet-wide and browser-tested; live interaction/review gates pending |
 | Plain Enter sends; Ctrl/Command+Enter inserts a newline | `completed/composer-keyboard-behavior.md` | Completed |
@@ -75,14 +75,14 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Collapse mixed tool/error rows, show metrics on every entry, and add Conversation totals | `conversation-metrics-and-grouping.md` | Deployed fleet-wide; live metrics verified except existing Clue mapping issue; review pending |
 | Collapse individual nodes and implement, review, test, build, and deploy ten dashboard improvements using agents | `dashboard-improvements.md` | Deployed and verified; physical iPhone retest pending |
 | Use Claude and Codex session logs as the conversation display | `completed/claude-codex-transcripts.md` | Completed |
-| Make Conversation reliable after agent updates and during slow or continuous output | `conversation-reliability.md` | Implemented and tested; Midnight support-issues live read verified; deployment/review pending |
+| Make Conversation reliable after agent updates and during slow or continuous output | `conversation-reliability.md` | Deployed fleet-wide 2026-09-26; review pending |
 | Support old/unlabeled Claude CLI storage and profile directories such as `~/.claude-max` | `completed/claude-codex-transcripts.md` | Completed |
 | Render agent output as safe native Markdown with links and highlighted, expandable code blocks | `completed/claude-codex-transcripts.md` | Completed |
 | Show compact, expandable Claude and Codex tool calls and results | `completed/claude-codex-transcripts.md` | Completed |
 | Hide Human messages or Internal activity independently while Agent prose stays visible | `completed/conversation-visibility-filters.md` | Completed |
 | Make agent boxes and the overall web view denser and more streamlined | `completed/claude-codex-transcripts.md` | Completed |
 | Put a nearby trash-can action beside each session in the left navigation | `completed/left-rail-session-controls.md` | Completed |
-| Rename a tmux session from the left navigation and give it a short description | `session-rename-description.md` | Implemented and live-tested on Linux; macOS/review/deploy pending |
+| Rename a tmux session from the left navigation and give it a short description | `session-rename-description.md` | Deployed fleet-wide 2026-09-26; review pending |
 | Collapse and restore the left navigation | `completed/left-rail-session-controls.md` | Completed |
 | Keep the agent pane full-width and stable when left navigation sizing changes | `completed/full-width-stable-agent-pane.md` | Completed |
 | Make mobile browser Back return from an agent to the agent menu instead of login | `completed/mobile-browser-back-navigation.md` | Completed |
