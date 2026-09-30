@@ -1482,7 +1482,10 @@ async fn overview_events(
     let mut shutdown = state.shutdown;
     let output = stream! {
         let mut previous = control.overview();
-        yield Ok(event("sessions.snapshot", previous.revision, &previous));
+        // Reconnect quickly after a proxy or network drop: the fresh
+        // snapshot makes a reconnect cheap and exact.
+        yield Ok(event("sessions.snapshot", previous.revision, &previous)
+            .retry(Duration::from_secs(1)));
         while wait_for_revision_or_shutdown(&mut receiver, &mut shutdown).await {
             let current = control.overview();
             let patch = overview_patch(&previous, &current);

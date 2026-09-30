@@ -2758,7 +2758,16 @@ function formatDecimal(value) {
 
 const ATMUX_HISTORY_VIEW = "atmuxView";
 
-function overviewConnectionPresentation(connection) {
+/// A proxy or network hop can drop a long-lived stream at any time, and the
+/// browser reconnects within a second or two. Only a drop that outlasts this
+/// grace period is worth a banner; before then the status pill says enough.
+const OVERVIEW_DROP_GRACE_MS = 8000;
+
+function overviewConnectionPresentation(connection, elapsedMs = Infinity) {
+  if ((connection === "reconnecting" || connection === "stale")
+    && Number.isFinite(elapsedMs) && elapsedMs >= 0 && elapsedMs < OVERVIEW_DROP_GRACE_MS) {
+    return { label: "Reconnecting…", note: "", retry: false };
+  }
   const states = {
     live: { label: "Live", note: "", retry: false },
     connecting: { label: "Connecting…", note: "Connecting to live updates…", retry: false },
@@ -3248,6 +3257,8 @@ function initialize() {
     overviewSource: null,
     paneSource: null,
     overviewConnection: "connecting",
+    overviewConnectionSince: 0,
+    overviewGraceTimer: null,
     statusPresentations: new Map(),
     statusTimer: null,
     filter: "",
@@ -3539,6 +3550,18 @@ function initialize() {
     state.overviewSource = createOverviewStream({
       createSource: () => new EventSource("/api/v1/events"),
       onConnection(connection) {
+        if (connection !== state.overviewConnection) {
+          state.overviewConnectionSince = Date.now();
+          if (state.overviewGraceTimer !== null) clearTimeout(state.overviewGraceTimer);
+          state.overviewGraceTimer = null;
+          if (connection === "reconnecting" || connection === "stale") {
+            // Repaint once the grace period ends, in case nothing else does.
+            state.overviewGraceTimer = setTimeout(() => {
+              state.overviewGraceTimer = null;
+              renderOverviewConnection();
+            }, OVERVIEW_DROP_GRACE_MS + 50);
+          }
+        }
         state.overviewConnection = connection;
         renderCounts();
       },
@@ -5579,7 +5602,10 @@ function initialize() {
   }
 
   function renderOverviewConnection() {
-    const view = overviewConnectionPresentation(state.overviewConnection);
+    const view = overviewConnectionPresentation(
+      state.overviewConnection,
+      Date.now() - state.overviewConnectionSince,
+    );
     const status = $("overview-status");
     status.textContent = view.label;
     status.dataset.connection = state.overviewConnection;

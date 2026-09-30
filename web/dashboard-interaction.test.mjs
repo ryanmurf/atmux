@@ -66,6 +66,14 @@ test("missing initial snapshot becomes visibly stale and a later snapshot recove
   h.emit("sessions.snapshot");
   assert.equal(h.states.at(-1), "live");
   assert.equal(overviewConnectionPresentation("live").retry, false);
+  // A brief drop that the browser recovers from does not raise the banner.
+  assert.equal(overviewConnectionPresentation("reconnecting", 1500).retry, false);
+  assert.equal(overviewConnectionPresentation("reconnecting", 1500).label, "Reconnecting…");
+  assert.equal(overviewConnectionPresentation("reconnecting", 1500).note, "");
+  assert.equal(overviewConnectionPresentation("stale", 7999).retry, false);
+  assert.equal(overviewConnectionPresentation("reconnecting", 8000).retry, true);
+  assert.match(overviewConnectionPresentation("reconnecting", 60_000).note, /disconnected/);
+  assert.equal(overviewConnectionPresentation("reconnecting", -5).retry, true);
 });
 
 test("native EventSource reconnects need their own authoritative snapshot", () => {
