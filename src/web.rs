@@ -1539,7 +1539,7 @@ async fn pane_events(
             }
         };
         reported = None;
-        yield Ok(event("pane.snapshot", previous.revision, &previous));
+        yield Ok(event("pane.snapshot", previous.revision, &previous).retry(Duration::from_secs(1)));
         while wait_for_revision_or_shutdown(&mut receiver, &mut shutdown).await {
             // A revision bump on any machine wakes every pane stream. Skip the
             // owning machine entirely unless this pane's advertised hash moved,
