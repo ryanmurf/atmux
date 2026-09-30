@@ -8,6 +8,7 @@ Status: implemented and tested locally 2026-09-29; fleet rollout pending
   Follow-up: "cve-planner-codex converation isn't working."
 - "Can you show compaction as a collapsed box instead of full screen?"
 - "Raw Pane sometimes doesn't show much, like the height isn't shown correctly."
+- "Sometimes I'm seeing a disconnected thing."
 
 ## Confirmed causes
 
@@ -23,6 +24,13 @@ A fleet probe of every live Claude/Codex pane found 13 of 44 without a Conversat
 - Raw pane: every detached window on Tron and Midnight is tmux's default 80×24, and several agents
   draw full-screen without scrollback.
 
+- Disconnected banner: every browser event stream through atmux.murphytek.com ended together at
+  each wall-clock 5-minute mark. The browser is Chrome on Tron. The `herodevs/containerd-watchdog`
+  CronJob (`*/5`) starts a pod whose Calico veth appears at :00 and disappears at :03, and Chrome
+  drops its connections on that network change. atmux (420 s direct stream), the in-pod gateway
+  (400 s), the ingress/hostPort path and pod-network TCP (keep-alive connections) all stayed up
+  across the marks, and the event stream had no revision gap.
+
 ## Implementation
 
 - Claude identity accepts the exact `procStart` (Linux start ticks, macOS UTC `lstart`) whenever
@@ -36,6 +44,9 @@ A fleet probe of every live Claude/Codex pane found 13 of 44 without a Conversat
   available with zero messages.
 - Compaction entries (`kind: "compaction"`) with trigger and pre/post token counts; the browser
   renders them as a collapsed box.
+- The dashboard waits 8 seconds before raising the disconnected banner (the pill says
+  Reconnecting meanwhile), and both event streams ask browsers to retry after 1 second. The root
+  cause is outside atmux: run the watchdog Job with `hostNetwork: true` or less often.
 - `POST /api/v1/panes/{id}/size` fits a detached single-pane window to the Raw view and unsets
   `window-size` afterwards; the browser measures its cell grid and debounces.
 
