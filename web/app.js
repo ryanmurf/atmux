@@ -1572,23 +1572,1002 @@ function linkifyInto(parent, text) {
   return parent;
 }
 
-function highlightCode(text) {
-  const source = String(text || "");
-  const pattern = /(\/\/.*$|(?:^|\s)#.*$|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b(?:async|await|break|case|class|const|continue|def|else|enum|false|fn|for|function|if|impl|import|in|let|match|mod|new|null|pub|return|self|static|struct|throw|trait|true|try|type|use|var|while)\b|\b\d+(?:\.\d+)?\b)/gm;
-  const segments = [];
-  let position = 0;
-  for (const match of source.matchAll(pattern)) {
-    if (match.index > position) segments.push({ kind: "plain", text: source.slice(position, match.index) });
-    const token = match[0];
-    const trimmed = token.trimStart();
-    const kind = trimmed.startsWith("//") || trimmed.startsWith("#") ? "comment"
-      : /^["'`]/.test(trimmed) ? "string"
-        : /^\d/.test(trimmed) ? "number" : "keyword";
-    segments.push({ kind, text: token });
-    position = match.index + token.length;
+// ---------------------------------------------------------------------------
+// Source highlighting and navigation helpers for the Files viewer.
+//
+// The tokenizer runs over a whole file so block comments, text blocks and
+// template literals keep their meaning across lines, then splits tokens back
+// into lines for rendering. It never evaluates source text; every token is
+// rendered with textContent.
+
+const MAX_CODE_SYMBOL_CHARS = 128;
+const CODE_SYMBOL_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/;
+const MAX_CODE_NAV_RESULTS = 200;
+const CODE_NAV_OPERATIONS = new Set(["definitions", "references", "resolve"]);
+const MAX_CODE_NAV_HISTORY = 50;
+
+const codeWords = (value) => new Set(String(value).split(/\s+/).filter(Boolean));
+
+const C_KEYWORDS = "auto break case char const continue default do double else enum extern float for goto if inline int long register restrict return short signed sizeof static struct switch typedef union unsigned void volatile while _Alignas _Alignof _Atomic _Bool _Complex _Generic _Noreturn _Static_assert _Thread_local";
+const JS_KEYWORDS = "as async await break case catch class const continue debugger default delete do else export extends finally for from function get if import in instanceof let new of return set static super switch this throw try typeof var void while with yield";
+
+const CODE_LANGUAGE_SPECS = (() => {
+  const base = {
+    lineComments: ["//"],
+    blockComment: ["/*", "*/"],
+    quotes: ['"', "'"],
+    triple: [],
+    backtick: false,
+    keywords: new Set(),
+    types: new Set(),
+    literals: codeWords("true false null"),
+    annotation: null,
+    preprocessor: false,
+    rust: false,
+    typeCase: true,
+    caseInsensitive: false,
+    dollarVariables: false,
+    ruby: false,
+    keyStrings: false,
+    hashBoundary: false,
+    identifier: /[A-Za-z_$][\w$]*/y,
+    stringPrefixes: null,
+    css: false,
+    navigable: true,
+  };
+  const spec = (overrides) => ({ ...base, ...overrides });
+  const specs = {
+    java: spec({
+      keywords: codeWords("abstract assert break case catch class const continue default do else enum exports extends final finally for goto if implements import instanceof interface module native new non-sealed open opens package permits private protected provides public record requires return sealed static strictfp super switch synchronized this throw throws to transient transitive try uses var void volatile when while with yield"),
+      types: codeWords("boolean byte char double float int long short"),
+      triple: ['"""'],
+      annotation: "@",
+    }),
+    kotlin: spec({
+      keywords: codeWords("abstract actual annotation as break by catch class companion const constructor continue crossinline data do else enum expect external final finally for fun get if import in infix init inline inner interface internal is lateinit noinline object open operator out override package private protected public reified return sealed set super suspend tailrec this throw try typealias typeof val value var vararg when where while"),
+      types: codeWords("Any Unit Nothing Int Long Short Byte Double Float Boolean Char String"),
+      triple: ['"""'],
+      annotation: "@",
+    }),
+    scala: spec({
+      keywords: codeWords("abstract case catch class def do else enum export extends extension final finally for forSome given if implicit import lazy match new object override package private protected return sealed super then this throw trait try type using val var while with yield"),
+      triple: ['"""'],
+      annotation: "@",
+    }),
+    groovy: spec({
+      keywords: codeWords("abstract as assert break case catch class const continue def default do else enum extends final finally for goto if implements import in instanceof interface native new package private protected public return static super switch synchronized this threadsafe throw throws trait transient try var while"),
+      types: codeWords("boolean byte char double float int long short void"),
+      triple: ['"""', "'''"],
+      annotation: "@",
+    }),
+    rust: spec({
+      keywords: codeWords("as async await break const continue crate dyn else enum extern fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait type union unsafe use where while yield macro_rules"),
+      types: codeWords("bool char str u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize f32 f64 String Vec Option Result Box"),
+      literals: codeWords("true false None Some Ok Err"),
+      quotes: ['"'],
+      rust: true,
+    }),
+    typescript: spec({
+      keywords: codeWords(`${JS_KEYWORDS} abstract any asserts declare enum implements infer interface is keyof module namespace never override private protected public readonly require satisfies type unique unknown`),
+      types: codeWords("string number boolean bigint symbol object void undefined never unknown any"),
+      literals: codeWords("true false null undefined NaN Infinity"),
+      backtick: true,
+      annotation: "@",
+    }),
+    javascript: spec({
+      keywords: codeWords(JS_KEYWORDS),
+      literals: codeWords("true false null undefined NaN Infinity"),
+      backtick: true,
+      annotation: "@",
+    }),
+    python: spec({
+      lineComments: ["#"],
+      blockComment: null,
+      triple: ['"""', "'''"],
+      keywords: codeWords("and as assert async await break case class continue def del elif else except finally for from global if import in is lambda match nonlocal not or pass raise return try type while with yield"),
+      types: codeWords("int float str bool bytes list dict set tuple object"),
+      literals: codeWords("True False None self cls"),
+      annotation: "@",
+      stringPrefixes: /[rRbBuUfF]{1,2}(?=["'])/y,
+    }),
+    go: spec({
+      keywords: codeWords("break case chan const continue default defer else fallthrough for func go goto if import interface map package range return select struct switch type var"),
+      types: codeWords("bool byte complex64 complex128 error float32 float64 int int8 int16 int32 int64 rune string uint uint8 uint16 uint32 uint64 uintptr any"),
+      literals: codeWords("true false nil iota"),
+      backtick: true,
+    }),
+    c: spec({
+      keywords: codeWords(C_KEYWORDS),
+      types: codeWords("size_t ssize_t int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t bool FILE"),
+      literals: codeWords("true false NULL"),
+      preprocessor: true,
+      typeCase: false,
+    }),
+    cpp: spec({
+      keywords: codeWords(`${C_KEYWORDS} alignas alignof and asm bool catch class concept consteval constexpr constinit co_await co_return co_yield decltype delete dynamic_cast explicit export final friend mutable namespace new noexcept not operator or override private protected public reinterpret_cast requires static_assert static_cast template this thread_local throw try typeid typename using virtual`),
+      types: codeWords("size_t std string vector map unique_ptr shared_ptr bool wchar_t char8_t char16_t char32_t"),
+      literals: codeWords("true false nullptr NULL"),
+      preprocessor: true,
+    }),
+    csharp: spec({
+      keywords: codeWords("abstract as async await base break case catch checked class const continue default delegate do else enum event explicit extern finally fixed for foreach get goto if implicit in init interface internal is lock namespace new operator out override params partial private protected public readonly record ref required return sealed set sizeof stackalloc static struct switch this throw try typeof unchecked unsafe using value var virtual void volatile when where while with yield"),
+      types: codeWords("bool byte char decimal double dynamic float int long nint nuint object sbyte short string uint ulong ushort"),
+      preprocessor: true,
+      stringPrefixes: /(?:\$@|@\$|\$|@)(?=")/y,
+    }),
+    swift: spec({
+      keywords: codeWords("actor any as associatedtype async await break case catch class continue default defer deinit do else enum extension fallthrough fileprivate final for func guard if import in indirect init inout internal is lazy let mutating nonmutating open operator override private protocol public repeat required rethrows return self Self some static struct subscript super switch throw throws try typealias var weak where while"),
+      types: codeWords("Int Double Float Bool String Character Array Dictionary Set Optional Void"),
+      literals: codeWords("true false nil"),
+      triple: ['"""'],
+      annotation: "@",
+      preprocessor: true,
+    }),
+    ruby: spec({
+      lineComments: ["#"],
+      blockComment: null,
+      keywords: codeWords("alias and begin break case class def defined do else elsif end ensure for if in module next not or redo rescue retry return self super then undef unless until when while yield require require_relative include extend attr_accessor attr_reader attr_writer private protected public"),
+      literals: codeWords("true false nil"),
+      ruby: true,
+      identifier: /[A-Za-z_][\w]*[?!]?/y,
+    }),
+    php: spec({
+      lineComments: ["//", "#"],
+      keywords: codeWords("abstract and array as break callable case catch class clone const continue declare default do echo else elseif empty enddeclare endfor endforeach endif endswitch endwhile enum extends final finally fn for foreach function global goto if implements include include_once instanceof insteadof interface isset list match namespace new or print private protected public readonly require require_once return static switch throw trait try unset use var while xor yield"),
+      types: codeWords("int float string bool array object mixed void never iterable"),
+      literals: codeWords("true false null TRUE FALSE NULL"),
+      dollarVariables: true,
+      hashBoundary: true,
+      annotation: "#[",
+    }),
+    shell: spec({
+      lineComments: ["#"],
+      blockComment: null,
+      keywords: codeWords("if then else elif fi case esac for select while until do done in function time coproc return exit break continue local export readonly declare typeset unset shift source alias eval exec set trap"),
+      literals: codeWords("true false"),
+      dollarVariables: true,
+      hashBoundary: true,
+      typeCase: false,
+      identifier: /[A-Za-z_][\w-]*/y,
+    }),
+    sql: spec({
+      lineComments: ["--"],
+      quotes: ["'", '"'],
+      keywords: codeWords("add all alter and any as asc begin between by case cascade check column commit constraint create cross database default delete desc distinct drop else end exists foreign from full function grant group having if in index inner insert intersect into is join key left like limit not null offset on or order outer primary procedure references replace returning revoke right rollback schema select sequence set table then to transaction trigger truncate union unique update using values view when where with"),
+      types: codeWords("int integer bigint smallint serial bigserial decimal numeric real double precision float boolean bool char varchar text date time timestamp timestamptz interval uuid json jsonb bytea"),
+      literals: codeWords("true false null"),
+      caseInsensitive: true,
+      typeCase: false,
+    }),
+    protobuf: spec({
+      keywords: codeWords("syntax edition package import option message enum service rpc returns stream repeated optional required oneof map reserved extend extensions to max public weak"),
+      types: codeWords("double float int32 int64 uint32 uint64 sint32 sint64 fixed32 fixed64 sfixed32 sfixed64 bool string bytes"),
+    }),
+    graphql: spec({
+      lineComments: ["#"],
+      blockComment: null,
+      quotes: ['"'],
+      triple: ['"""'],
+      keywords: codeWords("query mutation subscription fragment on type interface union enum input scalar schema extend implements directive repeatable"),
+      types: codeWords("Int Float String Boolean ID"),
+      dollarVariables: true,
+      annotation: "@",
+    }),
+    json: spec({
+      quotes: ['"'],
+      keyStrings: true,
+      typeCase: false,
+      navigable: false,
+    }),
+    css: spec({
+      lineComments: [],
+      css: true,
+      typeCase: false,
+      navigable: false,
+      identifier: /-?-?[A-Za-z_][\w-]*/y,
+      keywords: codeWords("important"),
+      literals: new Set(),
+    }),
+    scss: spec({
+      css: true,
+      typeCase: false,
+      navigable: false,
+      dollarVariables: true,
+      identifier: /-?-?[A-Za-z_][\w-]*/y,
+      keywords: codeWords("important"),
+      literals: new Set(),
+    }),
+    generic: spec({
+      lineComments: ["//", "#"],
+      hashBoundary: true,
+      backtick: true,
+      keywords: codeWords("async await break case class const continue def else enum fn for function if impl import in let match mod new pub return self static struct throw trait try type use var while"),
+      typeCase: false,
+      navigable: false,
+    }),
+  };
+  specs.jsx = specs.javascript;
+  specs.tsx = specs.typescript;
+  return specs;
+})();
+
+const CODE_LINE_MODES = new Set(["yaml", "toml", "markdown", "dockerfile", "makefile", "ini", "gitignore", "text"]);
+const CODE_MARKUP_MODES = new Set(["html", "xml"]);
+
+const CODE_LANGUAGE_ALIASES = new Map(Object.entries({
+  ts: "typescript", mts: "typescript", cts: "typescript", tsx: "tsx", jsx: "jsx", js: "javascript",
+  mjs: "javascript", cjs: "javascript", node: "javascript", py: "python", python3: "python",
+  rs: "rust", sh: "shell", bash: "shell", zsh: "shell", ksh: "shell", dash: "shell", console: "shell",
+  yml: "yaml", htm: "html", xhtml: "html", svg: "xml", kt: "kotlin", kts: "kotlin", cs: "csharp",
+  "c++": "cpp", cc: "cpp", cxx: "cpp", hpp: "cpp", h: "c", rb: "ruby", golang: "go", proto: "protobuf",
+  gql: "graphql", md: "markdown", docker: "dockerfile", make: "makefile", mk: "makefile",
+  gradle: "groovy", sass: "scss", less: "scss", jsonc: "json", json5: "json", vue: "html",
+  svelte: "html", plaintext: "text", txt: "text",
+}));
+
+const CODE_EXTENSIONS = new Map(Object.entries({
+  java: "java", kt: "kotlin", kts: "kotlin", scala: "scala", sc: "scala", groovy: "groovy",
+  gradle: "groovy", rs: "rust", ts: "typescript", mts: "typescript", cts: "typescript",
+  tsx: "tsx", js: "javascript", mjs: "javascript", cjs: "javascript", jsx: "jsx", py: "python",
+  pyi: "python", go: "go", c: "c", h: "c", cc: "cpp", cpp: "cpp", cxx: "cpp", hpp: "cpp",
+  hh: "cpp", hxx: "cpp", m: "cpp", mm: "cpp", cs: "csharp", swift: "swift", rb: "ruby",
+  rake: "ruby", gemspec: "ruby", php: "php", sh: "shell", bash: "shell", zsh: "shell",
+  ksh: "shell", sql: "sql", json: "json", jsonc: "json", json5: "json", yaml: "yaml", yml: "yaml",
+  toml: "toml", xml: "xml", xsd: "xml", xsl: "xml", svg: "xml", plist: "xml", pom: "xml",
+  html: "html", htm: "html", vue: "html", svelte: "html", css: "css", scss: "scss", sass: "scss",
+  less: "scss", md: "markdown", markdown: "markdown", proto: "protobuf", graphql: "graphql",
+  gql: "graphql", ini: "ini", cfg: "ini", conf: "ini", properties: "ini", env: "ini",
+}));
+
+const CODE_FILE_NAMES = new Map(Object.entries({
+  dockerfile: "dockerfile", containerfile: "dockerfile", makefile: "makefile",
+  gnumakefile: "makefile", jenkinsfile: "groovy", rakefile: "ruby", gemfile: "ruby",
+  podfile: "ruby", vagrantfile: "ruby", build: "python", workspace: "python",
+  ".bashrc": "shell", ".zshrc": "shell", ".profile": "shell", ".bash_profile": "shell",
+  ".gitignore": "gitignore", ".dockerignore": "gitignore", ".editorconfig": "ini",
+}));
+
+/// Resolves the highlighting language from the owner's hint, the file name,
+/// and a shebang for extensionless scripts.
+function codeLanguage(path, hint = "", content = "") {
+  const declared = String(hint || "").trim().toLowerCase().replace(/[^a-z0-9_+-]/g, "");
+  const known = (value) => {
+    const resolved = CODE_LANGUAGE_ALIASES.get(value) || value;
+    return CODE_LANGUAGE_SPECS[resolved] || CODE_LINE_MODES.has(resolved)
+      || CODE_MARKUP_MODES.has(resolved) || resolved === "diff" ? resolved : null;
+  };
+  if (declared && declared !== "text") {
+    const resolved = known(declared);
+    if (resolved) return resolved;
   }
-  if (position < source.length) segments.push({ kind: "plain", text: source.slice(position) });
+  const name = String(path || "").split("/").pop().toLowerCase();
+  if (CODE_FILE_NAMES.has(name)) return CODE_FILE_NAMES.get(name);
+  if (name.startsWith("dockerfile.") || name.endsWith(".dockerfile")) return "dockerfile";
+  const extension = name.includes(".") ? name.split(".").pop() : "";
+  if (extension && CODE_EXTENSIONS.has(extension)) return CODE_EXTENSIONS.get(extension);
+  const firstLine = String(content || "").slice(0, 200).split("\n", 1)[0];
+  const shebang = /^#!\s*(?:\S*\/)?(?:env\s+(?:-\S+\s+)*)?([A-Za-z0-9_.+-]+)/.exec(firstLine);
+  if (shebang) {
+    const interpreter = shebang[1].toLowerCase().replace(/[0-9.]+$/, "");
+    const mapped = {
+      python: "python", node: "javascript", deno: "typescript", bun: "typescript",
+      bash: "shell", sh: "shell", zsh: "shell", ksh: "shell", dash: "shell", ruby: "ruby",
+      php: "php", groovy: "groovy", swift: "swift", kotlin: "kotlin",
+    }[interpreter];
+    if (mapped) return mapped;
+  }
+  return declared && known(declared) ? known(declared) : "text";
+}
+
+/// Whether identifiers in this language can be sent to the owner for
+/// definition and reference search.
+function codeLanguageNavigable(language) {
+  const spec = CODE_LANGUAGE_SPECS[language];
+  return Boolean(spec?.navigable);
+}
+
+function codeSymbolValid(symbol) {
+  return typeof symbol === "string" && CODE_SYMBOL_PATTERN.test(symbol);
+}
+
+function sourceLineEnd(source, index) {
+  const end = source.indexOf("\n", index);
+  return end < 0 ? source.length : end;
+}
+
+function closingQuoteIndex(source, from, quote, escapes = true, multiline = false) {
+  for (let index = from; index < source.length; index += 1) {
+    const character = source[index];
+    if (escapes && character === "\\") { index += 1; continue; }
+    if (character === quote) return index;
+    if (character === "\n" && !multiline) return index - 1;
+  }
+  return source.length - 1;
+}
+
+function nextSignificantCharacter(source, index) {
+  let cursor = index;
+  while (cursor < source.length && (source[cursor] === " " || source[cursor] === "\t")) cursor += 1;
+  return source[cursor] || "";
+}
+
+function classifyCodeWord(word, spec, source, end) {
+  const lookup = spec.caseInsensitive ? word.toLowerCase() : word;
+  if (spec.keywords.has(lookup)) return "keyword";
+  if (spec.literals.has(lookup)) return "literal";
+  if (spec.types.has(lookup)) return "type";
+  const next = nextSignificantCharacter(source, end);
+  if (next === "(") return "function";
+  if (spec.rust && next === "!" && source[end + 1] !== "=") return "function";
+  if (spec.typeCase && /^[A-Z]/.test(word)) {
+    return word.length > 1 && word === word.toUpperCase() ? "constant" : "type";
+  }
+  return "identifier";
+}
+
+const CODE_NUMBER_PATTERN = /(?:0[xX][\da-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|(?:\d[\d_]*)?\.?\d[\d_]*(?:[eE][+-]?\d+)?)[A-Za-z%]*/y;
+
+/// Tokenizes C-family, scripting, and data languages in one pass.
+function tokenizeCode(source, spec) {
+  const tokens = [];
+  const length = source.length;
+  let index = 0;
+  let plain = 0;
+  let depth = 0;
+  let lineStart = true;
+  let lastKind = "";
+  let lastText = "";
+  const emit = (kind, start, end) => {
+    if (start > plain) tokens.push({ kind: "plain", text: source.slice(plain, start) });
+    tokens.push({ kind, text: source.slice(start, end) });
+    plain = end;
+    index = end;
+    lastKind = kind;
+    lastText = tokens[tokens.length - 1].text;
+  };
+  const sticky = (pattern) => {
+    pattern.lastIndex = index;
+    const match = pattern.exec(source);
+    return match ? match[0] : null;
+  };
+  while (index < length) {
+    const character = source[index];
+    if (character === "\n") { lineStart = true; index += 1; continue; }
+    if (character === " " || character === "\t" || character === "\r") { index += 1; continue; }
+    const atLineStart = lineStart;
+    lineStart = false;
+    const previous = index > 0 ? source[index - 1] : "\n";
+    const boundary = !/[\w$]/.test(previous);
+
+    const comment = spec.lineComments.find((marker) => source.startsWith(marker, index)
+      && (marker !== "#" || !spec.hashBoundary || /\s/.test(previous) || index === 0)
+      && !(marker === "#" && spec.annotation === "#[" && source[index + 1] === "["));
+    if (comment) { emit("comment", index, sourceLineEnd(source, index)); continue; }
+    if (spec.blockComment && source.startsWith(spec.blockComment[0], index)) {
+      const close = source.indexOf(spec.blockComment[1], index + spec.blockComment[0].length);
+      emit("comment", index, close < 0 ? length : close + spec.blockComment[1].length);
+      continue;
+    }
+    if (spec.preprocessor && character === "#" && atLineStart) {
+      const directive = sticky(/#\s*[A-Za-z_]\w*/y);
+      if (directive) {
+        emit("annotation", index, index + directive.length);
+        if (/include|import/.test(directive)) {
+          while (source[index] === " " || source[index] === "\t") index += 1;
+          if (source[index] === "<") {
+            const close = source.indexOf(">", index);
+            const end = close < 0 || close > sourceLineEnd(source, index) ? sourceLineEnd(source, index) : close + 1;
+            emit("string", index, end);
+          }
+        }
+        continue;
+      }
+    }
+    if ((spec.rust || spec.annotation === "#[") && character === "#"
+      && (source[index + 1] === "[" || (source[index + 1] === "!" && source[index + 2] === "["))) {
+      const lineEnd = sourceLineEnd(source, index);
+      let bracket = 0;
+      let end = lineEnd;
+      for (let cursor = index; cursor < lineEnd; cursor += 1) {
+        if (source[cursor] === "[") bracket += 1;
+        else if (source[cursor] === "]") { bracket -= 1; if (bracket === 0) { end = cursor + 1; break; } }
+      }
+      emit("annotation", index, end);
+      continue;
+    }
+    const triple = spec.triple.find((quote) => source.startsWith(quote, index));
+    if (triple) {
+      const close = source.indexOf(triple, index + triple.length);
+      emit("string", index, close < 0 ? length : close + triple.length);
+      continue;
+    }
+    if (spec.rust && boundary && (character === "r" || (character === "b" && source[index + 1] === "r"))) {
+      const raw = sticky(/b?r(#*)"/y);
+      if (raw) {
+        const hashes = raw.slice(raw.indexOf("r") + 1, -1);
+        const close = source.indexOf(`"${hashes}`, index + raw.length);
+        emit("string", index, close < 0 ? length : close + 1 + hashes.length);
+        continue;
+      }
+    }
+    if (spec.stringPrefixes && boundary) {
+      const prefix = sticky(spec.stringPrefixes);
+      if (prefix) {
+        const quoteIndex = index + prefix.length;
+        const quote = source[quoteIndex];
+        const tripleQuote = spec.triple.find((value) => source.startsWith(value, quoteIndex));
+        if (tripleQuote) {
+          const close = source.indexOf(tripleQuote, quoteIndex + 3);
+          emit("string", index, close < 0 ? length : close + 3);
+        } else {
+          const verbatim = prefix.includes("@");
+          const close = closingQuoteIndex(source, quoteIndex + 1, quote, !verbatim, verbatim);
+          emit("string", index, close + 1);
+        }
+        continue;
+      }
+    }
+    if (character === "`" && spec.backtick) {
+      const close = closingQuoteIndex(source, index + 1, "`", true, true);
+      emit("string", index, close + 1);
+      continue;
+    }
+    if (spec.rust && character === "b" && source[index + 1] === "'" && boundary) {
+      const literal = sticky(/b'(?:\\.|[^\\'\n])'/y);
+      if (literal) { emit("string", index, index + literal.length); continue; }
+    }
+    if (spec.rust && character === "'") {
+      const literal = sticky(/'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]{1,6}\}|.)|[^\\'\n])'/y);
+      if (literal) { emit("string", index, index + literal.length); continue; }
+      const lifetime = sticky(/'[A-Za-z_]\w*/y);
+      if (lifetime) { emit("annotation", index, index + lifetime.length); continue; }
+    }
+    if (spec.quotes.includes(character)) {
+      const close = closingQuoteIndex(source, index + 1, character, true, spec.rust);
+      emit("string", index, close + 1);
+      if (spec.keyStrings && nextSignificantCharacter(source, index) === ":") {
+        tokens[tokens.length - 1].kind = "property";
+        lastKind = "property";
+      }
+      continue;
+    }
+    if (spec.dollarVariables && character === "$") {
+      const variable = sticky(/\$(?:\{[^}\n]*\}|\([^)\n]*\)|[A-Za-z_][\w]*|[0-9@#?$!*-])/y);
+      if (variable) { emit("variable", index, index + variable.length); continue; }
+    }
+    if (spec.ruby && (character === "@" || (character === ":" && source[index + 1] !== ":" && previous !== ":"))) {
+      const word = sticky(character === "@" ? /@@?[A-Za-z_]\w*/y : /:[A-Za-z_]\w*[?!]?/y);
+      if (word) { emit(character === "@" ? "variable" : "literal", index, index + word.length); continue; }
+    }
+    if (spec.annotation === "@" && character === "@") {
+      const annotation = sticky(spec.css ? /@[A-Za-z-]+/y : /@[A-Za-z_][\w.]*/y);
+      if (annotation) { emit(spec.css ? "keyword" : "annotation", index, index + annotation.length); continue; }
+    }
+    if (spec.css) {
+      if (character === "{") depth += 1;
+      else if (character === "}") depth = Math.max(0, depth - 1);
+      if (character === "#" && /[0-9a-fA-F]/.test(source[index + 1] || "")) {
+        const color = sticky(/#[0-9a-fA-F]{3,8}\b/y);
+        if (color) { emit("number", index, index + color.length); continue; }
+      }
+      if (character === "@") {
+        const rule = sticky(/@[A-Za-z-]+/y);
+        if (rule) { emit("keyword", index, index + rule.length); continue; }
+      }
+      if (character === "!" && source.startsWith("!important", index)) { emit("keyword", index, index + 10); continue; }
+    }
+    if (boundary && (/[0-9]/.test(character) || (character === "." && /[0-9]/.test(source[index + 1] || "")))) {
+      const number = sticky(CODE_NUMBER_PATTERN);
+      if (number) { emit("number", index, index + number.length); continue; }
+    }
+    if (boundary && (/[A-Za-z_$]/.test(character) || (spec.css && character === "-" && /[-A-Za-z_]/.test(source[index + 1] || "")))) {
+      const word = sticky(spec.identifier);
+      if (word) {
+        let kind = classifyCodeWord(word, spec, source, index + word.length);
+        if (spec.css) {
+          kind = depth > 0 && nextSignificantCharacter(source, index + word.length) === ":" ? "property" : "plain";
+        } else if (lastKind === "keyword" && kind === "identifier"
+          && /^(?:class|interface|enum|struct|trait|record|type|typealias|object|protocol|union|namespace|module|actor)$/.test(lastText)) {
+          kind = "type";
+        } else if (lastKind === "keyword" && ["identifier", "type"].includes(kind)
+          && /^(?:function|fn|def|func|fun)$/.test(lastText)) {
+          kind = "function";
+        }
+        emit(kind, index, index + word.length);
+        continue;
+      }
+    }
+    index += 1;
+  }
+  if (plain < length) tokens.push({ kind: "plain", text: source.slice(plain) });
+  return tokens;
+}
+
+/// Tokenizes XML and HTML, including embedded script and style blocks.
+function tokenizeMarkup(source, html) {
+  const tokens = [];
+  let index = 0;
+  let plain = 0;
+  const flush = (end) => { if (end > plain) tokens.push({ kind: "plain", text: source.slice(plain, end) }); };
+  const emit = (kind, start, end) => { flush(start); tokens.push({ kind, text: source.slice(start, end) }); plain = end; index = end; };
+  while (index < source.length) {
+    if (source.startsWith("<!--", index)) {
+      const close = source.indexOf("-->", index + 4);
+      emit("comment", index, close < 0 ? source.length : close + 3); continue;
+    }
+    if (source.startsWith("<![CDATA[", index)) {
+      const close = source.indexOf("]]>", index);
+      emit("string", index, close < 0 ? source.length : close + 3); continue;
+    }
+    if (source.startsWith("<?", index) || source.startsWith("<!", index)) {
+      const close = source.indexOf(">", index);
+      emit("annotation", index, close < 0 ? source.length : close + 1); continue;
+    }
+    if (source[index] === "&") {
+      const entity = /&(?:#\d+|#x[0-9a-fA-F]+|[A-Za-z]+);/y;
+      entity.lastIndex = index;
+      const match = entity.exec(source);
+      if (match) { emit("literal", index, index + match[0].length); continue; }
+    }
+    if (source[index] === "<" && /[A-Za-z/]/.test(source[index + 1] || "")) {
+      const name = /<\/?([A-Za-z][\w:.-]*)/y;
+      name.lastIndex = index;
+      const match = name.exec(source);
+      if (match) {
+        flush(index);
+        const opening = source[index + 1] !== "/";
+        const bracketLength = opening ? 1 : 2;
+        tokens.push({ kind: "plain", text: source.slice(index, index + bracketLength) });
+        tokens.push({ kind: "tag", text: match[1] });
+        index += match[0].length; plain = index;
+        while (index < source.length && source[index] !== ">") {
+          const character = source[index];
+          if (character === '"' || character === "'") {
+            const close = source.indexOf(character, index + 1);
+            emit("string", index, close < 0 ? source.length : close + 1); continue;
+          }
+          if (/[^\s=/>"']/.test(character)) {
+            const attribute = /[^\s=/>"']+/y;
+            attribute.lastIndex = index;
+            const found = attribute.exec(source);
+            emit("property", index, index + found[0].length); continue;
+          }
+          index += 1;
+        }
+        if (index < source.length) index += 1;
+        const tag = match[1].toLowerCase();
+        if (html && opening && (tag === "script" || tag === "style")) {
+          flush(index); plain = index;
+          const close = source.toLowerCase().indexOf(`</${tag}`, index);
+          const end = close < 0 ? source.length : close;
+          const embedded = tokenizeCode(source.slice(index, end), CODE_LANGUAGE_SPECS[tag === "script" ? "javascript" : "css"]);
+          tokens.push(...embedded);
+          index = end; plain = end;
+        }
+        continue;
+      }
+    }
+    index += 1;
+  }
+  flush(source.length);
+  return tokens;
+}
+
+/// Line-oriented formats: YAML, TOML, INI, Markdown, Dockerfile, Makefile.
+function tokenizeLines(source, mode) {
+  const tokens = [];
+  const lines = source.split("\n");
+  let fenced = false;
+  let tripleQuote = null;
+  const pushValue = (text) => {
+    const pattern = /("(?:\\.|[^"\\])*"?|'[^']*'?|\$\{[^}]*\}|\$\([^)]*\)|\$[A-Za-z_@<^?*][\w]*|\b\d[\d_.:\-TZ]*\b|\b(?:true|false|null|yes|no|on|off)\b|#.*$|[&*][A-Za-z_][\w-]*)/g;
+    let position = 0;
+    for (const match of text.matchAll(pattern)) {
+      const value = match[0];
+      if (value.startsWith("#") && match.index > 0 && !/\s/.test(text[match.index - 1])) continue;
+      if (match.index > position) tokens.push({ kind: "plain", text: text.slice(position, match.index) });
+      const kind = value.startsWith("#") ? "comment"
+        : value.startsWith('"') || value.startsWith("'") ? "string"
+          : value.startsWith("$") ? "variable"
+            : value.startsWith("&") || value.startsWith("*") ? "annotation"
+              : /^\d/.test(value) ? "number" : "literal";
+      tokens.push({ kind, text: value });
+      position = match.index + value.length;
+    }
+    if (position < text.length) tokens.push({ kind: "plain", text: text.slice(position) });
+  };
+  lines.forEach((line, index) => {
+    if (index > 0) tokens.push({ kind: "plain", text: "\n" });
+    if (mode === "text" || !line) { if (line) tokens.push({ kind: "plain", text: line }); return; }
+    if (mode === "markdown") {
+      if (/^\s*(?:```|~~~)/.test(line)) { fenced = !fenced; tokens.push({ kind: "keyword", text: line }); return; }
+      if (fenced) { tokens.push({ kind: "string", text: line }); return; }
+      if (/^#{1,6}\s/.test(line)) { tokens.push({ kind: "heading", text: line }); return; }
+      if (/^\s*>/.test(line)) { tokens.push({ kind: "comment", text: line }); return; }
+      const marker = /^(\s*)([-*+]|\d+[.)])(\s+)/.exec(line);
+      let rest = line;
+      if (marker) {
+        tokens.push({ kind: "plain", text: marker[1] }, { kind: "keyword", text: marker[2] }, { kind: "plain", text: marker[3] });
+        rest = line.slice(marker[0].length);
+      }
+      let position = 0;
+      for (const match of rest.matchAll(/`[^`]+`|\[[^\]]+\]\([^)]+\)/g)) {
+        if (match.index > position) tokens.push({ kind: "plain", text: rest.slice(position, match.index) });
+        tokens.push({ kind: match[0].startsWith("`") ? "string" : "property", text: match[0] });
+        position = match.index + match[0].length;
+      }
+      if (position < rest.length) tokens.push({ kind: "plain", text: rest.slice(position) });
+      return;
+    }
+    if (tripleQuote) {
+      const close = line.indexOf(tripleQuote);
+      if (close < 0) { tokens.push({ kind: "string", text: line }); return; }
+      tokens.push({ kind: "string", text: line.slice(0, close + 3) });
+      tripleQuote = null;
+      pushValue(line.slice(close + 3));
+      return;
+    }
+    if ((mode === "ini" ? /^\s*[#;]/ : /^\s*#/).test(line)) { tokens.push({ kind: "comment", text: line }); return; }
+    if (mode === "gitignore") { tokens.push({ kind: line.startsWith("!") ? "keyword" : "plain", text: line }); return; }
+    if (mode === "dockerfile") {
+      const instruction = /^(\s*)([A-Za-z]+)(\s|$)/.exec(line);
+      if (instruction) {
+        tokens.push({ kind: "plain", text: instruction[1] }, { kind: "keyword", text: instruction[2] });
+        pushValue(line.slice(instruction[1].length + instruction[2].length));
+        return;
+      }
+      pushValue(line); return;
+    }
+    if (mode === "makefile") {
+      const target = /^([A-Za-z0-9_.%/$(){}-][^:=#]*?)(\s*::?)(?!=)/.exec(line);
+      const variable = /^(\s*)([A-Za-z_][\w.]*)(\s*(?:[:?+!]?=))/.exec(line);
+      if (!line.startsWith("\t") && variable) {
+        tokens.push({ kind: "plain", text: variable[1] }, { kind: "property", text: variable[2] }, { kind: "plain", text: variable[3] });
+        pushValue(line.slice(variable[0].length)); return;
+      }
+      if (!line.startsWith("\t") && target) {
+        tokens.push({ kind: "function", text: target[1] }, { kind: "plain", text: target[2] });
+        pushValue(line.slice(target[0].length)); return;
+      }
+      pushValue(line); return;
+    }
+    if ((mode === "toml" || mode === "ini") && /^\s*\[/.test(line)) { tokens.push({ kind: "heading", text: line }); return; }
+    const key = mode === "yaml"
+      ? /^(\s*(?:-\s+)?)((?:"[^"]*"|'[^']*'|[^\s#'"{}[\],:][^#:]*?))(\s*:)(?=\s|$)/.exec(line)
+      : /^(\s*)((?:"[^"]*"|'[^']*'|[A-Za-z0-9_.-]+(?:\s*\.\s*[A-Za-z0-9_-]+)*))(\s*[=:])/.exec(line);
+    if (mode === "yaml" && /^(?:---|\.\.\.)\s*$/.test(line)) { tokens.push({ kind: "keyword", text: line }); return; }
+    if (key) {
+      tokens.push({ kind: "plain", text: key[1] }, { kind: "property", text: key[2] }, { kind: "plain", text: key[3] });
+      const rest = line.slice(key[0].length);
+      const opener = /("""|''')/.exec(rest);
+      if (mode === "toml" && opener && rest.indexOf(opener[1], opener.index + 3) < 0) {
+        pushValue(rest.slice(0, opener.index));
+        tokens.push({ kind: "string", text: rest.slice(opener.index) });
+        tripleQuote = opener[1];
+        return;
+      }
+      pushValue(rest);
+      return;
+    }
+    pushValue(line);
+  });
+  return tokens;
+}
+
+/// Splits whole-file tokens into rendered lines. Each line is an array of
+/// `{ kind, text }` segments whose texts concatenate to the source line.
+function splitTokenLines(tokens) {
+  const lines = [[]];
+  for (const token of tokens) {
+    const parts = token.text.split("\n");
+    parts.forEach((part, index) => {
+      if (index > 0) lines.push([]);
+      if (part) lines[lines.length - 1].push({ kind: token.kind, text: part });
+    });
+  }
+  return lines;
+}
+
+/// Tokenizes a whole source file into highlighted lines.
+function tokenizeSource(text, language = "text") {
+  const source = String(text ?? "");
+  const resolved = CODE_LANGUAGE_ALIASES.get(String(language || "").toLowerCase()) || String(language || "").toLowerCase();
+  if (CODE_MARKUP_MODES.has(resolved)) return splitTokenLines(tokenizeMarkup(source, resolved === "html"));
+  if (CODE_LINE_MODES.has(resolved)) return splitTokenLines(tokenizeLines(source, resolved));
+  const spec = CODE_LANGUAGE_SPECS[resolved] || CODE_LANGUAGE_SPECS.generic;
+  return splitTokenLines(tokenizeCode(source, spec));
+}
+
+/// Flat highlighted segments, used by Markdown code blocks. Newlines are
+/// kept as plain segments so the text round-trips exactly.
+function highlightCode(text, language = "generic") {
+  const segments = [];
+  tokenizeSource(text, language || "generic").forEach((line, index) => {
+    if (index > 0) segments.push({ kind: "plain", text: "\n" });
+    segments.push(...line);
+  });
   return segments;
+}
+
+// ---------------------------------------------------------------------------
+// Import extraction
+
+function codeImportEntry(lines, line, start, end, spec, symbol = null) {
+  if (!spec || spec.length > 512 || end <= start) return;
+  const entries = lines.get(line) || [];
+  entries.push({ start, end, spec, symbol });
+  lines.set(line, entries);
+}
+
+/// Finds import statements and the names they bind. `lines` maps a 1-based
+/// line to clickable `{ start, end, spec, symbol }` ranges; `names` maps an
+/// imported local name to the `{ spec, symbol }` that resolves it.
+function sourceImports(content, language) {
+  const names = new Map();
+  const lines = new Map();
+  const text = String(content || "");
+  const sourceLines = text.split("\n");
+  const bind = (name, spec, symbol) => {
+    if (codeSymbolValid(name) && !names.has(name)) {
+      names.set(name, { spec, symbol: codeSymbolValid(symbol) ? symbol : null });
+    }
+  };
+  const lang = CODE_LANGUAGE_ALIASES.get(language) || language;
+  let goImportGroup = false;
+  sourceLines.forEach((line, index) => {
+    const number = index + 1;
+    if (["java", "kotlin", "scala", "groovy"].includes(lang)) {
+      const match = /^(\s*import\s+(?:static\s+)?)([\w.]+(?:\.\*)?)(?:\s+as\s+(\w+))?/.exec(line);
+      if (match) {
+        const path = match[2];
+        const spec = line.trim().replace(/;\s*$/, "");
+        codeImportEntry(lines, number, match[1].length, match[1].length + path.length, spec);
+        const last = path.split(".").pop();
+        if (last !== "*") bind(match[3] || last, spec, last);
+      }
+    } else if (["typescript", "tsx", "javascript", "jsx"].includes(lang)) {
+      for (const match of line.matchAll(/\b(?:from|import|require\s*\(|import\s*\()\s*(['"])([^'"\n]+)\1/g)) {
+        const start = match.index + match[0].indexOf(match[1]) + 1;
+        codeImportEntry(lines, number, start, start + match[2].length, match[2]);
+      }
+    } else if (lang === "python") {
+      const from = /^(\s*from\s+)([.\w]+)(\s+import\s+)(.*)$/.exec(line);
+      if (from) {
+        codeImportEntry(lines, number, from[1].length, from[1].length + from[2].length, `from ${from[2]} import *`);
+        let clause = from[4];
+        if (clause.includes("(") && !clause.includes(")")) {
+          for (let next = index + 1; next < sourceLines.length && next < index + 200; next += 1) {
+            clause += ` ${sourceLines[next]}`;
+            if (sourceLines[next].includes(")")) break;
+          }
+        }
+        for (const part of clause.replace(/[()]/g, " ").split(",")) {
+          const [name, alias] = part.trim().split(/\s+as\s+/);
+          if (name && name !== "*") bind((alias || name).trim(), `from ${from[2]} import ${name.trim()}`, name.trim());
+        }
+      }
+      const plain = /^(\s*import\s+)([\w.]+)(?:\s+as\s+(\w+))?/.exec(line);
+      if (plain) {
+        codeImportEntry(lines, number, plain[1].length, plain[1].length + plain[2].length, `import ${plain[2]}`);
+        bind(plain[3] || plain[2].split(".")[0], `import ${plain[2]}`, null);
+      }
+    } else if (lang === "rust") {
+      const module = /^(\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+)([A-Za-z_]\w*)\s*;/.exec(line);
+      if (module) codeImportEntry(lines, number, module[1].length, module[1].length + module[2].length, `mod ${module[2]}`);
+      const use = /^(\s*(?:pub(?:\([^)]*\))?\s+)?use\s+)([^;]+)/.exec(line);
+      if (use) {
+        let tree = use[2];
+        if (tree.includes("{") && !tree.includes("}")) {
+          for (let next = index + 1; next < sourceLines.length && next < index + 200; next += 1) {
+            tree += ` ${sourceLines[next]}`;
+            if (sourceLines[next].includes("}")) break;
+          }
+        }
+        tree = tree.replace(/;.*$/, "").trim();
+        const brace = tree.indexOf("::{");
+        const prefix = brace < 0 ? tree : tree.slice(0, brace);
+        const rawPath = use[2].split(";")[0];
+        const braceAt = rawPath.indexOf("::{");
+        const visible = braceAt < 0 ? rawPath.trimEnd() : rawPath.slice(0, braceAt);
+        codeImportEntry(lines, number, use[1].length, use[1].length + visible.length, brace < 0 ? `use ${tree}` : `use ${prefix}`);
+        const members = brace < 0 ? [tree.split("::").pop()] : tree.slice(brace + 3).replace(/}.*$/, "").split(",");
+        for (const member of members) {
+          const [path, alias] = member.trim().split(/\s+as\s+/);
+          if (!path || path === "*" || path === "self") continue;
+          const full = brace < 0 ? tree.split(/\s+as\s+/)[0] : `${prefix}::${path.trim()}`;
+          const leaf = full.split("::").pop();
+          bind((alias || leaf).trim(), `use ${full}`, null);
+        }
+      }
+    } else if (lang === "go") {
+      if (/^\s*import\s*\(\s*$/.test(line)) { goImportGroup = true; return; }
+      if (goImportGroup && /^\s*\)/.test(line)) { goImportGroup = false; return; }
+      const single = /^(\s*import\s+)(?:([A-Za-z_.]\w*)\s+)?("([^"\n]+)")/.exec(line);
+      const grouped = /^(\s*)(?:([A-Za-z_.]\w*)\s+)?("([^"\n]+)")\s*$/.exec(line);
+      const match = single || (goImportGroup ? grouped : null);
+      if (match) {
+        const start = line.indexOf(match[3]) + 1;
+        codeImportEntry(lines, number, start, start + match[4].length, match[3]);
+        const leaf = match[4].split("/").filter((part) => !/^v\d+$/.test(part)).pop()?.replace(/[^A-Za-z0-9_]/g, "_");
+        const alias = match[2] && match[2] !== "." && match[2] !== "_" ? match[2] : leaf;
+        if (alias) bind(alias, match[3], null);
+      }
+    } else if (lang === "c" || lang === "cpp") {
+      const include = /^(\s*#\s*include\s*)(["<])([^">\n]+)[">]/.exec(line);
+      if (include) codeImportEntry(lines, number, include[1].length + 1, include[1].length + 1 + include[3].length, `#include ${include[2]}${include[3]}${include[2] === "<" ? ">" : "\""}`);
+    } else if (lang === "ruby") {
+      const require = /^(\s*require(?:_relative)?\s*\(?\s*)(['"])([^'"\n]+)\2/.exec(line);
+      if (require) codeImportEntry(lines, number, require[1].length + 1, require[1].length + 1 + require[3].length, `${line.trim().startsWith("require_relative") ? "require_relative" : "require"} '${require[3]}'`);
+    } else if (lang === "php") {
+      const use = /^(\s*use\s+)([\w\\]+)(?:\s+as\s+(\w+))?\s*;/.exec(line);
+      if (use) {
+        codeImportEntry(lines, number, use[1].length, use[1].length + use[2].length, `use ${use[2]}`);
+        const leaf = use[2].split("\\").pop();
+        bind(use[3] || leaf, `use ${use[2]}`, leaf);
+      }
+    } else if (lang === "css" || lang === "scss") {
+      const imported = /^(\s*@(?:import|use|forward)\s+(?:url\()?)(['"])([^'"\n]+)\2/.exec(line);
+      if (imported) codeImportEntry(lines, number, imported[1].length + 1, imported[1].length + 1 + imported[3].length, imported[3]);
+    } else if (lang === "protobuf") {
+      const imported = /^(\s*import\s+(?:public\s+|weak\s+)?)(")([^"\n]+)"/.exec(line);
+      if (imported) codeImportEntry(lines, number, imported[1].length + 1, imported[1].length + 1 + imported[3].length, imported[3]);
+    }
+  });
+  if (["typescript", "tsx", "javascript", "jsx"].includes(lang)) {
+    const clauses = /\b(?:import|export)\s+(?:type\s+)?([\w$*{},\s]+?)\s+from\s+(['"])([^'"\n]+)\2/g;
+    for (const match of text.matchAll(clauses)) {
+      const clause = match[1];
+      const spec = match[3];
+      const namespace = /\*\s+as\s+([\w$]+)/.exec(clause);
+      if (namespace) bind(namespace[1], spec, null);
+      const braces = /\{([^}]*)\}/.exec(clause);
+      if (braces) {
+        for (const part of braces[1].split(",")) {
+          const [name, alias] = part.trim().replace(/^type\s+/, "").split(/\s+as\s+/);
+          if (name) bind((alias || name).trim(), spec, name.trim());
+        }
+      }
+      const defaultName = /^\s*([\w$]+)\s*(?:,|$)/.exec(clause.replace(/\{[^}]*\}/, "").replace(/\*\s+as\s+[\w$]+/, ""));
+      if (defaultName && defaultName[1] !== "type") bind(defaultName[1], spec, defaultName[1]);
+    }
+    for (const match of text.matchAll(/\b(?:const|let|var)\s+(\{[^}]*\}|[\w$]+)\s*=\s*require\s*\(\s*(['"])([^'"\n]+)\2\s*\)/g)) {
+      if (match[1].startsWith("{")) {
+        for (const part of match[1].slice(1, -1).split(",")) {
+          const [name, alias] = part.trim().split(/\s*:\s*/);
+          if (name) bind((alias || name).trim(), match[3], name.trim());
+        }
+      } else bind(match[1], match[3], null);
+    }
+  }
+  return { names, lines };
+}
+
+// ---------------------------------------------------------------------------
+// Same-file definitions
+
+const CODE_DECLARATION_KEYWORDS = codeWords("class interface enum struct trait fn func function def fun type typealias const let var val record object mod module namespace protocol macro_rules message service rpc input scalar union actor");
+
+/// Lines in an already tokenized file that declare `symbol`, found from the
+/// tokens around each occurrence. Local variables count here; the owner-side
+/// search deliberately ignores them.
+function localDefinitionLines(tokenLines, language, symbol) {
+  if (!codeSymbolValid(symbol) || !Array.isArray(tokenLines)) return [];
+  const typed = ["java", "groovy", "c", "cpp", "csharp"].includes(language);
+  const found = [];
+  tokenLines.forEach((segments, index) => {
+    const significant = [];
+    let column = 0;
+    for (const segment of segments) {
+      if (segment.kind !== "plain" || segment.text.trim()) {
+        significant.push({ ...segment, column, trimmed: segment.text.trim() });
+      }
+      column += segment.text.length;
+    }
+    const lineText = segments.map((segment) => segment.text).join("");
+    significant.forEach((token, position) => {
+      if (token.text !== symbol || token.kind === "comment" || token.kind === "string") return;
+      const previous = significant[position - 1];
+      const next = significant[position + 1];
+      const before = lineText.slice(0, token.column).trimEnd();
+      const after = lineText.slice(token.column + symbol.length).trimStart();
+      if (previous && previous.kind === "keyword" && CODE_DECLARATION_KEYWORDS.has(previous.trimmed)) {
+        found.push({ line: index + 1, column: token.column + 1 });
+        return;
+      }
+      if (language === "rust" && /macro_rules!\s*$/.test(before)) { found.push({ line: index + 1, column: token.column + 1 }); return; }
+      if (language === "python" && /^\s*$/.test(before) && /^=(?!=)/.test(after)) { found.push({ line: index + 1, column: token.column + 1 }); return; }
+      if (language === "go" && (/^func\s*\([^)]*\)\s*$/.test(before.trim()) || (/^\s*$/.test(before) && /^:=/.test(after)))) { found.push({ line: index + 1, column: token.column + 1 }); return; }
+      if (typed && previous && ["type", "identifier", "keyword"].includes(previous.kind)
+        && !/[.=(,]$/.test(before) && (previous.kind !== "keyword" || /^(?:int|long|short|char|byte|double|float|boolean|bool|void|var|auto|unsigned|signed|string|object|decimal|uint|ulong|ushort|sbyte)$/.test(previous.trimmed))
+        && /^(?:[;=,({]|$)/.test(after) && !/^==/.test(after)) {
+        found.push({ line: index + 1, column: token.column + 1 });
+        return;
+      }
+      if (["typescript", "tsx", "javascript", "jsx", "java", "kotlin", "csharp", "php"].includes(language)
+        && /^\s*(?:(?:public|private|protected|static|async|get|set|readonly|abstract|override|export|default)\s+)*$/.test(before)
+        && /^\([^)]*\)\s*(?::[^={;]+)?\{/.test(after)) {
+        found.push({ line: index + 1, column: token.column + 1 });
+        return;
+      }
+      if (["typescript", "tsx", "javascript", "jsx"].includes(language) && next?.trimmed === "=>" && /^\s*$/.test(before)) {
+        found.push({ line: index + 1, column: token.column + 1 });
+      }
+    });
+  });
+  return found;
+}
+
+/// Chooses the declaration a reader most likely means: the nearest one above
+/// the clicked line (locals shadow outer names), otherwise the first.
+function chooseLocalDefinition(definitions, line) {
+  if (!Array.isArray(definitions) || !definitions.length) return null;
+  const above = definitions.filter((definition) => definition.line <= line);
+  return above.length ? above[above.length - 1] : definitions[0];
+}
+
+/// The qualifier before a clicked identifier: `ns` in `ns.name` or
+/// `module::name`.
+function symbolQualifier(lineText, column) {
+  const before = String(lineText || "").slice(0, Math.max(0, column - 1));
+  const match = /([A-Za-z_$][\w$]*)\s*(?:\.|::|->)\s*$/.exec(before);
+  return match ? match[1] : null;
+}
+
+// ---------------------------------------------------------------------------
+// Owner requests
+
+function paneCodePath(paneId, operation, params = {}) {
+  if (!paneId || !CODE_NAV_OPERATIONS.has(operation)) return null;
+  const query = new URLSearchParams();
+  for (const key of ["symbol", "path", "spec"]) {
+    const value = params[key];
+    if (value === undefined || value === null || value === "") continue;
+    if (key === "symbol" && !codeSymbolValid(value)) return null;
+    if (key === "path" && !projectRelativePath(value)) return null;
+    if (key === "spec" && (String(value).length > 512 || /[\u0000-\u001f\u007f]/.test(String(value)))) return null;
+    query.set(key, String(value));
+  }
+  if (operation !== "resolve" && !query.has("symbol")) return null;
+  if (operation === "resolve" && (!query.has("path") || !query.has("spec"))) return null;
+  return `/api/v1/panes/${encodeURIComponent(String(paneId))}/code/${operation}?${query}`;
+}
+
+/// Normalizes an owner response: only project-relative paths, positive
+/// positions, bounded kinds and previews.
+function codeNavResults(data) {
+  const results = (Array.isArray(data?.results) ? data.results : []).slice(0, MAX_CODE_NAV_RESULTS)
+    .map((result) => {
+      const path = projectRelativePath(result?.path);
+      const line = Number(result?.line);
+      const column = Number(result?.column);
+      if (!path || !Number.isInteger(line) || line < 1) return null;
+      return {
+        path,
+        line,
+        column: Number.isInteger(column) && column >= 1 ? column : 1,
+        kind: typeof result?.kind === "string" ? result.kind.replace(/[^a-z_-]/g, "").slice(0, 24) || "match" : "match",
+        preview: typeof result?.preview === "string" ? result.preview.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 240) : "",
+      };
+    })
+    .filter(Boolean);
+  return { results, truncated: Boolean(data?.truncated) };
+}
+
+/// Back/forward stacks for the file viewer.
+function pushCodeHistory(history, entry) {
+  const back = [...(history?.back || []), entry].slice(-MAX_CODE_NAV_HISTORY);
+  return { back, forward: [] };
+}
+
+function stepCodeHistory(history, direction, current) {
+  const back = [...(history?.back || [])];
+  const forward = [...(history?.forward || [])];
+  const from = direction === "back" ? back : forward;
+  const to = direction === "back" ? forward : back;
+  const target = from.pop();
+  if (!target) return { history: { back, forward }, target: null };
+  if (current) to.push(current);
+  return { history: { back: back.slice(-MAX_CODE_NAV_HISTORY), forward: forward.slice(-MAX_CODE_NAV_HISTORY) }, target };
 }
 
 function projectRelativePath(value) {
@@ -1870,7 +2849,7 @@ function markdownFragment(markdown) {
       const pre = document.createElement("pre");
       const code = document.createElement("code");
       code.className = `language-${String(block.language || "text").replace(/[^a-z0-9_+-]/gi, "")}`;
-      for (const segment of highlightCode(block.text)) {
+      for (const segment of highlightCode(block.text, block.language || "generic")) {
         const span = document.createElement("span");
         span.className = segment.kind === "plain" ? "" : `syntax-${segment.kind}`;
         span.textContent = segment.text;
@@ -3019,6 +3998,18 @@ if (typeof module !== "undefined" && module.exports) {
     launchMachines,
     imageFilesFromTransfer,
     highlightCode,
+    tokenizeSource,
+    codeLanguage,
+    codeLanguageNavigable,
+    codeSymbolValid,
+    sourceImports,
+    localDefinitionLines,
+    chooseLocalDefinition,
+    symbolQualifier,
+    paneCodePath,
+    codeNavResults,
+    pushCodeHistory,
+    stepCodeHistory,
     inlineTokens,
     machineStatusLabel,
     isLaunchCapableMachine,
@@ -3309,6 +4300,8 @@ function initialize() {
     projectView: null,
     filesRequest: 0,
     fileSaveRequest: 0,
+    codeNavRequest: 0,
+    codeNavController: null,
     gitRequest: 0,
     filesController: null,
     fileSaveController: null,
@@ -3574,6 +4567,9 @@ function initialize() {
   }
 
   function resetProjectView() {
+    state.codeNavController?.abort();
+    state.codeNavController = null;
+    state.codeNavRequest += 1;
     state.filesController?.abort();
     state.fileSaveController?.abort();
     state.gitController?.abort();
@@ -4089,6 +5085,8 @@ function initialize() {
         editing: false, editDraft: "", saving: false, reloading: false, saveError: null,
         conflict: false, selection: null,
         listScrolls: new Map(), viewerScrolls: new Map(),
+        history: { back: [], forward: [] }, symbol: null, symbolPanel: null,
+        symbolCount: 0, navModel: null, pendingReveal: null,
       },
       git: {
         summary: null, diff: null, loading: false, diffLoading: false, error: null,
@@ -4203,15 +5201,18 @@ function initialize() {
     return controls;
   }
 
-  function appendSource(parent, content, language, diff = false, onSelectLine = null, selection = null) {
+  function appendSource(parent, content, language, diff = false, onSelectLine = null, selection = null, navigation = null) {
     const source = String(content || "").slice(0, MAX_PROJECT_SOURCE_CHARS);
     const code = document.createElement("pre");
     code.className = "code-source";
     const lines = source.split("\n").slice(0, MAX_PROJECT_SOURCE_LINES);
+    const tokenLines = diff ? null : (navigation?.tokenLines || tokenizeSource(lines.join("\n"), language));
+    const interactive = Boolean(navigation?.interactive);
     for (let index = 0; index < lines.length; index += 1) {
       const row = document.createElement("span");
       const diffKind = diff ? diffLineKind(lines[index]) : null;
       row.className = `code-line${diffKind && diffKind !== "context" ? ` diff-line-${diffKind}` : ""}`;
+      row.dataset.line = String(index + 1);
       const number = document.createElement(onSelectLine ? "button" : "span");
       number.className = "code-line-number";
       number.textContent = String(index + 1);
@@ -4232,10 +5233,28 @@ function initialize() {
       if (diff) {
         lineContent.append(document.createTextNode(lines[index]));
       } else {
-        for (const segment of highlightCode(lines[index], language)) {
+        const importRanges = interactive ? navigation.imports?.lines.get(index + 1) || [] : [];
+        let column = 0;
+        for (const segment of tokenLines[index] || []) {
           const token = document.createElement("span");
           if (segment.kind !== "plain") token.className = `syntax-${segment.kind}`;
           token.textContent = segment.text;
+          if (interactive) {
+            const end = column + segment.text.length;
+            const range = importRanges.find((candidate) => column < candidate.end && end > candidate.start);
+            if (range && segment.text.trim()) {
+              token.classList.add("code-import");
+              token.dataset.importSpec = range.spec;
+              if (range.symbol) token.dataset.importSymbol = range.symbol;
+              token.title = "Open imported file";
+            } else if (["identifier", "function", "type", "constant"].includes(segment.kind)
+              && codeSymbolValid(segment.text)) {
+              token.classList.add("code-symbol");
+              token.dataset.symbol = segment.text;
+              token.dataset.column = String(column + 1);
+            }
+          }
+          column += segment.text.length;
           lineContent.append(token);
         }
       }
@@ -4243,6 +5262,394 @@ function initialize() {
       code.append(row);
     }
     parent.append(code);
+    return code;
+  }
+
+  /// Tokens, imports, and language for the open file, computed once per
+  /// file revision so selection and panel updates never re-tokenize.
+  function fileNavigationModel(files) {
+    const file = files?.file;
+    if (!file || typeof file.content !== "string") return null;
+    const language = codeLanguage(file.path, file.language, file.content);
+    const cached = files.navModel;
+    if (cached && cached.content === file.content && cached.language === language && cached.path === file.path) return cached;
+    const source = file.content.slice(0, MAX_PROJECT_SOURCE_CHARS).split("\n").slice(0, MAX_PROJECT_SOURCE_LINES).join("\n");
+    const tokenLines = tokenizeSource(source, language);
+    const interactive = codeLanguageNavigable(language);
+    const model = {
+      path: file.path,
+      content: file.content,
+      language,
+      tokenLines,
+      interactive,
+      imports: interactive ? sourceImports(source, language) : { names: new Map(), lines: new Map() },
+    };
+    files.navModel = model;
+    return model;
+  }
+
+  function codeLineText(model, line) {
+    return (model?.tokenLines?.[line - 1] || []).map((segment) => segment.text).join("");
+  }
+
+  function highlightSymbolOccurrences(symbol) {
+    const viewer = $("file-viewer");
+    for (const node of viewer.querySelectorAll(".code-symbol.symbol-match, .code-symbol.symbol-origin")) {
+      node.classList.remove("symbol-match", "symbol-origin");
+    }
+    if (!symbol) return 0;
+    const escaped = typeof CSS !== "undefined" && CSS.escape ? CSS.escape(symbol.name) : symbol.name.replace(/["\\]/g, "\\$&");
+    const matches = viewer.querySelectorAll(`.code-symbol[data-symbol="${escaped}"]`);
+    for (const node of matches) {
+      node.classList.add("symbol-match");
+      const row = node.closest(".code-line");
+      if (Number(row?.dataset.line) === symbol.line && Number(node.dataset.column) === symbol.column) {
+        node.classList.add("symbol-origin");
+      }
+    }
+    return matches.length;
+  }
+
+  function selectCodeSymbol(view, symbol) {
+    const files = view?.files;
+    const model = fileNavigationModel(files);
+    if (!files?.file || !model || !codeSymbolValid(symbol?.name)) return;
+    files.symbol = {
+      name: symbol.name,
+      line: symbol.line,
+      column: symbol.column,
+      qualifier: symbolQualifier(codeLineText(model, symbol.line), symbol.column),
+    };
+    files.symbolPanel = { status: "", results: null, truncated: false, operation: null };
+    files.symbolCount = highlightSymbolOccurrences(files.symbol);
+    renderSymbolPanel(view);
+  }
+
+  function clearCodeSymbol(view) {
+    const files = view?.files;
+    if (!files) return;
+    files.symbol = null;
+    files.symbolPanel = null;
+    state.codeNavController?.abort();
+    state.codeNavController = null;
+    state.codeNavRequest += 1;
+    highlightSymbolOccurrences(null);
+    $("file-viewer").querySelector(".code-symbol-panel")?.remove();
+  }
+
+  function renderSymbolPanel(view) {
+    const viewer = $("file-viewer");
+    const files = view?.files;
+    const existing = viewer.querySelector(".code-symbol-panel");
+    if (!files?.symbol || !files.file || files.editing) { existing?.remove(); return; }
+    const panel = document.createElement("div");
+    panel.className = "code-symbol-panel";
+    panel.setAttribute("role", "region");
+    panel.setAttribute("aria-label", `Navigation for ${files.symbol.name}`);
+    const head = document.createElement("div");
+    head.className = "code-symbol-head";
+    const name = document.createElement("code");
+    name.className = "code-symbol-name";
+    const named = codeSymbolValid(files.symbol.name);
+    name.textContent = !named ? String(files.symbol.importSpec || "import")
+      : files.symbol.qualifier ? `${files.symbol.qualifier}.${files.symbol.name}` : files.symbol.name;
+    const count = document.createElement("span");
+    count.className = "code-symbol-count";
+    count.textContent = named ? `${files.symbolCount || 0} in this file` : "import";
+    const definition = document.createElement("button");
+    definition.type = "button"; definition.className = "subtle code-go-definition";
+    definition.textContent = "Go to definition";
+    definition.title = "Go to definition (F12, or Ctrl/⌘-click a name)";
+    definition.addEventListener("click", () => { void goToDefinition(view); });
+    const references = document.createElement("button");
+    references.type = "button"; references.className = "subtle code-find-references";
+    references.textContent = "Find references";
+    references.title = "Find references (Shift+F12)";
+    references.addEventListener("click", () => { void findReferences(view); });
+    const close = document.createElement("button");
+    close.type = "button"; close.className = "icon-button code-symbol-close";
+    close.textContent = "×"; close.setAttribute("aria-label", "Close symbol navigation");
+    close.addEventListener("click", () => clearCodeSymbol(view));
+    head.append(name, count);
+    if (named) head.append(definition, references);
+    head.append(close);
+    panel.append(head);
+    const panelState = files.symbolPanel || {};
+    if (panelState.status) {
+      const status = document.createElement("p");
+      status.className = `code-symbol-status${panelState.error ? " error" : ""}`;
+      status.setAttribute("role", "status");
+      status.textContent = panelState.status;
+      panel.append(status);
+    }
+    if (Array.isArray(panelState.results) && panelState.results.length) {
+      const list = document.createElement("ul");
+      list.className = "code-symbol-results";
+      for (const result of panelState.results) {
+        const item = document.createElement("li");
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "code-symbol-result";
+        const location = document.createElement("span");
+        location.className = "code-symbol-location";
+        location.textContent = `${result.path}:${result.line}`;
+        const kind = document.createElement("span");
+        kind.className = "code-symbol-kind";
+        kind.textContent = result.kind;
+        const preview = document.createElement("span");
+        preview.className = "code-symbol-preview";
+        preview.textContent = result.preview;
+        button.title = `${result.path}:${result.line}`;
+        button.append(location, kind, preview);
+        button.addEventListener("click", () => navigateToCodeLocation(view, result));
+        item.append(button);
+        list.append(item);
+      }
+      panel.append(list);
+    }
+    if (existing) existing.replaceWith(panel); else viewer.append(panel);
+  }
+
+  function setSymbolPanel(view, change) {
+    const files = view?.files;
+    if (!files?.symbol) return;
+    files.symbolPanel = { ...(files.symbolPanel || {}), ...change };
+    if (state.projectView === view && state.viewMode === "files") renderSymbolPanel(view);
+  }
+
+  async function codeNavRequest(view, operation, params) {
+    const paneId = state.selected;
+    const endpoint = paneCodePath(paneId, operation, params);
+    if (!view || !endpoint) return null;
+    const machine = machineOf(state.sessions.get(paneId));
+    if (!isMachineControllable(machine)) {
+      setSymbolPanel(view, { status: "The selected machine is offline.", error: true, results: null });
+      return null;
+    }
+    state.codeNavController?.abort();
+    const controller = new AbortController();
+    state.codeNavController = controller;
+    const generation = ++state.codeNavRequest;
+    setSymbolPanel(view, { status: "Searching the project…", error: false, results: null });
+    try {
+      const data = await request(endpoint, { signal: controller.signal });
+      if (generation !== state.codeNavRequest || state.selected !== paneId || state.projectView !== view) return null;
+      return codeNavResults(data);
+    } catch (error) {
+      if (error?.name === "AbortError") return null;
+      if (generation === state.codeNavRequest && state.projectView === view) {
+        setSymbolPanel(view, { status: projectErrorMessage(error, "Source navigation"), error: true, results: null });
+      }
+      return null;
+    } finally {
+      if (state.codeNavController === controller) state.codeNavController = null;
+    }
+  }
+
+  /// Opens one result, or lists several so the reader can choose.
+  function presentCodeResults(view, found, operation, emptyMessage) {
+    if (!found) return false;
+    const current = view.files.symbol;
+    const results = found.results.filter((result) => operation !== "definitions" || !current
+      || !(result.path === view.files.file?.path && result.line === current.line && result.column === current.column));
+    if (!results.length) {
+      setSymbolPanel(view, { status: emptyMessage, error: false, results: null, operation });
+      return false;
+    }
+    if (results.length === 1 && operation !== "references") {
+      setSymbolPanel(view, { status: "", results: null, operation });
+      navigateToCodeLocation(view, results[0]);
+      return true;
+    }
+    const label = operation === "references"
+      ? `${results.length}${found.truncated ? "+" : ""} reference${results.length === 1 ? "" : "s"}`
+      : `${results.length}${found.truncated ? "+" : ""} candidate definitions`;
+    setSymbolPanel(view, {
+      status: found.truncated ? `${label}. The search stopped at its safety limit.` : label,
+      error: false, results, truncated: found.truncated, operation,
+    });
+    return true;
+  }
+
+  async function resolveImport(view, spec, symbol = null, options = {}) {
+    const files = view?.files;
+    if (!files?.file || !spec) return false;
+    if (!files.symbol && !options.quiet) {
+      // An import click has no selected name; its panel reports progress.
+      files.symbol = { name: null, importSpec: spec, line: 0, column: 0, qualifier: null };
+      files.symbolCount = 0;
+      files.symbolPanel = { status: "", results: null };
+    }
+    const found = await codeNavRequest(view, "resolve", {
+      path: files.file.path,
+      spec,
+      symbol: codeSymbolValid(symbol) ? symbol : null,
+    });
+    if (!found) return false;
+    if (options.quiet && !found.results.length) return false;
+    return presentCodeResults(view, found, "resolve", `Could not resolve ${spec} inside this project.`);
+  }
+
+  async function goToDefinition(view) {
+    const files = view?.files;
+    const symbol = files?.symbol;
+    const model = fileNavigationModel(files);
+    if (!symbol || !model || !codeSymbolValid(symbol.name)) return;
+    const imports = model.imports;
+    const importedQualifier = symbol.qualifier && imports.names.get(symbol.qualifier);
+    if (importedQualifier && await resolveImport(view, importedQualifier.spec, symbol.name, { quiet: true })) return;
+    const imported = !symbol.qualifier && imports.names.get(symbol.name);
+    if (imported && await resolveImport(view, imported.spec, imported.symbol || symbol.name, { quiet: true })) return;
+    const locals = localDefinitionLines(model.tokenLines, model.language, symbol.name);
+    const selfDeclared = locals.some((definition) => definition.line === symbol.line && definition.column === symbol.column);
+    const localQualifier = !symbol.qualifier || ["this", "self", "Self", "super", "cls"].includes(symbol.qualifier);
+    if (!selfDeclared && localQualifier) {
+      const local = chooseLocalDefinition(locals, symbol.line);
+      if (local) {
+        navigateToCodeLocation(view, { path: files.file.path, line: local.line, column: local.column });
+        return;
+      }
+    }
+    if (selfDeclared) {
+      // Already on the declaration: an editor shows its usages instead.
+      await findReferences(view);
+      return;
+    }
+    const found = await codeNavRequest(view, "definitions", { symbol: symbol.name, path: files.file.path });
+    presentCodeResults(view, found, "definitions", `No definition of ${symbol.name} found in this project.`);
+  }
+
+  async function findReferences(view) {
+    const files = view?.files;
+    const symbol = files?.symbol;
+    if (!symbol || !files.file || !codeSymbolValid(symbol.name)) return;
+    const found = await codeNavRequest(view, "references", { symbol: symbol.name, path: files.file.path });
+    presentCodeResults(view, found, "references", `No references to ${symbol.name} found.`);
+  }
+
+  function codeViewerPosition(files) {
+    const viewer = $("file-viewer");
+    return files?.file ? { path: files.file.path, top: viewer.scrollTop, left: viewer.scrollLeft } : null;
+  }
+
+  function navigateToCodeLocation(view, location) {
+    const files = view?.files;
+    if (!files?.file || !location?.path) return;
+    if (!confirmDiscardFileEdit(files)) return;
+    const current = codeViewerPosition(files);
+    if (current) files.history = pushCodeHistory(files.history, current);
+    if (location.path === files.file.path) {
+      updateCodeHistoryButtons(files);
+      revealCodeLine(view, location.line, location.column);
+      return;
+    }
+    void loadProjectFile(location.path, { reveal: { line: location.line, column: location.column } });
+  }
+
+  function stepCodeNavigation(view, direction) {
+    const files = view?.files;
+    if (!files || !confirmDiscardFileEdit(files)) return;
+    const { history, target } = stepCodeHistory(files.history, direction, codeViewerPosition(files));
+    if (!target) return;
+    files.history = history;
+    if (target.path === files.file?.path) {
+      const viewer = $("file-viewer");
+      viewer.scrollTop = target.top || 0;
+      viewer.scrollLeft = target.left || 0;
+      updateCodeHistoryButtons(files);
+      return;
+    }
+    void loadProjectFile(target.path, { scroll: { top: target.top || 0, left: target.left || 0 } });
+  }
+
+  function updateCodeHistoryButtons(files) {
+    const viewer = $("file-viewer");
+    const back = viewer.querySelector(".code-history-back");
+    const forward = viewer.querySelector(".code-history-forward");
+    if (back) back.disabled = !files?.history?.back?.length;
+    if (forward) forward.disabled = !files?.history?.forward?.length;
+  }
+
+  function codeHistoryControls(view) {
+    const files = view.files;
+    const group = document.createElement("div");
+    group.className = "code-history-controls";
+    group.setAttribute("role", "group");
+    group.setAttribute("aria-label", "File navigation history");
+    for (const [direction, label, text] of [["back", "Back (Alt+←)", "←"], ["forward", "Forward (Alt+→)", "→"]]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `subtle code-history-${direction}`;
+      button.textContent = text;
+      button.title = label;
+      button.setAttribute("aria-label", label);
+      button.disabled = !files.history?.[direction]?.length;
+      button.addEventListener("click", () => stepCodeNavigation(view, direction));
+      group.append(button);
+    }
+    return group;
+  }
+
+  /// Scrolls a line into the reader's upper third, flashes it, and selects
+  /// the name at the target column so its occurrences light up.
+  function revealCodeLine(view, line, column = null) {
+    const viewer = $("file-viewer");
+    const row = viewer.querySelector(`.code-line[data-line="${Number(line) || 1}"]`);
+    if (!row) return;
+    const delta = row.getBoundingClientRect().top - viewer.getBoundingClientRect().top;
+    viewer.scrollTop = Math.max(0, viewer.scrollTop + delta - viewer.clientHeight / 3);
+    const target = column ? row.querySelector(`.code-symbol[data-column="${Number(column)}"]`) : null;
+    if (target && !state.fileReaderPreferences.wrap) {
+      const offset = target.getBoundingClientRect().left - viewer.getBoundingClientRect().left;
+      if (offset < 0 || offset > viewer.clientWidth - 40) viewer.scrollLeft = Math.max(0, viewer.scrollLeft + offset - 80);
+    }
+    row.classList.remove("code-line-flash");
+    void row.offsetWidth;
+    row.classList.add("code-line-flash");
+    setTimeout(() => row.classList.remove("code-line-flash"), 1800);
+    if (target) selectCodeSymbol(view, { name: target.dataset.symbol, line: Number(line), column: Number(column) });
+  }
+
+  function handleSourceClick(view, event) {
+    const files = view?.files;
+    if (!files?.file || files.editing) return;
+    const element = event.target instanceof Element ? event.target : null;
+    const target = element?.closest("[data-symbol], [data-import-spec]");
+    if (!target) return;
+    if (String(window.getSelection?.() || "").trim()) return;
+    const row = target.closest(".code-line");
+    const line = Number(row?.dataset.line) || 1;
+    if (target.dataset.importSpec) {
+      event.preventDefault();
+      clearCodeSymbol(view);
+      void resolveImport(view, target.dataset.importSpec, target.dataset.importSymbol || null);
+      return;
+    }
+    selectCodeSymbol(view, { name: target.dataset.symbol, line, column: Number(target.dataset.column) || 1 });
+    if (event.metaKey || event.ctrlKey) {
+      event.preventDefault();
+      void goToDefinition(view);
+    }
+  }
+
+  function handleFileViewerKeydown(event) {
+    const view = state.projectView;
+    if (!view || state.viewMode !== "files" || !view.files.file || view.files.editing) return;
+    if (event.target instanceof Element && event.target.closest("textarea, input, select")) return;
+    if (event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+      event.preventDefault();
+      stepCodeNavigation(view, event.key === "ArrowLeft" ? "back" : "forward");
+    } else if (event.key === "F12" && view.files.symbol) {
+      event.preventDefault();
+      if (event.shiftKey) void findReferences(view); else void goToDefinition(view);
+    } else if (event.key === "Escape" && view.files.symbol) {
+      event.preventDefault();
+      clearCodeSymbol(view);
+    }
+  }
+
+  function setNavigationModifier(active) {
+    $("file-viewer").classList.toggle("nav-modifier", Boolean(active));
   }
 
   function updateFileSelection(view, line, extend) {
@@ -4413,7 +5820,11 @@ function initialize() {
           if (entry.kind === "directory") {
             const crumbs = [...files.breadcrumbs, { name: entry.name, path: entry.path }];
             void loadFilesDirectory(entry.path, crumbs);
-          } else void loadProjectFile(entry.path);
+          } else {
+            const current = codeViewerPosition(files);
+            if (current && current.path !== entry.path) files.history = pushCodeHistory(files.history, current);
+            void loadProjectFile(entry.path);
+          }
         });
         return button;
       }) : [projectStateNode(files.error || "This directory is empty.", Boolean(files.error))]));
@@ -4446,6 +5857,7 @@ function initialize() {
       const meta = document.createElement("span");
       meta.textContent = [files.file.language, formatBytes(files.file.size), files.file.truncated ? "truncated" : ""].filter(Boolean).join(" · ");
       const actions = document.createElement("div"); actions.className = "file-viewer-actions";
+      if (typeof files.file.content === "string" && !files.editing) actions.append(codeHistoryControls(view));
       if (typeof files.file.content === "string") actions.append(fileReaderControls());
       if (typeof files.file.content === "string" && !files.editing) {
         const reference = document.createElement("button");
@@ -4493,6 +5905,7 @@ function initialize() {
           edit.addEventListener("click", () => {
             files.editing = true; files.editDraft = files.file.content;
             files.saveError = null; files.conflict = false; files.selection = null;
+            files.symbol = null; files.symbolPanel = null;
             renderFiles();
             $("file-viewer").querySelector(".file-editor")?.focus({ preventScroll: true });
           });
@@ -4519,18 +5932,37 @@ function initialize() {
         viewer.append(status, editor);
         updateFileEditControls(files);
       } else {
-        appendSource(
+        const model = fileNavigationModel(files);
+        const code = appendSource(
           viewer,
           files.file.content,
-          files.file.language,
+          model?.language || files.file.language,
           false,
           (line, extend) => updateFileSelection(view, line, extend),
           files.selection,
+          model,
         );
+        code.addEventListener("click", (event) => handleSourceClick(view, event));
+        viewer.classList.toggle("code-navigable", Boolean(model?.interactive));
         if (files.file.truncated) viewer.append(projectStateNode("Preview truncated at the safe display limit."));
+        if (files.symbol) {
+          files.symbolCount = highlightSymbolOccurrences(files.symbol);
+          renderSymbolPanel(view);
+        }
       }
     }
     restoreProjectScroll("files", view.paneId, files.file?.path || "");
+    const reveal = files.pendingReveal;
+    files.pendingReveal = null;
+    if (reveal && reveal.path === files.file?.path && !files.editing) {
+      // Runs after restoreProjectScroll's frame callback, so the target
+      // line wins over a remembered position.
+      requestAnimationFrame(() => {
+        if (state.projectView === view && state.viewMode === "files" && files.file?.path === reveal.path) {
+          revealCodeLine(view, reveal.line, reveal.column);
+        }
+      });
+    }
   }
 
   async function loadFilesDirectory(path = "", breadcrumbs = null) {
@@ -4584,7 +6016,7 @@ function initialize() {
     }
   }
 
-  async function loadProjectFile(path) {
+  async function loadProjectFile(path, options = {}) {
     const view = selectedProjectView();
     const paneId = state.selected;
     const endpoint = paneFilesPath(paneId, path);
@@ -4597,6 +6029,11 @@ function initialize() {
     view.files.editing = false; view.files.editDraft = ""; view.files.saveError = null;
     view.files.saving = false; view.files.reloading = false;
     view.files.conflict = false; view.files.selection = null;
+    view.files.symbol = null; view.files.symbolPanel = null;
+    view.files.navModel = null; view.files.pendingReveal = null;
+    state.codeNavController?.abort();
+    state.codeNavController = null;
+    state.codeNavRequest += 1;
     renderFiles();
     try {
       const data = await request(endpoint, { signal: controller.signal });
@@ -4607,6 +6044,10 @@ function initialize() {
         throw new Error("The owner returned an invalid file response");
       }
       view.files.file = projectFilePreview(data, responsePath);
+      if (options.scroll) view.files.viewerScrolls.set(responsePath, options.scroll);
+      if (options.reveal) {
+        view.files.pendingReveal = { path: responsePath, line: options.reveal.line, column: options.reveal.column };
+      }
     } catch (error) {
       if (error?.name === "AbortError") return;
       view.files.error = projectErrorMessage(error, "File");
@@ -7240,6 +8681,14 @@ function initialize() {
   $("conversation-view").addEventListener("click", () => setViewMode("conversation"));
   $("raw-view").addEventListener("click", () => setViewMode("raw"));
   $("files-view").addEventListener("click", () => setViewMode("files"));
+  $("file-viewer").addEventListener("keydown", handleFileViewerKeydown);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Control" || event.key === "Meta") setNavigationModifier(true);
+  });
+  document.addEventListener("keyup", (event) => {
+    if (event.key === "Control" || event.key === "Meta") setNavigationModifier(false);
+  });
+  window.addEventListener("blur", () => setNavigationModifier(false));
   $("git-view").addEventListener("click", () => setViewMode("git"));
   $("conversation-filters-open").addEventListener("click", () => {
     const dialog = $("conversation-filters-dialog");

@@ -22,6 +22,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Harden pane-to-Conversation mapping (including resumed Codex panes) | `conversation-mapping-compaction-raw-fit.md` | Implemented and tested; rollout pending |
 | Show compaction as a collapsed box | `conversation-mapping-compaction-raw-fit.md` | Implemented and tested; rollout pending |
 | Make Raw pane use the browser's height instead of tmux's 80×24 default | `conversation-mapping-compaction-raw-fit.md` | Implemented and tested; rollout pending |
+| Give the Files view IDE-style highlighting and click-through for Java, Rust, TypeScript, and other popular languages | `ide-code-viewer.md` | Implemented and tested; rollout pending |
 
 ## Usage intelligence
 

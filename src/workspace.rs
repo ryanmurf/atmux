@@ -62,14 +62,14 @@ pub struct WorkspaceError {
 }
 
 impl WorkspaceError {
-    fn invalid(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
         Self {
             kind: WorkspaceErrorKind::Invalid,
             message: message.into(),
         }
     }
 
-    fn not_found(message: impl Into<String>) -> Self {
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self {
             kind: WorkspaceErrorKind::NotFound,
             message: message.into(),
@@ -83,7 +83,7 @@ impl WorkspaceError {
         }
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             kind: WorkspaceErrorKind::Internal,
             message: message.into(),
@@ -104,7 +104,7 @@ impl std::fmt::Display for WorkspaceError {
 
 impl std::error::Error for WorkspaceError {}
 
-type WorkspaceResult<T> = Result<T, WorkspaceError>;
+pub(crate) type WorkspaceResult<T> = Result<T, WorkspaceError>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1576,7 +1576,7 @@ async fn drain_bounded(
     Ok((output, truncated))
 }
 
-fn project_root(pane_cwd: &Path, allowed_roots: &[PathBuf]) -> WorkspaceResult<PathBuf> {
+pub(crate) fn project_root(pane_cwd: &Path, allowed_roots: &[PathBuf]) -> WorkspaceResult<PathBuf> {
     let cwd = pane_cwd
         .canonicalize()
         .map_err(|_| WorkspaceError::not_found("pane working directory is unavailable"))?;
@@ -1628,7 +1628,7 @@ fn repository_root(start: &Path, boundary: &Path) -> Option<PathBuf> {
         })
 }
 
-fn validate_relative_path(value: &str, allow_empty: bool) -> WorkspaceResult<PathBuf> {
+pub(crate) fn validate_relative_path(value: &str, allow_empty: bool) -> WorkspaceResult<PathBuf> {
     if value.len() > MAX_RELATIVE_PATH_BYTES
         || value.contains('\0')
         || value.chars().any(char::is_control)
@@ -1701,7 +1701,7 @@ fn open_relative(root: &Path, relative: &Path) -> WorkspaceResult<(File, Metadat
     Ok((current, metadata))
 }
 
-fn open_absolute_directory(path: &Path) -> WorkspaceResult<File> {
+pub(crate) fn open_absolute_directory(path: &Path) -> WorkspaceResult<File> {
     if !path.is_absolute() {
         return Err(WorkspaceError::not_found(
             "pane project root is unavailable",
@@ -1752,7 +1752,7 @@ fn ensure_same_file(before: &Metadata, after: &Metadata) -> WorkspaceResult<()> 
     Ok(())
 }
 
-fn ensure_visible_path(path: &Path) -> WorkspaceResult<()> {
+pub(crate) fn ensure_visible_path(path: &Path) -> WorkspaceResult<()> {
     for component in path.components() {
         let Component::Normal(component) = component else {
             return Err(WorkspaceError::invalid("path must be relative"));
@@ -1767,14 +1767,14 @@ fn ensure_visible_path(path: &Path) -> WorkspaceResult<()> {
     Ok(())
 }
 
-fn safe_component(component: &str) -> bool {
+pub(crate) fn safe_component(component: &str) -> bool {
     !component.is_empty()
         && component != "."
         && component != ".."
         && !component.chars().any(char::is_control)
 }
 
-fn sensitive_component(component: &str) -> bool {
+pub(crate) fn sensitive_component(component: &str) -> bool {
     let lower = component.to_ascii_lowercase();
     if lower.starts_with(".atmux-edit-") {
         return true;
@@ -1805,7 +1805,7 @@ fn sensitive_component(component: &str) -> bool {
         .is_some_and(|extension| matches!(extension, "pem" | "key" | "p12" | "pfx"))
 }
 
-fn path_for_response(path: &Path) -> String {
+pub(crate) fn path_for_response(path: &Path) -> String {
     path.components()
         .filter_map(|component| match component {
             Component::Normal(value) => value.to_str(),

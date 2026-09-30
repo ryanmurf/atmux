@@ -24,6 +24,7 @@ use tokio::{sync::watch, task::JoinSet};
 use crate::{
     MAX_REQUEST_BODY_BYTES,
     attachment::{ImageMessageRequest, MAX_ATTACHMENT_REQUEST_BODY_BYTES},
+    code_nav::{CodeNavRequest, CodeNavResponse},
     config::Config,
     control::{
         CloneLaunchRepositoryRequest, ControlPlane, CreateLaunchDirectoryRequest, ErrorKind,
@@ -78,6 +79,19 @@ struct TranscriptQuery {
 #[serde(deny_unknown_fields)]
 struct RelativePathQuery {
     path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodeSymbolQuery {
+    symbol: String,
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodeResolveQuery {
+    path: String,
+    spec: String,
+    symbol: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -835,6 +849,15 @@ fn routes(state: WebState) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_FILE_WRITE_REQUEST_BYTES)),
         )
         .route("/api/v1/panes/{id}/git", get(pane_git))
+        .route(
+            "/api/v1/panes/{id}/code/definitions",
+            get(pane_code_definitions),
+        )
+        .route(
+            "/api/v1/panes/{id}/code/references",
+            get(pane_code_references),
+        )
+        .route("/api/v1/panes/{id}/code/resolve", get(pane_code_resolve))
         .route("/api/v1/panes/{id}/models", get(pane_models))
         .route("/api/v1/panes/{id}/model", post(switch_model))
         .route("/api/v1/panes/{id}/restart", post(restart_current_agent))
@@ -1105,6 +1128,57 @@ async fn write_pane_file(
         .map_err(|error| ApiError::from_control(&error))?
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("no agent pane matches {id}")))
+}
+
+async fn pane_code(
+    state: &WebState,
+    id: &str,
+    request: CodeNavRequest,
+) -> Result<Json<CodeNavResponse>, ApiError> {
+    state
+        .control
+        .pane_code(id, request)
+        .await
+        .map_err(|error| ApiError::from_control(&error))?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("no agent pane matches {id}")))
+}
+
+async fn pane_code_definitions(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    Query(query): Query<CodeSymbolQuery>,
+) -> Result<Json<CodeNavResponse>, ApiError> {
+    let request = CodeNavRequest::Definitions {
+        symbol: query.symbol,
+        path: query.path,
+    };
+    pane_code(&state, &id, request).await
+}
+
+async fn pane_code_references(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    Query(query): Query<CodeSymbolQuery>,
+) -> Result<Json<CodeNavResponse>, ApiError> {
+    let request = CodeNavRequest::References {
+        symbol: query.symbol,
+        path: query.path,
+    };
+    pane_code(&state, &id, request).await
+}
+
+async fn pane_code_resolve(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    Query(query): Query<CodeResolveQuery>,
+) -> Result<Json<CodeNavResponse>, ApiError> {
+    let request = CodeNavRequest::Resolve {
+        path: query.path,
+        spec: query.spec,
+        symbol: query.symbol,
+    };
+    pane_code(&state, &id, request).await
 }
 
 async fn pane_git(
@@ -3090,6 +3164,58 @@ mod tests {
             StatusCode::METHOD_NOT_ALLOWED,
             "workspace routes are read-only"
         );
+        for uri in [
+            "/api/v1/panes/nope/code/definitions?symbol=Foo",
+            "/api/v1/panes/nope/code/references?symbol=Foo&path=src%2Fa.rs",
+            "/api/v1/panes/nope/code/resolve?path=src%2Fa.ts&spec=.%2Fb",
+        ] {
+            assert_eq!(
+                status_of(&app, "GET", uri, None).await,
+                StatusCode::NOT_FOUND,
+                "{uri}"
+            );
+            assert_eq!(
+                status_of(&app, "POST", uri, Some("{}")).await,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "source navigation is read-only: {uri}"
+            );
+        }
+        for (uri, reason) in [
+            ("/api/v1/panes/nope/code/definitions", "symbol is required"),
+            (
+                "/api/v1/panes/nope/code/resolve?path=a.ts",
+                "spec is required",
+            ),
+            (
+                "/api/v1/panes/%254294967295/code/definitions?symbol=a.b",
+                "symbol must be one identifier",
+            ),
+            (
+                "/api/v1/panes/%254294967295/code/references?symbol=Foo&path=..%2Fsecret",
+                "path must stay inside the project",
+            ),
+            (
+                "/api/v1/panes/%254294967295/code/resolve?path=src%2Fa.ts&spec=%0Abad",
+                "specifiers cannot carry control characters",
+            ),
+        ] {
+            assert_eq!(
+                status_of(&app, "GET", uri, None).await,
+                StatusCode::BAD_REQUEST,
+                "{reason}"
+            );
+        }
+        // Like Files, a sensitive path is indistinguishable from a missing one.
+        assert_eq!(
+            status_of(
+                &app,
+                "GET",
+                "/api/v1/panes/%254294967295/code/definitions?symbol=Foo&path=.git%2Fconfig",
+                None,
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
         assert_eq!(
             status_of(&app, "GET", "/api/v1/panes/%254294967295/transcript", None,).await,
             StatusCode::OK
@@ -3182,6 +3308,21 @@ mod tests {
             ("GET", "/api/v1/panes/gpu-box~%251", None),
             ("GET", "/api/v1/panes/gpu-box~%251/files", None),
             ("GET", "/api/v1/panes/gpu-box~%251/git", None),
+            (
+                "GET",
+                "/api/v1/panes/gpu-box~%251/code/definitions?symbol=Foo",
+                None,
+            ),
+            (
+                "GET",
+                "/api/v1/panes/gpu-box~%251/code/references?symbol=Foo",
+                None,
+            ),
+            (
+                "GET",
+                "/api/v1/panes/gpu-box~%251/code/resolve?path=a.rs&spec=mod%20b",
+                None,
+            ),
             (
                 "POST",
                 "/api/v1/panes/gpu-box~%251/messages",
