@@ -196,11 +196,12 @@ worker ceiling and strictly below the current host/inherited-cgroup limit. The
 canonical Tron bridge therefore keeps workers at their 12 GiB default with a
 48 GiB override ceiling while reserving a bounded 56 GiB scope for the web
 service. This does not raise any worker cap.
-Tron's live `/home/ryan/resume-tron.sh` must replace its raw `send()` function
-with `deploy/systemd/resume-tron-scoped-exec-block.bash` before Quick Resume is
-available; atmux rejects the old script shape. Max's checked-in boot recovery
-already uses the bridge for every roster entry. There is no unbounded recovery
-fallback. `scoped-exec` deliberately preserves opaque launcher argv instead of
+On a node with this policy, a Quick Resume roster must launch every entry
+through `deploy/systemd/resume-tron-scoped-exec-block.bash` (with the node's
+own atmux executable and configuration path); atmux rejects any other `send()`
+shape there. Max's checked-in boot recovery already uses the bridge for every
+roster entry. There is no unbounded recovery fallback on a memory-isolated
+node. `scoped-exec` deliberately preserves opaque launcher argv instead of
 guessing what a credential wrapper does internally; the pinned Claude recovery
 commands remain responsible for supplying their already-configured permission
 policy exactly once.
@@ -216,6 +217,49 @@ Choose a limit below host capacity but above the largest legitimate native or
 GPU build, leaving memory for the OS, tmux, atmux, caches, and other workers.
 Roll it out on one Linux owner at a time after verifying its user manager and
 cgroup delegation. Keep this setting absent on Midnight/macOS.
+
+### Quick Resume (host restart recovery)
+
+Every owner node can offer one **Quick resume** action in the dashboard topbar.
+It runs that machine's own roster script, which recreates missing tmux
+sessions after a reboot and resumes each agent on its saved native
+conversation. Sessions that already exist are preserved. The browser never
+supplies a path, a command, or an argument: it can only ask the owning machine
+to run its one fixed script, and it sees only a phase and a message, never the
+script's output or any local path.
+
+```toml
+[recovery]
+# Default: quick-resume.sh beside config.toml.
+script = "~/.config/atmux/quick-resume.sh"
+# Absolute launchers the roster needs; Quick Resume stays unavailable until
+# every one exists. bash and a tmux on the sanitized PATH are always required.
+required_commands = ["~/.local/bin/claude", "~/.local/bin/codex"]
+```
+
+The script is accepted only when it is owned by the atmux user, is a regular
+file (not a symlink, no extra hard links), is not group/world writable, sits
+under a directory chain nobody else can write, stays under 1 MiB, carries the
+`ATMUX_QUICK_RESUME_IDEMPOTENT_V1` marker, and contains the canonical
+transactional helper block byte for byte between the
+`ATMUX_QUICK_RESUME_TRANSACTION_BEGIN`/`END` lines. The helper block's launch
+bridge must match the node's memory policy: a node with
+`[agent_resources].memory_max_bytes` accepts only the `scoped-exec` bridge
+(`ATMUX_QUICK_RESUME_SCOPED_EXEC_V1`), any other node accepts only the direct
+bridge (`ATMUX_QUICK_RESUME_DIRECT_EXEC_V1`, macOS included). The script runs
+with an empty environment plus `HOME`, `USER`, `LOGNAME`, `LANG`, and a fixed
+`PATH` (the system directories, `~/.asdf/shims`, `~/.local/bin`, and
+`/opt/homebrew/bin` on macOS); it leads its own process group, is killed after
+three minutes, and only one run per machine can be in flight, guarded by a
+lock in the user's private runtime directory (`$XDG_RUNTIME_DIR`,
+`/run/user/<uid>`, or `$TMPDIR` on macOS).
+
+`deploy/quick-resume/quick-resume.example.sh` is a complete, valid direct-bridge
+roster to copy; `deploy/quick-resume/README.md` explains how to derive each
+pane's resume id and how to adapt the block for a memory-isolated node. A
+coordinator reads every machine's state through `/api/v1/fleet/quick-resume`
+and shows one row per answering owner, so a node without a roster explains
+itself instead of disappearing.
 
 ### Owner-local CLI maintenance
 

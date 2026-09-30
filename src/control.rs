@@ -119,6 +119,17 @@ pub struct FleetUpdate {
     pub error: Option<String>,
 }
 
+/// One machine's Quick Resume state as seen by a coordinator.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FleetRecovery {
+    pub id: String,
+    pub label: String,
+    pub online: bool,
+    /// Absent when the machine could not be read; `error` says why.
+    pub recovery: Option<RecoveryStatus>,
+    pub error: Option<String>,
+}
+
 /// Classifies any control-plane failure.
 ///
 /// Unclassified failures are treated as this coordinator's own fault, which is
@@ -931,7 +942,7 @@ impl ControlPlane {
         let (revisions, _) = watch::channel(0);
         let bare_local_ids = machines.is_empty() && !config.discovery.enabled;
         let configured_machine_ids = machines.keys().cloned().collect();
-        let recovery = RecoveryRunner::production(&config.node.id);
+        let recovery = RecoveryRunner::production(&config);
         let updater = SelfUpdater::production(&config.self_update)?;
         let control = Self {
             inner: Arc::new(Inner {
@@ -1032,6 +1043,101 @@ impl ControlPlane {
             )
             .await
             .map_err(|error| upstream(&error))
+    }
+
+    /// Every machine's Quick Resume state, read concurrently.
+    ///
+    /// Like [`Self::fleet_updates`], one slow or broken node bounds its own
+    /// entry.  A coordinator-only local node reports an error entry rather
+    /// than a runner, because it owns no tmux server to restore.
+    pub async fn fleet_recovery(&self) -> Vec<FleetRecovery> {
+        let local_id = self.inner.local_id.clone();
+        let local_label = self.inner.local_label.clone();
+        let mut summaries = self.machines();
+        if !summaries.iter().any(|machine| machine.id == local_id) {
+            summaries.insert(
+                0,
+                MachineSummary {
+                    id: local_id.clone(),
+                    label: local_label,
+                    kind: MachineKind::Local,
+                    online: true,
+                    sessions: 0,
+                    health: None,
+                    last_seen_ms: None,
+                    address: None,
+                    metrics: MachineMetrics::default(),
+                },
+            );
+        }
+        let mut tasks = Vec::with_capacity(summaries.len());
+        for machine in summaries {
+            if machine.id == local_id {
+                let local = self.clone();
+                tasks.push(tokio::spawn(async move {
+                    let (recovery, error) = match local.recovery_status(&machine.id).await {
+                        Ok(status) => (Some(status), None),
+                        Err(error) => (None, Some(error.to_string())),
+                    };
+                    FleetRecovery {
+                        id: machine.id,
+                        label: machine.label,
+                        online: true,
+                        recovery,
+                        error,
+                    }
+                }));
+                continue;
+            }
+            let remote = self.remote_machine(&machine.id).ok();
+            tasks.push(tokio::spawn(async move {
+                let Some(remote) = remote.filter(|_| machine.online) else {
+                    return FleetRecovery {
+                        error: Some(
+                            machine
+                                .health
+                                .clone()
+                                .unwrap_or_else(|| "machine is offline".to_owned()),
+                        ),
+                        id: machine.id,
+                        label: machine.label,
+                        online: machine.online,
+                        recovery: None,
+                    };
+                };
+                let path = format!(
+                    "/api/v1/machines/{}/quick-resume",
+                    encode_segment(&machine.id)
+                );
+                let read = tokio::time::timeout(
+                    FLEET_UPDATE_TIMEOUT,
+                    remote.get_json::<RecoveryStatus>(&path),
+                )
+                .await;
+                let (recovery, error) = match read {
+                    Ok(Ok(status)) => (Some(status), None),
+                    Ok(Err(error)) => (None, Some(format!("{error:#}"))),
+                    Err(_) => (
+                        None,
+                        Some("machine did not answer the Quick Resume read in time".to_owned()),
+                    ),
+                };
+                FleetRecovery {
+                    id: machine.id,
+                    label: machine.label,
+                    online: true,
+                    recovery,
+                    error,
+                }
+            }));
+        }
+        let mut entries = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            if let Ok(entry) = task.await {
+                entries.push(entry);
+            }
+        }
+        entries
     }
 
     /// Identifier this coordinator uses for its own tmux server.
@@ -6093,7 +6199,7 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
             resume_leases: Mutex::new(ResumeLeaseState::default()),
             revisions,
             refresh_now: Notify::new(),
-            recovery: RecoveryRunner::production(&local_id),
+            recovery: RecoveryRunner::detached(&local_id),
             updater: SelfUpdater::with_environment(
                 &crate::self_update::SelfUpdateConfig::default(),
                 self_update::Environment {

@@ -1,9 +1,11 @@
-//! Host-scoped restart recovery.
+//! Host-scoped restart recovery ("Quick Resume").
 //!
-//! This deliberately exposes one fixed operation rather than a generic command
-//! runner.  Only Tron's canonical, locally owned recovery script is eligible,
-//! browser callers cannot supply a path or arguments, output is never returned,
-//! and one process may run at a time.
+//! This deliberately exposes one fixed operation per machine rather than a
+//! generic command runner.  Only the node's configured, locally owned roster
+//! script is eligible, browser callers cannot supply a path or arguments,
+//! output is never returned, and one process may run at a time.  The script
+//! must carry the canonical transactional helper block and must launch every
+//! roster entry through the bridge the node's own memory policy requires.
 
 use std::{
     fs::{self, File},
@@ -23,18 +25,28 @@ use rustix::{
 use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncWriteExt, process::Command, sync::Mutex};
 
-const TRON_MACHINE_ID: &str = "tron";
-const TRON_RESUME_SCRIPT: &str = "/home/ryan/resume-tron.sh";
+use crate::config::Config;
+
 const SCRIPT_MARKER: &str = "ATMUX_QUICK_RESUME_IDEMPOTENT_V1";
 const SCOPED_EXEC_MARKER: &str = "ATMUX_QUICK_RESUME_SCOPED_EXEC_V1";
-#[cfg(test)]
-const SCOPED_EXEC_WEB_OVERRIDE_FRAGMENT: &str = "if [ \"$unit_session\" = atmux-web ]; then\n    scoped_exec_command+=' --recovery-service-memory-max-bytes 60129542144'\n  fi";
-#[cfg(test)]
-const SCOPED_EXEC_SEND_FRAGMENT: &str = "\"exec $scoped_exec_command -- $2\" Enter";
+const DIRECT_EXEC_MARKER: &str = "ATMUX_QUICK_RESUME_DIRECT_EXEC_V1";
 const TRANSACTION_BEGIN: &[u8] = b"\n# ATMUX_QUICK_RESUME_TRANSACTION_BEGIN\n";
 const TRANSACTION_END: &[u8] = b"# ATMUX_QUICK_RESUME_TRANSACTION_END\n";
-const EXPECTED_TRANSACTION_HELPERS: &str =
+/// Tron's canonical helper block: the transactional helpers with the
+/// memory-scoped launch bridge exactly as the checked-in template ships it.
+/// Every other machine's block is this text with its bridge substituted.
+const CANONICAL_SCOPED_HELPERS: &str =
     include_str!("../tests/fixtures/resume_tron_transactional_helpers.sh");
+const SCOPED_SEND_BLOCK: &str =
+    include_str!("../deploy/systemd/resume-tron-scoped-exec-block.bash");
+const DIRECT_SEND_BLOCK: &str = include_str!("../deploy/quick-resume/send-direct.bash");
+const SCOPED_COMMAND_PREFIX: &str = "  local scoped_exec_command='";
+const SCOPED_COMMAND_SUFFIX: &str = "'";
+const SERVICE_OVERRIDE_IF_LINE: &str = "  if [ \"$unit_session\" = atmux-web ]; then";
+const SERVICE_OVERRIDE_CAP_PREFIX: &str =
+    "    scoped_exec_command+=' --recovery-service-memory-max-bytes ";
+const SERVICE_OVERRIDE_CAP_SUFFIX: &str = "'";
+const SERVICE_OVERRIDE_END_LINE: &str = "  fi";
 const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
 const RUN_TIMEOUT: Duration = Duration::from_secs(180);
 #[cfg(not(test))]
@@ -43,24 +55,13 @@ const PROCESS_GROUP_GRACE: Duration = Duration::from_secs(5);
 const PROCESS_GROUP_GRACE: Duration = Duration::from_millis(100);
 // Keep the interpreter absolute and platform-pinned: the recovery child runs
 // with an empty environment, so PATH lookup is intentionally unavailable.
-// Linux (including Tron) installs bash in /usr/bin, while macOS ships it in
-// /bin. This also keeps recovery fixtures representative on both CI hosts.
+// Linux installs bash in /usr/bin, while macOS ships it in /bin.
 #[cfg(target_os = "macos")]
 const BASH_COMMAND: &str = "/bin/bash";
 #[cfg(not(target_os = "macos"))]
 const BASH_COMMAND: &str = "/usr/bin/bash";
-const RECOVERY_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:/home/ryan/.asdf/shims:/home/ryan/.local/bin";
-const TRON_HOME: &str = "/home/ryan";
-const REQUIRED_RECOVERY_COMMANDS: &[&str] = &[
-    "/usr/bin/bash",
-    "/usr/bin/tmux",
-    "/home/ryan/.local/bin/atmux",
-    "/home/ryan/.asdf/shims/codex",
-    "/home/ryan/.local/bin/claude",
-    "/home/ryan/.local/bin/claude-hd",
-    "/home/ryan/.local/bin/claude-max",
-];
-const LOCK_FILE_NAME: &str = "resume-tron.lock";
+const DEFAULT_SCRIPT_NAME: &str = "quick-resume.sh";
+const LOCK_FILE_NAME: &str = "quick-resume.lock";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -99,19 +100,122 @@ impl std::fmt::Display for RecoveryStartError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unavailable(message) => formatter.write_str(message),
-            Self::Running => formatter.write_str("Tron recovery is already running"),
+            Self::Running => formatter.write_str("Quick Resume is already running"),
         }
     }
 }
 
 impl std::error::Error for RecoveryStartError {}
 
+/// How every roster entry must be launched on this node.
+///
+/// A node with a configured per-agent memory cap accepts only the scoped
+/// bridge, so recovery can never start an unbounded worker there.  A node
+/// without that policy accepts only the direct bridge, because `scoped-exec`
+/// would fail closed on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchBridge {
+    Scoped {
+        /// The configuration the daemon itself runs with.  The bridge must
+        /// name the same file so the roster enters the policy in effect.
+        config_path: Option<PathBuf>,
+    },
+    Direct,
+}
+
+impl LaunchBridge {
+    const fn marker(&self) -> &'static str {
+        match self {
+            Self::Scoped { .. } => SCOPED_EXEC_MARKER,
+            Self::Direct => DIRECT_EXEC_MARKER,
+        }
+    }
+}
+
+/// The fixed environment a roster script runs with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HostEnvironment {
+    home: PathBuf,
+    user: String,
+    path: String,
+}
+
+impl HostEnvironment {
+    fn capture() -> Option<Self> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute())
+            .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()))?;
+        let user = ["USER", "LOGNAME"]
+            .iter()
+            .find_map(|key| std::env::var(key).ok())
+            .filter(|user| !user.is_empty())
+            .or_else(|| {
+                home.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })?;
+        let path = recovery_path(&home);
+        Some(Self { home, user, path })
+    }
+
+    #[cfg(test)]
+    fn fixture(home: &Path) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            user: "fixture".to_owned(),
+            path: recovery_path(home),
+        }
+    }
+}
+
+/// The sanitized PATH a roster runs with: the user's launcher directories
+/// plus the system directories, on every supported platform.
+fn recovery_path(home: &Path) -> String {
+    let mut entries = vec![
+        "/usr/local/sbin".to_owned(),
+        "/usr/local/bin".to_owned(),
+        "/usr/sbin".to_owned(),
+        "/usr/bin".to_owned(),
+        "/sbin".to_owned(),
+        "/bin".to_owned(),
+    ];
+    if cfg!(target_os = "macos") {
+        entries.insert(0, "/opt/homebrew/bin".to_owned());
+    } else {
+        entries.push("/snap/bin".to_owned());
+    }
+    entries.push(home.join(".asdf/shims").to_string_lossy().into_owned());
+    entries.push(home.join(".local/bin").to_string_lossy().into_owned());
+    entries.join(":")
+}
+
+/// Where the single-flight lock lives: the user's private runtime directory.
+fn runtime_directory(uid: u32) -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute() && dir.is_dir())
+    {
+        return Some(dir.join("atmux"));
+    }
+    let linux = PathBuf::from(format!("/run/user/{uid}"));
+    if linux.is_dir() {
+        return Some(linux.join("atmux"));
+    }
+    // macOS has no /run/user; launchd gives each user a private, 0700
+    // temporary directory instead.
+    std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute() && dir.is_dir())
+        .map(|dir| dir.join("atmux"))
+}
+
 #[derive(Debug)]
 struct RecoveryInner {
-    enabled: bool,
     script: PathBuf,
-    runtime_dir: PathBuf,
-    required_commands: &'static [&'static str],
+    bridge: LaunchBridge,
+    environment: Option<HostEnvironment>,
+    runtime_dir: Option<PathBuf>,
+    required_commands: Vec<PathBuf>,
     timeout: Duration,
     state: Mutex<RecoveryStatus>,
 }
@@ -119,6 +223,12 @@ struct RecoveryInner {
 #[derive(Debug)]
 struct ValidatedScript {
     contents: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScriptProblem {
+    Missing,
+    Invalid,
 }
 
 #[derive(Debug)]
@@ -134,83 +244,112 @@ pub struct RecoveryRunner {
 }
 
 impl RecoveryRunner {
+    /// Builds this node's runner from its configuration.
+    ///
+    /// The roster script is `[recovery].script`, or `quick-resume.sh` beside
+    /// the configuration file.  The launch bridge follows the node's memory
+    /// policy, and the environment comes from the daemon's own identity.
     #[must_use]
-    pub fn production(machine: &str) -> Self {
+    pub fn production(config: &Config) -> Self {
         let uid = geteuid().as_raw();
+        let config_path = config.source_path.clone().or_else(|| Config::path().ok());
+        let script = config.recovery.script.clone().unwrap_or_else(|| {
+            config_path.as_deref().and_then(Path::parent).map_or_else(
+                || PathBuf::from(DEFAULT_SCRIPT_NAME),
+                |dir| dir.join(DEFAULT_SCRIPT_NAME),
+            )
+        });
+        let bridge = if config.agent_resources.memory_max_bytes.is_some() {
+            LaunchBridge::Scoped { config_path }
+        } else {
+            LaunchBridge::Direct
+        };
         Self::new(
-            machine,
-            machine == TRON_MACHINE_ID,
-            PathBuf::from(TRON_RESUME_SCRIPT),
-            PathBuf::from(format!("/run/user/{uid}/atmux")),
+            &config.node.id,
+            script,
+            bridge,
+            HostEnvironment::capture(),
+            runtime_directory(uid),
             RUN_TIMEOUT,
-            REQUIRED_RECOVERY_COMMANDS,
+            config.recovery.required_commands.clone(),
         )
     }
 
     fn new(
         machine: &str,
-        enabled: bool,
         script: PathBuf,
-        runtime_dir: PathBuf,
+        bridge: LaunchBridge,
+        environment: Option<HostEnvironment>,
+        runtime_dir: Option<PathBuf>,
         timeout: Duration,
-        required_commands: &'static [&'static str],
+        required_commands: Vec<PathBuf>,
     ) -> Self {
-        let available = enabled
-            && validate_script(&script).is_ok()
-            && validate_runtime_location(&runtime_dir).is_ok()
-            && required_commands_available(required_commands);
-        let (phase, message) = if !enabled {
-            (
-                RecoveryPhase::Unavailable,
-                "Quick Resume is available only on Tron".to_owned(),
-            )
-        } else if available {
-            (
-                RecoveryPhase::Idle,
-                "Ready to restore Tron's saved session roster".to_owned(),
-            )
-        } else {
-            (
-                RecoveryPhase::Unavailable,
-                "Tron's recovery script is unavailable or fails its safety checks".to_owned(),
-            )
-        };
-        Self {
-            inner: Arc::new(RecoveryInner {
-                enabled,
-                script,
-                runtime_dir,
-                timeout,
-                required_commands,
-                state: Mutex::new(RecoveryStatus {
-                    machine: machine.to_owned(),
-                    available,
-                    phase,
-                    started_at_ms: None,
-                    finished_at_ms: None,
-                    message,
-                }),
+        let mut inner = RecoveryInner {
+            script,
+            bridge,
+            environment,
+            runtime_dir,
+            required_commands,
+            timeout,
+            state: Mutex::new(RecoveryStatus {
+                machine: machine.to_owned(),
+                available: false,
+                phase: RecoveryPhase::Unavailable,
+                started_at_ms: None,
+                finished_at_ms: None,
+                message: String::new(),
             }),
+        };
+        let (available, message) = match inner.probe() {
+            Ok(_) => (true, READY_MESSAGE.to_owned()),
+            Err(message) => (false, message),
+        };
+        {
+            let state = inner.state.get_mut();
+            state.available = available;
+            state.phase = if available {
+                RecoveryPhase::Idle
+            } else {
+                RecoveryPhase::Unavailable
+            };
+            state.message = message;
         }
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// A runner for control-plane tests: no roster exists, so every start
+    /// fails closed without touching the filesystem or spawning anything.
+    #[cfg(test)]
+    pub(crate) fn detached(machine: &str) -> Self {
+        Self::new(
+            machine,
+            PathBuf::from("/nonexistent/atmux-recovery/quick-resume.sh"),
+            LaunchBridge::Direct,
+            None,
+            None,
+            RUN_TIMEOUT,
+            Vec::new(),
+        )
     }
 
     pub async fn status(&self) -> RecoveryStatus {
         let mut state = self.inner.state.lock().await;
         if state.phase != RecoveryPhase::Running {
-            state.available = self.inner.enabled
-                && validate_script(&self.inner.script).is_ok()
-                && validate_runtime_location(&self.inner.runtime_dir).is_ok()
-                && required_commands_available(self.inner.required_commands);
-            if !state.available {
-                state.phase = RecoveryPhase::Unavailable;
-                state.message = if self.inner.enabled {
-                    "Tron's recovery script is unavailable or fails its safety checks".to_owned()
-                } else {
-                    "Quick Resume is available only on Tron".to_owned()
-                };
-            } else if state.phase == RecoveryPhase::Unavailable {
-                state.phase = RecoveryPhase::Idle;
-                "Ready to restore Tron's saved session roster".clone_into(&mut state.message);
+            match self.inner.probe() {
+                Ok(_) => {
+                    state.available = true;
+                    if state.phase == RecoveryPhase::Unavailable {
+                        state.phase = RecoveryPhase::Idle;
+                        READY_MESSAGE.clone_into(&mut state.message);
+                    }
+                }
+                Err(message) => {
+                    state.available = false;
+                    state.phase = RecoveryPhase::Unavailable;
+                    state.message = message;
+                }
             }
         }
         state.clone()
@@ -226,33 +365,40 @@ impl RecoveryRunner {
     ///
     /// Returns [`RecoveryStartError::Running`] while this process has a run in
     /// flight, or [`RecoveryStartError::Unavailable`] when the fixed script
-    /// fails validation or recovery is disabled for this machine.
+    /// fails validation or recovery is not set up on this machine.
     pub async fn start(&self) -> Result<RecoveryStatus, RecoveryStartError> {
         let mut state = self.inner.state.lock().await;
         if state.phase == RecoveryPhase::Running {
             return Err(RecoveryStartError::Running);
         }
-        let script =
-            if self.inner.enabled && required_commands_available(self.inner.required_commands) {
-                validate_script(&self.inner.script).ok()
-            } else {
-                None
-            };
-        let Some(script) = script else {
+        let script = match self.inner.probe() {
+            Ok(script) => script,
+            Err(message) => {
+                state.available = false;
+                state.phase = RecoveryPhase::Unavailable;
+                state.message = message;
+                return Err(RecoveryStartError::Unavailable(state.message.clone()));
+            }
+        };
+        let Some(environment) = self.inner.environment.clone() else {
             state.available = false;
             state.phase = RecoveryPhase::Unavailable;
-            "Tron's recovery script is unavailable or fails its safety checks"
-                .clone_into(&mut state.message);
+            NO_IDENTITY_MESSAGE.clone_into(&mut state.message);
             return Err(RecoveryStartError::Unavailable(state.message.clone()));
         };
-        let lock = match acquire_runtime_lock(&self.inner.runtime_dir) {
+        let lock = match self
+            .inner
+            .runtime_dir
+            .as_deref()
+            .ok_or(LockError::Unsafe)
+            .and_then(acquire_runtime_lock)
+        {
             Ok(lock) => lock,
             Err(LockError::Busy) => return Err(RecoveryStartError::Running),
             Err(LockError::Unsafe) => {
                 state.available = false;
                 state.phase = RecoveryPhase::Unavailable;
-                "Tron's secure runtime lock directory is unavailable"
-                    .clone_into(&mut state.message);
+                LOCK_MESSAGE.clone_into(&mut state.message);
                 return Err(RecoveryStartError::Unavailable(state.message.clone()));
             }
         };
@@ -262,32 +408,32 @@ impl RecoveryRunner {
         state.phase = RecoveryPhase::Running;
         state.started_at_ms = Some(started_at_ms);
         state.finished_at_ms = None;
-        "Restoring missing Tron sessions; existing sessions are preserved"
+        "Restoring missing sessions; existing sessions are preserved"
             .clone_into(&mut state.message);
         let started = state.clone();
         drop(state);
 
         let runner = self.clone();
         tokio::spawn(async move {
-            let outcome = run_script(script, lock, runner.inner.timeout).await;
+            let outcome = run_script(script, &environment, lock, runner.inner.timeout).await;
             let mut state = runner.inner.state.lock().await;
             state.finished_at_ms = Some(now_ms());
             match outcome {
                 ScriptOutcome::Succeeded => {
                     state.phase = RecoveryPhase::Succeeded;
-                    "Tron recovery script finished; sessions will appear as they become ready"
+                    "Recovery script finished; sessions will appear as they become ready"
                         .clone_into(&mut state.message);
                 }
                 ScriptOutcome::Failed(code) => {
                     state.phase = RecoveryPhase::Failed;
                     state.message = code.map_or_else(
-                        || "Tron recovery script was terminated".to_owned(),
-                        |code| format!("Tron recovery script exited with status {code}"),
+                        || "Recovery script was terminated".to_owned(),
+                        |code| format!("Recovery script exited with status {code}"),
                     );
                 }
                 ScriptOutcome::TimedOut => {
                     state.phase = RecoveryPhase::TimedOut;
-                    "Tron recovery stopped after its three-minute safety limit"
+                    "Recovery stopped after its three-minute safety limit"
                         .clone_into(&mut state.message);
                 }
             }
@@ -296,9 +442,61 @@ impl RecoveryRunner {
     }
 
     #[cfg(test)]
-    fn fixture(machine: &str, script: PathBuf, timeout: Duration) -> Self {
-        let runtime_dir = script.parent().unwrap().join("runtime");
-        Self::new(machine, true, script, runtime_dir, timeout, &[])
+    fn fixture(machine: &str, script: &Path, timeout: Duration) -> Self {
+        Self::fixture_with_bridge(machine, script, timeout, LaunchBridge::Direct)
+    }
+
+    #[cfg(test)]
+    fn fixture_with_bridge(
+        machine: &str,
+        script: &Path,
+        timeout: Duration,
+        bridge: LaunchBridge,
+    ) -> Self {
+        let directory = script.parent().unwrap();
+        Self::new(
+            machine,
+            script.to_path_buf(),
+            bridge,
+            Some(HostEnvironment::fixture(directory)),
+            Some(directory.join("runtime")),
+            timeout,
+            Vec::new(),
+        )
+    }
+}
+
+const READY_MESSAGE: &str = "Ready to restore this machine's saved session roster";
+const NO_IDENTITY_MESSAGE: &str = "Quick Resume cannot determine this machine's user identity";
+const LOCK_MESSAGE: &str = "Quick Resume's secure runtime lock directory is unavailable";
+
+impl RecoveryInner {
+    /// Re-validates everything a run depends on and returns the script bytes
+    /// to execute, or the user-facing reason recovery is unavailable.
+    fn probe(&self) -> Result<ValidatedScript, String> {
+        let script =
+            validate_script(&self.script, &self.bridge).map_err(|problem| match problem {
+                ScriptProblem::Missing => {
+                    "Quick Resume roster script is not installed on this machine".to_owned()
+                }
+                ScriptProblem::Invalid => {
+                    "Quick Resume roster script fails its safety checks".to_owned()
+                }
+            })?;
+        let Some(environment) = &self.environment else {
+            return Err(NO_IDENTITY_MESSAGE.to_owned());
+        };
+        if !required_commands_available(&self.required_commands, &environment.path) {
+            return Err(
+                "Quick Resume roster commands are missing or not executable on this machine"
+                    .to_owned(),
+            );
+        }
+        match &self.runtime_dir {
+            Some(dir) if validate_runtime_location(dir).is_ok() => {}
+            _ => return Err(LOCK_MESSAGE.to_owned()),
+        }
+        Ok(script)
     }
 }
 
@@ -309,12 +507,17 @@ enum ScriptOutcome {
     TimedOut,
 }
 
-async fn run_script(script: ValidatedScript, _lock: File, timeout: Duration) -> ScriptOutcome {
+async fn run_script(
+    script: ValidatedScript,
+    environment: &HostEnvironment,
+    _lock: File,
+    timeout: Duration,
+) -> ScriptOutcome {
     // Execute the already-opened, validated bytes instead of reopening a path
     // after validation. The child leads a new process group so timeout cleanup
     // reaches every descendant the recovery script started.
     let mut command = Command::new(BASH_COMMAND);
-    configure_script_environment(&mut command);
+    configure_script_environment(&mut command, environment);
     command
         .arg("-s")
         .stdin(Stdio::piped())
@@ -364,27 +567,39 @@ async fn run_script(script: ValidatedScript, _lock: File, timeout: Duration) -> 
     }
 }
 
-fn configure_script_environment(command: &mut Command) {
+fn configure_script_environment(command: &mut Command, environment: &HostEnvironment) {
     // Bash evaluates BASH_ENV before stdin and imports exported shell
     // functions. Start from an empty environment so the pinned script bytes
-    // are the only shell program that can execute, then add only fixed data the
-    // Tron roster and its verification commands require.
+    // are the only shell program that can execute, then add only the fixed
+    // identity data a roster and its verification commands require.
     command.env_clear().envs([
-        ("HOME", TRON_HOME),
-        ("LANG", "C.UTF-8"),
-        ("LOGNAME", "ryan"),
-        ("PATH", RECOVERY_PATH),
-        ("USER", "ryan"),
+        ("HOME", environment.home.as_os_str().to_owned()),
+        ("LANG", "C.UTF-8".into()),
+        ("LOGNAME", environment.user.clone().into()),
+        ("PATH", environment.path.clone().into()),
+        ("USER", environment.user.clone().into()),
     ]);
 }
 
-fn required_commands_available(commands: &[&str]) -> bool {
-    commands.iter().all(|command| {
-        let path = Path::new(command);
-        path.is_absolute()
-            && fs::metadata(path)
-                .is_ok_and(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0)
-    })
+/// Every configured roster command plus the interpreter and a `tmux` on the
+/// sanitized PATH must exist and be executable before recovery is offered.
+fn required_commands_available(commands: &[PathBuf], path: &str) -> bool {
+    executable_file(Path::new(BASH_COMMAND))
+        && resolve_on_path("tmux", path).is_some()
+        && commands
+            .iter()
+            .all(|command| command.is_absolute() && executable_file(command))
+}
+
+fn executable_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0)
+}
+
+fn resolve_on_path(name: &str, path: &str) -> Option<PathBuf> {
+    path.split(':')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| Path::new(entry).join(name))
+        .find(|candidate| executable_file(candidate))
 }
 
 async fn terminate_process_group(child: &mut tokio::process::Child, group: Pid) {
@@ -401,18 +616,22 @@ async fn terminate_process_group(child: &mut tokio::process::Child, group: Pid) 
     }
 }
 
-fn validate_script(path: &Path) -> Result<ValidatedScript, ()> {
+fn validate_script(path: &Path, bridge: &LaunchBridge) -> Result<ValidatedScript, ScriptProblem> {
     let euid = geteuid().as_raw();
-    validate_secure_ancestry(path, euid)?;
-    let path_metadata = fs::symlink_metadata(path).map_err(|_| ())?;
+    if matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Err(ScriptProblem::Missing);
+    }
+    validate_secure_ancestry(path, euid).map_err(|()| ScriptProblem::Invalid)?;
+    let path_metadata = fs::symlink_metadata(path).map_err(|_| ScriptProblem::Invalid)?;
     let descriptor = rustix::fs::open(
         path,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|_| ())?;
+    .map_err(|_| ScriptProblem::Invalid)?;
     let mut file = File::from(descriptor);
-    let metadata = file.metadata().map_err(|_| ())?;
+    let metadata = file.metadata().map_err(|_| ScriptProblem::Invalid)?;
     if !metadata.file_type().is_file()
         || metadata.len() > MAX_SCRIPT_BYTES
         || metadata.mode() & 0o111 == 0
@@ -422,17 +641,22 @@ fn validate_script(path: &Path) -> Result<ValidatedScript, ()> {
         || path_metadata.dev() != metadata.dev()
         || path_metadata.ino() != metadata.ino()
     {
-        return Err(());
+        return Err(ScriptProblem::Invalid);
     }
-    let mut contents = Vec::with_capacity(usize::try_from(metadata.len()).map_err(|_| ())?);
-    file.read_to_end(&mut contents).map_err(|_| ())?;
+    let mut contents =
+        Vec::with_capacity(usize::try_from(metadata.len()).map_err(|_| ScriptProblem::Invalid)?);
+    file.read_to_end(&mut contents)
+        .map_err(|_| ScriptProblem::Invalid)?;
     let lines = contents.split(|byte| *byte == b'\n').collect::<Vec<_>>();
-    if ![SCRIPT_MARKER, SCOPED_EXEC_MARKER].iter().all(|marker| {
+    let has_marker = |marker: &str| {
         let expected = format!("# {marker}");
         lines.contains(&expected.as_bytes())
-    }) || transaction_helpers(&contents) != Some(EXPECTED_TRANSACTION_HELPERS.as_bytes())
+    };
+    if !has_marker(SCRIPT_MARKER)
+        || !has_marker(bridge.marker())
+        || !transaction_helpers(&contents).is_some_and(|helpers| helpers_match(helpers, bridge))
     {
-        return Err(());
+        return Err(ScriptProblem::Invalid);
     }
     Ok(ValidatedScript { contents })
 }
@@ -450,6 +674,116 @@ fn single_fragment_offset(contents: &[u8], fragment: &[u8]) -> Option<usize> {
         .filter_map(|(offset, candidate)| (candidate == fragment).then_some(offset));
     let first = matches.next()?;
     matches.next().is_none().then_some(first)
+}
+
+/// The canonical helper block for a bridge, as it must appear on a node
+/// without a memory policy.  The scoped variant is matched structurally by
+/// [`scoped_helpers_match`] instead, because its bridge names host paths.
+fn direct_helpers() -> String {
+    CANONICAL_SCOPED_HELPERS.replacen(SCOPED_SEND_BLOCK, DIRECT_SEND_BLOCK, 1)
+}
+
+fn helpers_match(candidate: &[u8], bridge: &LaunchBridge) -> bool {
+    let Ok(candidate) = std::str::from_utf8(candidate) else {
+        return false;
+    };
+    match bridge {
+        LaunchBridge::Direct => candidate == direct_helpers(),
+        LaunchBridge::Scoped { config_path } => {
+            scoped_helpers_match(candidate, config_path.as_deref())
+        }
+    }
+}
+
+/// Matches a candidate block against Tron's canonical scoped block line by
+/// line.  Exactly two things may differ: the `scoped_exec_command` line may
+/// name this node's own atmux executable and configuration file, and the
+/// `atmux-web` service-cap override may be absent or carry another byte count
+/// (`scoped-exec` itself enforces the owner's cap policy at launch).
+fn scoped_helpers_match(candidate: &str, config_path: Option<&Path>) -> bool {
+    let Some(canonical_command_line) = SCOPED_SEND_BLOCK
+        .lines()
+        .find(|line| line.starts_with(SCOPED_COMMAND_PREFIX))
+    else {
+        return false;
+    };
+    let mut expected = CANONICAL_SCOPED_HELPERS.split('\n');
+    let mut actual = candidate.split('\n').peekable();
+    while let Some(line) = expected.next() {
+        if line == canonical_command_line {
+            let Some(bridge_line) = actual.next() else {
+                return false;
+            };
+            if !scoped_command_line_is_this_node(bridge_line, config_path) {
+                return false;
+            }
+        } else if line == SERVICE_OVERRIDE_IF_LINE {
+            // Consume the canonical three-line override; the candidate may
+            // omit it entirely or supply its own byte count.
+            let (Some(cap), Some(end)) = (expected.next(), expected.next()) else {
+                return false;
+            };
+            if !(cap.starts_with(SERVICE_OVERRIDE_CAP_PREFIX) && end == SERVICE_OVERRIDE_END_LINE) {
+                return false;
+            }
+            if actual.peek() == Some(&SERVICE_OVERRIDE_IF_LINE) {
+                actual.next();
+                let (Some(cap), Some(end)) = (actual.next(), actual.next()) else {
+                    return false;
+                };
+                if !(service_override_cap_line(cap) && end == SERVICE_OVERRIDE_END_LINE) {
+                    return false;
+                }
+            }
+        } else if actual.next() != Some(line) {
+            return false;
+        }
+    }
+    actual.next().is_none()
+}
+
+fn service_override_cap_line(line: &str) -> bool {
+    line.strip_prefix(SERVICE_OVERRIDE_CAP_PREFIX)
+        .and_then(|rest| rest.strip_suffix(SERVICE_OVERRIDE_CAP_SUFFIX))
+        .is_some_and(|digits| !digits.is_empty() && digits.parse::<u64>().is_ok())
+}
+
+/// The bridge must run an atmux executable this user owns (or root installed)
+/// through the daemon's own configuration file, so the roster enters exactly
+/// the memory policy in effect.
+fn scoped_command_line_is_this_node(line: &str, config_path: Option<&Path>) -> bool {
+    let Some(inner) = line
+        .strip_prefix(SCOPED_COMMAND_PREFIX)
+        .and_then(|rest| rest.strip_suffix(SCOPED_COMMAND_SUFFIX))
+    else {
+        return false;
+    };
+    let Ok(words) = shell_words::split(inner) else {
+        return false;
+    };
+    let [executable, config_flag, configured, verb] = words.as_slice() else {
+        return false;
+    };
+    if config_flag != "--config" || verb != "scoped-exec" {
+        return false;
+    }
+    let executable = Path::new(executable);
+    let euid = geteuid().as_raw();
+    let trusted_executable = executable.is_absolute()
+        && validate_secure_ancestry(executable, euid).is_ok()
+        && fs::symlink_metadata(executable).is_ok_and(|metadata| {
+            metadata.is_file()
+                && metadata.mode() & 0o111 != 0
+                && metadata.mode() & 0o022 == 0
+                && (metadata.uid() == euid || metadata.uid() == 0)
+        });
+    let same_config = config_path.is_some_and(|expected| {
+        match (fs::canonicalize(configured), fs::canonicalize(expected)) {
+            (Ok(actual), Ok(expected)) => actual == expected,
+            _ => false,
+        }
+    });
+    trusted_executable && same_config
 }
 
 fn validate_secure_ancestry(path: &Path, euid: u32) -> Result<(), ()> {
@@ -568,7 +902,7 @@ mod tests {
 
     static FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
 
-    fn fixture_script(body: &str) -> PathBuf {
+    fn fixture_directory() -> PathBuf {
         let directory = std::env::current_dir().unwrap().join(format!(
             ".atmux-recovery-test-{}-{}",
             std::process::id(),
@@ -576,17 +910,56 @@ mod tests {
         ));
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-        let path = directory.join("resume.sh");
-        let mut file = File::create(&path).unwrap();
-        writeln!(
+        directory
+    }
+
+    fn write_script(path: &Path, helpers: &str, body: &str) {
+        let mut file = File::create(path).unwrap();
+        write!(
             file,
-            "#!/usr/bin/env bash\n# {SCRIPT_MARKER}\n# ATMUX_QUICK_RESUME_TRANSACTION_BEGIN\n{EXPECTED_TRANSACTION_HELPERS}# ATMUX_QUICK_RESUME_TRANSACTION_END\n{body}"
+            "#!/usr/bin/env bash\n# {SCRIPT_MARKER}\n# ATMUX_QUICK_RESUME_TRANSACTION_BEGIN\n{helpers}# ATMUX_QUICK_RESUME_TRANSACTION_END\n{body}\n"
         )
         .unwrap();
         let mut permissions = file.metadata().unwrap().permissions();
         permissions.set_mode(0o700);
-        fs::set_permissions(&path, permissions).unwrap();
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    /// A direct-bridge fixture script in its own private directory.
+    fn fixture_script(body: &str) -> PathBuf {
+        let path = fixture_directory().join("resume.sh");
+        write_script(&path, &direct_helpers(), body);
         path
+    }
+
+    /// A scoped-bridge fixture: the canonical Tron block rewritten to name a
+    /// private executable and configuration file beside the script.
+    fn scoped_fixture(body: &str) -> (PathBuf, LaunchBridge, String) {
+        let directory = fixture_directory();
+        let executable = directory.join("atmux");
+        fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = directory.join("config.toml");
+        fs::write(&config, "").unwrap();
+        let canonical_line = SCOPED_SEND_BLOCK
+            .lines()
+            .find(|line| line.starts_with(SCOPED_COMMAND_PREFIX))
+            .unwrap();
+        let this_node_line = format!(
+            "{SCOPED_COMMAND_PREFIX}{} --config {} scoped-exec{SCOPED_COMMAND_SUFFIX}",
+            executable.display(),
+            config.display()
+        );
+        let helpers = CANONICAL_SCOPED_HELPERS.replacen(canonical_line, &this_node_line, 1);
+        let path = directory.join("resume.sh");
+        write_script(&path, &helpers, body);
+        (
+            path,
+            LaunchBridge::Scoped {
+                config_path: Some(config),
+            },
+            helpers,
+        )
     }
 
     fn remove_fixture(path: &Path) {
@@ -607,7 +980,7 @@ mod tests {
     #[tokio::test]
     async fn single_flight_rejects_a_second_start() {
         let path = fixture_script("sleep 0.25");
-        let runner = RecoveryRunner::fixture("tron", path.clone(), Duration::from_secs(2));
+        let runner = RecoveryRunner::fixture("tron", &path, Duration::from_secs(2));
         assert_eq!(runner.start().await.unwrap().phase, RecoveryPhase::Running);
         assert!(matches!(
             runner.start().await,
@@ -623,8 +996,8 @@ mod tests {
     #[tokio::test]
     async fn file_lock_prevents_two_server_processes_from_running_recovery() {
         let path = fixture_script("sleep 0.4");
-        let first = RecoveryRunner::fixture("tron", path.clone(), Duration::from_secs(2));
-        let second = RecoveryRunner::fixture("tron", path.clone(), Duration::from_secs(2));
+        let first = RecoveryRunner::fixture("tron", &path, Duration::from_secs(2));
+        let second = RecoveryRunner::fixture("tron", &path, Duration::from_secs(2));
         first.start().await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(matches!(
@@ -642,12 +1015,57 @@ mod tests {
     async fn output_is_not_exposed_and_failure_is_bounded_to_an_exit_code() {
         let path =
             fixture_script("printf 'secret-output\\n'\nprintf 'secret-error\\n' >&2\nexit 7");
-        let runner = RecoveryRunner::fixture("tron", path.clone(), Duration::from_secs(2));
+        let runner = RecoveryRunner::fixture("tron", &path, Duration::from_secs(2));
         runner.start().await.unwrap();
         let status = wait_until_finished(&runner).await;
         assert_eq!(status.phase, RecoveryPhase::Failed);
-        assert_eq!(status.message, "Tron recovery script exited with status 7");
-        assert!(!serde_json::to_string(&status).unwrap().contains("secret"));
+        assert_eq!(status.message, "Recovery script exited with status 7");
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains("secret"));
+        assert!(!json.contains(".atmux-recovery-test"));
+        remove_fixture(&path);
+    }
+
+    #[tokio::test]
+    async fn the_script_sees_only_the_fixed_identity_environment() {
+        let path = fixture_script(
+            "[ \"$HOME\" = \"$ATMUX_EXPECTED_HOME\" ] && exit 9\nprintf '%s\\n' \"$HOME\" \"$USER\" \"$LOGNAME\" \"$PATH\" > \"$HOME/seen\"\n[ -z \"${ATMUX_LEAK:-}\" ] || exit 5\n",
+        );
+        let directory = path.parent().unwrap().to_path_buf();
+        // SAFETY-free: these are process-wide test variables the child must
+        // never inherit; the runner clears its environment before spawning.
+        // They are read back only by this test.
+        let runner = RecoveryRunner::fixture("tron", &path, Duration::from_secs(2));
+        let mut command = Command::new(BASH_COMMAND);
+        command.env("ATMUX_LEAK", "1");
+        configure_script_environment(&mut command, &HostEnvironment::fixture(&directory));
+        let status = command
+            .arg("-c")
+            .arg("[ -z \"${ATMUX_LEAK:-}\" ] && [ \"$USER\" = fixture ] && [ \"$LOGNAME\" = fixture ] && [ \"$HOME\" = \"$1\" ]")
+            .arg("--")
+            .arg(&directory)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success(), "the fixed environment was not applied");
+
+        runner.start().await.unwrap();
+        assert_eq!(
+            wait_until_finished(&runner).await.phase,
+            RecoveryPhase::Succeeded
+        );
+        let seen = fs::read_to_string(directory.join("seen")).unwrap();
+        let mut lines = seen.lines();
+        assert_eq!(lines.next(), Some(directory.to_str().unwrap()));
+        assert_eq!(lines.next(), Some("fixture"));
+        assert_eq!(lines.next(), Some("fixture"));
+        let path_entries = lines.next().unwrap().split(':').collect::<Vec<_>>();
+        assert!(path_entries.contains(&"/usr/bin"));
+        assert!(
+            path_entries
+                .iter()
+                .any(|entry| entry.ends_with(".local/bin"))
+        );
         remove_fixture(&path);
     }
 
@@ -667,7 +1085,7 @@ mod tests {
         .unwrap();
         let mut command = Command::new(BASH_COMMAND);
         command.env("BASH_ENV", &bash_env);
-        configure_script_environment(&mut command);
+        configure_script_environment(&mut command, &HostEnvironment::fixture(directory));
         let status = command.arg("-c").arg(":").status().await.unwrap();
         assert!(status.success());
         assert!(!marker.exists(), "BASH_ENV code ran before the fixture");
@@ -677,28 +1095,43 @@ mod tests {
     #[test]
     fn pinned_bash_is_absolute_and_executable_on_this_platform() {
         assert!(Path::new(BASH_COMMAND).is_absolute());
-        assert!(required_commands_available(&[BASH_COMMAND]));
+        assert!(executable_file(Path::new(BASH_COMMAND)));
     }
 
     #[test]
-    fn sanitized_path_covers_every_preflighted_roster_command() {
-        assert!(!required_commands_available(&[
-            "/definitely/missing/atmux-recovery-command"
-        ]));
-        let path_entries = RECOVERY_PATH.split(':').collect::<Vec<_>>();
-        for command in REQUIRED_RECOVERY_COMMANDS {
-            let parent = Path::new(command).parent().unwrap().to_string_lossy();
-            assert!(
-                path_entries.contains(&parent.as_ref()),
-                "sanitized PATH omits required command directory {parent}"
-            );
-        }
+    fn sanitized_path_finds_tmux_and_the_user_launcher_directories() {
+        let home = Path::new("/nonexistent/home");
+        let path = recovery_path(home);
+        let entries = path.split(':').collect::<Vec<_>>();
+        assert!(entries.contains(&"/usr/bin"));
+        assert!(entries.contains(&"/nonexistent/home/.local/bin"));
+        assert!(entries.contains(&"/nonexistent/home/.asdf/shims"));
+        assert_eq!(
+            entries.contains(&"/opt/homebrew/bin"),
+            cfg!(target_os = "macos")
+        );
+        assert_eq!(resolve_on_path("sh", "/nonexistent:/usr/bin:/bin"), {
+            if executable_file(Path::new("/usr/bin/sh")) {
+                Some(PathBuf::from("/usr/bin/sh"))
+            } else {
+                Some(PathBuf::from("/bin/sh"))
+            }
+        });
+        assert!(resolve_on_path("definitely-missing-atmux-command", &path).is_none());
+        assert!(!required_commands_available(
+            &[PathBuf::from("/definitely/missing/atmux-recovery-command")],
+            &path
+        ));
+        assert!(!required_commands_available(
+            &[PathBuf::from("relative/command")],
+            &path
+        ));
     }
 
     #[tokio::test]
     async fn timeout_stops_a_hung_fixture() {
         let path = fixture_script("sleep 30");
-        let runner = RecoveryRunner::fixture("tron", path.clone(), Duration::from_secs(1));
+        let runner = RecoveryRunner::fixture("tron", &path, Duration::from_secs(1));
         runner.start().await.unwrap();
         assert_eq!(
             wait_until_finished(&runner).await.phase,
@@ -711,16 +1144,15 @@ mod tests {
     async fn timeout_terminates_and_reaps_background_descendants() {
         let path = fixture_script(":");
         let pid_file = path.parent().unwrap().join("descendant.pid");
-        fs::write(
+        write_script(
             &path,
-            format!(
-                "#!/usr/bin/env bash\n# {SCRIPT_MARKER}\n# ATMUX_QUICK_RESUME_TRANSACTION_BEGIN\n{EXPECTED_TRANSACTION_HELPERS}# ATMUX_QUICK_RESUME_TRANSACTION_END\n(trap '' TERM; while :; do sleep 30; done) &\nprintf '%s' \"$!\" > {}\nwait\n",
+            &direct_helpers(),
+            &format!(
+                "(trap '' TERM; while :; do sleep 30; done) &\nprintf '%s' \"$!\" > {}\nwait",
                 shell_words::quote(&pid_file.display().to_string()),
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-        let runner = RecoveryRunner::fixture("tron", path.clone(), Duration::from_secs(1));
+        );
+        let runner = RecoveryRunner::fixture("tron", &path, Duration::from_secs(1));
         runner.start().await.unwrap();
         assert_eq!(
             wait_until_finished(&runner).await.phase,
@@ -743,18 +1175,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_exec_marker_and_machine_scope_fail_closed() {
-        let path = fixture_script(":");
-        let wrong_machine = RecoveryRunner::production("midnight");
-        assert!(!wrong_machine.status().await.available);
+    async fn missing_or_markerless_roster_fails_closed_with_a_pathless_message() {
+        let detached = RecoveryRunner::detached("midnight");
+        let status = detached.status().await;
+        assert!(!status.available);
+        assert_eq!(status.phase, RecoveryPhase::Unavailable);
+        assert_eq!(
+            status.message,
+            "Quick Resume roster script is not installed on this machine"
+        );
+        assert!(matches!(
+            detached.start().await,
+            Err(RecoveryStartError::Unavailable(_))
+        ));
 
+        let path = fixture_script(":");
         fs::write(
             &path,
             format!("#!/usr/bin/env bash\n# {SCRIPT_MARKER}\nexit 0\n"),
         )
         .unwrap();
-        let runner = RecoveryRunner::fixture("tron", path.clone(), Duration::from_secs(1));
-        assert!(!runner.status().await.available);
+        let runner = RecoveryRunner::fixture("tron", &path, Duration::from_secs(1));
+        let status = runner.status().await;
+        assert!(!status.available);
+        assert_eq!(
+            status.message,
+            "Quick Resume roster script fails its safety checks"
+        );
         assert!(matches!(
             runner.start().await,
             Err(RecoveryStartError::Unavailable(_))
@@ -762,25 +1209,167 @@ mod tests {
         remove_fixture(&path);
     }
 
+    #[tokio::test]
+    async fn production_runner_follows_the_configuration() {
+        let directory = fixture_directory();
+        let config_file = directory.join("config.toml");
+        fs::write(&config_file, "").unwrap();
+        let script = directory.join(DEFAULT_SCRIPT_NAME);
+        write_script(&script, &direct_helpers(), ":");
+
+        let mut config = Config::default();
+        config.node.id = "clue".to_owned();
+        config.source_path = Some(config_file.clone());
+        let runner = RecoveryRunner::production(&config);
+        assert_eq!(runner.inner.script, script);
+        assert_eq!(runner.inner.bridge, LaunchBridge::Direct);
+        let status = runner.status().await;
+        assert_eq!(status.machine, "clue");
+        assert!(
+            status.available || status.message == LOCK_MESSAGE,
+            "a direct roster beside the config is offered unless this host lacks a private runtime dir: {}",
+            status.message
+        );
+
+        let explicit = directory.join("elsewhere.sh");
+        write_script(&explicit, &direct_helpers(), ":");
+        config.recovery.script = Some(explicit.clone());
+        config.recovery.required_commands = vec![directory.join("missing-launcher")];
+        let runner = RecoveryRunner::production(&config);
+        assert_eq!(runner.inner.script, explicit);
+        let status = runner.status().await;
+        assert!(!status.available);
+        assert_eq!(
+            status.message,
+            "Quick Resume roster commands are missing or not executable on this machine"
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            config.agent_resources.memory_max_bytes = Some(1024 * 1024 * 1024);
+            let runner = RecoveryRunner::production(&config);
+            assert_eq!(
+                runner.inner.bridge,
+                LaunchBridge::Scoped {
+                    config_path: Some(config_file.clone())
+                }
+            );
+            // A direct roster is refused where the memory policy demands the
+            // scoped bridge.
+            assert!(!runner.status().await.available);
+        }
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn checked_in_direct_bridge_and_example_roster_validate_only_without_memory_policy() {
+        let path = fixture_script(":");
+        assert!(validate_script(&path, &LaunchBridge::Direct).is_ok());
+        assert!(
+            validate_script(
+                &path,
+                &LaunchBridge::Scoped {
+                    config_path: Some(path.parent().unwrap().join("config.toml"))
+                }
+            )
+            .is_err()
+        );
+        let direct = direct_helpers();
+        assert!(direct.contains(&format!("# {DIRECT_EXEC_MARKER}")));
+        assert!(
+            !direct
+                .lines()
+                .any(|line| !line.starts_with('#') && line.contains("scoped-exec"))
+        );
+        assert!(direct.contains("\"exec $2\" Enter"));
+
+        // The shipped example roster carries exactly this block.
+        let example = fs::read_to_string(
+            std::env::current_dir()
+                .unwrap()
+                .join("deploy/quick-resume/quick-resume.example.sh"),
+        )
+        .unwrap();
+        let example_path = path.parent().unwrap().join("example.sh");
+        fs::write(&example_path, &example).unwrap();
+        fs::set_permissions(&example_path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(validate_script(&example_path, &LaunchBridge::Direct).is_ok());
+
+        let valid = fs::read_to_string(&path).unwrap();
+        let assert_invalid = |source: String| {
+            fs::write(&path, source).unwrap();
+            assert!(validate_script(&path, &LaunchBridge::Direct).is_err());
+        };
+        assert_invalid(valid.replace("\"exec $2\" Enter", "\"exec $2; rm -rf /\" Enter"));
+        assert_invalid(valid.replace(&format!("# {DIRECT_EXEC_MARKER}\n"), ""));
+        assert_invalid(valid.replace(
+            DIRECT_SEND_BLOCK,
+            &format!("if false; then\n{DIRECT_SEND_BLOCK}fi\n"),
+        ));
+        assert_invalid(valid.replace(
+            "# ATMUX_QUICK_RESUME_TRANSACTION_END\n",
+            &format!("{DIRECT_SEND_BLOCK}# ATMUX_QUICK_RESUME_TRANSACTION_END\n"),
+        ));
+        remove_fixture(&path);
+    }
+
     #[test]
     fn checked_in_tron_bridge_requires_exact_active_transaction_helpers() {
-        let path = fixture_script(":");
+        let (path, bridge, valid_helpers) = scoped_fixture(":");
         let block = fs::read_to_string(
             std::env::current_dir()
                 .unwrap()
                 .join("deploy/systemd/resume-tron-scoped-exec-block.bash"),
         )
         .unwrap();
-        assert!(EXPECTED_TRANSACTION_HELPERS.contains(&block));
-        assert!(validate_script(&path).is_ok());
+        assert_eq!(block, SCOPED_SEND_BLOCK);
+        assert!(CANONICAL_SCOPED_HELPERS.contains(&block));
+        assert!(validate_script(&path, &bridge).is_ok());
+        // Tron's live roster shape (its own paths) is what the canonical
+        // fixture holds; on any other machine it fails closed because that
+        // executable and configuration are not this node's.
+        assert!(
+            !scoped_helpers_match(
+                CANONICAL_SCOPED_HELPERS,
+                Some(path.parent().unwrap().join("config.toml").as_path())
+            ) || Path::new("/home/ryan/.local/bin/atmux").exists()
+        );
+
         let valid = fs::read_to_string(&path).unwrap();
         let assert_invalid = |source: String| {
             fs::write(&path, source).unwrap();
-            assert!(validate_script(&path).is_err());
+            assert!(validate_script(&path, &bridge).is_err());
         };
+        let assert_valid = |source: String| {
+            fs::write(&path, source).unwrap();
+            assert!(validate_script(&path, &bridge).is_ok());
+        };
+        let override_block = "  if [ \"$unit_session\" = atmux-web ]; then\n    scoped_exec_command+=' --recovery-service-memory-max-bytes 60129542144'\n  fi\n";
+        assert!(valid.contains(override_block));
+        // The service cap is optional and policy-checked by scoped-exec.
+        assert_valid(valid.replace(override_block, ""));
+        assert_valid(valid.replace("60129542144", "51539607552"));
+        assert_invalid(valid.replace("60129542144", "lots"));
+        assert_invalid(valid.replace("60129542144", ""));
 
-        assert_invalid(valid.replace(SCOPED_EXEC_WEB_OVERRIDE_FRAGMENT, ""));
-        assert_invalid(valid.replace("60129542144", "51539607552"));
+        let this_line = valid_helpers
+            .lines()
+            .find(|line| line.starts_with(SCOPED_COMMAND_PREFIX))
+            .unwrap()
+            .to_owned();
+        assert_invalid(valid.replace(
+            &this_line,
+            &this_line.replace("scoped-exec'", "scoped-exec --memory-max-bytes 1'"),
+        ));
+        assert_invalid(valid.replace(
+            &this_line,
+            &this_line.replace("/atmux --config", "/missing-atmux --config"),
+        ));
+        assert_invalid(valid.replace(
+            &this_line,
+            &this_line.replace("/config.toml scoped-exec", "/other.toml scoped-exec"),
+        ));
+        assert_invalid(valid.replace(&this_line, "  local scoped_exec_command='/bin/sh -c'"));
 
         let commented = block.lines().fold(String::new(), |mut output, line| {
             output.push_str("# ");
@@ -788,20 +1377,37 @@ mod tests {
             output.push('\n');
             output
         });
-        assert_invalid(valid.replace(&block, &commented));
-        assert_invalid(valid.replace(&block, &format!("if false; then\n{block}fi\n")));
-        assert_invalid(valid.replace(SCOPED_EXEC_SEND_FRAGMENT, "\"exec $2\" Enter"));
-
+        let this_block = block.replacen(
+            SCOPED_SEND_BLOCK
+                .lines()
+                .find(|line| line.starts_with(SCOPED_COMMAND_PREFIX))
+                .unwrap(),
+            &this_line,
+            1,
+        );
+        assert!(valid.contains(&this_block));
+        assert_invalid(valid.replace(&this_block, &commented));
+        assert_invalid(valid.replace(&this_block, &format!("if false; then\n{this_block}fi\n")));
+        assert_invalid(valid.replace(
+            "\"exec $scoped_exec_command -- $2\" Enter",
+            "\"exec $2\" Enter",
+        ));
         assert_invalid(valid.replace(
             "# ATMUX_QUICK_RESUME_TRANSACTION_END\n",
-            &format!("{block}# ATMUX_QUICK_RESUME_TRANSACTION_END\n"),
+            &format!("{this_block}# ATMUX_QUICK_RESUME_TRANSACTION_END\n"),
         ));
         assert_invalid(valid.replace(
-            &block,
+            &this_block,
             &format!(
-                "{block}scoped_exec_command+=' --recovery-service-memory-max-bytes 60129542144'\n"
+                "{this_block}scoped_exec_command+=' --recovery-service-memory-max-bytes 60129542144'\n"
             ),
         ));
+        // A direct roster never satisfies a memory-scoped node.
+        assert_invalid(
+            valid
+                .replace(&this_block, DIRECT_SEND_BLOCK)
+                .replace(&format!("# {SCOPED_EXEC_MARKER}\n"), ""),
+        );
         remove_fixture(&path);
     }
 
@@ -810,13 +1416,13 @@ mod tests {
         let path = fixture_script(":");
         let directory = path.parent().unwrap();
         fs::set_permissions(directory, fs::Permissions::from_mode(0o770)).unwrap();
-        let runner = RecoveryRunner::fixture("tron", path.clone(), Duration::from_secs(1));
+        let runner = RecoveryRunner::fixture("tron", &path, Duration::from_secs(1));
         assert!(!runner.status().await.available);
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
 
         let link = directory.join("linked.sh");
         std::os::unix::fs::symlink(&path, &link).unwrap();
-        let linked = RecoveryRunner::fixture("tron", link, Duration::from_secs(1));
+        let linked = RecoveryRunner::fixture("tron", &link, Duration::from_secs(1));
         assert!(!linked.status().await.available);
         remove_fixture(&path);
     }
@@ -830,8 +1436,10 @@ mod tests {
         fs::set_permissions(&runtime_target, fs::Permissions::from_mode(0o700)).unwrap();
         std::os::unix::fs::symlink(&runtime_target, directory.join("runtime")).unwrap();
 
-        let runner = RecoveryRunner::fixture("tron", path.clone(), Duration::from_secs(1));
-        assert!(!runner.status().await.available);
+        let runner = RecoveryRunner::fixture("tron", &path, Duration::from_secs(1));
+        let status = runner.status().await;
+        assert!(!status.available);
+        assert_eq!(status.message, LOCK_MESSAGE);
         assert!(matches!(
             runner.start().await,
             Err(RecoveryStartError::Unavailable(_))

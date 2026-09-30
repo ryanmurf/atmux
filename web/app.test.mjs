@@ -57,6 +57,9 @@ const {
   formatUptime,
   formatRelativeTime,
   fleetUpdatePollDelay,
+  recoveryMachines,
+  recoveryPollDelay,
+  recoveryRowState,
   updateConfirmCopy,
   groupSessionsByMachine,
   machineCanCheck,
@@ -2714,16 +2717,52 @@ test("agent restart uses a confirmation and never sends browser-supplied session
   assert.doesNotMatch(source, /CODEX_HOME/);
 });
 
-test("Tron Quick Resume is confirmed and sends no browser command or path", () => {
+test("Quick Resume is offered per machine and sends no browser command or path", () => {
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
   const markup = readFileSync(new URL("./index.html", import.meta.url), "utf8");
   assert.match(markup, /id="recovery-open"/);
   assert.match(markup, /id="recovery-dialog"/);
+  assert.match(markup, /id="recovery-machines"/);
   assert.match(markup, /Sessions that already exist are preserved/);
-  assert.match(source, /\/api\/v1\/machines\/tron\/quick-resume/);
+  assert.match(source, /\/api\/v1\/fleet\/quick-resume/);
+  assert.match(source, /\/api\/v1\/machines\/\$\{encodeURIComponent\(machineId\)\}\/quick-resume/);
   assert.match(source, /body: JSON\.stringify\(\{\}\)/);
+  // No machine is special-cased any more, and nothing about a script crosses the wire.
+  assert.doesNotMatch(source, /machines\/tron\/quick-resume/);
   assert.doesNotMatch(source, /resume-tron\.sh/);
   assert.doesNotMatch(source, /recovery[^\n]*(?:command|script_path|arguments):/i);
+});
+
+test("the Quick Resume dialog lists each answering machine and enables only available ones", () => {
+  const entry = (id, recovery, extra = {}) => ({ id, label: id[0].toUpperCase() + id.slice(1), online: true, recovery, error: null, ...extra });
+  const ready = entry("tron", { machine: "tron", available: true, phase: "idle", message: "Ready to restore this machine's saved session roster" });
+  const running = entry("midnight", { machine: "midnight", available: true, phase: "running", message: "Restoring missing sessions; existing sessions are preserved" });
+  const missing = entry("max", { machine: "max", available: false, phase: "unavailable", message: "Quick Resume roster script is not installed on this machine" });
+  const offline = entry("clue", null, { online: false, error: "machine is offline" });
+  const coordinator = entry("local", null, { error: "machine local is a coordinator-only node and has no local owner capabilities" });
+  const roster = [ready, running, missing, offline, coordinator];
+
+  assert.deepEqual(recoveryMachines(roster).map((row) => row.id), ["tron", "midnight", "max"]);
+  assert.deepEqual(recoveryMachines(null), []);
+  assert.equal(recoveryPollDelay(roster), 2000);
+  assert.equal(recoveryPollDelay([ready, missing]), 60000);
+  assert.equal(recoveryPollDelay([]), 60000);
+
+  const readyRow = recoveryRowState(ready, false);
+  assert.equal(readyRow.label, "Tron");
+  assert.equal(readyRow.canStart, true);
+  assert.equal(readyRow.action, "Resume missing sessions");
+  assert.equal(readyRow.message, "Ready to restore this machine's saved session roster");
+  assert.equal(recoveryRowState(ready, true).canStart, false, "a start in flight disables the button");
+  const runningRow = recoveryRowState(running, false);
+  assert.equal(runningRow.running, true);
+  assert.equal(runningRow.canStart, false);
+  assert.equal(runningRow.action, "Resuming\u2026");
+  const missingRow = recoveryRowState(missing, false);
+  assert.equal(missingRow.canStart, false);
+  assert.match(missingRow.message, /not installed/);
+  assert.equal(recoveryRowState(entry("clue", { available: true, phase: "idle", message: "" }, { online: false }), false).canStart, false);
+  assert.equal(recoveryRowState(null, false).label, "machine");
 });
 
 test("pane failures use a pane-scoped surface and never the tmux health alert", () => {

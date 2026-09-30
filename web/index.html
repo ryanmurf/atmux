@@ -258,10 +258,11 @@
 
   <dialog id="recovery-dialog" aria-labelledby="recovery-dialog-title">
     <form class="dialog-form">
-      <h2 id="recovery-dialog-title">Resume Tron sessions?</h2>
-      <p>Restore the saved Tron session roster after a restart. Sessions that already exist are preserved; only missing sessions are launched.</p>
-      <p id="recovery-status" class="dialog-note" role="status"></p>
-      <div class="dialog-actions"><button type="button" class="subtle dialog-cancel">Cancel</button><button id="recovery-confirm" class="primary" type="button">Resume missing sessions</button></div>
+      <h2 id="recovery-dialog-title">Quick resume</h2>
+      <p>Restore a machine's saved session roster after a restart. Sessions that already exist are preserved; only missing sessions are launched.</p>
+      <ul id="recovery-machines" class="recovery-machines" aria-label="Machines with a saved session roster"></ul>
+      <p id="recovery-status" class="dialog-note" role="status" hidden></p>
+      <div class="dialog-actions"><button type="button" class="subtle dialog-cancel">Close</button></div>
     </form>
   </dialog>
 

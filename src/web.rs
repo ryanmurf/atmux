@@ -27,9 +27,9 @@ use crate::{
     config::Config,
     control::{
         CloneLaunchRepositoryRequest, ControlPlane, CreateLaunchDirectoryRequest, ErrorKind,
-        FleetUpdate, LaunchDirectoryActionResult, LaunchDirectoryListing, LaunchRequest,
-        ModelSwitchRequest, Overview, PaneModels, PaneOutput, ResumableLaunchSessions,
-        SessionUpdateRequest, error_kind, overview_patch, pane_patch,
+        FleetRecovery, FleetUpdate, LaunchDirectoryActionResult, LaunchDirectoryListing,
+        LaunchRequest, ModelSwitchRequest, Overview, PaneModels, PaneOutput,
+        ResumableLaunchSessions, SessionUpdateRequest, error_kind, overview_patch, pane_patch,
     },
     discovery,
     machine::{MachineSummary, Secret, resolve_token},
@@ -806,6 +806,7 @@ fn routes(state: WebState) -> Router {
         .route("/api/v1/update/rollback", post(update_rollback))
         // Coordinator aggregation and forwarding.
         .route("/api/v1/fleet/updates", get(fleet_updates))
+        .route("/api/v1/fleet/quick-resume", get(fleet_recovery))
         .route(
             "/api/v1/machines/{id}/update/{action}",
             post(machine_update),
@@ -1271,6 +1272,12 @@ async fn run_local_update(
 /// Every machine's update state, for the coordinator dashboard.
 async fn fleet_updates(State(state): State<WebState>) -> Json<Vec<FleetUpdate>> {
     Json(state.control.fleet_updates().await)
+}
+
+/// Every machine's Quick Resume state; the dashboard offers the action only
+/// where the owning node reports it available.
+async fn fleet_recovery(State(state): State<WebState>) -> Json<Vec<FleetRecovery>> {
+    Json(state.control.fleet_recovery().await)
 }
 
 /// Forwards one fixed update verb to the machine that owns the executable.
@@ -2809,6 +2816,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fleet_quick_resume_reports_one_entry_per_machine_without_paths() {
+        let control = crate::control::test_control(&["gpu-box"]);
+        let (app, _shutdown) = authenticated_real_app(control);
+        let read = protected_api(
+            "GET",
+            "/api/v1/fleet/quick-resume",
+            "",
+            Some("quick-resume-test-token"),
+            None,
+        );
+        let response = app.oneshot(read).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.contains("/home/") && !text.contains(".sh"), "{text}");
+        let entries: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(entries.len(), 2);
+        let local = entries
+            .iter()
+            .find(|entry| entry["id"] == "local")
+            .expect("the local machine is always reported");
+        // The test node has no roster, so it reports itself unavailable
+        // rather than failing the whole read.
+        assert_eq!(local["recovery"]["available"], false);
+        assert_eq!(local["recovery"]["phase"], "unavailable");
+        assert!(local["error"].is_null());
+        let remote = entries
+            .iter()
+            .find(|entry| entry["id"] == "gpu-box")
+            .expect("every configured machine is reported");
+        assert_eq!(remote["online"], false);
+        assert!(remote["recovery"].is_null());
+        assert!(remote["error"].is_string());
+    }
+
+    #[tokio::test]
     async fn quick_resume_is_owner_scoped_and_origin_protected_without_running_a_script() {
         let control = crate::control::test_control(&[]);
         let local_id = control.local_id().to_owned();
@@ -2837,7 +2886,7 @@ mod tests {
             .header(header::ORIGIN, "http://localhost:7345")
             .body(Body::from("{}"))
             .unwrap();
-        // The test node is intentionally not Tron, so the fixed runner fails
+        // The test node has no roster script, so the fixed runner fails
         // closed after Origin validation and no process is spawned.
         assert_eq!(
             app.oneshot(same_origin).await.unwrap().status(),
@@ -2847,8 +2896,8 @@ mod tests {
 
     #[tokio::test]
     async fn outer_router_protects_quick_resume_schema_origin_and_owner_without_spawning() {
-        // `test_control` identifies as `local`, not Tron, so its fixed recovery
-        // runner fails closed before process creation. The configured remote is
+        // `test_control` has no roster script, so its fixed recovery runner
+        // fails closed before process creation. The configured remote is
         // offline, which also proves that its owner route is not run locally.
         let control = crate::control::test_control(&["gpu-box"]);
         let (app, _shutdown) = authenticated_real_app(control);

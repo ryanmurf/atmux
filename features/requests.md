@@ -18,6 +18,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Hide the `atmux-web` service tmux session from the user session list | `completed/agent-interaction-controls.md` | Completed |
 | Keep Midnight on its Aqua tmux server so Claude can read the login Keychain | `completed/mac-and-max-runtime.md` | Completed and standing constraint |
 | Use only the LaunchAgent kickstart for future Midnight web restarts; never rebuild its tmux server | `completed/mac-and-max-runtime.md` | Completed and standing constraint |
+| Make Quick Resume work on any computer, not only Tron | `quick-resume-any-machine.md` | Implemented and tested; fleet rollout pending |
 
 ## Usage intelligence
 

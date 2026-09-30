@@ -99,6 +99,16 @@ interval_minutes = 30
 update_timeout_seconds = 180
 relaunch_limit = 4
 
+# Quick Resume: one owner-validated roster script per machine which recreates
+# missing tmux sessions after a reboot. The dashboard offers it for every
+# machine whose script passes atmux's safety checks. The default location is
+# quick-resume.sh beside this file; see deploy/quick-resume/README.md.
+[recovery]
+# script = "~/.config/atmux/quick-resume.sh"
+# Absolute executables the roster needs; Quick Resume stays unavailable until
+# every one exists. bash and tmux are always required.
+# required_commands = ["~/.local/bin/claude", "~/.local/bin/codex"]
+
 # Signed self-update from GitHub Releases. Each node verifies and installs its
 # own artifact; a coordinator only triggers and observes. Disabled by default.
 [self_update]
@@ -206,6 +216,8 @@ pub struct Config {
     #[serde(default)]
     pub maintenance: MaintenanceConfig,
     #[serde(default)]
+    pub recovery: RecoveryConfig,
+    #[serde(default)]
     pub self_update: SelfUpdateConfig,
     #[serde(default)]
     pub node: NodeConfig,
@@ -219,6 +231,47 @@ pub struct Config {
     /// Explicitly trusted remote atmux nodes aggregated by this coordinator.
     #[serde(default)]
     pub machines: Vec<MachineConfig>,
+    /// The file this configuration was loaded from, when it came from one.
+    ///
+    /// Owner-local features which must agree with the policy in effect (for
+    /// example a Quick Resume roster's `scoped-exec --config` argument) compare
+    /// against this path rather than guessing the platform default.
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
+}
+
+/// Owner-validated host restart recovery ("Quick Resume").
+///
+/// atmux never runs an operator-supplied command from the browser. It runs one
+/// fixed roster script per machine, only after that script passes ownership,
+/// permission, and shape checks, and only through the launch bridge the node's
+/// own memory policy requires.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RecoveryConfig {
+    /// Absolute path of the roster script. Defaults to `quick-resume.sh`
+    /// beside the configuration file.
+    pub script: Option<PathBuf>,
+    /// Absolute executables the roster depends on. Quick Resume reports itself
+    /// unavailable until every one exists and is executable, so a half-restored
+    /// machine never types launch commands into empty sessions.
+    pub required_commands: Vec<PathBuf>,
+}
+
+impl RecoveryConfig {
+    fn validate(&self) -> Result<()> {
+        if let Some(script) = &self.script
+            && !script.is_absolute()
+        {
+            bail!("[recovery].script must be an absolute path");
+        }
+        for command in &self.required_commands {
+            if !command.is_absolute() {
+                bail!("[recovery].required_commands entries must be absolute paths");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Opt-in LAN discovery for nearby atmux web nodes.
@@ -536,6 +589,10 @@ impl Config {
             .validate()
             .with_context(|| format!("invalid maintenance configuration in {}", path.display()))?;
         config
+            .recovery
+            .validate()
+            .with_context(|| format!("invalid recovery configuration in {}", path.display()))?;
+        config
             .self_update
             .validate()
             .with_context(|| format!("invalid self-update configuration in {}", path.display()))?;
@@ -544,6 +601,7 @@ impl Config {
             .pulse
             .validate()
             .with_context(|| format!("invalid Pulse configuration in {}", path.display()))?;
+        config.source_path = Some(path.clone());
         Ok((config, path))
     }
 
@@ -890,6 +948,12 @@ impl Config {
             *path = expand_tilde(path);
         }
         if let Some(path) = &mut self.web.proxy_token_file {
+            *path = expand_tilde(path);
+        }
+        if let Some(path) = &mut self.recovery.script {
+            *path = expand_tilde(path);
+        }
+        for path in &mut self.recovery.required_commands {
             *path = expand_tilde(path);
         }
         #[cfg(feature = "pulse")]
@@ -2596,6 +2660,54 @@ coordinator_only = true
                 Some("CLIENT_SECRET".to_owned());
             assert_rejected(config, "owner-local Pulse credential references");
         }
+    }
+
+    #[test]
+    fn recovery_paths_expand_tilde_and_must_be_absolute() {
+        let mut config: Config = toml::from_str(
+            r#"
+[recovery]
+script = "~/resume-this-machine.sh"
+required_commands = ["~/.local/bin/claude", "/usr/bin/tmux"]
+"#,
+        )
+        .unwrap();
+        config.normalize();
+        let script = config.recovery.script.clone().unwrap();
+        assert!(script.is_absolute());
+        assert!(script.ends_with("resume-this-machine.sh"));
+        assert!(
+            config
+                .recovery
+                .required_commands
+                .iter()
+                .all(|path| path.is_absolute())
+        );
+        config.recovery.validate().unwrap();
+
+        let relative: Config = toml::from_str("[recovery]\nscript = \"resume.sh\"\n").unwrap();
+        assert!(
+            relative
+                .recovery
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("[recovery].script")
+        );
+        let relative: Config =
+            toml::from_str("[recovery]\nrequired_commands = [\"claude\"]\n").unwrap();
+        assert!(
+            relative
+                .recovery
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("[recovery].required_commands")
+        );
+
+        let default: Config = toml::from_str("profiles = []").unwrap();
+        assert_eq!(default.recovery, RecoveryConfig::default());
+        assert!(default.source_path.is_none());
     }
 
     #[test]

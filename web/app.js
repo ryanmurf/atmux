@@ -715,6 +715,42 @@ function updatableMachines(entries) {
   return (Array.isArray(entries) ? entries : []).filter(machineCanUpdate);
 }
 
+/// Poll cadence for the fleet Quick Resume roster: quick only while a
+/// machine's recovery script is running.
+const RECOVERY_POLL_ACTIVE_MS = 2000;
+const RECOVERY_POLL_IDLE_MS = 60000;
+
+/// Machines whose owning node answered the Quick Resume read with its own
+/// document. A node with no roster still answers (as unavailable, with the
+/// reason), so the dialog can say why; an offline machine has no document.
+function recoveryMachines(entries) {
+  return (Array.isArray(entries) ? entries : [])
+    .filter((entry) => entry && entry.recovery && typeof entry.recovery === "object");
+}
+
+function recoveryInFlight(entries) {
+  return recoveryMachines(entries).some((entry) => entry.recovery.phase === "running");
+}
+
+function recoveryPollDelay(entries) {
+  return recoveryInFlight(entries) ? RECOVERY_POLL_ACTIVE_MS : RECOVERY_POLL_IDLE_MS;
+}
+
+/// One dialog row. The owner's own document decides whether the button is
+/// enabled; the browser never chooses a script, path, or command.
+function recoveryRowState(entry, busy) {
+  const recovery = entry?.recovery && typeof entry.recovery === "object" ? entry.recovery : null;
+  const running = recovery?.phase === "running";
+  return {
+    id: entry?.id || "",
+    label: entry?.label || entry?.id || "machine",
+    message: entry?.error || recovery?.message || "",
+    running,
+    canStart: recovery?.available === true && !running && !busy && entry?.online !== false,
+    action: running ? "Resuming\u2026" : "Resume missing sessions",
+  };
+}
+
 /// The one thing an operator needs to know before pressing Update.
 function updateRestartWarning(labels) {
   const names = (Array.isArray(labels) ? labels : [labels]).filter(Boolean);
@@ -2904,6 +2940,9 @@ if (typeof module !== "undefined" && module.exports) {
     parseMemoryLimitSelection,
     formatRelativeTime,
     fleetUpdatePollDelay,
+    recoveryMachines,
+    recoveryPollDelay,
+    recoveryRowState,
     updateConfirmCopy,
     groupSessionsByMachine,
     favoriteSessionKey,
@@ -3256,9 +3295,11 @@ function initialize() {
     modelSwitchingPaneId: null,
     duplicatingPaneId: null,
     resumingPaneId: null,
-    recoveryStatus: null,
-    recoveryLoading: false,
+    /// Machine id -> the node's own Quick Resume document, as the coordinator read it.
+    fleetRecovery: new Map(),
     recoveryPoll: null,
+    /// Machines with a Quick Resume start in flight from this browser.
+    recoveryBusy: new Set(),
     /// Machine id -> the node's own update document, as the coordinator read it.
     fleetUpdates: new Map(),
     fleetUpdatePoll: null,
@@ -5174,17 +5215,37 @@ function initialize() {
     renderViewMode();
   }
 
+  /// The topbar action and the dialog roster, both from the fleet document.
   function renderRecoveryControl() {
-    const machine = state.machines.find((candidate) => candidate.id === "tron") || null;
+    const entries = recoveryMachines([...state.fleetRecovery.values()]);
     const button = $("recovery-open");
-    button.hidden = !machine;
-    if (!machine) return;
-    const running = state.recoveryStatus?.phase === "running";
-    button.disabled = !isMachineControllable(machine) || state.recoveryLoading || running;
-    button.textContent = running ? "Resuming…" : "Quick resume";
+    button.hidden = entries.length === 0;
+    button.textContent = recoveryInFlight(entries) ? "Resuming\u2026" : "Quick resume";
+    $("recovery-machines").replaceChildren(...entries.map(createRecoveryRow));
     const status = $("recovery-status");
-    status.textContent = state.recoveryStatus?.message || "Ready to restore Tron's saved session roster.";
-    $("recovery-confirm").disabled = state.recoveryLoading || running || state.recoveryStatus?.available === false;
+    status.hidden = entries.length > 0;
+    status.textContent = entries.length ? "" : "No machine currently reports a saved session roster.";
+  }
+
+  function createRecoveryRow(entry) {
+    const view = recoveryRowState(entry, state.recoveryBusy.has(entry.id));
+    const li = document.createElement("li");
+    li.className = "recovery-machine";
+    li.dataset.machineId = view.id;
+    const label = textSpan(view.label, "recovery-machine-label");
+    const message = textSpan(view.message, "recovery-machine-message");
+    message.setAttribute("role", "status");
+    const actions = document.createElement("div");
+    actions.className = "recovery-machine-actions";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "primary";
+    button.textContent = view.action;
+    button.disabled = !view.canStart;
+    button.addEventListener("click", () => { void startRecovery(view.id); });
+    actions.append(button);
+    li.append(label, message, actions);
+    return li;
   }
 
   function renderModelControl(session, controllable) {
@@ -6840,32 +6901,55 @@ function initialize() {
     if (state.recoveryPoll !== null) clearTimeout(state.recoveryPoll);
     state.recoveryPoll = null;
   }
-  async function refreshRecoveryStatus(showDialog = false) {
-    const machine = state.machines.find((candidate) => candidate.id === "tron") || null;
-    if (!machine || !isMachineControllable(machine)) {
-      toast("Tron is offline");
-      return null;
+  /// Reads every machine's Quick Resume document through the coordinator.
+  ///
+  /// One request covers the fleet; each owning node reports only whether its
+  /// own fixed roster is available and what state it is in.
+  async function refreshFleetRecovery(showDialog = false) {
+    stopRecoveryPolling();
+    let entries = [];
+    try {
+      entries = await request("/api/v1/fleet/quick-resume");
+    } catch (error) {
+      if (showDialog) toast(error.message);
+      scheduleRecoveryRefresh();
+      return;
     }
-    state.recoveryLoading = true;
+    state.fleetRecovery = new Map(
+      (Array.isArray(entries) ? entries : []).map((entry) => [entry.id, entry]),
+    );
+    if (showDialog && !$("recovery-dialog").open) $("recovery-dialog").showModal();
+    renderRecoveryControl();
+    scheduleRecoveryRefresh();
+  }
+
+  function scheduleRecoveryRefresh(delay = null) {
+    stopRecoveryPolling();
+    if (document.hidden) return;
+    const wait = delay ?? recoveryPollDelay([...state.fleetRecovery.values()]);
+    state.recoveryPoll = setTimeout(() => { void refreshFleetRecovery(false); }, wait);
+  }
+
+  /// Starts one machine's fixed roster script. The body is intentionally
+  /// empty: the owning node runs only its own validated script.
+  async function startRecovery(machineId) {
+    if (!machineId || state.recoveryBusy.has(machineId)) return;
+    state.recoveryBusy.add(machineId);
     renderRecoveryControl();
     try {
-      const status = await request("/api/v1/machines/tron/quick-resume");
-      state.recoveryStatus = status;
-      if (showDialog && !$("recovery-dialog").open) $("recovery-dialog").showModal();
-      if (status.phase === "running") {
-        stopRecoveryPolling();
-        state.recoveryPoll = setTimeout(() => { void refreshRecoveryStatus(false); }, 2000);
-      } else {
-        stopRecoveryPolling();
-      }
-      return status;
+      const status = await request(`/api/v1/machines/${encodeURIComponent(machineId)}/quick-resume`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      const existing = state.fleetRecovery.get(machineId) || { id: machineId, label: machineId, online: true };
+      state.fleetRecovery.set(machineId, { ...existing, recovery: status, error: null });
+      toast(`${existing.label || machineId} recovery started`);
     } catch (error) {
-      stopRecoveryPolling();
       toast(error.message);
-      return null;
     } finally {
-      state.recoveryLoading = false;
+      state.recoveryBusy.delete(machineId);
       renderRecoveryControl();
+      scheduleRecoveryRefresh(1000);
     }
   }
   function stopFleetUpdatePolling() {
@@ -6971,26 +7055,7 @@ function initialize() {
       ? `Rolling back ${started} machine${started === 1 ? "" : "s"}`
       : `Updating ${started} machine${started === 1 ? "" : "s"}`);
   });
-  $("recovery-open").addEventListener("click", () => { void refreshRecoveryStatus(true); });
-  $("recovery-confirm").addEventListener("click", async () => {
-    if (state.recoveryLoading || state.recoveryStatus?.phase === "running") return;
-    state.recoveryLoading = true;
-    renderRecoveryControl();
-    try {
-      state.recoveryStatus = await request("/api/v1/machines/tron/quick-resume", {
-        method: "POST",
-        body: JSON.stringify({}),
-      });
-      toast("Tron recovery started");
-      stopRecoveryPolling();
-      state.recoveryPoll = setTimeout(() => { void refreshRecoveryStatus(false); }, 1000);
-    } catch (error) {
-      toast(error.message);
-    } finally {
-      state.recoveryLoading = false;
-      renderRecoveryControl();
-    }
-  });
+  $("recovery-open").addEventListener("click", () => { void refreshFleetRecovery(true); });
   $("pulse-mobile-back").addEventListener("click", backToAgentMenu);
   $("pulse-refresh").addEventListener("click", () => { void refreshPulse(true); });
   $("pulse-account").addEventListener("change", (event) => { setPulseAccount(event.target.value); });
@@ -9075,7 +9140,7 @@ function initialize() {
       if (state.pulseOpen) {
         void loadPulseAccounts(true);
       }
-      if (state.recoveryStatus?.phase === "running") void refreshRecoveryStatus(false);
+      void refreshFleetRecovery(false);
       void refreshFleetUpdates();
     }
   });
@@ -9108,6 +9173,7 @@ function initialize() {
   render();
   connectOverview();
   void refreshFleetUpdates();
+  void refreshFleetRecovery(false);
   if (state.selected) connectPane();
   if (state.pulseOpen) void loadPulseAccounts();
 }
