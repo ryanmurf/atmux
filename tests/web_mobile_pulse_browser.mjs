@@ -17,6 +17,7 @@ const transcriptRequests = [];
 let paneSnapshotContent = "";
 const paneStreams = new Set();
 const overviewStreams = new Set();
+let overviewUnavailable = false;
 const launchRequests = [];
 const launchSessionRequests = [];
 const launchDirectoryMutationRequests = [];
@@ -203,6 +204,11 @@ function errorJson(response, status, message) {
 
 function mockApi(url, response, request) {
   const { pathname } = url;
+  if (pathname === "/api/v1/events" && overviewUnavailable) {
+    response.writeHead(503, { "content-type": "text/plain", "cache-control": "no-store" });
+    response.end("unavailable");
+    return true;
+  }
   if (pathname === "/api/v1/events") {
     response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
     response.write(`event: sessions.snapshot\ndata: ${JSON.stringify({
@@ -4755,11 +4761,28 @@ test("dashboard reconnect preserves the pane and draft, and link/search actions 
       input.dispatchEvent(new InputEvent('input', { bubbles: true }));
     })()`);
     const originalPaneStreams = new Set(paneStreams);
+    // A brief drop that the browser reconnects from never raises the banner.
+    for (const response of overviewStreams) response.end();
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('overview-status').textContent === 'Reconnecting…'"),
+      "a dropped overview did not report reconnecting",
+      5_000,
+    );
+    assert.equal(await cdp.evaluate("document.getElementById('overview-notice').hidden"), true);
+    await waitFor(
+      () => cdp.evaluate("document.getElementById('overview-status').textContent === 'Live'"),
+      "a briefly dropped overview did not reconnect by itself",
+    );
+    assert.equal(await cdp.evaluate("document.getElementById('health-alert').hidden"), true);
+    // A drop that outlasts the grace period exposes the banner and Retry.
+    overviewUnavailable = true;
     for (const response of overviewStreams) response.end();
     await waitFor(
       () => cdp.evaluate("!document.getElementById('overview-notice').hidden && !document.getElementById('overview-retry').disabled"),
       "disconnected overview did not expose retry",
+      15_000,
     );
+    overviewUnavailable = false;
     const offline = await cdp.evaluate(`(() => ({
       note: document.getElementById('overview-note').textContent,
       bannerHeight: document.getElementById('health-alert').getBoundingClientRect().height,
