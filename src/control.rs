@@ -30,6 +30,7 @@ use crate::{
     attachment::{self, DeliveryErrorKind, ImageMessageRequest},
     auto_compact::{self, Decision as AutoCompactDecision},
     auto_update::{self, Harness as UpdateHarness, PendingMarker},
+    code_nav::{CodeNavRequest, CodeNavResponse},
     config::{AgentProfile, Config, ProfileMode},
     launch_directory,
     machine::{
@@ -2499,6 +2500,63 @@ impl ControlPlane {
                     .put_json_response(&route, &request)
                     .await
                     .map_err(|error| remote_mutation_error(&error))?;
+                Ok(Some(
+                    response.with_pane_id(composite_id(&machine.id, &pane_id)),
+                ))
+            }
+        }
+    }
+
+    /// Answers one source-navigation question (definitions, references, or
+    /// an import target) inside the pane's project, on the owning machine.
+    /// The owner derives the project root exactly as it does for Files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid symbol, specifier, or path, an
+    /// unavailable project root, or an offline/refusing owner.
+    pub async fn pane_code(
+        &self,
+        id: &str,
+        request: CodeNavRequest,
+    ) -> Result<Option<CodeNavResponse>> {
+        let Some(target) = self.find_target(id)? else {
+            return Ok(None);
+        };
+        match target {
+            Target::Local { pane_id, .. } => {
+                let pane_cwd = {
+                    let state = self.read_state();
+                    find_session(&state.sessions, &pane_id).map(|session| session.path.clone())
+                };
+                let Some(pane_cwd) = pane_cwd else {
+                    return Ok(None);
+                };
+                let response =
+                    crate::code_nav::navigate(pane_cwd, self.inner.config.launch_roots(), request)
+                        .await
+                        .map_err(|error| workspace_error(&error))?;
+                Ok(Some(response.with_pane_id(self.local_identity(&pane_id))))
+            }
+            Target::Remote {
+                machine, pane_id, ..
+            } => {
+                self.ensure_online(&machine.id)?;
+                let query = request
+                    .query_pairs()
+                    .into_iter()
+                    .map(|(key, value)| format!("{key}={}", encode_segment(value)))
+                    .collect::<Vec<_>>()
+                    .join("&");
+                let route = format!(
+                    "/api/v1/panes/{}/code/{}?{query}",
+                    encode_segment(&pane_id),
+                    request.operation(),
+                );
+                let response: CodeNavResponse = machine
+                    .get_json(&route)
+                    .await
+                    .map_err(|error| upstream(&error))?;
                 Ok(Some(
                     response.with_pane_id(composite_id(&machine.id, &pane_id)),
                 ))

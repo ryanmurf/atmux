@@ -42,6 +42,20 @@ let delayGitSummaryPane = null;
 let delayGitDiffPane = null;
 let nextFileSaveConflict = false;
 const fileSaveRequests = [];
+const codeNavRequests = [];
+const NAV_FIXTURE = [
+  'import { formatTotal } from "./util";',
+  "export function total(values: number[]): number {",
+  "  const sum = values.reduce((left, right) => left + right, 0);",
+  "  return formatTotal(sum);",
+  "}",
+  "export const report = () => total([1, 2]);",
+].join("\n");
+const UTIL_FIXTURE = [
+  "export function formatTotal(value: number): number {",
+  "  return value;",
+  "}",
+].join("\n");
 const messageRequests = [];
 const imageMessageRequests = [];
 const specialKeyRequests = [];
@@ -264,6 +278,29 @@ function mockApi(url, response, request) {
     else json(response, payload);
     return true;
   }
+  if (/^\/api\/v1\/panes\/[^/]+\/code\/(?:definitions|references|resolve)$/.test(pathname)) {
+    const operation = pathname.split("/").pop();
+    const observed = {
+      operation,
+      pane: decodeURIComponent(pathname.split("/")[4]),
+      symbol: url.searchParams.get("symbol"),
+      path: url.searchParams.get("path"),
+      spec: url.searchParams.get("spec"),
+    };
+    codeNavRequests.push(observed);
+    const reply = (results) => json(response, {
+      pane_id: observed.pane, operation, query: observed.symbol || observed.spec, truncated: false, results,
+    });
+    if (operation === "resolve" && observed.spec === "./util") {
+      reply([{ path: "src/util.ts", line: 1, column: 17, kind: "function", preview: "export function formatTotal(value: number): number {" }]);
+    } else if (operation === "definitions" && observed.symbol === "reduce") {
+      reply([
+        { path: "src/util.ts", line: 2, column: 3, kind: "method", preview: "return value;" },
+        { path: "src/app.js", line: 3, column: 7, kind: "variable", preview: "const line2 = <script>" },
+      ]);
+    } else reply([]);
+    return true;
+  }
   if (/^\/api\/v1\/panes\/[^/]+\/files$/.test(pathname)) {
     const paneId = decodeURIComponent(pathname.split("/")[4]);
     const path = url.searchParams.get("path") || "";
@@ -316,7 +353,17 @@ function mockApi(url, response, request) {
     } else if (path === "src") {
       json(response, {
         kind: "directory", path: "src", truncated: false,
-        entries: [{ kind: "file", name: "app.js", path: "src/app.js", size: 8192 }],
+        entries: [
+          { kind: "file", name: "app.js", path: "src/app.js", size: 8192 },
+          { kind: "file", name: "nav.ts", path: "src/nav.ts", size: Buffer.byteLength(NAV_FIXTURE) },
+          { kind: "file", name: "util.ts", path: "src/util.ts", size: Buffer.byteLength(UTIL_FIXTURE) },
+        ],
+      });
+    } else if (path === "src/nav.ts" || path === "src/util.ts") {
+      const content = path === "src/nav.ts" ? NAV_FIXTURE : UTIL_FIXTURE;
+      json(response, {
+        kind: "file", path, language: "typescript", size: Buffer.byteLength(content), truncated: false,
+        content, content_hash: "9".repeat(64), line_count: content.split("\n").length,
       });
     } else if (path === "src/app.js") {
       const content = fixtureProjectFile(paneId);
@@ -2636,6 +2683,94 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(referenceState.outer, referenceState.before.outer, JSON.stringify(referenceState));
     await new Promise((resolveWait) => setTimeout(resolveWait, 100));
     assert.equal(messageRequests.length, messagesBeforeReference, "referencing source must not POST a message");
+
+    // Source navigation: plain taps select a name and show the symbol panel,
+    // same-file definitions jump without asking the owner, imported names
+    // resolve through the owner, Back returns, and ambiguous definitions list.
+    await cdp.evaluate("document.querySelector('#file-viewer .project-viewer-back').click(); true");
+    await cdp.evaluate(`(() => {
+      [...document.querySelectorAll('#files-list .project-entry')].find((entry) => entry.textContent.includes('nav.ts')).click();
+      return true;
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("document.querySelectorAll('#file-viewer .code-line').length === 6 && Boolean(document.querySelector('#file-viewer .code-symbol[data-symbol=\"total\"]'))"),
+      "navigable TypeScript source did not render",
+    );
+    const navigationRequestsBefore = codeNavRequests.length;
+    const selected = await cdp.evaluate(`(() => {
+      const usage = document.querySelector('#file-viewer .code-line[data-line="6"] .code-symbol[data-symbol="total"]');
+      usage.click();
+      const panel = document.querySelector('#file-viewer .code-symbol-panel');
+      return {
+        name: panel?.querySelector('.code-symbol-name')?.textContent,
+        count: panel?.querySelector('.code-symbol-count')?.textContent,
+        matches: document.querySelectorAll('#file-viewer .code-symbol.symbol-match').length,
+        origin: usage.classList.contains('symbol-origin'),
+        keyword: document.querySelector('#file-viewer .code-line[data-line="2"] .syntax-keyword')?.textContent,
+        imported: document.querySelector('#file-viewer .code-line[data-line="1"] .code-import')?.dataset.importSpec,
+      };
+    })()`);
+    assert.deepEqual(selected, {
+      name: "total", count: "2 in this file", matches: 2, origin: true, keyword: "export", imported: "./util",
+    });
+    await cdp.evaluate("document.querySelector('#file-viewer .code-go-definition').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.querySelector('#file-viewer .code-line[data-line=\"2\"]').classList.contains('code-line-flash')"),
+      "same-file definition was not revealed",
+    );
+    assert.equal(codeNavRequests.length, navigationRequestsBefore, "a same-file definition must not query the owner");
+    await cdp.evaluate(`(() => {
+      const call = document.querySelector('#file-viewer .code-line[data-line="4"] .code-symbol[data-symbol="formatTotal"]');
+      call.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, ctrlKey: true }));
+      return true;
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("document.querySelector('#file-viewer .code-viewer-path')?.textContent === 'src/util.ts' && document.querySelectorAll('#file-viewer .code-line').length === 3"),
+      "Ctrl-click on an imported name did not open its module",
+    );
+    await waitFor(
+      () => cdp.evaluate("Boolean(document.querySelector('#file-viewer .code-line[data-line=\"1\"] .code-symbol.symbol-origin[data-symbol=\"formatTotal\"]'))"),
+      "the imported declaration was not selected after the jump",
+    );
+    assert.deepEqual(codeNavRequests.at(-1), {
+      operation: "resolve", pane: "tron~%100", symbol: "formatTotal", path: "src/nav.ts", spec: "./util",
+    });
+    assert.equal(await cdp.evaluate("document.querySelector('#file-viewer .code-history-back').disabled"), false);
+    await cdp.evaluate("document.querySelector('#file-viewer .code-history-back').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.querySelector('#file-viewer .code-viewer-path')?.textContent === 'src/nav.ts' && document.querySelectorAll('#file-viewer .code-line').length === 6"),
+      "Back did not return to the previous file",
+    );
+    assert.equal(await cdp.evaluate("document.querySelector('#file-viewer .code-history-forward').disabled"), false);
+    await cdp.evaluate(`(() => {
+      document.querySelector('#file-viewer .code-line[data-line="3"] .code-symbol[data-symbol="reduce"]').click();
+      document.querySelector('#file-viewer .code-go-definition').click();
+      return true;
+    })()`);
+    await waitFor(
+      () => cdp.evaluate("document.querySelectorAll('#file-viewer .code-symbol-result').length === 2"),
+      "ambiguous definitions were not listed",
+    );
+    const listed = await cdp.evaluate(`(() => ({
+      status: document.querySelector('#file-viewer .code-symbol-status')?.textContent,
+      locations: [...document.querySelectorAll('#file-viewer .code-symbol-location')].map((node) => node.textContent),
+      markup: Boolean(document.querySelector('#file-viewer .code-symbol-panel script')),
+    }))()`);
+    assert.equal(listed.status, "2 candidate definitions");
+    assert.deepEqual(listed.locations, ["src/util.ts:2", "src/app.js:3"]);
+    assert.equal(listed.markup, false);
+    assert.deepEqual(codeNavRequests.at(-1), {
+      operation: "definitions", pane: "tron~%100", symbol: "reduce", path: "src/nav.ts", spec: null,
+    });
+    await cdp.evaluate("document.querySelectorAll('#file-viewer .code-symbol-result')[1].click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.querySelector('#file-viewer .code-viewer-path')?.textContent === 'src/app.js' && document.querySelectorAll('#file-viewer .code-line').length === 320"),
+      "choosing a listed definition did not open it",
+    );
+    await waitFor(
+      () => cdp.evaluate("document.querySelector('#file-viewer .code-line[data-line=\"3\"]').classList.contains('code-line-flash')"),
+      "the chosen definition line was not revealed",
+    );
 
     const mobileEditorEntry = await cdp.evaluate(`(() => {
       document.querySelector('#file-viewer .file-edit').click();

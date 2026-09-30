@@ -83,6 +83,71 @@ be merged into a half-correct view.
 
 Click a machine header in the session rail to inspect that machine's live CPU, memory, GPU, and temperature readings. GPU data is shown when the host exposes NVIDIA's `nvidia-smi`; unavailable hardware probes stay empty instead of failing the dashboard. The launch dialog has an **Agent** picker (Claude or Codex), a profile picker, and a project field that filters recursively discovered projects as you type. Its bounded, accessible suggestion list remains responsive for large project sets and supports keyboard, mouse, and touch selection. **Browse** safely explores the selected machine's configured project roots; it can navigate to every allowed parent, create a folder, or clone a credential-free HTTPS/SSH repository into the displayed directory. These mutations run only on the selected owning machine and never overwrite an existing target. A chosen folder is remembered for that machine while every launch remains server-validated. When viewing an agent in a browser that supports the Web Speech API, hold **Talk** to dictate and release it to send the recognized text directly to that agent.
 
+### Files viewer and source navigation
+
+The **Files** tab reads the selected pane's project through its owning machine.
+Source is highlighted by a whole-file tokenizer, so block comments, Java text
+blocks, Python triple quotes, Rust raw strings, and JavaScript template
+literals keep their meaning across lines. The language comes from the owner's
+hint, the file name, or a shebang. Highlighting covers Java, Kotlin, Scala,
+Groovy, Rust, TypeScript/TSX, JavaScript/JSX, Python, Go, C, C++, C#, Swift,
+Ruby, PHP, shell, SQL, JSON, YAML, TOML, XML/HTML (with embedded script and
+style), CSS/SCSS, Markdown, Dockerfile, Makefile, Protocol Buffers, and GraphQL.
+
+In a navigable language, names are interactive:
+
+- A tap or click on a name highlights every occurrence in the file and opens
+  a panel with **Go to definition** and **Find references**.
+- Ctrl-click or ⌘-click (or F12) jumps straight to the definition, and
+  Shift+F12 finds references.
+- A tap on an import target opens the imported file: Java/Kotlin `import`,
+  TS/JS `from`/`require`, Rust `mod` and `use`, Python `from ... import`, Go
+  import paths, C/C++ `#include "..."`, Ruby `require`, PHP `use`, and CSS
+  `@import`.
+- Definitions are looked up in order: an imported name or qualifier, then a
+  same-file declaration nearest above the click (no owner request), then a
+  project-wide owner search. One result opens and flashes its line; several
+  are listed to choose from.
+- **←**/**→** in the viewer header (or Alt+←/Alt+→) walk back and forward
+  through jumps with their scroll positions. Unsaved edits are confirmed
+  before any jump.
+
+The owner answers three read-only routes. Each is forwarded by a
+coordinator exactly like Files:
+
+```text
+GET /api/v1/panes/{id}/code/definitions?symbol=Name&path=src/Main.java
+GET /api/v1/panes/{id}/code/references?symbol=Name&path=src/Main.java
+GET /api/v1/panes/{id}/code/resolve?path=src/app.ts&spec=./util&symbol=format
+```
+
+Each returns
+`{pane_id, operation, query, results: [{path, line, column, kind, preview}], truncated}`.
+A symbol must be one identifier of at most 128 characters (`[A-Za-z_$][A-Za-z0-9_$]*`).
+Paths use the Files validation, so sensitive paths answer like missing ones.
+The owner derives the root from the live pane and walks it descriptor-relatively
+without following symlinks. It skips hidden, sensitive, and generated
+directories (`node_modules`, `target`, `build`, `dist`, `out`, `obj`,
+`coverage`, `vendor`, `venv`, `__pycache__`, `Pods`, `DerivedData`). Results
+carry only project-relative paths and a trimmed one-line preview of at most
+200 characters. Every request stops at fixed budgets and then reports
+`truncated`:
+
+| Budget | Limit |
+| --- | --- |
+| Files walked | 20,000 |
+| Directories walked | 6,000 |
+| Bytes read | 48 MiB |
+| Largest file read | 1 MiB |
+| Wall clock | 2 s |
+| Results | 200 |
+
+Definition detection is heuristic per language family: declaration keywords,
+typed C-family signatures and fields, Go receivers and grouped declarations,
+Python `def`/`class`/module assignments, and similar shapes. Files of the
+requesting file's language family are searched first, nearest directories
+first. Nothing in the project is executed or evaluated.
+
 ### Automatic context compaction
 
 Each atmux node can compact its own inactive Claude and Codex panes. The
