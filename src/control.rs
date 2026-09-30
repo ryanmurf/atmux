@@ -102,6 +102,27 @@ impl fmt::Display for ControlError {
 
 impl std::error::Error for ControlError {}
 
+/// Bounds for fitting a detached pane's window to a browser viewport.
+pub const MIN_FIT_COLS: u16 = 40;
+pub const MAX_FIT_COLS: u16 = 400;
+pub const MIN_FIT_ROWS: u16 = 10;
+pub const MAX_FIT_ROWS: u16 = 200;
+
+/// A browser's raw-view size in terminal cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaneSizeRequest {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// What the owner did: `resized`, `unchanged`, `attached` (a terminal owns
+/// the size) or `split` (the window holds more than one pane).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSizeResponse {
+    pub fit: String,
+}
+
 /// How long one node has to answer a fleet update read before its entry
 /// reports a timeout instead of holding up every other machine.
 const FLEET_UPDATE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -3847,6 +3868,63 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Sizes a detached pane's window to the browser's raw view, on the
+    /// pane's owning machine. See [`Tmux::fit_detached_window`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an out-of-range size, an unknown pane, or a
+    /// failed tmux or owner request.
+    pub async fn fit_pane(&self, id: &str, request: PaneSizeRequest) -> Result<PaneSizeResponse> {
+        if !(MIN_FIT_COLS..=MAX_FIT_COLS).contains(&request.cols)
+            || !(MIN_FIT_ROWS..=MAX_FIT_ROWS).contains(&request.rows)
+        {
+            return Err(bad_request(format!(
+                "pane size must be {MIN_FIT_COLS}-{MAX_FIT_COLS} columns and {MIN_FIT_ROWS}-{MAX_FIT_ROWS} rows"
+            )));
+        }
+        match self.resolve(id)? {
+            Target::Local { pane_id, .. } => {
+                let (cols, rows) = (request.cols, request.rows);
+                let fit = tokio::task::spawn_blocking(move || {
+                    Tmux::fit_detached_window(&pane_id, cols, rows)
+                })
+                .await
+                .map_err(|error| {
+                    internal(&anyhow::Error::new(error).context("a tmux task panicked"))
+                })?
+                .map_err(|error| internal(&error))?;
+                if fit == crate::tmux::PaneFit::Resized {
+                    self.inner.refresh_now.notify_one();
+                }
+                Ok(PaneSizeResponse {
+                    fit: fit.as_str().to_owned(),
+                })
+            }
+            Target::Remote {
+                machine, pane_id, ..
+            } => {
+                self.ensure_online(&machine.id)?;
+                let response: PaneSizeResponse = machine
+                    .post_json_response(
+                        &format!("/api/v1/panes/{}/size", encode_segment(&pane_id)),
+                        &request,
+                    )
+                    .await
+                    .map_err(|error| upstream(&error))?;
+                if !matches!(
+                    response.fit.as_str(),
+                    "resized" | "unchanged" | "attached" | "split"
+                ) {
+                    return Err(upstream(&anyhow::anyhow!(
+                        "the owner returned an unknown pane fit"
+                    )));
+                }
+                Ok(response)
+            }
+        }
+    }
+
     /// Renames and/or describes one agent session on its owning machine.
     ///
     /// # Errors
@@ -5052,7 +5130,7 @@ fn restart_token_from_stamp(session: &Session, stamp: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn native_process_start_stamp(pid: u32) -> Option<String> {
+pub(crate) fn native_process_start_stamp(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;
     }
@@ -5074,7 +5152,7 @@ fn linux_process_start_ticks(stat: &str) -> Option<u64> {
 }
 
 #[cfg(target_os = "macos")]
-fn native_process_start_stamp(pid: u32) -> Option<String> {
+pub(crate) fn native_process_start_stamp(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;
     }
@@ -5100,7 +5178,7 @@ fn native_process_start_stamp(pid: u32) -> Option<String> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn native_process_start_stamp(_pid: u32) -> Option<String> {
+pub(crate) fn native_process_start_stamp(_pid: u32) -> Option<String> {
     None
 }
 

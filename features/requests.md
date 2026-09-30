@@ -19,6 +19,9 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Keep Midnight on its Aqua tmux server so Claude can read the login Keychain | `completed/mac-and-max-runtime.md` | Completed and standing constraint |
 | Use only the LaunchAgent kickstart for future Midnight web restarts; never rebuild its tmux server | `completed/mac-and-max-runtime.md` | Completed and standing constraint |
 | Make Quick Resume work on any computer, not only Tron | `quick-resume-any-machine.md` | Deployed on Tron and Max; Clue and Midnight pending |
+| Harden pane-to-Conversation mapping (including resumed Codex panes) | `conversation-mapping-compaction-raw-fit.md` | Implemented and tested; rollout pending |
+| Show compaction as a collapsed box | `conversation-mapping-compaction-raw-fit.md` | Implemented and tested; rollout pending |
+| Make Raw pane use the browser's height instead of tmux's 80×24 default | `conversation-mapping-compaction-raw-fit.md` | Implemented and tested; rollout pending |
 
 ## Usage intelligence
 

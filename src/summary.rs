@@ -248,6 +248,7 @@ mod tests {
             agent_name: None,
             input_tokens: None,
             output_tokens: None,
+            compaction: None,
         }
     }
 

@@ -242,6 +242,14 @@ button.code-line-number:focus-visible, button.code-line-number[aria-pressed="tru
 .tool-run-group { border-color: #2c414a; background: #0a1418; }
 .tool-call-group-items > .tool-card-group-item { margin: 0; background: #081116; }
 .tool-card-group-item > summary { font-size: 11px; }
+.compaction-card { width: 100%; margin: 4px 0 10px; border: 1px dashed #3c5a63; border-radius: 7px; background: #0b1519; overflow: hidden; }
+.compaction-card > summary { padding: 7px 11px; cursor: pointer; color: #9fc3c9; font-size: 12px; font-weight: 650; user-select: none; }
+.compaction-card > summary:focus-visible { outline: 2px solid var(--cyan); outline-offset: -2px; }
+.compaction-card[open] > summary { border-bottom: 1px dashed #3c5a63; }
+.compaction-card.compaction-empty > summary { cursor: default; list-style: none; }
+.compaction-card.compaction-empty > summary::-webkit-details-marker { display: none; }
+.compaction-body { max-height: 60vh; overflow: auto; padding: 8px 12px; color: #b9c8cd; }
+.transcript-owner-note { color: var(--muted); }
 .tool-body { display: grid; gap: 7px; padding: 8px 10px 10px; }
 .tool-body section > span { display: block; margin-bottom: 3px; color: var(--muted); font-size: 10px; font-weight: 750; letter-spacing: .06em; text-transform: uppercase; }
 .tool-body pre { max-height: 320px; margin: 0; padding: 8px 9px; overflow: auto; border-radius: 5px; background: #060b0e; color: #d5e1e3; font: 11.5px/1.45 "SFMono-Regular", Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }

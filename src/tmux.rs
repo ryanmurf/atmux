@@ -315,6 +315,28 @@ pub struct Session {
     pub status: AgentStatus,
 }
 
+/// What [`Tmux::fit_detached_window`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PaneFit {
+    Resized,
+    Unchanged,
+    /// A terminal client is attached and owns the window size.
+    Attached,
+    /// The window holds more than one pane.
+    Split,
+}
+
+impl PaneFit {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resized => "resized",
+            Self::Unchanged => "unchanged",
+            Self::Attached => "attached",
+            Self::Split => "split",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LivePaneIdentity {
     pub pane_id: String,
@@ -1481,6 +1503,55 @@ impl Tmux {
     /// Returns an error when the pane does not exist or tmux rejects the key.
     pub fn interrupt(&self, pane_id: &str) -> Result<()> {
         Self::output(["send-keys", "-t", pane_id, "Escape"]).map(|_| ())
+    }
+
+    /// Sizes a detached pane's window to a browser viewport.
+    ///
+    /// tmux gives a window with no attached client its `default-size`
+    /// (80x24), so a full-screen agent draws only 24 short rows and the raw
+    /// view cannot show more. Only a single-pane window with no attached
+    /// client is resized: a terminal client owns its own size, and resizing a
+    /// split window would reflow panes the browser is not showing. The
+    /// window's `window-size` option is unset again afterwards, so the next
+    /// terminal that attaches takes over the size exactly as before.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid pane id or a failed tmux command.
+    pub(crate) fn fit_detached_window(pane_id: &str, cols: u16, rows: u16) -> Result<PaneFit> {
+        if !valid_tmux_pane_id(pane_id) {
+            bail!("invalid tmux pane id");
+        }
+        let state = Self::output([
+            "display-message",
+            "-p",
+            "-t",
+            pane_id,
+            "#{window_id}\t#{window_panes}\t#{session_attached}\t#{window_width}\t#{window_height}",
+        ])?;
+        let fields = state.trim_end().split('\t').collect::<Vec<_>>();
+        let [window_id, panes, attached, width, height] = fields.as_slice() else {
+            bail!("tmux returned an unexpected window description");
+        };
+        if !window_id
+            .strip_prefix('@')
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            bail!("tmux returned an invalid window id");
+        }
+        if attached.parse::<u32>().map_or(true, |clients| clients > 0) {
+            return Ok(PaneFit::Attached);
+        }
+        if panes.parse::<u32>().ok() != Some(1) {
+            return Ok(PaneFit::Split);
+        }
+        if width.parse::<u16>().ok() == Some(cols) && height.parse::<u16>().ok() == Some(rows) {
+            return Ok(PaneFit::Unchanged);
+        }
+        let (cols, rows) = (cols.to_string(), rows.to_string());
+        Self::output(["resize-window", "-t", window_id, "-x", &cols, "-y", &rows])?;
+        Self::output(["set-window-option", "-u", "-t", window_id, "window-size"])?;
+        Ok(PaneFit::Resized)
     }
 
     /// Sends one fixed interactive key, or the existing fixed tmux-prefix
@@ -4024,6 +4095,45 @@ mod tests {
     }
 
     #[test]
+    fn fitting_resizes_only_a_detached_single_pane_window_and_restores_client_sizing() {
+        let probe = disposable_tmux("fit");
+        Tmux::with_socket_for_test(&probe.socket, || {
+            Tmux::output(["new-session", "-d", "-s", "fit", "sleep 30"])?;
+            let pane = Tmux::output(["list-panes", "-t", "=fit", "-F", "#{pane_id}"])?;
+            let size = || {
+                Tmux::output([
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &pane,
+                    "#{window_width}x#{window_height}",
+                ])
+            };
+            assert_eq!(size()?, "80x24");
+
+            assert_eq!(Tmux::fit_detached_window(&pane, 150, 50)?, PaneFit::Resized);
+            assert_eq!(size()?, "150x50");
+            // resize-window pins window-size to manual; the fit unsets it so
+            // the next attached terminal takes the size over again.
+            let option = Tmux::output(["show-options", "-w", "-t", &pane, "window-size"])?;
+            assert!(option.is_empty(), "window-size stayed pinned: {option}");
+            assert_eq!(
+                Tmux::fit_detached_window(&pane, 150, 50)?,
+                PaneFit::Unchanged
+            );
+
+            Tmux::output(["split-window", "-d", "-t", &pane, "sleep 30"])?;
+            assert_eq!(Tmux::fit_detached_window(&pane, 120, 40)?, PaneFit::Split);
+            assert_eq!(size()?, "150x50");
+
+            assert!(Tmux::fit_detached_window("not-a-pane", 100, 30).is_err());
+            assert!(Tmux::fit_detached_window("%999999", 100, 30).is_err());
+            Tmux.kill("fit")
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn renames_describes_and_kills_sessions_by_pane_on_an_isolated_server() {
         let probe = disposable_tmux("rename");
         Tmux::with_socket_for_test(&probe.socket, || {
@@ -6047,7 +6157,10 @@ mod tests {
             "#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_start_command}";
         let inspect = || Tmux::output(["display-message", "-p", "-t", &pane_id, format]).unwrap();
         let before = inspect();
-        let fields = before.trim_end().splitn(4, '\t').collect::<Vec<_>>();
+        let fields = before
+            .trim_end_matches(['\r', '\n'])
+            .splitn(4, '\t')
+            .collect::<Vec<_>>();
         assert_eq!(fields.len(), 4);
         let root_pid = fields[0].parse().unwrap();
         let kind = match env::var("ATMUX_LIVE_CONVERSATION_AGENT").as_deref() {
@@ -6091,15 +6204,20 @@ mod tests {
             "live native conversation mapping is unavailable"
         );
         let count = transcript.messages.as_ref().map_or(0, Vec::len);
-        assert!(count > 0, "mapped native log has no visible entries");
+        // A mapped session with no log yet, or one still resuming, explains
+        // itself instead of listing entries.
+        assert!(
+            count > 0 || transcript.note.is_some(),
+            "mapped native log has no visible entries"
+        );
         assert!(
             before
                 == Tmux::output(["display-message", "-p", "-t", &session.pane_id, format]).unwrap(),
             "live pane identity changed during read-only verification"
         );
         eprintln!(
-            "Read-only live Conversation: source={}, pid={pid}, entries={count}, truncated={}",
-            transcript.source, transcript.truncated
+            "Read-only live Conversation: source={}, pid={pid}, entries={count}, truncated={}, note={:?}",
+            transcript.source, transcript.truncated, transcript.note
         );
     }
 

@@ -1918,6 +1918,10 @@ function markdownFragmentFromBlock(block) {
 function reduceTranscript(current, data) {
   const available = Boolean(data?.available);
   const source = data?.source || "agent";
+  // The owner explains unusual mapping states (a CLI still at a startup
+  // prompt, a session with no messages yet). Bounded plain text only.
+  const note = typeof data?.note === "string" && data.note.trim()
+    ? data.note.trim().slice(0, MAX_TRANSCRIPT_NOTE_CHARS) : "";
   if (!available) {
     return {
       hash: "",
@@ -1927,6 +1931,7 @@ function reduceTranscript(current, data) {
         messages: [],
         truncated: false,
         error: null,
+        note,
       },
     };
   }
@@ -1940,8 +1945,44 @@ function reduceTranscript(current, data) {
         : current.messages,
       truncated: data.changed ? Boolean(data.truncated) : current.truncated,
       error: null,
+      note,
     },
   };
+}
+
+const MAX_TRANSCRIPT_NOTE_CHARS = 400;
+
+/// Terminal-cell bounds for fitting a detached tmux window to the raw view.
+/// The owner accepts 40-400 columns and 10-200 rows; below 60 columns a
+/// full-screen agent becomes unreadable, so a phone keeps at least that.
+const RAW_FIT_MIN_COLS = 60;
+const RAW_FIT_MAX_COLS = 300;
+const RAW_FIT_MIN_ROWS = 16;
+const RAW_FIT_MAX_ROWS = 150;
+
+/// How many terminal cells fit the raw view's content box.
+function rawPaneGrid({ width, height, charWidth, lineHeight } = {}) {
+  if (![width, height, charWidth, lineHeight].every((value) => Number.isFinite(value) && value > 0)) return null;
+  const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
+  return {
+    cols: clamp(Math.floor(width / charWidth), RAW_FIT_MIN_COLS, RAW_FIT_MAX_COLS),
+    rows: clamp(Math.floor(height / lineHeight), RAW_FIT_MIN_ROWS, RAW_FIT_MAX_ROWS),
+  };
+}
+
+/// One line for a collapsed compaction: what happened, how it was started,
+/// and how much context it reclaimed when the CLI recorded that.
+function compactionSummaryLabel(message) {
+  const detail = message?.compaction && typeof message.compaction === "object" ? message.compaction : {};
+  const parts = ["Conversation compacted"];
+  if (typeof detail.trigger === "string" && /^[a-z0-9_-]{1,32}$/i.test(detail.trigger)) parts.push(detail.trigger);
+  const tokens = (value) => Number.isSafeInteger(value) && value >= 0 ? value : null;
+  const before = tokens(detail.pre_tokens);
+  const after = tokens(detail.post_tokens);
+  if (before !== null && after !== null) parts.push(`${formatTokenCount(before)} \u2192 ${formatTokenCount(after)} tokens`);
+  else if (before !== null) parts.push(`${formatTokenCount(before)} tokens before`);
+  if (typeof message?.markdown === "string" && message.markdown.trim()) parts.push("summary");
+  return parts.join(" \u00b7 ");
 }
 
 /// One request at a time: activity cannot postpone an already scheduled read
@@ -3060,6 +3101,8 @@ if (typeof module !== "undefined" && module.exports) {
     collapsibleCoordinationTool,
     internalToolGroupKey,
     compactTranscriptItems,
+    compactionSummaryLabel,
+    rawPaneGrid,
     coordinationGroupSummary,
     toolGroupSummary,
     collapsibleToolRun,
@@ -3298,6 +3341,8 @@ function initialize() {
     /// Machine id -> the node's own Quick Resume document, as the coordinator read it.
     fleetRecovery: new Map(),
     recoveryPoll: null,
+    rawFitTimer: null,
+    rawFitKey: null,
     /// Machines with a Quick Resume start in flight from this browser.
     recoveryBusy: new Set(),
     /// Machine id -> the node's own update document, as the coordinator read it.
@@ -3529,6 +3574,7 @@ function initialize() {
   }
 
   function connectPane(resetProject = true) {
+    state.rawFitKey = null;
     state.paneSource?.close();
     stopTranscriptPolling();
     if (resetProject) resetProjectView();
@@ -3758,6 +3804,28 @@ function initialize() {
     return details;
   }
 
+  /// A compaction replaces most of the context with a long summary. Show it
+  /// as one collapsed row; the summary opens on demand.
+  function renderCompactionCard(message, expandedTools) {
+    const details = document.createElement("details");
+    details.className = "compaction-card";
+    details.dataset.transcriptId = String(message.id || "");
+    details.dataset.transcriptVisibility = transcriptVisibilityKind(message);
+    details.open = expandedTools.has(details.dataset.transcriptId);
+    const summary = document.createElement("summary");
+    summary.textContent = compactionSummaryLabel(message);
+    details.append(summary);
+    if (typeof message.markdown === "string" && message.markdown.trim()) {
+      const body = document.createElement("div");
+      body.className = "markdown-body compaction-body";
+      body.append(markdownFragment(message.markdown));
+      details.append(body);
+    } else {
+      details.classList.add("compaction-empty");
+    }
+    return details;
+  }
+
   function renderToolGroup(group, expandedTools) {
     const details = document.createElement("details");
     details.className = "tool-card tool-call-group";
@@ -3881,11 +3949,18 @@ function initialize() {
       ? null
       : transcriptReadingAnchor(conversation, retainAfterFilter);
     const expandedTools = new Set(
-      [...conversation.querySelectorAll("details.tool-card[open]")]
+      [...conversation.querySelectorAll("details.tool-card[open], details.compaction-card[open]")]
         .map((node) => node.dataset.transcriptId)
         .filter(Boolean),
     );
     const nodes = [];
+    if (state.transcript.available && state.transcript.note) {
+      const notice = document.createElement("p");
+      notice.className = "transcript-notice transcript-owner-note";
+      notice.setAttribute("role", "status");
+      notice.textContent = state.transcript.note;
+      nodes.push(notice);
+    }
     if (state.transcript.truncated && state.conversationVisibility.internal) {
       const notice = document.createElement("p");
       notice.className = "transcript-notice";
@@ -3910,6 +3985,11 @@ function initialize() {
         renderedMessages += 1;
         continue;
       }
+      if (message.kind === "compaction") {
+        nodes.push(renderCompactionCard(message, expandedTools));
+        renderedMessages += 1;
+        continue;
+      }
       const visibility = transcriptVisibilityKind(message);
       if (visibility === "internal" && typeof message.markdown !== "string") continue;
       const article = document.createElement("article");
@@ -3925,7 +4005,7 @@ function initialize() {
       article.append(label, body); nodes.push(article);
       renderedMessages += 1;
     }
-    const hasOnlyNotice = nodes.length === 1 && nodes[0].classList.contains("transcript-notice");
+    const hasOnlyNotice = nodes.length > 0 && nodes.every((node) => node.classList.contains("transcript-notice"));
     if (!renderedMessages && (!nodes.length || hasOnlyNotice)) {
       const empty = document.createElement("div");
       empty.className = "conversation-empty";
@@ -3936,7 +4016,7 @@ function initialize() {
           ? `Conversation log unavailable: ${state.transcript.error}. Raw pane remains available.`
         : (state.transcript.available
           ? `Waiting for ${state.transcript.source} conversation messages…`
-          : "No agent session log is mapped yet. Raw pane remains available.");
+          : (state.transcript.note || "No agent session log is mapped yet. Raw pane remains available."));
       nodes.push(empty);
     } else if (state.transcript.error) {
       // A failed refresh must never look like a quiet agent.
@@ -4832,6 +4912,7 @@ function initialize() {
       state.paneReadingScrollTop = pane.scrollTop;
       state.paneExpectedScrollTop = pane.scrollTop;
     }
+    if (raw) scheduleRawFit(revealRaw ? 0 : 350);
     // Conversation is hidden while Files, Git or the raw pane are open, and a
     // hidden element reports no scroll height, so every redraw it missed left
     // it parked at the top. Re-apply the reader's place once it is measurable.
@@ -4864,6 +4945,67 @@ function initialize() {
       if (view?.git.summary || view?.git.loading || view?.git.error) renderGit();
       else void loadGitSummary();
     }
+  }
+
+  /// A detached tmux window is 80x24 unless something sizes it, so a
+  /// full-screen agent draws only 24 short rows. While Raw pane is open, ask
+  /// the owner to fit the window to this view. The owner skips windows a
+  /// terminal is attached to, and the next attached terminal takes over.
+  function scheduleRawFit(delay = 350) {
+    if (state.rawFitTimer !== null) clearTimeout(state.rawFitTimer);
+    state.rawFitTimer = setTimeout(() => {
+      state.rawFitTimer = null;
+      void fitRawPane();
+    }, delay);
+  }
+
+  function measureRawPaneGrid() {
+    const style = getComputedStyle(pane);
+    const probe = document.createElement("span");
+    probe.textContent = "M".repeat(100);
+    probe.style.cssText = "position:absolute;left:-10000px;top:0;visibility:hidden;white-space:pre";
+    probe.style.font = style.font;
+    document.body.append(probe);
+    const charWidth = probe.getBoundingClientRect().width / 100;
+    probe.remove();
+    const fontSize = parseFloat(style.fontSize);
+    const lineHeight = parseFloat(style.lineHeight) || fontSize * 1.45;
+    const horizontal = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
+    const vertical = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0);
+    return rawPaneGrid({
+      width: pane.clientWidth - horizontal,
+      height: pane.clientHeight - vertical,
+      charWidth,
+      lineHeight,
+    });
+  }
+
+  async function fitRawPane() {
+    if (state.viewMode !== "raw" || pane.hidden || document.hidden) return;
+    const paneId = state.selected;
+    const session = state.sessions.get(paneId);
+    if (!session || !isMachineControllable(machineOf(session))) return;
+    const grid = measureRawPaneGrid();
+    if (!grid) return;
+    const key = `${paneId}:${grid.cols}x${grid.rows}`;
+    if (state.rawFitKey === key) return;
+    state.rawFitKey = key;
+    try {
+      await request(`/api/v1/panes/${encodeURIComponent(paneId)}/size`, {
+        method: "POST",
+        body: JSON.stringify({ cols: grid.cols, rows: grid.rows }),
+      });
+    } catch {
+      // An older owner, a vanished pane or a transient failure: Raw pane
+      // still shows what tmux has, and the next resize or visit retries.
+      if (state.rawFitKey === key) state.rawFitKey = null;
+    }
+  }
+
+  if (typeof ResizeObserver === "function") {
+    new ResizeObserver(() => {
+      if (state.viewMode === "raw" && !pane.hidden) scheduleRawFit();
+    }).observe(pane);
   }
 
   function drawPane(initial) {

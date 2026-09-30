@@ -176,6 +176,8 @@ const {
   collapsibleToolRun,
   internalToolGroupKey,
   compactTranscriptItems,
+  compactionSummaryLabel,
+  rawPaneGrid,
   coordinationGroupSummary,
   toolGroupSummary,
   groupRepeatedTools,
@@ -1546,6 +1548,57 @@ test("an unchanged transcript preserves its prior truncation state", () => {
   assert.equal(next.hash, "same");
   assert.equal(next.transcript.truncated, true);
   assert.deepEqual(next.transcript.messages, current.messages);
+});
+
+test("the owner's mapping note survives unavailable and unchanged reads, bounded", () => {
+  const current = { available: false, source: "claude", messages: [], truncated: false, error: null, note: "" };
+  const starting = reduceTranscript(current, {
+    available: false, source: "claude", content_hash: "", changed: false, truncated: false, messages: [],
+    note: "Claude has not finished starting.",
+  });
+  assert.equal(starting.transcript.note, "Claude has not finished starting.");
+  const resuming = reduceTranscript(starting.transcript, {
+    available: true, source: "claude", content_hash: "h", changed: true, truncated: false,
+    messages: [{ id: "m", role: "assistant", kind: "message", markdown: "hi" }],
+    note: "Showing the conversation it was launched to resume.",
+  });
+  assert.equal(resuming.transcript.note, "Showing the conversation it was launched to resume.");
+  const unchanged = reduceTranscript(resuming.transcript, { available: true, source: "claude", content_hash: "h", changed: false });
+  assert.equal(unchanged.transcript.note, "");
+  assert.equal(reduceTranscript(current, { available: false, note: "x".repeat(5000) }).transcript.note.length, 400);
+  assert.equal(reduceTranscript(current, { available: false, note: { html: "<b>" } }).transcript.note, "");
+});
+
+test("a compaction renders as one collapsed box labelled with its trigger and token counts", () => {
+  assert.equal(
+    compactionSummaryLabel({ kind: "compaction", markdown: "This session is being continued…", compaction: { trigger: "manual", pre_tokens: 245549, post_tokens: 11832 } }),
+    "Conversation compacted \u00b7 manual \u00b7 246k \u2192 11.8k tokens \u00b7 summary",
+  );
+  assert.equal(compactionSummaryLabel({ kind: "compaction", markdown: "", compaction: {} }), "Conversation compacted");
+  assert.equal(
+    compactionSummaryLabel({ kind: "compaction", compaction: { trigger: "<script>", pre_tokens: -1, post_tokens: "9" } }),
+    "Conversation compacted",
+  );
+  const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  const renderer = source.slice(source.indexOf("function renderCompactionCard"), source.indexOf("function renderToolGroup"));
+  assert.match(renderer, /document\.createElement\("details"\)/);
+  assert.doesNotMatch(renderer, /details\.open = true/);
+  assert.doesNotMatch(renderer, /innerHTML/);
+  assert.match(source, /details\.tool-card\[open\], details\.compaction-card\[open\]/);
+});
+
+test("Raw pane asks its owner for a window that fits the view, within fixed bounds", () => {
+  assert.deepEqual(rawPaneGrid({ width: 1200, height: 760, charWidth: 7.8, lineHeight: 18.85 }), { cols: 153, rows: 40 });
+  assert.deepEqual(rawPaneGrid({ width: 300, height: 200, charWidth: 7.8, lineHeight: 18.85 }), { cols: 60, rows: 16 });
+  assert.deepEqual(rawPaneGrid({ width: 9000, height: 9000, charWidth: 7.8, lineHeight: 18.85 }), { cols: 300, rows: 150 });
+  assert.equal(rawPaneGrid({ width: 0, height: 700, charWidth: 7.8, lineHeight: 18 }), null);
+  assert.equal(rawPaneGrid({ width: 900, height: 700, charWidth: Number.NaN, lineHeight: 18 }), null);
+  assert.equal(rawPaneGrid(), null);
+  const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  const fit = source.slice(source.indexOf("async function fitRawPane"), source.indexOf("function drawPane"));
+  assert.match(fit, /\/size`, \{/);
+  assert.match(fit, /body: JSON\.stringify\(\{ cols: grid\.cols, rows: grid\.rows \}\)/);
+  assert.match(fit, /state\.viewMode !== "raw"/);
 });
 
 test("conversation items distinguish compact tool calls from chat messages", () => {

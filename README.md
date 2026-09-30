@@ -81,6 +81,34 @@ Each patch names the revision it applies to. A client that receives a patch whic
 the revision it holds discards it and reconnects for a fresh snapshot, so a missed update can never
 be merged into a half-correct view.
 
+**Conversation mapping.** Conversation shows the native log of the exact agent process in the
+selected pane. For Claude, atmux reads the CLI's `sessions/<pid>.json` in every `~/.claude*`
+config directory and requires the live PID, the pane's working directory, and a matching start
+time. Claude records its session start only when startup finishes, so a startup prompt (for
+example the development-channels confirmation) answered minutes later used to break the match.
+Current Claude versions also record the exact OS process start (`procStart`), the tmux pane
+(`tmux`), and the machine and PID namespace (`pidDomain`); atmux uses the exact start whenever the
+approximate one does not match, and rejects metadata recorded for another pane, machine, or
+namespace. While Claude has not published metadata at all, Conversation says so and, when the
+process was launched with an explicit `--resume <id>` whose log exists in exactly one config
+directory, shows that conversation. A session with no messages yet shows as empty rather than
+unavailable. Codex is mapped through the one rollout its process holds open; a freshly resumed
+Codex keeps none open until its next turn, so atmux shows the rollout named by `codex resume <id>`
+unless any other same-directory user thread was created after the process started. These
+launch-argument fallbacks are display-only: restart, maintenance relaunch, and auto-compact never
+use them.
+
+**Compaction.** A native compaction (Claude's boundary plus the summary it continues from, or
+Codex's `compacted` record) appears as one collapsed row naming its trigger and token counts. Its
+summary opens on demand instead of filling the view as an operator message.
+
+**Raw pane sizing.** tmux gives a window with no attached terminal its `default-size` (80×24), so a
+full-screen agent draws only 24 short rows. While Raw pane is open, the browser asks the pane's
+owner to fit that window to the view (60–300 columns, 16–150 rows) through
+`POST /api/v1/panes/{id}/size`. The owner resizes only a single-pane window with no attached
+client, then unsets the window's `window-size` so the next terminal that attaches takes the size
+over exactly as before.
+
 Click a machine header in the session rail to inspect that machine's live CPU, memory, GPU, and temperature readings. GPU data is shown when the host exposes NVIDIA's `nvidia-smi`; unavailable hardware probes stay empty instead of failing the dashboard. The launch dialog has an **Agent** picker (Claude or Codex), a profile picker, and a project field that filters recursively discovered projects as you type. Its bounded, accessible suggestion list remains responsive for large project sets and supports keyboard, mouse, and touch selection. **Browse** safely explores the selected machine's configured project roots; it can navigate to every allowed parent, create a folder, or clone a credential-free HTTPS/SSH repository into the displayed directory. These mutations run only on the selected owning machine and never overwrite an existing target. A chosen folder is remembered for that machine while every launch remains server-validated. When viewing an agent in a browser that supports the Web Speech API, hold **Talk** to dictate and release it to send the recognized text directly to that agent.
 
 ### Automatic context compaction

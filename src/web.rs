@@ -28,8 +28,9 @@ use crate::{
     control::{
         CloneLaunchRepositoryRequest, ControlPlane, CreateLaunchDirectoryRequest, ErrorKind,
         FleetRecovery, FleetUpdate, LaunchDirectoryActionResult, LaunchDirectoryListing,
-        LaunchRequest, ModelSwitchRequest, Overview, PaneModels, PaneOutput,
-        ResumableLaunchSessions, SessionUpdateRequest, error_kind, overview_patch, pane_patch,
+        LaunchRequest, ModelSwitchRequest, Overview, PaneModels, PaneOutput, PaneSizeRequest,
+        PaneSizeResponse, ResumableLaunchSessions, SessionUpdateRequest, error_kind,
+        overview_patch, pane_patch,
     },
     discovery,
     machine::{MachineSummary, Secret, resolve_token},
@@ -842,6 +843,7 @@ fn routes(state: WebState) -> Router {
             post(restart_agent_instance),
         )
         .route("/api/v1/panes/{id}/resume", post(resume_current_claude))
+        .route("/api/v1/panes/{id}/size", post(fit_pane_size))
         .route("/api/v1/panes/{id}/events", get(pane_events))
         .route("/api/v1/panes/{id}/messages", post(send_message))
         .route(
@@ -1387,6 +1389,22 @@ async fn interrupt(
         .await
         .map_err(|error| ApiError::from_control(&error))?;
     Ok(Json(OkResponse { ok: true }))
+}
+
+/// Fits a detached pane's window to the browser's raw view.
+async fn fit_pane_size(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<PaneSizeRequest>,
+) -> Result<Json<PaneSizeResponse>, ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    state
+        .control
+        .fit_pane(&id, request)
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::from_control(&error))
 }
 
 async fn kill(
@@ -2813,6 +2831,66 @@ mod tests {
         assert_eq!(remote["online"], false);
         assert!(remote["update"].is_null());
         assert!(remote["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn pane_size_is_origin_protected_bounded_and_owner_routed() {
+        let control = crate::control::test_control(&["gpu-box"]);
+        let (app, _shutdown) = authenticated_real_app(control);
+        let post = |path: &str, body: &str, origin: &str| {
+            protected_api(
+                "POST",
+                path,
+                body,
+                Some("quick-resume-test-token"),
+                Some(origin),
+            )
+        };
+        let same = "http://localhost:7345";
+        let local = "/api/v1/panes/%254294967295/size";
+        assert_eq!(
+            app.clone()
+                .oneshot(post(
+                    local,
+                    r#"{"cols":120,"rows":40}"#,
+                    "https://attacker.example"
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        for body in [r#"{"cols":20,"rows":40}"#, r#"{"cols":120,"rows":900}"#] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(post(local, body, same))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST,
+                "{body}"
+            );
+        }
+        assert_eq!(
+            app.clone()
+                .oneshot(post(local, r#"{"cols":120,"rows":40,"window":"@1"}"#, same))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(post(
+                    "/api/v1/panes/gpu-box~%251/size",
+                    r#"{"cols":120,"rows":40}"#,
+                    same
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]
