@@ -1,6 +1,6 @@
 # Quick Resume on any machine
 
-Status: deployed on Tron and Max 2026-09-29; Clue and Midnight pending
+Status: deployed fleet-wide 2026-09-30 UTC (with `38bc395`); rosters exist only on Tron
 
 ## Request
 
@@ -83,3 +83,10 @@ dashboard assets.
 - Max, Clue, Midnight: write a roster from `deploy/quick-resume/quick-resume.example.sh`. Max's
   boot roster (`deploy/systemd/resume-max-at-boot`) is a different, boot-only format and is not
   reused. Midnight and Clue take the direct bridge; Max takes the scoped bridge.
+
+## Fleet completion — 2026-09-30 (UTC)
+
+Midnight, Clue, and the coordinator received this change as part of the `38bc395` rollout (see
+`conversation-mapping-compaction-raw-fit.md`). The public dashboard now reads
+`/api/v1/fleet/quick-resume`. Max, Midnight, and Clue still have no roster script, so they report
+"roster script is not installed" until one is written from `deploy/quick-resume/`.

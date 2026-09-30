@@ -1,6 +1,6 @@
 # Conversation mapping, collapsed compaction, and Raw pane sizing
 
-Status: implemented and tested locally 2026-09-29; fleet rollout pending
+Status: deployed fleet-wide 2026-09-30 UTC; review gates pending
 
 ## Requests (2026-09-29)
 
@@ -54,7 +54,7 @@ A fleet probe of every live Claude/Codex pane found 13 of 44 without a Conversat
 
 - [x] Implementation
 - [x] Focused Rust and browser tests
-- [ ] Live verification on every owner after rollout (Tron read-only live checks passed pre-rollout)
+- [x] Live verification on every owner after rollout
 - [ ] Fable/Claude Max review
 - [ ] Independent security review
 
@@ -69,3 +69,37 @@ A fleet probe of every live Claude/Codex pane found 13 of 44 without a Conversat
 - Tron read-only live checks: `dispatch` (empty, noted), `coord` (240 entries), `projects` Codex
   (112), `atmux-fable` (216). The first run caught that `pidDomain` embeds `/etc/machine-id`, not the
   boot id; the check was corrected before any deployment.
+
+## Deployment — 2026-09-30 (UTC)
+
+Runtime commit `38bc395` (merge of the Conversation/compaction/Raw-fit and IDE-viewer work, on top
+of per-machine Quick Resume `3e6a7a1`). Each binary was checked to embed the committed `app.js`,
+`app.css`, and `index.html`, and the coordinator serves all three byte for byte.
+
+| Machine | Artifact | SHA-256 prefix | Restart |
+| --- | --- | --- | --- |
+| Tron | local release build | `e2783566c5a68102` | `atmux-web:0.0` respawned in its original `scoped-exec` 56 GiB scope |
+| Max | Tron's binary, checksum-verified | `e2783566c5a68102` | user `atmux-web.service` |
+| Midnight | native macOS build in `.deploy-38bc395-WN5atA` | `399f54b904b70e78` | Aqua `launchctl kickstart -k gui/$(id -u)/dev.herodevs.atmux-web` |
+| Clue | native ARM64 build in `~/atmux-build-38bc395-bQx5XI` | `33beed5e3e8a53c3` | user `atmux-web.service` |
+| Coordinator | `localhost:32000/atmux@sha256:3c929925…a3e12` | — | Helm `atmux-web` revision 31 |
+
+- Only web services restarted. Every tmux server kept its pid (Tron 11243, Max 7182, Midnight
+  42550, Clue 169912) and every agent pane kept its id, pid, and identity.
+- The Helm render differed from the live manifest only in the two image references.
+- Through the coordinator: all four owners online with no health error; Conversation available
+  for 40 of 41 live agent panes (31 of 44 before). The remaining pane is Clue's Codex, whose open
+  rollout was archived and deleted from disk while the process kept running.
+- Rollback copies: Tron `target/release/atmux.rollback-3e6a7a1`, Max
+  `target/release/atmux.rollback-3e6a7a1`, Midnight `target/release/atmux.rollback-8d5cd01-pre-38bc395`,
+  Clue `~/.local/bin/atmux.rollback-8d5cd01-pre-38bc395`, Helm revision 30. Private snapshots and
+  values are in `/mnt/data/herodevs-agents/atmux-rollout-38bc395-bBNq2p` on Tron.
+
+Live checks after rollout, through the coordinator:
+
+- `cve-planner-codex` (Midnight) shows 131 entries with the resumed-Codex note; startup-prompt
+  `max` panes on Midnight and Max show their resumed conversation with the startup note;
+  `nes-ecosystem` maps through `procStart`; Tron `dispatch` reports no messages yet.
+- 30 panes include `compaction` entries.
+- `POST /api/v1/panes/{id}/size` on a disposable Tron session: 80×24 to 150×45 (`resized`),
+  `window-size` unset afterwards, `unchanged` on repeat, 400 for 10 columns; session removed.

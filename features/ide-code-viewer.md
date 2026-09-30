@@ -1,6 +1,6 @@
 # IDE-style Files viewer
 
-Status: implemented and tested locally 2026-09-29; not deployed
+Status: deployed fleet-wide 2026-09-30 UTC; review gates pending
 
 ## Request
 
@@ -38,7 +38,7 @@ detection, no multi-line comments or strings, and no navigation.
   in `web/app.js`, `web/app.css`)
 - [x] Focused Rust and dashboard tests
 - [x] Browser integration test in the existing mobile dashboard suite
-- [ ] Live runtime test on each owner after rollout
+- [x] Live runtime test after rollout (through the coordinator against Tron)
 - [ ] Fable/Claude Max review
 - [ ] Independent security review
 
@@ -82,3 +82,37 @@ detection, no multi-line comments or strings, and no navigation.
   generic highlighting. Passing the fence language would give them the same per-language colors.
 - Definition search is heuristic, not a language server. It does not resolve overloads, types of
   receivers, or external dependencies such as `node_modules`, crates, or JDK classes.
+
+## Deployment — 2026-09-30 (UTC)
+
+Runtime commit `38bc395` (merge of the Conversation/compaction/Raw-fit and IDE-viewer work, on top
+of per-machine Quick Resume `3e6a7a1`). Each binary was checked to embed the committed `app.js`,
+`app.css`, and `index.html`, and the coordinator serves all three byte for byte.
+
+| Machine | Artifact | SHA-256 prefix | Restart |
+| --- | --- | --- | --- |
+| Tron | local release build | `e2783566c5a68102` | `atmux-web:0.0` respawned in its original `scoped-exec` 56 GiB scope |
+| Max | Tron's binary, checksum-verified | `e2783566c5a68102` | user `atmux-web.service` |
+| Midnight | native macOS build in `.deploy-38bc395-WN5atA` | `399f54b904b70e78` | Aqua `launchctl kickstart -k gui/$(id -u)/dev.herodevs.atmux-web` |
+| Clue | native ARM64 build in `~/atmux-build-38bc395-bQx5XI` | `33beed5e3e8a53c3` | user `atmux-web.service` |
+| Coordinator | `localhost:32000/atmux@sha256:3c929925…a3e12` | — | Helm `atmux-web` revision 31 |
+
+- Only web services restarted. Every tmux server kept its pid (Tron 11243, Max 7182, Midnight
+  42550, Clue 169912) and every agent pane kept its id, pid, and identity.
+- The Helm render differed from the live manifest only in the two image references.
+- Through the coordinator: all four owners online with no health error; Conversation available
+  for 40 of 41 live agent panes (31 of 44 before). The remaining pane is Clue's Codex, whose open
+  rollout was archived and deleted from disk while the process kept running.
+- Rollback copies: Tron `target/release/atmux.rollback-3e6a7a1`, Max
+  `target/release/atmux.rollback-3e6a7a1`, Midnight `target/release/atmux.rollback-8d5cd01-pre-38bc395`,
+  Clue `~/.local/bin/atmux.rollback-8d5cd01-pre-38bc395`, Helm revision 30. Private snapshots and
+  values are in `/mnt/data/herodevs-agents/atmux-rollout-38bc395-bBNq2p` on Tron.
+
+Live checks after rollout, through the coordinator against the atmux repository on Tron:
+
+- `definitions?symbol=native_resume_target&path=src/control.rs` returns `src/transcript.rs:478`
+  (function).
+- `references?symbol=claude_lookup_in_home` returns its definition and three references.
+- `resolve?spec=crate::transcript::Transcript&symbol=Transcript` returns `src/transcript.rs:113`
+  (struct).
+- A path-like symbol and a `.git/config` source path are refused by the owner.
