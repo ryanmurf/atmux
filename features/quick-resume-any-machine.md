@@ -1,6 +1,6 @@
 # Quick Resume on any machine
 
-Status: implemented and tested locally 2026-09-29; fleet rollout pending
+Status: deployed on Tron and Max 2026-09-29; Clue and Midnight pending
 
 ## Request
 
@@ -32,7 +32,7 @@ constants.
 - [x] Implementation (`src/recovery.rs`, `src/config.rs`, `src/control.rs`, `src/web.rs`,
   `web/`, `deploy/quick-resume/`)
 - [x] Focused Rust and dashboard tests
-- [ ] Live runtime test on each owner after rollout
+- [x] Live runtime test on Tron and Max after rollout (Clue and Midnight pending)
 - [ ] Fable/Claude Max review
 - [ ] Independent security review
 
@@ -51,6 +51,30 @@ constants.
   special-cased and nothing about a script crosses the wire.
 - The Tron shell tests (`tests/resume_tron_scoped_exec.sh`, `tests/resume_tron_transactional.sh`)
   still pass against the unchanged canonical fixture.
+
+## Deployment — 2026-09-29
+
+Runtime commit `3e6a7a1`, release build `33e4b692…` (x86_64, LTO), embedding the committed
+dashboard assets.
+
+| Machine | Artifact | Restart | Result |
+| --- | --- | --- | --- |
+| Tron | local release build | `atmux-web:0.0` respawned in its original `scoped-exec` 56 GiB scope | reports its real `/home/ryan/resume-tron.sh` available under the scoped bridge with no script edit |
+| Max | Tron's binary, checksum-verified | user `atmux-web.service` (`KillMode=process`) | reports "roster script is not installed" |
+
+- Only web services restarted. Tron's tmux server kept pid 11243 and Max's kept pid 25728; every
+  pre-existing agent pane id, pid, and command is unchanged on both.
+- `/api/v1/fleet/quick-resume` on Tron lists all three online owners with their own documents;
+  Midnight still runs the previous binary and answers with its old Tron-only message until it is
+  redeployed.
+- Rollback copies: Tron `target/release/atmux.rollback-8d5cd01` (the running pre-rollout binary,
+  `37a04f7a…`), Max `target/release/atmux.rollback-8d5cd01-pre-3e6a7a1`.
+- Not deployed: Clue (needs its native ARM64 build) and Midnight, which had rebooted at 18:41 MDT
+  and was being brought back up by hand during this work; its web service was restarted from the
+  LaunchAgent at 19:27 on the previous binary.
+- The full parallel `cargo test --lib` run on Tron intermittently fails one self-update test with
+  `Text file busy`; the same flake reproduces at the previous commit and the tests pass in
+  isolation, so it is unrelated to this change.
 
 ## Rollout notes
 
