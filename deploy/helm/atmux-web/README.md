@@ -234,3 +234,30 @@ Run the chart regression suite with:
 ```bash
 bash deploy/helm/atmux-web/tests/render.sh
 ```
+
+Agent events are an optional coordinator capability. Enable
+`server.events.enabled` to persist bounded logs on the existing PVC, and
+`server.events.redpanda.enabled` to publish the platform lifecycle topic.
+`server.events.redpanda.tenantId`, `brokers`, and `topic` are configurable;
+defaults match the verified herodevs PLAINTEXT/no-auth listener and HQ tenant.
+Broker publishing adds only TCP 9092 egress to `app=redpanda` Pods in `herodevs`.
+Other broker topologies need a corresponding reviewed NetworkPolicy override.
+
+The broker advertises the short hostname `redpanda`, even when bootstrap uses
+`redpanda.herodevs.svc.cluster.local:9092`. A coordinator outside `herodevs`
+therefore needs the optional top-level `hostAliases` value:
+
+```yaml
+hostAliases:
+  - ip: "10.152.183.23" # Re-check the Redpanda Service ClusterIP before rollout.
+    hostnames: [redpanda]
+server:
+  events:
+    enabled: true
+    redpanda:
+      enabled: true
+```
+
+`hostAliases` defaults to `[]` and renders no Pod field when empty. This example
+does not enable `server.enabled` or provision a broker/topic. The lead must
+reconcile the current Service IP and opt-in values before deployment.

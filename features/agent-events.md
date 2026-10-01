@@ -1,6 +1,6 @@
 # A1: Agent events (hooks, spool, federation, MCP, Redpanda)
 
-Status: implementation and acceptance verification in progress on `feat/agent-events`
+Status: complete; all acceptance gates passed on `feat/agent-events` (2026-09-30)
 
 Read `features/agent-control-plane.md` first; it defines the event envelope, types, session key,
 and rules. This record is your brief. Update it with progress, evidence, and gate checkboxes.
@@ -155,6 +155,11 @@ A4 will consume your `needs_input/startup_prompt` events; keep that type stable.
   clears attention, cursor reset clears cached state, and status supplies a
   fallback for older owners. The rail reserves a badge slot so changing
   attention does not move click targets. Hidden pages stop long-polling.
+- Helm defaults keep events and the sink disabled, with `hostAliases: []`
+  omitted from Pod specs. Optional generated coordinator configuration uses
+  the existing PVC. Enabling the sink adds narrowly scoped Redpanda TCP 9092
+  egress because the chart's existing NetworkPolicy otherwise blocks it.
+  Sink enablement without event storage fails rendering.
 
 ## Gates
 
@@ -162,12 +167,89 @@ A4 will consume your `needs_input/startup_prompt` events; keep that type stable.
 - [x] Spool restart, rotation, retention, partial-tail recovery, epoch/cursor,
   filtered-page advancement and long-poll wakeup tests.
 - [x] Disposable-tmux hook delivery with stable session_key; spoof rejection;
-  silent successful helper when owner is down.
+  silent successful helper with owner down, unclosed stdin or hung owner.
 - [x] HTTP fixture federation, token forwarding, 404 compatibility, durable
   restart/replay de-duplication; no fleet events re-exported as owner events.
 - [x] Fake-producer retry/checkpoint and exact platform wrapper tests.
 - [x] MCP enabled/disabled/filter tool tests.
 - [x] Launch/resume/maintenance/Quick Resume hook propagation coverage.
 - [x] Dashboard reason badges and browser suites.
-- [ ] Helm hostAliases rendering/default and documented broker resolution.
-- [ ] Full format, zero-warning clippy, Rust and JavaScript acceptance commands.
+- [x] Helm hostAliases rendering/default and documented broker resolution.
+- [x] Full format, zero-warning clippy, Rust and JavaScript acceptance commands.
+
+## Acceptance evidence
+
+All shell commands below were invoked through `rtk`. Rust integration tests
+use disposable tmux socket names, and the browser tests use fixture servers.
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed |
+| `cargo clippy --all-targets --all-features -- -D warnings` | Passed, zero warnings |
+| `cargo test --all-features` (environment below) | 827 passed, 7 ignored; 21 suites |
+| `cargo check --no-default-features` | Passed |
+| `cargo test --all-features events::tests` | 12 passed |
+| `cargo test --all-features agent_events_tool` | 1 passed |
+| `cargo test --all-features configured_event_hooks` | 1 passed |
+| `cargo test --all-features --test agent_events` | 4 passed |
+| `node --check web/app.js` | Passed |
+| `node --test web/*.test.mjs tests/navigation.test.mjs` | 187 passed, zero failures |
+| `node --test --test-concurrency=1 tests/mobile_viewport_browser.mjs tests/navigation_browser.mjs tests/web_mobile_pulse_browser.mjs` | 10 passed, zero failures or skips |
+| `node tests/quick_talk_browser.mjs <fixture-url> <fixture-chrome-port>` | Passed with a disposable sleep pane and event-enabled owner |
+| `bash deploy/helm/atmux-web/tests/render.sh` | Security render checks passed; Helm lint: 1 chart, zero failures |
+| `git diff --check` | Passed |
+
+The final full Rust invocation was:
+
+```sh
+rtk proxy env ATMUX_TMUX_SOCKET_NAME=atmux-test-a1-acceptance-20260930 \
+  ATMUX_REQUIRE_TMUX=1 RUST_TEST_THREADS=1 rtk cargo test --all-features
+```
+
+Serial test execution avoids an existing parallel staged-binary fixture's
+`Text file busy` race. The separate spool-lock inheritance race found during
+parallel execution is fixed in A1. The seven ignored tests are existing
+platform probes or child-process helper fixtures; live-agent probes were not
+enabled. This worktree arrived with directory mode 0775; existing recovery
+security fixtures require non-writable ancestors, so its mode was temporarily
+0755 for verification and restored afterward. The user's untracked
+`.atmux.toml` was neither modified nor committed.
+
+Quick Talk followed the fixture recipe in `.github/workflows/ci.yml`, using
+random loopback web/Chrome ports, private temporary runtime/config directories,
+and a unique `atmux-test-a1-quick-*` socket running only `/bin/sleep`. The local
+runner was `python3 /tmp/atmux-a1-quick-talk.py`; it terminated only those test
+processes and its disposable tmux server.
+
+## Scope adjustments and merge notes
+
+- The lead's verified contract supersedes the original raw Redpanda value:
+  the sink publishes HdEventEnvelope v2 with both tenantId locations. The
+  owner/fleet APIs still return the shared `atmux.agent.event/v1` objects.
+- Fixture payloads use official, verified native shapes with illustrative
+  values. No running CLI was used to capture payloads. Stop additionally
+  emits needs_input/idle_prompt, and targeted question hooks close native
+  question/plan-approval coverage gaps. No A2/A3/A4 behavior is implemented.
+- A2 can reuse `KafkaProducer::connect` and the `Producer::publish(topic,
+  key_bytes, value_bytes)` trait API. Entity-change callers construct their
+  own platform envelope and retain their own retry/checkpoint policy. The
+  producer accepts at most 128 KiB; H2's digest document must still obey its
+  separate 8 KiB limit.
+- A2/A3/A4 can call `ControlPlane::emit_agent_event` with
+  `AgentEvent::from_session`. A1 emits agent.exited on process/pane loss; A3
+  owns session.closed/archived/resumed. Session identity already exists in
+  base commit `4e2d0de`; do not mint another session key on ordinary relaunch.
+- Shared-file merge sites include Config.events/profile hook configuration,
+  ControlPlane startup/scans/federation, MCP and HTTP registration, the hidden
+  main subcommand, README and the small appended dashboard sections.
+  `resume_claude` now receives an inject_hooks argument; reconcile A4 callers
+  while preserving launch, maintenance and scoped-exec injection coverage.
+- Enable `[events]` on owners and coordinator explicitly; only the coordinator
+  gets `[events.redpanda]`. Before rollout, the lead must ensure topics exist
+  (atmux deliberately does not create them), verify the current Service IP
+  used by hostAliases, and opt into chart event/sink values. H1/H2 should
+  de-duplicate using eventPayload.id: acknowledged-page replay is at least
+  once. Retention deliberately bounds backlog and can expose cursor gaps.
+- No deployment, push, service restart, Kubernetes mutation, live broker
+  publication, or running tmux/agent interaction was performed. macOS/ARM
+  cross-builds were not run on this Linux worktree.
