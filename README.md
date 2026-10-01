@@ -1271,3 +1271,25 @@ or require the Claude Pulse TypeScript service at runtime.
 ## License
 
 MIT
+
+
+### Durable session history (opt-in)
+
+`[registry] enabled = true` records owner-local agents under the platform state directory and
+archives their final native logs and Git position when panes disappear. Set `directory` to an
+absolute private (0700) directory to choose another location. Owners retain up to 10,000 records
+and 90 days of archived history; bundles default to 256 MiB each and a 4 GiB total quota. Override
+`max_owner_records`, `archived_retention_days`, `bundle_max_bytes`, or `bundle_quota_bytes` in the
+same section. A bundle failure leaves a closed record available for search and retries locally.
+
+A configured coordinator pulls registry changes and checksummed tar.gz archives from trusted
+owners over the existing federation transport. Its records remain durable after owner retention
+and bundle eviction. Give the coordinator a persistent writable volume and set its registry
+`directory` to that mount before enabling it. Private exports require the owner's node bearer
+credential; browser/proxy access uses only the public history projection.
+
+Use the dashboard's **Sessions** view or MCP `sessions_search` / `session_get` to find current and
+archived work by stable session key. REST equivalents are `/api/v1/session-history` and
+`/api/v1/session-history/{session_key}`. Native provider ids and config roots are omitted from
+history responses. Resume wiring is supplied by the separate resume-anywhere workstream; the
+integration contract and acceptance evidence are in [the A3 record](features/session-registry-archive.md).

@@ -821,6 +821,9 @@ enum ResumeLeaseAcquireError {
 #[derive(Debug)]
 struct Inner {
     config: Config,
+    registry: Option<Arc<crate::registry::Registry>>,
+    registry_peer_token: Option<crate::machine::Secret>,
+    registry_watchers: Mutex<BTreeMap<String, AbortHandle>>,
     local_id: String,
     local_label: String,
     /// With no `[[machines]]` configured or discovery enabled there is nothing
@@ -972,8 +975,21 @@ impl ControlPlane {
         let configured_machine_ids = machines.keys().cloned().collect();
         let recovery = RecoveryRunner::production(&config);
         let updater = SelfUpdater::production(&config.self_update)?;
+        let registry = crate::registry::Registry::open(&config.registry, &config.node.id)?;
+        let registry_peer_token = if registry.is_some() {
+            crate::machine::resolve_token(
+                &config.node.id,
+                config.node.token_env.as_deref(),
+                config.node.token_file.as_deref(),
+            )?
+        } else {
+            None
+        };
         let control = Self {
             inner: Arc::new(Inner {
+                registry,
+                registry_peer_token,
+                registry_watchers: Mutex::new(BTreeMap::new()),
                 local_id: config.node.id.clone(),
                 local_label: config.node_label(),
                 bare_local_ids,
@@ -1345,6 +1361,18 @@ impl ControlPlane {
 
     fn start_watcher(&self, machine: Arc<RemoteMachine>) {
         let id = machine.id.clone();
+        if let Some(registry) = &self.inner.registry {
+            let handle = crate::registry::spawn_pull(Arc::clone(registry), Arc::clone(&machine));
+            if let Some(previous) = self
+                .inner
+                .registry_watchers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id.clone(), handle)
+            {
+                previous.abort();
+            }
+        }
         let watcher = remote::spawn_watcher(self.clone(), machine);
         self.inner
             .watchers
@@ -1433,6 +1461,15 @@ impl ControlPlane {
             .remove(id);
         if removed.is_none() {
             return;
+        }
+        if let Some(watcher) = self
+            .inner
+            .registry_watchers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id)
+        {
+            watcher.abort();
         }
         if let Some(watcher) = self
             .inner
@@ -2157,6 +2194,9 @@ impl ControlPlane {
             truncate_front(&mut session.content, MAX_CAPTURE_BYTES);
         }
 
+        if let Some(registry) = &self.inner.registry {
+            registry.observe(&sessions, now_ms())?;
+        }
         self.apply_refresh(sessions);
         let metrics = self
             .inner
@@ -6319,6 +6359,9 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
     ControlPlane {
         inner: Arc::new(Inner {
             config,
+            registry: None,
+            registry_peer_token: None,
+            registry_watchers: Mutex::new(BTreeMap::new()),
             local_id: local_id.clone(),
             local_label,
             bare_local_ids: handles.is_empty(),
@@ -6394,6 +6437,53 @@ pub(crate) fn test_session(name: &str, pane_id: &str, content: &str) -> Session 
         systemd_scope: None,
         memory_max_bytes: None,
         status: crate::status::AgentStatus::Working,
+    }
+}
+
+// A3 history/federation integration. Keep these independent of live pane routing.
+impl ControlPlane {
+    /// # Errors
+    /// Returns `NotFound` while the explicitly configured registry is disabled.
+    pub fn registry(&self) -> Result<Arc<crate::registry::Registry>> {
+        self.inner
+            .registry
+            .clone()
+            .ok_or_else(|| not_found("session registry is disabled"))
+    }
+
+    pub(crate) fn registry_peer_authorized(&self, credential: &str) -> bool {
+        self.inner
+            .registry_peer_token
+            .as_ref()
+            .is_some_and(|token| {
+                let expected = token.expose().as_bytes();
+                let supplied = credential.as_bytes();
+                expected.len() == supplied.len()
+                    && expected
+                        .iter()
+                        .zip(supplied)
+                        .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
+                        == 0
+            })
+    }
+
+    /// # Errors
+    /// Returns disabled/invalid-filter errors; native identity is never returned.
+    pub fn sessions_search(
+        &self,
+        query: &crate::registry::SessionsSearch,
+    ) -> Result<crate::registry::SessionsPage> {
+        self.registry()?
+            .search(query)
+            .map_err(|_| bad_request("invalid session history filters"))
+    }
+
+    /// # Errors
+    /// Returns disabled/invalid-key errors; native identity is never returned.
+    pub fn session_get(&self, key: &str) -> Result<Option<crate::registry::SessionRecord>> {
+        self.registry()?
+            .get(key)
+            .map_err(|_| bad_request("invalid session key"))
     }
 }
 

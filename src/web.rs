@@ -803,6 +803,7 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
 }
 
 fn routes(state: WebState) -> Router {
+    let registry = crate::registry_web::routes(state.control.clone());
     Router::new()
         .route("/", get(index))
         .route("/app.css", get(css))
@@ -886,6 +887,7 @@ fn routes(state: WebState) -> Router {
         .route("/api/v1/sessions/{id}", delete(kill).patch(update_session))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
+        .merge(registry)
 }
 
 /// Builds the dashboard and JSON API routes without the host and token policy

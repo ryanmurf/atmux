@@ -684,3 +684,12 @@ dialog::backdrop { background: #000a; }
 }
 
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } }
+
+/* A3 session history shares the existing detail/navigation layout. */
+.session-history-view { padding: 1.25rem; min-width: 0; }
+.session-history-filters { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1rem 0; }
+.session-history-filters input { min-width: 8rem; flex: 1 1 10rem; }
+.session-history-list { list-style: none; margin: 0; padding: 0; }
+.session-history-row { border-bottom: 1px solid var(--border, #333); padding: 1rem 0; overflow-wrap: anywhere; }
+.session-history-row p { margin: .4rem 0; }
+@media (max-width: 600px) { .session-history-view { padding: .75rem; } }

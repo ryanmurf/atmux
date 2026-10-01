@@ -3867,12 +3867,38 @@ function agentSearchShortcut(event, { dialogOpen = false, searchVisible = true }
   return "focus";
 }
 
+// Shared A3 history contract; A4 can consume sessionHistoryResumeRequest.
+function sessionHistoryQuery(filters = {}, cursor = null) {
+  const query = new URLSearchParams({ limit: "100" });
+  for (const key of ["state", "machine", "project", "text"]) {
+    const value = String(filters[key] || "").trim().slice(0, 2048);
+    if (value) query.set(key, value);
+  }
+  if (cursor) query.set("cursor", String(cursor));
+  return `/api/v1/session-history?${query}`;
+}
+function sessionHistoryRow(record) {
+  return {
+    sessionKey: String(record?.session_key || ""),
+    name: String(record?.name || "Untitled session"),
+    description: String(record?.description || ""),
+    machine: String(record?.machine || ""),
+    project: String(record?.project?.remote || record?.project?.root || record?.cwd || ""),
+    lastActiveMs: Number(record?.last_active_ms || 0),
+    state: ["running", "exited", "closed", "archived"].includes(record?.state) ? record.state : "unknown",
+  };
+}
+function sessionHistoryResumeRequest(record) {
+  return { session_key: String(record?.session_key || record?.sessionKey || ""), machine: String(record?.machine || "") };
+}
+
 function appRoute(urlValue) {
   const url = urlValue instanceof URL ? urlValue : new URL(String(urlValue), "https://atmux.invalid/");
   const session = url.searchParams.get("session");
   if (session) return { view: "session", id: session };
   const machine = url.searchParams.get("machine");
   if (machine) return { view: "machine", id: machine };
+  if (url.searchParams.get("view") === "sessions") return { view: "sessions", id: null };
   if (url.searchParams.get("view") === "usage") return { view: "usage", id: null };
   return { view: "menu", id: null };
 }
@@ -3925,6 +3951,9 @@ if (typeof module !== "undefined" && module.exports) {
     attachmentSelectionMatches,
     agentMenuUrl,
     appRoute,
+    sessionHistoryQuery,
+    sessionHistoryRow,
+    sessionHistoryResumeRequest,
     paneOutputBinding,
     paneOutputMatchesSession,
     overviewConnectionPresentation,
@@ -4238,6 +4267,12 @@ function initialize() {
   const requestedPulseAccount = pulseAccountId(pageUrl.searchParams.get("pulseAccount"));
   const state = {
     revision: 0,
+    historyOpen: initialRoute.view === "sessions",
+    historyRows: [],
+    historyCursor: null,
+    historyGeneration: 0,
+    historyController: null,
+    historyTimer: null,
     sessions: new Map(),
     machines: [],
     selected: initialRoute.view === "session" ? initialRoute.id : null,
@@ -6563,7 +6598,7 @@ function initialize() {
   }
 
   function selectSession(id, historyMode = "push") {
-    const changed = state.selected !== id || state.selectedMachine !== null || state.pulseOpen;
+    const changed = state.selected !== id || state.selectedMachine !== null || state.pulseOpen || state.historyOpen;
     const paneChanged = state.selected !== id;
     if (changed && !confirmDiscardFileEdit()) return false;
     if (changed) {
@@ -6573,6 +6608,7 @@ function initialize() {
     state.selected = id;
     state.selectedMachine = null;
     state.pulseOpen = false;
+    closeSessionHistory();
     bindComposerDraftToSelection();
     stopPulseRefresh();
     stopPulseEvents();
@@ -6591,7 +6627,7 @@ function initialize() {
   }
 
   function selectMachine(id, historyMode = "push") {
-    const changed = state.selected !== null || state.selectedMachine !== id || state.pulseOpen;
+    const changed = state.selected !== null || state.selectedMachine !== id || state.pulseOpen || state.historyOpen;
     if (changed && !confirmDiscardFileEdit()) return false;
     if (changed) {
       persistBoundComposerDraft(true);
@@ -6600,6 +6636,7 @@ function initialize() {
     state.selected = null;
     state.selectedMachine = id;
     state.pulseOpen = false;
+    closeSessionHistory();
     bindComposerDraftToSelection();
     resetProjectView();
     stopPulseRefresh();
@@ -6619,12 +6656,13 @@ function initialize() {
 
   function selectPulse(open, historyMode = "push") {
     const nextOpen = Boolean(open);
-    const changed = state.selected !== null || state.selectedMachine !== null || state.pulseOpen !== nextOpen;
+    const changed = state.selected !== null || state.selectedMachine !== null || state.pulseOpen !== nextOpen || state.historyOpen;
     if (changed && !confirmDiscardFileEdit()) return false;
     if (changed) {
       persistBoundComposerDraft(true);
       invalidateLaunchDialog();
     }
+    closeSessionHistory();
     state.pulseOpen = nextOpen;
     state.selected = null;
     state.selectedMachine = null;
@@ -6654,6 +6692,84 @@ function initialize() {
     return true;
   }
 
+  function closeSessionHistory() {
+    state.historyOpen = false;
+    state.historyGeneration += 1;
+    state.historyController?.abort();
+    clearTimeout(state.historyTimer);
+  }
+
+  function selectSessionHistory(open, historyMode = "push") {
+    const changed = state.historyOpen !== Boolean(open) || state.selected !== null || state.selectedMachine !== null || state.pulseOpen;
+    if (!selectSession(null, "none")) return false;
+    state.historyOpen = Boolean(open);
+    const url = agentMenuUrl(location.href);
+    if (open) url.searchParams.set("view", "sessions");
+    updateSelectionHistory(url, historyMode, changed);
+    render();
+    if (open) void loadSessionHistory();
+    return true;
+  }
+
+  async function loadSessionHistory(more = false) {
+    if (!state.historyOpen) return;
+    state.historyController?.abort();
+    clearTimeout(state.historyTimer);
+    const controller = new AbortController();
+    state.historyController = controller;
+    const generation = ++state.historyGeneration;
+    const filters = { text: $("history-text").value, state: $("history-state").value,
+      machine: $("history-machine").value, project: $("history-project").value };
+    $("history-status").textContent = "Loading sessions…";
+    $("history-more").disabled = true;
+    try {
+      const page = await request(sessionHistoryQuery(filters, more ? state.historyCursor : null), { signal: controller.signal });
+      if (!state.historyOpen || generation !== state.historyGeneration) return;
+      const rows = (Array.isArray(page.sessions) ? page.sessions : []).slice(0, 100).map(sessionHistoryRow);
+      const combined = more ? [...state.historyRows, ...rows] : rows;
+      state.historyRows = [...new Map(combined.map((row) => [row.sessionKey, row])).values()].slice(0, 1000);
+      state.historyCursor = state.historyRows.length < 1000 ? page.next_cursor : null;
+      renderSessionHistory();
+      $("history-status").textContent = state.historyRows.length ? `${state.historyRows.length} sessions${page.next_cursor ? " · more available" : ""}` : "No matching sessions.";
+    } catch (error) {
+      if (generation !== state.historyGeneration || controller.signal.aborted) return;
+      $("history-status").textContent = error.status === 404 ? "Session history is disabled on this node." : `Session history unavailable: ${error.message}`;
+    } finally {
+      if (generation === state.historyGeneration) {
+        $("history-more").disabled = false;
+        state.historyTimer = setTimeout(() => { if (state.historyOpen && !document.hidden) void loadSessionHistory(); }, 30_000);
+      }
+    }
+  }
+
+  function renderSessionHistory() {
+    const rows = state.historyRows.map((row) => {
+      const item = document.createElement("li"); item.className = "session-history-row";
+      item.dataset.sessionKey = row.sessionKey;
+      const name = document.createElement("strong"); name.textContent = row.name;
+      const description = document.createElement("p"); description.textContent = row.description;
+      const metadata = document.createElement("p"); metadata.className = "meta";
+      const date = row.lastActiveMs ? new Date(row.lastActiveMs) : null;
+      metadata.textContent = [row.machine, row.project, date && Number.isFinite(date.getTime()) ? date.toLocaleString() : "No activity recorded", row.state].filter(Boolean).join(" · ");
+      item.append(name, description, metadata);
+      const live = [...state.sessions.values()].find((session) => session.session_key === row.sessionKey);
+      if (live) {
+        const button = document.createElement("button"); button.className = "subtle"; button.textContent = "Open";
+        button.addEventListener("click", () => selectSession(live.id)); item.append(button);
+      } else {
+        const button = document.createElement("button"); button.className = "subtle"; button.textContent = "Resume";
+        button.dataset.sessionResume = row.sessionKey;
+        // A4's clearly named hook owns destination selection and confirmation.
+        button.disabled = typeof window.atmuxSessionResume !== "function";
+        button.addEventListener("click", () => window.atmuxSessionResume?.(sessionHistoryResumeRequest(row)));
+        item.append(button);
+      }
+      return item;
+    });
+    $("history-list").replaceChildren(...rows);
+    $("history-more").hidden = !state.historyCursor;
+  }
+
   function backToAgentMenu() {
     const route = appRoute(location.href);
     if (route.view === "menu") return;
@@ -6666,6 +6782,7 @@ function initialize() {
     const route = appRoute(location.href);
     const accepted = route.view === "session" ? selectSession(route.id, "none")
       : route.view === "machine" ? selectMachine(route.id, "none")
+        : route.view === "sessions" ? selectSessionHistory(true, "none")
         : route.view === "usage" ? selectPulse(true, "none")
           : selectSession(null, "none");
     if (accepted === false) {
@@ -6674,6 +6791,7 @@ function initialize() {
       if (state.selected) url.searchParams.set("session", state.selected);
       else if (state.selectedMachine) url.searchParams.set("machine", state.selectedMachine);
       else if (state.pulseOpen) url.searchParams.set("view", "usage");
+      else if (state.historyOpen) url.searchParams.set("view", "sessions");
       // Back already exposed the existing Agents entry. Put the rejected
       // editor detail back above it; replacing here would consume that only
       // in-app escape hatch and make the next Back leave atmux/login origin.
@@ -6739,13 +6857,17 @@ function initialize() {
 
     const selected = state.sessions.get(state.selected);
     const selectedMachine = state.machines.find((machine) => machine.id === state.selectedMachine) || null;
-    $("welcome").hidden = Boolean(selected || selectedMachine || state.pulseOpen);
+    $("welcome").hidden = Boolean(selected || selectedMachine || state.pulseOpen || state.historyOpen);
     $("machine-view").hidden = !selectedMachine || Boolean(selected);
     $("agent-view").hidden = !selected;
+    $("history-view").hidden = !state.historyOpen;
+    $("history-open").setAttribute("aria-pressed", String(state.historyOpen));
+    $("history-open").classList.toggle("selected", state.historyOpen);
     $("pulse-view").hidden = !state.pulseOpen;
     $("pulse-open").classList.toggle("selected", state.pulseOpen);
     $("pulse-open").setAttribute("aria-pressed", String(state.pulseOpen));
-    document.body.classList.toggle("has-selection", Boolean(selected || selectedMachine || state.pulseOpen));
+    document.body.classList.toggle("has-selection", Boolean(selected || selectedMachine || state.pulseOpen || state.historyOpen));
+    if (state.historyOpen) return;
     if (state.pulseOpen) {
       renderPulse();
       return;
@@ -8505,6 +8627,11 @@ function initialize() {
   $("overview-retry").addEventListener("click", () => {
     if (!$("overview-retry").disabled) connectOverview();
   });
+  $("history-open").addEventListener("click", () => selectSessionHistory(!state.historyOpen));
+  $("history-back").addEventListener("click", backToAgentMenu);
+  $("history-refresh").addEventListener("click", () => void loadSessionHistory());
+  $("history-more").addEventListener("click", () => void loadSessionHistory(true));
+  $("history-filters").addEventListener("submit", (event) => { event.preventDefault(); void loadSessionHistory(); });
   $("pulse-open").addEventListener("click", () => selectPulse(!state.pulseOpen));
   function stopRecoveryPolling() {
     if (state.recoveryPoll !== null) clearTimeout(state.recoveryPoll);
@@ -10789,6 +10916,7 @@ function initialize() {
 
   render();
   connectOverview();
+  if (state.historyOpen) void loadSessionHistory();
   void refreshFleetUpdates();
   void refreshFleetRecovery(false);
   if (state.selected) connectPane();

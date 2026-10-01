@@ -16,6 +16,7 @@
     <div class="brand"><img class="brand-logo" src="/atmux-logo.jpg" alt=""><span class="brand-wordmark">atmux</span><small>agent control plane</small></div>
     <div id="counts" class="counts" aria-label="Agent summary">Connecting…</div>
     <span id="overview-status" class="overview-status" role="status" aria-label="Live update connection">Connecting…</span>
+    <button id="history-open" class="subtle topbar-action" type="button" aria-pressed="false">Sessions</button>
     <button id="pulse-open" class="subtle topbar-action" type="button" aria-pressed="false">Usage</button>
     <button id="recovery-open" class="subtle topbar-action" type="button" hidden>Quick resume</button>
     <button id="launch-open" class="primary" type="button">New agent</button>
@@ -70,6 +71,23 @@
         <p id="machine-offline" class="agent-offline" role="status" hidden></p>
         <section id="machine-software" class="software-card" aria-label="Machine software updates"></section>
         <div id="machine-metrics" class="metrics-grid" aria-label="Machine resource metrics"></div>
+      </section>
+
+      <section id="history-view" class="session-history-view" aria-labelledby="history-heading" hidden>
+        <header class="pulse-head">
+          <button id="history-back" class="subtle" type="button">← Agents</button>
+          <div><h1 id="history-heading">Sessions</h1><p id="history-status" class="meta" role="status"></p></div>
+          <button id="history-refresh" class="subtle" type="button">Refresh</button>
+        </header>
+        <form id="history-filters" class="session-history-filters">
+          <input id="history-text" type="search" maxlength="2048" aria-label="Search session history" placeholder="Name, description, title…">
+          <select id="history-state" aria-label="Session state"><option value="">All states</option><option value="running">Running</option><option value="exited">Exited</option><option value="closed">Closed</option><option value="archived">Archived</option></select>
+          <input id="history-machine" maxlength="2048" aria-label="Session machine" placeholder="Machine">
+          <input id="history-project" maxlength="2048" aria-label="Session project" placeholder="Project">
+          <button class="subtle" type="submit">Search</button>
+        </form>
+        <ul id="history-list" class="session-history-list" aria-live="polite"></ul>
+        <button id="history-more" class="subtle" type="button" hidden>Load more</button>
       </section>
 
       <section id="pulse-view" class="pulse-view" aria-labelledby="pulse-heading" hidden>
