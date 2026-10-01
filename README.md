@@ -1470,8 +1470,9 @@ credential; browser/proxy access uses only the public history projection.
 Use the dashboard's **Sessions** view or MCP `sessions_search` / `session_get` to find current and
 archived work by stable session key. REST equivalents are `/api/v1/session-history` and
 `/api/v1/session-history/{session_key}`. Native provider ids and config roots are omitted from
-history responses. Resume wiring is supplied by the separate resume-anywhere workstream; the
-integration contract and acceptance evidence are in [the A3 record](features/session-registry-archive.md).
+history responses. **Resume on…** uses these same records and archives; the integration contract
+and acceptance evidence are in [the A3 record](features/session-registry-archive.md) and
+[the A4 record](features/resume-anywhere.md).
 
 
 ## Intake and Work ledger

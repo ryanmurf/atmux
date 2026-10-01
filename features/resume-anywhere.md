@@ -1,6 +1,6 @@
 # A4: Resume anywhere, phone-home restore, no startup prompts
 
-Status: A4 integration acceptance in progress on `feat/resume-anywhere` (2026-10-01)
+Status: A4 MERGED; all acceptance gates passed on `feat/resume-anywhere` (2026-10-01)
 
 Read `features/agent-control-plane.md` first. This record is your brief; keep it updated with
 progress, evidence, and gate checkboxes.
@@ -121,11 +121,12 @@ Agents never sit at a startup prompt.
   avoids opening a second writer and closes the restart-before-scan gap. Restore commit
   rechecks desired intent atomically; an exact-generation TUI intent also wins before commit.
   Unmatched intents are retained briefly while a new launch is awaiting its first registry scan.
-  No mailbox contains
-  conversation content. Native files are refreshed before restore to retain post-archive turns.
+  No mailbox contains conversation content. Native files are refreshed before restore to retain
+  post-archive turns.
 - A1 EventService records unknown startup dialogs as agent.needs_input/startup_prompt and
-  auto-answers as agent.startup_prompt_answered with dialog/verification/process-generation metadata only. The TUI's existing
-  per-process tmux claim and bounded outcome marker let the owner emit a TUI answer as well.
+  auto-answers as agent.startup_prompt_answered with dialog/verification/process-generation
+  metadata only. The TUI's existing per-process tmux claim and bounded outcome marker let the
+  owner emit a TUI answer as well.
   session.resumed goes through ControlPlane::emit_agent_event. A1 node.started carries A3's
   owner boot id; tmux server changes emit another node.started. The existing durable event
   checkpoint retains latest imported node boots. An allowlisted coordinator retries missing
@@ -164,17 +165,69 @@ snapshot and shared Cargo target directory; existing recovery security fixtures 
 The user's untracked .atmux.toml and original permissions are preserved. Self-update fixtures
 use four test threads to avoid the previously observed ETXTBSY flake.
 
-First integration evidence: A3 Claude/Codex translation, damaged/oversized archive and
-profile/branch/symlink refusal fixtures pass; authenticated disposable two-owner federation
-export/import, recorder launch, copy, changed-source/divergent-target move refusal, neighboring
-pane preservation, native-tail restore, event-triggered coordinator restore and explicit-close
-exclusion pass. JavaScript unit tests pass (195); browser navigation/history passes.
+Integration commits:
+
+- `c5dfabd`: merge A1/A2/A3 at `13fe19a`; consolidate native resume onto A3's registry,
+  archive transport, configuration and Sessions view.
+- `a46bb70`: merge lifecycle/search/fleet wiring at `a585502`; complete A1 event-driven
+  recovery, atomic close-intent handling and non-primary source-copy restore.
+- `a54725d`: merge the latest lead head, `a4d071d`, including A5 intake; all final gates
+  below cover this combined tree.
+
+Acceptance fixtures cover exact Claude development/workspace-trust and Codex folder-trust
+dialogs, near misses, live flag/canonical-root checks and once-per-process verification. A
+disposable fake CLI verifies the development dialog is answered exactly once; event fixtures
+verify body-free startup outcomes and durable process-generation replay de-duplication.
+Claude and Codex native translation covers Linux/macOS homes, sibling files/empty directories,
+unchanged bodies, no-op identical imports, damaged/oversized archives and profile/branch/symlink
+refusals. Authenticated disposable two-owner federation verifies archive export/import, recorder
+launch arguments/cwd/stable identity, default copy, changed-source/divergent-target move refusal,
+neighboring-pane preservation, native-tail restore, non-primary source-copy recovery,
+event-triggered coordinator restore and explicit-close exclusion (including an intent arriving
+at resume commit). Browser fixtures exercise both agent Actions and the A3 Sessions picker.
 
 - [x] Consolidate onto A3 registry/config/archive/peer API/Sessions view
 - [x] A1 startup input/auto-answer/resumed/node-started wiring
 - [x] Merge lead's latest lifecycle/search/fleet wiring (`a585502`)
-- [ ] Final cargo fmt, strict clippy, full all-features Rust suite
-- [ ] Final JS and full browser suites
+- [x] Merge subsequent latest lead integration (`a4d071d`, including A5 intake)
+- [x] Final cargo fmt, strict clippy, full all-features Rust suite
+- [x] Final JS and full browser suites
+
+Final commands (all invoked through `rtk`):
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed |
+| `cargo clippy --all-targets --all-features -- -D warnings` | Passed, zero warnings |
+| `cargo test --all-features -- --test-threads=4` | 913 passed, zero failed; 7 pre-existing declared ignored |
+| `node --check web/app.js` | Passed |
+| `node --test web/*.test.mjs tests/navigation.test.mjs` | 196 passed, zero failed/skipped |
+| `node --test tests/mobile_viewport_browser.mjs tests/navigation_browser.mjs tests/quick_talk_browser.mjs tests/web_mobile_pulse_browser.mjs` | 13 passed, zero failed/skipped |
+| `git diff --check` | Passed |
+
+The Rust gate ran from identical tracked sources in private snapshot
+`/home/ryan/.cache/atmux-a4-merged-gates-0_g8vopu` (mode 0700), with
+`CARGO_TARGET_DIR=/home/ryan/IdeaProjects/atmux-resume/target`, `ATMUX_REQUIRE_TMUX=1` and
+`ATMUX_TMUX_SOCKET_NAME=atmux-ci-a4-intake-final-0g8vopu`. The snapshot avoids changing the
+original worktree's mode 0775 and satisfies existing secure-executable ancestry tests.
+
+Validation deviations: the existing Pulse post-flock replacement fixture's final reacquire now
+allows 200 ms for descriptors briefly inherited by concurrent fork/exec fixtures; the competing
+owner and unsafe-replacement assertions still use immediate refusal, and a leaked lock still
+fails the bounded deadline. Production Pulse code is unchanged. One earlier Chromium navigation
+run hit `Inspected target navigated or closed`; its focused retry and subsequent complete browser
+runs passed. Four Rust threads and the private snapshot are validation accommodations, not
+product behavior changes.
+
+Lead merge notes: no functional work remains open. This branch contains lead head `a4d071d`;
+merge it as a whole to retain the A3/A4 reconciliation. Use the single `[registry].directory`
+configuration and A3 archive schema; there is no separate A4 store/manifest/Saved sessions view.
+Automatic restore additionally requires `[events]` on coordinator and owners, coordinator
+`restore_on_start = true` and explicit `restore_machines`, matching target profile names/native
+stores, configured project roots and existing federation credentials. Session lifecycle/search
+callbacks remain in `registry_integration.rs`; A4 uses the shared event service/fleet append and
+does not introduce another publisher. Defaults remain off. No manual conflict reconciliation is
+pending with A1/A2/A3/A5.
 
 No deployment, push, service restart, cluster change or mutation of existing tmux/agents.
 All tmux mutation fixtures use explicitly disposable sockets.

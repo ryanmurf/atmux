@@ -349,3 +349,15 @@ without repeating browser suites. Every new transport/model test uses a fake
 producer, private temporary storage or loopback fixtures. No deployment, push,
 restart, cluster access/mutation, live broker or running tmux/agent operation
 was performed; the user's untracked .atmux.toml remains untouched.
+
+## A4 integration (2026-10-01)
+
+A4 adds `agent.startup_prompt_answered` through the existing EventService owner spool and fleet
+append/publication path. Its detail contains only a whitelisted dialog name, verification result,
+agent PID and process-start stamp; it never includes the captured dialog or argv. Persistent
+process-generation de-duplication prevents replaying the outcome after monitor restart.
+Unrecognized or refused startup dialogs retain `agent.needs_input` with `startup_prompt`.
+`session.resumed` uses `ControlPlane::emit_agent_event`, and `node.started` carries the A3
+registry owner boot identity used for allowlisted phone-home restore. The existing
+registry lifecycle/search callback remains authoritative. A4's final combined-tree tests and
+configuration requirements are recorded in [resume-anywhere.md](resume-anywhere.md).
