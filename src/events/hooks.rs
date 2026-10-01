@@ -146,6 +146,8 @@ pub(crate) fn injection_args(harness: &str, binary: &Path) -> Result<Vec<String>
             "SessionStart",
             "SessionEnd",
             "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
         ][..],
         "codex" => &[
             "PermissionRequest",
@@ -154,6 +156,8 @@ pub(crate) fn injection_args(harness: &str, binary: &Path) -> Result<Vec<String>
             "SessionStart",
             "SessionEnd",
             "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
         ][..],
         _ => return Ok(Vec::new()),
     };
@@ -163,6 +167,13 @@ pub(crate) fn injection_args(harness: &str, binary: &Path) -> Result<Vec<String>
             (*event).into(),
             json!([{"hooks":[{"type":"command", "command":command, "timeout":1}]}]),
         );
+        if matches!(*event, "PreToolUse" | "PostToolUse") {
+            hooks.get_mut(*event).unwrap()[0]["matcher"] = json!(if harness == "claude" {
+                "^(AskUserQuestion|ExitPlanMode)$"
+            } else {
+                "^(request_user_input|request_user_input_async)$"
+            });
+        }
     }
     if harness == "claude" {
         return Ok(vec![
@@ -212,6 +223,7 @@ pub fn inject_command(mut command: Vec<String>, enabled: bool) -> Result<Vec<Str
     Ok(command)
 }
 
+#[allow(clippy::too_many_lines)] // Explicit native-event allowlist keeps message extraction auditable.
 pub(crate) fn map_hook(event: &mut AgentEvent, delivery: &HookDelivery) -> bool {
     if !["claude", "codex"].contains(&delivery.harness.as_str()) {
         return false;
@@ -224,6 +236,41 @@ pub(crate) fn map_hook(event: &mut AgentEvent, delivery: &HookDelivery) -> bool 
         .or(delivery.event.as_deref())
         .unwrap_or_default();
     let reason = match (delivery.harness.as_str(), name) {
+        ("claude", "PreToolUse") => match delivery.payload.get("tool_name").and_then(Value::as_str)
+        {
+            Some("AskUserQuestion") => "question",
+            Some("ExitPlanMode") => "plan_approval",
+            _ => return false,
+        },
+        ("codex", "PreToolUse")
+            if delivery
+                .payload
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .is_some_and(|v| {
+                    matches!(v, "request_user_input" | "request_user_input_async")
+                }) =>
+        {
+            "question"
+        }
+        ("claude" | "codex", "PostToolUse")
+            if delivery
+                .payload
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .is_some_and(|v| {
+                    matches!(
+                        v,
+                        "AskUserQuestion"
+                            | "ExitPlanMode"
+                            | "request_user_input"
+                            | "request_user_input_async"
+                    )
+                }) =>
+        {
+            event.event_type = "agent.working".into();
+            ""
+        }
         ("claude", "Notification") => match delivery
             .payload
             .get("notification_type")

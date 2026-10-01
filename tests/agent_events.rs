@@ -239,27 +239,48 @@ async fn disposable_pane_hook_delivers_needs_input_with_its_stable_session_key()
 fn hook_is_silent_and_returns_success_with_owner_down_or_unclosed_stdin() {
     let sandbox = Sandbox::new();
     let binary = env!("CARGO_BIN_EXE_atmux");
-    let started = std::time::Instant::now();
-    let mut child = Command::new(binary)
-        .args(["hook", "codex"])
-        .env("XDG_RUNTIME_DIR", &sandbox.path)
-        .env("TMPDIR", &sandbox.path)
-        .env("TMUX_PANE", "%999")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let input = child.stdin.take().unwrap();
-    while child.try_wait().unwrap().is_none() {
-        assert!(started.elapsed() < Duration::from_millis(500));
-        std::thread::sleep(Duration::from_millis(2));
+    let mut listener = None;
+    for scenario in ["owner_down", "unclosed_stdin", "unresponsive_owner"] {
+        if scenario == "unclosed_stdin" {
+            let directory = sandbox.path.join("atmux");
+            fs::create_dir_all(&directory).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+            let socket = directory.join("hooks.sock");
+            listener = Some(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+            fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let started = std::time::Instant::now();
+        let mut child = Command::new(binary)
+            .args(["hook", "codex"])
+            .env("XDG_RUNTIME_DIR", &sandbox.path)
+            .env("TMPDIR", &sandbox.path)
+            .env("TMUX_PANE", "%999")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = Some(child.stdin.take().unwrap());
+        if scenario == "unresponsive_owner" {
+            use std::io::Write as _;
+            input
+                .as_mut()
+                .unwrap()
+                .write_all(include_bytes!("fixtures/agent-events/codex-stop.json"))
+                .unwrap();
+            drop(input.take());
+        }
+        while child.try_wait().unwrap().is_none() {
+            assert!(started.elapsed() < Duration::from_millis(500), "{scenario}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drop(input);
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{scenario}");
+        assert!(output.stdout.is_empty(), "{scenario}");
+        assert!(output.stderr.is_empty(), "{scenario}");
     }
-    drop(input);
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(output.stderr.is_empty());
+    drop(listener);
 }
 
 type ObservedRequest = (Option<String>, Option<String>);

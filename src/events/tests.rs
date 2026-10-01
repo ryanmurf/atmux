@@ -195,6 +195,44 @@ fn startup_and_permission_dialog_reasons_are_stable() {
         crate::status::input_reason(AgentKind::Codex, "Implement this plan?"),
         Some("plan_approval")
     );
+    assert!(!crate::status::startup_prompt(
+        AgentKind::Claude,
+        "Do you trust the files in this folder?\nPreviously approved\n❯ "
+    ));
+    assert_eq!(
+        crate::status::input_reason(AgentKind::Claude, "Allow this command\nCompleted\n❯ "),
+        None
+    );
+}
+
+#[test]
+fn native_question_hooks_and_answers_have_no_message_body() {
+    for (harness, tool, reason) in [
+        ("claude", "AskUserQuestion", "question"),
+        ("claude", "ExitPlanMode", "plan_approval"),
+        ("codex", "request_user_input", "question"),
+        ("codex", "request_user_input_async", "question"),
+    ] {
+        let mut delivery = hooks::HookDelivery {
+            harness: harness.into(),
+            pane: "%7".into(),
+            parent_pid: 1,
+            event: None,
+            payload: json!({"hook_event_name":"PreToolUse", "tool_name":tool, "tool_input":{"questions":[{"question":"secret question"}], "plan":"secret plan"}}),
+        };
+        let mut mapped = event();
+        assert!(hooks::map_hook(&mut mapped, &delivery));
+        assert_eq!(mapped.reason.as_deref(), Some(reason));
+        assert!(
+            !String::from_utf8(mapped.bounded_json().unwrap())
+                .unwrap()
+                .contains("secret")
+        );
+        delivery.payload["hook_event_name"] = json!("PostToolUse");
+        assert!(hooks::map_hook(&mut mapped, &delivery));
+        assert_eq!(mapped.event_type, "agent.working");
+        assert!(mapped.reason.is_none());
+    }
 }
 
 #[test]

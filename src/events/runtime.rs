@@ -544,14 +544,20 @@ async fn receive_hook(
     let delivery: HookDelivery = serde_json::from_slice(&bytes)?;
     let control = control.upgrade().context("owner stopped")?;
     let pane = delivery.pane.clone();
-    let session = tokio::task::spawn_blocking(move || control.event_session(&pane)).await??;
+    let pane_pid =
+        tokio::task::spawn_blocking(move || crate::tmux::Tmux::hook_pane_pid(&pane)).await??;
     if let Some(pid) = peer.pid().and_then(|v| u32::try_from(v).ok())
-        && !descends_from(pid, session.pane_pid, delivery.parent_pid)
+        && !descends_from(pid, pane_pid, delivery.parent_pid)
     {
         bail!("hook process does not descend from pane");
     }
     // The client stays alive for peer validation, but never waits on git/fsync.
-    stream.write_all(b"1").await?;
+    let _ = stream.write_all(b"1").await;
+    let pane = delivery.pane.clone();
+    let session = tokio::task::spawn_blocking(move || control.event_session(&pane)).await??;
+    if session.pane_pid != pane_pid {
+        bail!("hook pane process changed during validation");
+    }
     let service = service.upgrade().context("event service stopped")?;
     tokio::task::spawn_blocking(move || service.ingest_hook(&session, &delivery)).await?
 }

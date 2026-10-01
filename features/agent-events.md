@@ -115,14 +115,24 @@ A4 will consume your `needs_input/startup_prompt` events; keep that type stable.
   fixtures. Codex has PermissionRequest rather than Claude Notification.
 - Codex inline `-c hooks.*` overrides require trust. Injection uses the native
   automation flag `--dangerously-bypass-hook-trust` to avoid startup prompts.
-  It applies to all loaded hooks and CLI overrides replace the corresponding
-  event arrays; this native limitation is documented. `inject_hooks=false`
-  opts out. Existing `notify` callbacks are preserved; Stop supplies turn
-  completion and avoids replacing the user's notification command.
+  It applies to all loaded hooks; this native limitation is documented.
+  Codex merges hooks across native configuration layers, preserving hooks
+  from lower layers. `inject_hooks=false` opts out. Existing `notify` callbacks
+  are preserved; Stop supplies turn completion and avoids replacing the
+  user's notification command.
 - Native hook signals take precedence for their process generation; explicit
   visible dialogs supplement incomplete CLI coverage. Stop also emits
   needs_input/idle_prompt so Codex idle attention does not depend on a
   nonexistent Notification hook. A4's startup_prompt reason stays stable.
+- Targeted PreToolUse/PostToolUse hooks cover Claude AskUserQuestion and
+  ExitPlanMode, plus Codex request_user_input/request_user_input_async. They
+  emit question/plan_approval and working without copying tool input/output.
+  An empty current composer suppresses stale dialog text in scrollback.
+- Peer validation uses a minimal pane-PID read before acknowledgement, then
+  checks the same process generation before ingestion. Cached sessions avoid
+  an expensive full scan for every hook. The writer explicitly unlocks on
+  drop because another concurrent fork can briefly inherit its descriptor
+  before exec; spool reopen must not depend on that unrelated child's timing.
 - Project metadata uses three bounded, 80 ms timeout-guarded git reads and a
   256-cwd/60-second cache. URL parsing strips userinfo, all queries/fragments
   and SCP usernames. New direct dependencies: `rskafka 0.6` (pure Rust,
@@ -151,8 +161,8 @@ A4 will consume your `needs_input/startup_prompt` events; keep that type stable.
 - [x] HTTP fixture federation, token forwarding, 404 compatibility, durable
   restart/replay de-duplication; no fleet events re-exported as owner events.
 - [x] Fake-producer retry/checkpoint and exact platform wrapper tests.
-- [ ] MCP enabled/disabled/filter tool tests.
-- [ ] Launch/resume/maintenance/Quick Resume hook propagation coverage.
+- [x] MCP enabled/disabled/filter tool tests.
+- [x] Launch/resume/maintenance/Quick Resume hook propagation coverage.
 - [ ] Dashboard reason badges and browser suites.
 - [ ] Helm hostAliases rendering/default and documented broker resolution.
 - [ ] Full format, zero-warning clippy, Rust and JavaScript acceptance commands.

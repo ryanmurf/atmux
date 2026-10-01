@@ -953,6 +953,20 @@ impl ControlPlane {
         {
             return Err(bad_request("invalid hook pane"));
         }
+        let cached = self
+            .read_state()
+            .sessions
+            .iter()
+            .find(|v| v.pane_id == pane)
+            .cloned();
+        if let Some(mut session) = cached
+            && let Some(live) = Tmux::live_pane_identity(pane)?
+            && live.pane_pid == session.pane_pid
+            && live.pane_identity == session.pane_identity
+        {
+            session.path = live.path;
+            return Ok(session);
+        }
         Tmux.sessions(&HashMap::new(), &self.inner.config.status)?
             .into_iter()
             .find(|v| v.pane_id == pane)

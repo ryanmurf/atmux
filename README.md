@@ -836,6 +836,8 @@ Codex 0.159.x requires hook trust for inline overrides. Atmux adds the native
 `--dangerously-bypass-hook-trust` flag for configured injection so its vetted
 bridge runs without a startup approval. This invocation-wide flag also applies
 to other loaded native hooks; disable injection if that policy is unsuitable.
+Codex preserves hooks from lower native configuration layers. Targeted tool
+hooks report questions and plan approval without retaining their message bodies.
 Codex `notify` is left intact: its legacy turn-completion callback is redundant
 with `Stop`, and replacing it would discard the user's notification program.
 

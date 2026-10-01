@@ -149,7 +149,16 @@ pub struct EventLog {
     config: EventsConfig,
     state: Mutex<LogState>,
     changed: watch::Sender<u64>,
-    _lock: File,
+    writer_lock: File,
+}
+
+impl Drop for EventLog {
+    fn drop(&mut self) {
+        // An unrelated concurrent fork can briefly inherit this open file
+        // description before CLOEXEC runs. Release the flock explicitly so
+        // an immediate reopen need not wait for that child to exec.
+        let _ = fs2::FileExt::unlock(&self.writer_lock);
+    }
 }
 
 pub(crate) fn private_directory(path: &Path) -> Result<()> {
@@ -322,7 +331,7 @@ impl EventLog {
             config,
             state: Mutex::new(state),
             changed,
-            _lock: lock,
+            writer_lock: lock,
         };
         {
             let mut state = log

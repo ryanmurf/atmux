@@ -162,6 +162,9 @@ pub fn classify(
 /// Startup dialogs have stable event semantics shared with resume automation.
 #[must_use]
 pub fn startup_prompt(kind: AgentKind, content: &str) -> bool {
+    if current_empty_composer(kind, content) {
+        return false;
+    }
     let tail = content
         .lines()
         .rev()
@@ -186,6 +189,9 @@ pub fn startup_prompt(kind: AgentKind, content: &str) -> bool {
 /// Explicit visible input dialogs supplement native lifecycle hooks.
 #[must_use]
 pub fn input_reason(kind: AgentKind, content: &str) -> Option<&'static str> {
+    if current_empty_composer(kind, content) {
+        return None;
+    }
     if startup_prompt(kind, content) {
         return Some("startup_prompt");
     }
@@ -223,6 +229,31 @@ pub fn input_reason(kind: AgentKind, content: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn current_empty_composer(kind: AgentKind, content: &str) -> bool {
+    let glyph = match kind {
+        AgentKind::Claude => '❯',
+        AgentKind::Codex => '›',
+        AgentKind::Other => return false,
+    };
+    let lines = visible_tail(content);
+    let Some(prompt) = lines
+        .iter()
+        .rposition(|line| line.trim_start().starts_with(glyph))
+    else {
+        return false;
+    };
+    let footer = &lines[prompt + 1..];
+    let body = lines[prompt]
+        .trim_start()
+        .strip_prefix(glyph)
+        .unwrap_or_default();
+    empty_composer(kind, body, footer)
+        && footer.iter().all(|v| footer_row(v))
+        && !footer
+            .iter()
+            .any(|v| v.to_lowercase().contains("enter to confirm"))
 }
 
 /// Characters the harnesses use to rule off the composer box.

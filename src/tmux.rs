@@ -763,6 +763,25 @@ impl Tmux {
         }))
     }
 
+    /// A minimal read for hook peer validation before the short client deadline.
+    pub(crate) fn hook_pane_pid(pane_id: &str) -> Result<u32> {
+        if !valid_tmux_pane_id(pane_id) {
+            bail!("invalid hook pane");
+        }
+        let result = Self::output([
+            "display-message",
+            "-p",
+            "-t",
+            pane_id,
+            "#{pane_id}\t#{pane_pid}",
+        ])?;
+        let (observed, pid) = result.split_once('\t').context("missing hook pane")?;
+        if observed != pane_id {
+            bail!("hook pane no longer exists");
+        }
+        pid.parse().context("invalid hook pane process")
+    }
+
     /// Creates a detached session running the chosen agent profile.
     ///
     /// # Errors
