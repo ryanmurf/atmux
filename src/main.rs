@@ -22,7 +22,17 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+enum HerodevsCommands {
+    Login,
+}
+
+#[derive(Debug, Subcommand)]
 enum Commands {
+    /// Approve coordinator offline herodevs access in your browser.
+    Herodevs {
+        #[command(subcommand)]
+        command: HerodevsCommands,
+    },
     /// Internal, best-effort lifecycle telemetry bridge.
     #[command(hide = true)]
     Hook {
@@ -172,6 +182,20 @@ async fn main() -> Result<()> {
                 recovery_service_memory_max_bytes,
                 command,
             );
+        }
+        Some(Commands::Herodevs {
+            command: HerodevsCommands::Login,
+        }) => {
+            let (config, _) = Config::load(Some(&config_path))?;
+            let auth = atmux::herodevs::DeviceAuth::new(config.herodevs.auth)?;
+            let login = auth.begin_login().await?;
+            println!(
+                "Open {} and approve code {}",
+                login.verification_uri, login.user_code
+            );
+            auth.finish_login(login).await?;
+            println!("Offline credential stored securely.");
+            return Ok(());
         }
         Some(Commands::Doctor) => return doctor(&config_path),
         Some(Commands::SelfUpdate {

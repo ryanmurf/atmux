@@ -79,3 +79,33 @@ item is triaged and routed independently with free local Qwen.
 - `cargo fmt`, zero-warning clippy, `cargo test --all-features`, node tests, browser suites.
 - Do not contact live GitHub, herodevs, or Qwen in tests. Read-only manual checks against the live
   Qwen endpoints are fine and should be recorded here.
+
+## Implementation record: shared clients (2026-09-30)
+
+- Shared bounded, non-redirecting hyper/rustls transport; HTTPS required unless a private
+  HTTP host is explicitly allowlisted (all resolved addresses checked). Responses <=2 MiB,
+  prompts <=96 KiB, LLM output <=64 KiB, operation timeouts <=300 seconds. Upstream error
+  bodies are never propagated, so rejected operations cannot reflect credentials into logs.
+- `HerodevsClient` exposes GraphQL jobs, metadata filters, fenced transitions, messages/history,
+  and MCP search. Claim/transition use message `id`, not `jobId`, as H4 requires. `AuthProvider`
+  is pluggable for A6/fakes/future exchange. No implicit exchange or service-account fallback.
+- `DeviceAuth` implements pinned discovery/origin, RS256 JWKS verification, expected subject,
+  issuer/time, azp, tenant, USER identity, all audiences, initial ID-token nonce/offline scope,
+  tenant_slug on each grant, serialized refresh and atomic 0600 token rotation. A durable
+  LOGIN_REQUIRED marker precedes refresh to fail closed after ambiguous consumption or crash.
+  `atmux herodevs login` displays only verification URI/user code. Client secret and refresh
+  token stay in separate files. Refresh locks also exclude multiple coordinator processes.
+- `GithubClient` provides ProjectsV2 pagination, single-select status updates, PR CI/merge/review
+  state and issue/PR links; its token is read from a file. `LlmClient` handles per-endpoint
+  model/key/timeout settings and strict JSON. The summarizer now shares that transport/client
+  while retaining its own prompt, output sanitation and scheduling.
+- Platform shapes were read from the H4/H2 plans and local GraphQL/resolver sources. No live
+  platform calls, login, Keycloak/cluster changes, deployment, push or session mutation.
+- H4 does not expose job metadata updates. Intake will use idempotent channel assignment/update
+  messages plus durable local overlays; the lead should add a metadata-update API if the row
+  itself must change. Retrying postJob deliberately returns the original payload.
+- Gates: client fake-server integration tests 4/4; clippy all targets/features with -D warnings
+  passed. Initial full suite: 733 passed, 12 failed, 6 ignored: ten recovery ancestry failures
+  (group-writable checkout and /tmp), one self-update ETXTBSY race, one summarizer literal-IP
+  validation regression subsequently fixed. Full gates will be repeated in a private fixture
+  checkout with a private TMPDIR. Test-only RSA fixture is generated locally, never a credential.

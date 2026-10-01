@@ -35,3 +35,8 @@ pub mod transcript;
 pub mod ui;
 pub mod web;
 pub mod workspace;
+
+pub mod github;
+pub mod herodevs;
+pub mod llm;
+mod platform_http;
