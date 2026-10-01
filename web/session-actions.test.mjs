@@ -53,6 +53,7 @@ test("session edits send only changed fields bound to the pane seen at open", ()
     assert.ok(app.sessionEditRequest(session, name, description).error, JSON.stringify([name, description]));
   }
   assert.ok(app.sessionEditRequest(session, "review", "é".repeat(120)).body);
+  assert.equal(app.sessionEditRequest({ ...session, description_source: "auto" }, "review", "Old note").body.description, "Old note", "saving an auto note explicitly makes it user-owned");
   const external = { ...session, name: "notes.2 draft" };
   assert.deepEqual(app.sessionEditRequest(external, "notes.2 draft", "Keep the odd name"), {
     id: "max~%1",

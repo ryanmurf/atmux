@@ -684,3 +684,17 @@ dialog::backdrop { background: #000a; }
 }
 
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } }
+
+/* Automatic notes and the conversation's persisted rolling digest. */
+.session-description[data-source="auto"]::after,
+.agent-description[data-source="auto"]::after { content: " auto"; opacity: .55; font-size: .8em; }
+.conversation-summary { margin: 0 0 14px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
+.conversation-summary summary { cursor: pointer; font-weight: 600; }
+.conversation-summary p { white-space: pre-wrap; overflow-wrap: anywhere; }
+.conversation-summary .summary-title { font-weight: 600; }
+.session-row, .agent-title-row { position: relative; }
+.inline-rename { position: absolute; inset: 0; z-index: 4; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; padding: 4px; background: var(--panel); }
+.inline-rename input { min-width: 70px; flex: 1; width: 100px; }
+.inline-rename button { padding: 5px; font-size: .8rem; }
+.inline-rename-note { flex-basis: 100%; font-size: .8rem; color: var(--red); }
+.session-name { touch-action: manipulation; }

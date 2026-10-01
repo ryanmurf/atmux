@@ -12,6 +12,8 @@ const CDP_COMMAND_TIMEOUT_MS = 15_000;
 const CHROME_START_TIMEOUT_MS = 30_000;
 const CLEANUP_TIMEOUT_MS = 5_000;
 let transcriptFixture = null;
+let agentSummaryFixture = null;
+const sessionRenameRequests = [];
 let transcriptResponseDelayMs = 0;
 const transcriptRequests = [];
 let paneSnapshotContent = "";
@@ -272,6 +274,16 @@ function mockApi(url, response, request) {
     paneStreams.add(response);
     request.once("close", () => { paneStreams.delete(response); });
     return true;
+  }
+  if (/^\/api\/v1\/panes\/[^/]+\/summary$/.test(pathname)) {
+    json(response, agentSummaryFixture || { enabled: false, title: "", digest: "" }); return true;
+  }
+  if (/^\/api\/v1\/sessions\/[^/]+$/.test(pathname) && request.method === "PATCH") {
+    let body = ""; request.setEncoding("utf8"); request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      sessionRenameRequests.push({ pane: decodeURIComponent(pathname.split("/")[4]), body: JSON.parse(body) });
+      response.writeHead(204); response.end();
+    }); return true;
   }
   if (/^\/api\/v1\/panes\/[^/]+\/transcript$/.test(pathname)) {
     const observed = { pane: decodeURIComponent(pathname.split("/")[4]), hash: url.searchParams.get("known_hash"), closed: false };
@@ -5002,5 +5014,52 @@ test("dashboard reconnect preserves the pane and draft, and link/search actions 
     }
     paneStreams.clear();
     overviewStreams.clear();
+  }
+});
+
+
+test("inline rename, keyboard controls and safe automatic summaries work in the browser", { timeout: 60_000 }, async () => {
+  const profileDirectory = await mkdtemp(join(tmpdir(), "atmux-a2-browser-"));
+  let server; let chrome; let cdp; let testError = null;
+  sessionRenameRequests.length = 0;
+  agentSummaryFixture = { enabled: true, title: "Durable session summaries", description: "Keep context",
+    digest: "Goal: retain context. <script>window.summaryInjected = true</script> Tests remain.", stale: false };
+  try {
+    const started = await startServer(); server = started.server;
+    const browser = await launchChrome(profileDirectory); chrome = browser.chrome;
+    cdp = await openCdp(browser.browserSocket, "about:blank"); await cdp.send("Page.enable");
+    await cdp.send("Page.navigate", { url: `http://127.0.0.1:${started.port}/?session=tron~%25100` });
+    await waitFor(() => cdp.evaluate("document.getElementById('agent-name').textContent === 'codex-main'"), "selected session did not load");
+    await cdp.evaluate("document.getElementById('message').blur(); document.dispatchEvent(new KeyboardEvent('keydown', { key: 'F2', bubbles: true })); true");
+    await waitFor(() => cdp.evaluate("Boolean(document.querySelector('.inline-rename-name'))"), "F2 did not open inline rename");
+    await cdp.evaluate("document.querySelector('.inline-rename-name').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); true");
+    assert.equal(await cdp.evaluate("Boolean(document.querySelector('.inline-rename'))"), false);
+    assert.equal(sessionRenameRequests.length, 0);
+    await cdp.evaluate("document.getElementById('agent-name').dispatchEvent(new MouseEvent('dblclick', { bubbles: true })); true");
+    await cdp.evaluate("[...document.querySelectorAll('.inline-rename button')].find(b => b.textContent === 'Suggest').click(); true");
+    await waitFor(() => cdp.evaluate("document.querySelector('.inline-rename-name').value === 'durable-session-summaries'"), "Suggest did not fill title");
+    await cdp.evaluate("document.querySelector('.inline-rename-name').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); true");
+    await waitFor(() => sessionRenameRequests.length === 1, "Enter did not send rename");
+    assert.deepEqual(sessionRenameRequests[0], { pane: "tron~%100", body: { instance_id: "pane-v1-" + "1".repeat(64), name: "durable-session-summaries" } });
+    await waitFor(() => cdp.evaluate("!document.querySelector('.inline-rename')"), "saved inline editor did not close");
+    await cdp.evaluate("document.getElementById('conversation-view').click(); true");
+    await waitFor(() => cdp.evaluate("Boolean(document.querySelector('.conversation-summary'))"), "summary block did not load");
+    assert.equal(await cdp.evaluate("document.querySelector('.conversation-summary').open"), false);
+    await cdp.evaluate("document.querySelector('.conversation-summary summary').click(); true");
+    assert.equal(await cdp.evaluate("document.querySelector('.conversation-summary').open"), true);
+    assert.equal(await cdp.evaluate("Boolean(window.summaryInjected)"), false);
+    assert.equal(await cdp.evaluate("document.querySelector('.conversation-summary script') === null"), true);
+    emitOverviewPatch([{ ...mockSession("tron", "%100", "durable-session-summaries", "waiting", { agent: "codex" }),
+      instance_id: "pane-v1-" + "1".repeat(64), description: "Keep context", description_source: "auto" }]);
+    await waitFor(() => cdp.evaluate("document.querySelector('.session-description[data-source=auto]')?.textContent === 'Keep context'"), "automatic note marker did not render");
+    await cdp.evaluate("document.querySelector('.session-button[data-session-id=\"tron~%100\"] .session-name').dispatchEvent(new MouseEvent('dblclick', { bubbles: true })); true");
+    assert.equal(await cdp.evaluate("Boolean(document.querySelector('.session-row .inline-rename'))"), true);
+    await cdp.evaluate("document.querySelector('.inline-rename-name').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); true");
+  } catch (error) { testError = error; throw error; }
+  finally {
+    agentSummaryFixture = null;
+    try { await cleanupBrowserHarness({ cdp, chrome, server, profileDirectory }); }
+    catch (error) { if (!testError) throw error; console.error(error); }
+    paneStreams.clear(); overviewStreams.clear();
   }
 });

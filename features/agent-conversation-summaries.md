@@ -209,6 +209,14 @@ title/description with very easy renaming.
 - Authorized work stayed local. No deployment, push, service restart, Kubernetes action, or running
   tmux session/agent was touched. Existing untracked `.atmux.toml` was left untouched.
 
+### Commits
+
+- `12fd4af`: bounded federated conversation MCP tool, filters/cursors, and native harness fixtures.
+- `be77e81`: coordinator digests, description ownership, summary/search MCP and APIs, exact H2
+  envelope builder/ordering and fixtures, real Qwen fixture, configuration/docs and backend tests.
+- The subsequent UI commit adds inline rename and automatic summary display with unit/browser
+  coverage; its hash is listed in the final handoff report.
+
 ### Gates
 
 - [x] Conversation filtering/cursors/bounds tested with both native harness fixtures.
