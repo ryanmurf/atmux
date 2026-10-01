@@ -1,6 +1,6 @@
 # A3: Session registry and archive on close
 
-Status: implemented on `feat/session-registry`; final acceptance checks in progress (2026-09-30)
+Status: implemented on `feat/session-registry`; local acceptance complete; lead-owned release gates pending (2026-09-30)
 
 Read `features/agent-control-plane.md` first. This record is your brief; keep it updated with
 progress, evidence, and gate checkboxes.
@@ -142,19 +142,36 @@ Bundle import/resume and phone-home restore (A4); summaries (A2); events (A1).
 ## Gates and evidence
 
 - [x] Implementation: registry, archive, federation, REST/MCP, and Sessions history are present.
-- [x] Focused Rust: `cargo test --all-features --lib registry::tests` — 14 passed (plus a separate actual MCP-tool redaction test).
+- [x] Focused Rust: `cargo test --all-features --lib registry::tests` — 15 passed (plus a separate actual MCP-tool redaction test).
 - [x] Disposable owner: `ATMUX_REQUIRE_TMUX=1 cargo test --all-features --test session_registry`
   — external and dashboard closes both archived the correct fixture native log/key (1 passed).
-- [x] `cargo fmt`; `cargo clippy --all-targets --all-features -- -D warnings` — clean.
+- [x] `cargo fmt -- --check`; `cargo clippy --all-targets --all-features -- -D warnings` — clean,
+  zero warnings on the final implementation and Git regression.
 - [x] `node --check web/app.js`; `node --test web/*.test.mjs tests/navigation.test.mjs` — 186 passed.
-- [x] `node --test tests/navigation_browser.mjs` — 2 passed, including new history coverage.
-- [x] Mobile viewport and mobile/Pulse browser suites — 9 passed combined. Quick Talk was then
-  run with its required disposable web/tmux/Chrome fixture and passed. Its script is a fixture
-  client, not an independently runnable `node --test` suite.
-- [ ] Full `cargo test --all-features`: the first run in this worktree reached 683 passing tests,
-  6 ignored, and exposed 10 pre-existing recovery failures because this worktree root is 0775;
-  one parallel self-update test hit a fork/exec `ETXTBSY` race. Final verification will use a
-  private local checkout and `RUST_TEST_THREADS=1`, with disposable sockets required.
+- [x] `node --test tests/navigation_browser.mjs tests/mobile_viewport_browser.mjs
+  tests/web_mobile_pulse_browser.mjs` — 11 passed, including the new history/navigation coverage.
+- [x] `node tests/quick_talk_browser.mjs <fixture-url> <debug-port>` — passed with an isolated
+  config, a disposable tmux socket, locally spawned test web process and headless Chrome profile,
+  and random loopback ports. Cleanup stopped only those spawned test processes/sessions. This
+  script is a fixture client, not an independently runnable `node --test` suite.
+- [x] Full `cargo test --all-features` on frozen source `2731044` — 824 passed, 7 existing
+  ignored, zero failed. Run from private local checkout
+  `/home/ryan/atmux-a3-validation-20260930` with `ATMUX_REQUIRE_TMUX=1`,
+  `ATMUX_TMUX_SOCKET_NAME=atmux-ci-a3-final-git-20260930`, `RUST_TEST_THREADS=1`, and `TMUX` /
+  `TMUX_PANE` removed. Full log: `/home/ryan/atmux-a3-validation-20260930/final-all-features-git.log`.
+  The original worktree is 0775, which its existing recovery safety tests reject; a parallel
+  self-update test also hit a baseline fork/exec `ETXTBSY` race. A private local clone and serial
+  execution satisfy those test prerequisites without weakening safety checks or changing the
+  original directory's permissions. Nested filtered subprocess checks are excluded from the
+  aggregate above. Registry, federation, external close and dashboard close tests all ran.
+- [x] `cargo +1.88 check --all-features --locked`; `cargo check --no-default-features --locked`
+  — passed.
+- [x] Registry portability checks: `cargo check --manifest-path
+  /home/ryan/atmux-a3-portability-20260930/Cargo.toml --target x86_64-apple-darwin` and the same
+  command with `--target aarch64-unknown-linux-gnu` — passed. The leaf harness includes the
+  actual `src/registry.rs` and real Rust archive/filesystem dependencies, with surrounding atmux
+  modules stubbed. This checks platform types and dependency portability, not the full native
+  binary or runtime. Linux x86_64 uses the real full build and integration tests above.
 - [ ] Platform runtime matrix / independent security and Fable/Claude review: lead-owned release
   gates per `features/README.md`. This record stays active; no running fleet, services, cluster,
   agents, or default tmux server were touched.
@@ -163,7 +180,33 @@ Bundle import/resume and phone-home restore (A4); summaries (A2); events (A1).
 ### Completed implementation commits
 
 - `2d36953` — durable records, native archives, federation, REST/MCP, Sessions view and tests.
-- Follow-up storage/paging hardening: bounded pages clone only returned records; storage mkdir
-  refuses symlink ancestors; precise A1 reasons/digest references survive scans; a streamed 404
-  retains its HTTP classification and cannot block later registry changes. Focused tests and
-  zero-warning clippy pass before the commit; full frozen-source verification follows.
+- `8135bbb` — storage/paging hardening, durable precise reasons/digests, and missing-owner-bundle
+  recovery. Pages clone only returned records; descriptor-relative mkdir refuses symlink ancestors.
+- `2731044` — regression coverage for the final branch, HEAD and dirty state captured at close,
+  credential-free project remotes, and the identical Git position in the archive manifest.
+
+
+### Merge reconciliation and bounded limitations
+
+- A1 must install the lifecycle callback and feed precise needs-input reasons; A2 must feed
+  digest references and reconcile automatic description provenance with scan-derived user
+  descriptions. None of the other workstreams' event spool, summaries, or resume behavior is
+  duplicated here.
+- A4 must wire the named browser Resume hook, use server-only native identity/verified bundle
+  descriptors, and preserve the stable key before scanning a restored pane. Registry imports
+  currently arbitrate cross-owner updates by `last_seen_ms`; integrate A4's desired-owner/lease
+  decision before relying on clock ordering during ownership transfers.
+- Shared merge points are `[registry]` in `Config`, registry initialization and watcher lifecycle
+  in `control.rs`, the REST router merge, MCP tools, the returned native log path in
+  `transcript.rs`, Cargo dependencies/features, and Sessions navigation in `web/app.js`. New
+  impl blocks stay before test modules to satisfy clippy rather than at the literal file end.
+- Retention bounds owner records; central records deliberately persist indefinitely. The total
+  quota bounds archive artifacts, including staged bytes, rather than durable JSON records.
+  Size the coordinator volume for both. A missing exact native binding produces an explicit
+  record-only archive; source safety or size failures retain `closed` and retry instead.
+- Operational actions remain with the lead: enable owner/coordinator config, supply a private
+  writable persistent directory/PVC, and run the native platform/runtime and independent
+  security/Fable release gates. This active record is not moved to `features/completed/` until
+  those separate gates pass. No deploy, push, service restart, cluster change, or operation on a
+  running fleet tmux session/agent was performed; the original untracked `.atmux.toml` remains
+  untouched.
