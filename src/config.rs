@@ -252,6 +252,8 @@ pub struct Config {
     pub summaries: crate::summarizer::SummariesConfig,
     #[serde(default)]
     pub herodevs: crate::herodevs::HerodevsConfig,
+    #[serde(default)]
+    pub supervisor: crate::supervisor::SupervisorConfig,
     /// Agent lifecycle telemetry is disabled unless this section exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<crate::events::EventsConfig>,
@@ -630,6 +632,10 @@ impl Config {
             .validate()
             .context("invalid registry configuration")?;
         config.source_path = Some(path.clone());
+        config
+            .supervisor
+            .validate()
+            .context("invalid supervisor configuration")?;
         crate::events::configure_profiles(&mut config)?;
         Ok((config, path))
     }

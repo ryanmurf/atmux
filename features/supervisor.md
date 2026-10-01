@@ -77,3 +77,67 @@ archived. Autonomy is approved; everything is audited.
   checks. Closing goes through the existing registry observation/archive lifecycle.
 - Initial focused gate: six supervisor policy/runtime tests passed, and library all-feature
   clippy with `-D warnings` passed. Full integration gates will be recorded at completion.
+
+### Coordinator integration
+
+- Merged A5 shared clients `ca03a48` through merge `1179541`. Adapters use those clients unchanged:
+  fenced GraphQL ledger transitions, bounded GitHub PR/CI queries and project updates, and the
+  shared OpenAI-compatible client. Slack uses the platform's existing `slackMutations.sendMessage`
+  operation, source-verified in `hd-mcp`'s `SlackToolHandler`, via the shared GraphQL client.
+- The in-process fleet long-poll has a durable cursor. A periodic reconciliation catches attention
+  missed during retention gaps, rate limiting, or coordinator downtime. Current native attention
+  and visible permission evidence override stale discovery `idle_prompt` events. Startup prompts
+  remain exclusively owned by the startup responder.
+- `JOB BLOCKED` and failed verification perform a fenced ledger `escalateJob` and notify Ryan.
+  Successful completion persists its project metadata before the ledger write, updates the
+  configured GitHub single-select option, then closes only after the quiet period. Completed ledger
+  history is excluded from polling so it cannot crowd out open work.
+- Duplicate protection is conservative: one automated answer per job/generation/reason/native
+  turn text and latest human text. Terminal echo cannot turn an answered prompt into another prompt.
+  Claims are reclaimed only for the matching archived generation. Archive totals count the
+  registry's `session.archived` confirmation, rather than a close request.
+- The first output change after a nudge is treated as possible input echo; it cannot reset the
+  stall clock indefinitely. Further output or a status change establishes fresh activity.
+- Intermediate full gate: `cargo fmt`, all-target/all-feature clippy with `-D warnings`, 901 Rust
+  tests passed / 7 ignored, 193 JavaScript tests passed, and all 12 browser cases passed across
+  the initial run and the isolated 9-case mobile-suite rerun. E2E used loopback OAuth/JWKS,
+  herodevs, GitHub, Qwen and a disposable tmux owner; routine permission answered, force-push
+  prompt escalated through channel and Slack, PR and CI verified, project updated, session
+  closed and archived, and the fleet audit confirmed every action.
+- Test accommodations: the worktree root was temporarily changed from 0775 to 0755 and restored
+  in `finally`, because existing recovery tests reject group-writable ancestry. Default Rust test
+  concurrency exposed existing fork/exec descriptor races (ETXTBSY, summarizer lock inheritance,
+  immediate-exit timing); the complete suite passed with `-- --test-threads=1`. A6's store now
+  explicitly unlocks on drop. One Chromium target-navigation failure passed on an isolated rerun.
+  No production code outside A6 was changed to accommodate these failures.
+
+### Lead configuration
+
+- Enable `[events]` and `[registry]` on the coordinator and owners, with durable private storage,
+  and configure federation. Owners must include A6's new guarded endpoints; older owners reject
+  automation with 404. Configure the existing coordinator Redpanda/search publication separately.
+- Configure the shared `[herodevs]` device-auth provider from A5's record, mount private credentials,
+  and perform Ryan's one-time device approval. Ledger job claiming and supervising must use the
+  same acting identity and current fence. Intake owns ongoing lease renewal.
+- Set `[supervisor]` `enabled`, `dry_run` (start true), an absolute `kill_switch` path on a writable
+  mount, `store_dir` on the persistent volume, and the authenticated HTTPS `dashboard_url`.
+  A kill-switch file stops model calls and external effects; removing it resumes the loop.
+- Set actual ledger channel IDs in `job_channels` and the ID of `ryan-tron` in `ryan_channel`;
+  channel names are not resolved implicitly. Set Ryan's private Slack channel and installation IDs.
+- Configure `[[supervisor.projects]]` with `channel_id`, `project_id`, `field_id`, and
+  `done_option_id` for boards #40/#51. The channel binding supplies project identity when jobs
+  carry only the brief's `project_item_id`; optional job `project_id` must agree with the mapping.
+- Configure `[supervisor.llm]` for Max's 27B gateway: endpoint, actual gateway model alias,
+  API-key file, explicit LAN HTTP allowlist, timeout and response token cap. Configure
+  `[supervisor.github]` with a mounted token file and the GraphQL endpoint. No live probes were run.
+- Intake jobs carry `completion_criteria` and optional booleans `require_pr`, `require_ci`,
+  `require_tests` (all default true) and `require_merged` (default false). Set false explicitly for
+  noncoding work. Kickoffs should teach `JOB DONE <job_id>: TESTS PASSED <summary> <PR URL>`;
+  tests are reported with the literal marker, GitHub evidence is independently checked. Missing
+  tests, absent/pending CI, a closed unmerged PR, or a different repository escalates.
+- Tune `allow_actions`, quiet/rate/stall/grace intervals, machine session cap, and hourly model/action
+  budgets alongside intake's caps. Orphan archiving is disabled unless `orphan_archive_seconds` is
+  set, requires a native conversation and cached digest, and should first be observed in dry run.
+  Keep each configured nonterminal ledger scan under 100 rows (H4's bounded API); saturation and
+  state-capacity exhaustion fail closed. Inspect `supervisor.error` events for ambiguous effects
+  or failed notifications; no blind retries can double-submit a prompt or close an uncertain job.

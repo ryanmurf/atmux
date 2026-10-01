@@ -1147,6 +1147,7 @@ impl ControlPlane {
         if let Some(service) = &self.inner.summarizer {
             tokio::spawn(service.clone().run(self.clone()));
         }
+        crate::supervisor::start(self.clone(), &self.inner.config, coordinator)?;
         Ok(())
     }
 
@@ -4451,7 +4452,9 @@ impl ControlPlane {
                     let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
                     let mut state = prompt_lock.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     let check = || -> Result<()> {
-                        let sessions = Tmux.sessions(&HashMap::new(), &control.inner.config.status)?;
+                        let previous_hashes = control.read_state().sessions.iter().map(|s| (s.pane_id.clone(), s.content_hash)).collect();
+                        let mut sessions = Tmux.sessions_with_capture(&previous_hashes, &control.inner.config.status, control.inner.config.general.preview_lines)?;
+                        for session in &mut sessions { truncate_front(&mut session.content, MAX_CAPTURE_BYTES); }
                         let live = sessions.iter().find(|s| s.pane_id == pane_id).ok_or_else(|| conflict("supervised pane disappeared"))?;
                         if live.pane_identity != guard.instance_id || live.session_key.as_deref() != Some(&guard.session_key)
                             || format!("{:016x}", observable_content_hash(&live.content)) != guard.content_hash
@@ -4465,7 +4468,9 @@ impl ControlPlane {
                     };
                     check()?;
                     begin_pane_mutation(&pane_id, &prompt_lock, &mut state)?;
-                    if let Some(text) = &text { Tmux::send_text_checked(&pane_id, text, true, check)?; }
+                    // Our own paste changes the hash. Evidence is checked before
+                    // paste, then generation is checked again before Enter.
+                    if let Some(text) = &text { Tmux::send_text_checked(&pane_id, text, true, || control.validate_live_message_instance(&pane_id,Some(&guard.instance_id)))?; }
                     else { check()?; Tmux.kill_pane_session(&pane_id)?; }
                     Ok(())
                 }).await)?;

@@ -6,6 +6,8 @@ use std::path::{Component, Path};
 #[allow(clippy::struct_excessive_bools)] // Independent ledger verification requirements.
 pub struct Job {
     pub id: String,
+    pub message_id: String,
+    pub fence: i64,
     pub channel: String,
     pub session_key: String,
     pub goal: String,
@@ -14,6 +16,7 @@ pub struct Job {
     pub repo_remote: String,
     pub source_url: String,
     pub project_item_id: Option<String>,
+    pub project_id: Option<String>,
     pub require_pr: bool,
     pub require_ci: bool,
     pub require_tests: bool,
@@ -40,7 +43,7 @@ impl Job {
     pub(crate) fn active(&self) -> bool {
         matches!(
             self.state.as_str(),
-            "CLAIMED" | "RUNNING" | "claimed" | "running"
+            "CLAIMED" | "IN_PROGRESS" | "RUNNING" | "claimed" | "running"
         )
     }
 }
@@ -77,6 +80,29 @@ pub fn classify(raw: &str) -> Result<Classification> {
         bail!("classification has unexpected fields");
     }
     Ok(serde_json::from_value(value)?)
+}
+
+pub(super) fn unsafe_prompt(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "--force",
+        "force push",
+        "rm -",
+        "delete branch",
+        "delete data",
+        "production",
+        "deploy",
+        "credential",
+        "keycloak",
+        "kubectl",
+        "ignore previous",
+        "ignore all previous",
+        "system prompt",
+        "override policy",
+        "supervisor policy",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
 }
 
 /// Permissions default to escalation. Only an explicit, simple command in the
@@ -193,7 +219,15 @@ pub fn completion(turn: &str, job_id: &str) -> Option<Completion> {
     let done = format!("JOB DONE {job_id}: ");
     let blocked = format!("JOB BLOCKED {job_id}: ");
     let mut found = None;
+    let mut fenced = false;
     for line in turn.lines() {
+        if line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
         let candidate = if let Some(text) = line.strip_prefix(&done) {
             if text.is_empty() || text.len() > 2048 {
                 return None;

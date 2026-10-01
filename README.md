@@ -1433,3 +1433,21 @@ archived work by stable session key. REST equivalents are `/api/v1/session-histo
 `/api/v1/session-history/{session_key}`. Native provider ids and config roots are omitted from
 history responses. Resume wiring is supplied by the separate resume-anywhere workstream; the
 integration contract and acceptance evidence are in [the A3 record](features/session-registry-archive.md).
+
+### Coordinator supervisor (opt-in)
+
+`[supervisor]` keeps assigned ledger jobs moving through the federated event log. It answers
+routine input, escalates decisions to Ryan's herodevs channel and private Slack channel, verifies
+reported completion against GitHub PR/CI evidence, and closes completed idle sessions for registry
+archival. Every decision is appended as a bounded `supervisor.*` fleet event. This requires events,
+registry, the shared herodevs device-auth setup, and upgraded owners with guarded mutation endpoints.
+
+The default is disabled; `dry_run` defaults true. Set an absolute `kill_switch` file path and a
+persistent private `store_dir`, the HTTPS dashboard URL, actual ledger/notification channel IDs,
+Slack installation ID, board field/option mappings, the 27B gateway configuration and a GitHub token
+file before enabling. Creating the kill-switch file stops automation. Permissions use a small
+command allowlist and untrusted model output cannot supply commands or free-form answers.
+
+The complete configuration contract, completion protocol, operating bounds and acceptance evidence
+are in [the A6 feature record](features/supervisor.md). Orphan archiving is separately opt-in and
+requires a cached digest. Begin with dry run and review the fleet decisions before allowing effects.

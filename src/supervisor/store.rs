@@ -2,7 +2,7 @@ use anyhow::{Context as _, Result, bail};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read as _, Write as _},
     os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
@@ -12,9 +12,11 @@ use std::{
 #[derive(Default, Deserialize, Serialize)]
 pub(super) struct State {
     pub cursor: Option<String>,
-    pub claims: BTreeMap<String, u64>,
+    pub claims: BTreeMap<String, Claim>,
     pub sessions: BTreeMap<String, Observation>,
     pub finished: BTreeMap<String, Finished>,
+    #[serde(default)]
+    pub pending_archives: BTreeSet<String>,
     pub hour: u64,
     pub model_calls: u64,
     pub actions: u64,
@@ -29,6 +31,12 @@ pub(super) struct Totals {
     pub model_calls: u64,
     pub actions: u64,
 }
+#[derive(Deserialize, Serialize)]
+pub(super) struct Claim {
+    pub at: u64,
+    pub session_key: Option<String>,
+    pub instance: Option<String>,
+}
 #[derive(Default, Deserialize, Serialize)]
 pub(super) struct Observation {
     pub instance: String,
@@ -36,12 +44,16 @@ pub(super) struct Observation {
     pub status: String,
     pub changed_at: u64,
     pub nudged_at: Option<u64>,
+    #[serde(default)]
+    pub nudge_echo_pending: bool,
     pub escalated: bool,
     pub answered_at: Option<u64>,
+    pub notified_at: Option<u64>,
 }
 #[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Finished {
     pub job: String,
+    pub ledger: super::Job,
     pub completed: bool,
     pub project_updated: bool,
     pub hash: String,
@@ -50,8 +62,15 @@ pub(super) struct Finished {
 }
 pub(super) struct Store {
     directory: PathBuf,
-    _lock: File,
+    lock_file: File,
     pub state: State,
+}
+impl Drop for Store {
+    fn drop(&mut self) {
+        // A concurrent fork may briefly inherit the open file description
+        // before exec closes it. Release ownership when this worker drops.
+        let _ = fs2::FileExt::unlock(&self.lock_file);
+    }
 }
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
 impl Store {
@@ -84,7 +103,7 @@ impl Store {
         };
         let store = Self {
             directory,
-            _lock: lock,
+            lock_file: lock,
             state,
         };
         store.check()?;
@@ -94,6 +113,7 @@ impl Store {
         if self.state.claims.len() > 8192
             || self.state.sessions.len() > 512
             || self.state.finished.len() > 512
+            || self.state.pending_archives.len() > 512
             || self.state.daily.len() > 32
         {
             bail!("supervisor state capacity reached; operator rotation required");
@@ -116,6 +136,11 @@ impl Store {
         Ok(())
     }
     pub fn budget(&mut self, now: u64) {
+        // Daily digest claims can expire: digest_day independently prevents
+        // same-day repeats. Pane claims expire only on a matching archive event.
+        self.state
+            .claims
+            .retain(|_, c| c.session_key.is_some() || now.saturating_sub(c.at) < 32 * 86400);
         if self.state.hour != now / 3600 {
             self.state.hour = now / 3600;
             self.state.model_calls = 0;

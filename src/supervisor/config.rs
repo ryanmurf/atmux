@@ -16,6 +16,16 @@ pub enum Action {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectStatus {
+    pub project_id: String,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    pub field_id: String,
+    pub done_option_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SupervisorConfig {
     pub enabled: bool,
@@ -26,8 +36,12 @@ pub struct SupervisorConfig {
     pub dashboard_url: String,
     pub ryan_channel: String,
     pub slack_channel: String,
+    pub slack_installation_id: String,
     pub job_channels: Vec<String>,
     pub done_status: String,
+    pub projects: Vec<ProjectStatus>,
+    pub llm: crate::llm::LlmConfig,
+    pub github: crate::github::GithubConfig,
     pub allow_actions: BTreeSet<Action>,
     pub poll_seconds: u64,
     pub quiet_seconds: u64,
@@ -51,8 +65,17 @@ impl Default for SupervisorConfig {
             dashboard_url: String::new(),
             ryan_channel: "ryan-tron".into(),
             slack_channel: String::new(),
+            slack_installation_id: String::new(),
             job_channels: Vec::new(),
             done_status: "Done".into(),
+            projects: Vec::new(),
+            llm: crate::llm::LlmConfig {
+                endpoint: "http://192.168.0.124:8094/v1".into(),
+                model: "qwen3.8-27b".into(),
+                max_tokens: 256,
+                ..crate::llm::LlmConfig::default()
+            },
+            github: crate::github::GithubConfig::default(),
             allow_actions: [
                 Action::Continue,
                 Action::Answer,
@@ -95,10 +118,29 @@ impl SupervisorConfig {
         {
             bail!("supervisor dashboard_url must be a credential-free HTTPS URL");
         }
-        for value in [&self.ryan_channel, &self.slack_channel, &self.done_status] {
+        for value in [
+            &self.ryan_channel,
+            &self.slack_channel,
+            &self.slack_installation_id,
+            &self.done_status,
+        ] {
             if value.is_empty() || value.len() > 200 || value.chars().any(char::is_control) {
                 bail!("supervisor destinations and done_status must be configured");
             }
+        }
+        if self.projects.len() > 16
+            || self.projects.iter().any(|p| {
+                p.channel_id.as_ref().is_some_and(|v| {
+                    v.is_empty() || v.len() > 200 || v.chars().any(char::is_control)
+                })
+            })
+            || self.projects.iter().any(|p| {
+                [&p.project_id, &p.field_id, &p.done_option_id]
+                    .iter()
+                    .any(|v| v.is_empty() || v.len() > 200 || v.chars().any(char::is_control))
+            })
+        {
+            bail!("invalid supervisor GitHub project status mapping");
         }
         if self.job_channels.is_empty()
             || self.job_channels.len() > 16
