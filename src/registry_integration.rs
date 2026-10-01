@@ -286,6 +286,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pidless_scan_during_close_does_not_reopen_or_emit_a_second_exit() {
+        for intentional in [true, false] {
+            let fixture = Fixture::new(false);
+            let control = fixture.control();
+            let registry = control.registry().unwrap();
+            let mut session = fixture.session();
+            let key = session.session_key.clone().unwrap();
+            registry
+                .observe(std::slice::from_ref(&session), 1000)
+                .unwrap();
+            control.apply_refresh(vec![session.clone()]);
+            if intentional {
+                registry
+                    .record_close(std::slice::from_ref(&key), 2000)
+                    .unwrap();
+            }
+            // A banner can still identify the harness after its process has
+            // exited, between the pre-close scan and the monitor's next scan.
+            session.agent_pid = None;
+            registry
+                .observe(std::slice::from_ref(&session), 2100)
+                .unwrap();
+            control.apply_refresh(vec![session]);
+            registry.observe(&[], 2200).unwrap();
+            control.apply_refresh(vec![]);
+            registry.observe(&[], 2300).unwrap();
+            let events = lifecycle_events(&control).await;
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|e| e.event_type.as_str())
+                    .collect::<Vec<_>>(),
+                ["agent.exited", "session.closed", "session.archived"],
+                "intentional={intentional}: {events:#?}"
+            );
+            assert_eq!(events[0].detail["agent_pid"], 100);
+            if intentional {
+                assert_eq!(events[1].detail["closed_ms"], 2000);
+                assert_eq!(registry.get(&key).unwrap().unwrap().closed_ms, Some(2000));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn close_retries_preserve_first_close_and_archived_generation() {
+        let fixture = Fixture::new(false);
+        let control = fixture.control();
+        let registry = control.registry().unwrap();
+        let session = fixture.session();
+        let key = session.session_key.clone().unwrap();
+        registry.observe(&[session], 1000).unwrap();
+        registry
+            .record_close(&[key.clone(), key.clone()], 2000)
+            .unwrap();
+        registry
+            .record_close(std::slice::from_ref(&key), 2100)
+            .unwrap();
+        registry.observe(&[], 2200).unwrap();
+        registry
+            .record_close(std::slice::from_ref(&key), 2300)
+            .unwrap();
+        let record = registry.get(&key).unwrap().unwrap();
+        assert_eq!(record.state, SessionState::Archived);
+        assert_eq!(record.closed_ms, Some(2000));
+        let events = lifecycle_events(&control).await;
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| e.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["agent.exited", "session.closed", "session.archived"]
+        );
+    }
+
+    #[tokio::test]
     async fn native_or_scan_first_exit_deduplicates_but_a_relaunch_has_its_own_exit() {
         let fixture = Fixture::new(false);
         let control = fixture.control();
