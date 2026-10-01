@@ -732,3 +732,8 @@ dialog::backdrop { background: #000a; }
 .session-history-row { border-bottom: 1px solid var(--border, #333); padding: 1rem 0; overflow-wrap: anywhere; }
 .session-history-row p { margin: .4rem 0; }
 @media (max-width: 600px) { .session-history-view { padding: .75rem; } }
+
+#work-dialog { width: min(48rem, calc(100vw - 2rem)); max-height: 85dvh; overflow: auto; }
+#work-jobs { margin-top: 1rem; }
+.work-job { padding: .8rem 0; border-top: 1px solid var(--border, #444); overflow-wrap: anywhere; }
+.work-job p { margin: .4rem 0; }

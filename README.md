@@ -1472,3 +1472,18 @@ archived work by stable session key. REST equivalents are `/api/v1/session-histo
 `/api/v1/session-history/{session_key}`. Native provider ids and config roots are omitted from
 history responses. Resume wiring is supplied by the separate resume-anywhere workstream; the
 integration contract and acceptance evidence are in [the A3 record](features/session-registry-archive.md).
+
+
+## Intake and Work ledger
+
+The coordinator can opt into `[intake]` to ingest GitHub ProjectsV2 boards, indexed Gather Markdown,
+forwarded Slack requests and unfinished idle sessions into herodevs channel jobs. It routes one item
+at a time through configured Qwen endpoints and owner launch policies. The Work button shows the
+local ledger mirror and links to assigned sessions. Intake is disabled by default; dry-run is the
+initial enabled mode. Create its configured kill-switch file to stop further mutations.
+
+See [the A5 feature record](features/intake-router.md) for the source-verified API contract,
+configuration, budgets, device-login setup, secrets/channel ids, and A6 assignment/lease protocol.
+`atmux herodevs login` performs confidential device approval and saves an owner-only offline
+refresh token; background intake only refreshes an already-approved credential. No login prompt
+appears at startup.

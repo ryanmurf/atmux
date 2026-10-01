@@ -9,6 +9,7 @@
   <link rel="apple-touch-icon" href="/atmux-logo.jpg">
   <link rel="stylesheet" href="/app.css">
   <script src="/app.js" defer></script>
+  <script src="/work.js" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -16,6 +17,7 @@
     <div class="brand"><img class="brand-logo" src="/atmux-logo.jpg" alt=""><span class="brand-wordmark">atmux</span><small>agent control plane</small></div>
     <div id="counts" class="counts" aria-label="Agent summary">Connecting…</div>
     <span id="overview-status" class="overview-status" role="status" aria-label="Live update connection">Connecting…</span>
+    <button id="work-open" class="subtle topbar-action" type="button" aria-haspopup="dialog">Work</button>
     <button id="history-open" class="subtle topbar-action" type="button" aria-pressed="false">Sessions</button>
     <button id="pulse-open" class="subtle topbar-action" type="button" aria-pressed="false">Usage</button>
     <button id="recovery-open" class="subtle topbar-action" type="button" hidden>Quick resume</button>
@@ -356,5 +358,13 @@
   </dialog>
 
   <div id="toast" role="status" aria-live="polite"></div>
+  <dialog id="work-dialog" aria-labelledby="work-heading">
+    <div class="dialog-heading"><h2 id="work-heading">Work</h2><button id="work-close" type="button">Close</button></div>
+    <p id="work-status" role="status"></p>
+    <label>Source <select id="work-source"><option value="">All sources</option></select></label>
+    <label>State <select id="work-state"><option value="">All states</option></select></label>
+    <button id="work-refresh" type="button">Refresh</button>
+    <div id="work-jobs" aria-live="polite"></div>
+  </dialog>
 </body>
 </html>

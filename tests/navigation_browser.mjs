@@ -84,7 +84,7 @@ test("mobile navigation persists preferences and session actions retain the sele
   ];
   let revision = 1;
   const snapshot = () => `event: sessions.snapshot\ndata: ${JSON.stringify({ revision, sessions, machines, health: null })}\n\n`;
-  const files = new Map(await Promise.all(["index.html", "app.js", "app.css"].map(async (name) =>
+  const files = new Map(await Promise.all(["index.html", "app.js", "app.css", "work.js"].map(async (name) =>
     [name, await readFile(new URL(`../web/${name}`, import.meta.url))])));
   const server = createServer((request, response) => {
     const path = new URL(request.url, "http://fixture").pathname;
@@ -343,7 +343,7 @@ test("session history supports filters, pagination, hostile text, resume hook an
   const profileDirectory = await mkdtemp(join(tmpdir(), "atmux-history-browser-"));
   const streams = new Set();
   const queries = [];
-  const files = new Map(await Promise.all(["index.html", "app.js", "app.css"].map(async (name) =>
+  const files = new Map(await Promise.all(["index.html", "app.js", "app.css", "work.js"].map(async (name) =>
     [name, await readFile(new URL(`../web/${name}`, import.meta.url))])));
   const archived = { session_key: "0199a5b7-5560-7abc-8def-0123456789ab", machine: "peer", name: "<img src=x onerror=window.historyXss=true>", description: "Archived task", project: { remote: "https://github.com/org/repo" }, state: "archived", last_active_ms: 1000 };
   let hold = false;
@@ -354,6 +354,12 @@ test("session history supports filters, pagination, hostile text, resume hook an
       response.writeHead(200, { "Content-Type": "text/event-stream" }); streams.add(response);
       response.write(`event: sessions.snapshot\ndata: ${JSON.stringify({ revision: 1, sessions: [], machines: [{id:"peer",label:"Peer",kind:"remote",online:true}], health: null })}\n\n`);
       request.on("close", () => streams.delete(response)); return;
+    }
+    if (url.pathname === "/api/v1/work") {
+      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ enabled: true, dry_run: true, stopped: false, jobs: [
+        { item: { goal: "<img src=x onerror=window.workXss=true>", source: "github:40" }, message: { jobId: "job", jobState: "IN_PROGRESS" }, assignment: { pane: "peer~%1", name: "assigned session" } },
+        { item: { goal: "Meeting action", source: "gather" }, message: { jobState: "PENDING" } },
+      ] })); return;
     }
     if (url.pathname === "/api/v1/session-history") {
       queries.push(url.searchParams);
@@ -404,6 +410,16 @@ test("session history supports filters, pagination, hostile text, resume hook an
     await waitFor(() => cdp.evaluate("document.getElementById('history-view').hidden && !document.body.classList.contains('has-selection')"), "history Back");
     assert.equal(await cdp.evaluate("new URL(location.href).searchParams.get('view')"), null);
     assert.equal(await cdp.evaluate("document.documentElement.scrollWidth <= innerWidth"), true);
+    await cdp.evaluate("document.getElementById('work-open').click()");
+    await waitFor(() => cdp.evaluate("document.querySelectorAll('.work-job').length === 2"), "Work ledger rows");
+    assert.equal(await cdp.evaluate("document.getElementById('work-status').textContent"), "Dry run: decisions only.");
+    assert.equal(await cdp.evaluate("Boolean(window.workXss) || Boolean(document.querySelector('.work-job img'))"), false);
+    assert.equal(await cdp.evaluate("new URL(document.querySelector('.work-job a').href).searchParams.get('session')"), "peer~%1");
+    await cdp.evaluate("document.getElementById('work-source').value='gather'; document.getElementById('work-source').dispatchEvent(new Event('change'))");
+    assert.equal(await cdp.evaluate("document.querySelectorAll('.work-job').length"), 1);
+    assert.equal(await cdp.evaluate("document.documentElement.scrollWidth <= innerWidth"), true);
+    await cdp.evaluate("document.getElementById('work-close').click()");
+    assert.equal(await cdp.evaluate("document.getElementById('work-dialog').open"), false);
   } finally {
     cdp?.socket.close();
     if (chrome?.pid && chrome.exitCode === null && chrome.signalCode === null) {
