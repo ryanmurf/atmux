@@ -20,6 +20,7 @@ pub mod project;
 pub mod pulse;
 pub mod recovery;
 pub mod registry;
+mod registry_integration;
 mod registry_web;
 pub mod remote;
 pub mod self_update;

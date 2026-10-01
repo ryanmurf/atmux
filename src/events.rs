@@ -189,7 +189,11 @@ impl AgentEvent {
             event_type: event_type.into(),
             reason: reason.map(str::to_owned),
             summary: None,
-            detail: json!({}),
+            detail: if event_type == "agent.exited" {
+                json!({"agent_pid": session.agent_pid})
+            } else {
+                json!({})
+            },
         })
     }
 
