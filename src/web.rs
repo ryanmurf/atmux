@@ -892,6 +892,14 @@ fn routes(state: WebState) -> Router {
         .route("/api/v1/panes/{id}/input-keys", post(send_input_keys))
         .route("/api/v1/panes/{id}/interrupt", post(interrupt))
         .route("/api/v1/sessions/{id}", delete(kill).patch(update_session))
+        .route(
+            "/api/v1/supervisor/panes/{id}/message",
+            post(supervisor_message),
+        )
+        .route(
+            "/api/v1/supervisor/panes/{id}/close",
+            post(supervisor_close),
+        )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
         .merge(registry)
@@ -1538,6 +1546,35 @@ async fn fit_pane_size(
         .await
         .map(Json)
         .map_err(|error| ApiError::from_control(&error))
+}
+
+async fn supervisor_message(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<crate::supervisor::GuardedMessage>,
+) -> Result<Json<OkResponse>, ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    state
+        .control
+        .supervisor_mutation(&id, request.guard, Some(request.text))
+        .await
+        .map_err(|error| ApiError::from_control(&error))?;
+    Ok(Json(OkResponse { ok: true }))
+}
+async fn supervisor_close(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(guard): Json<crate::supervisor::Guard>,
+) -> Result<Json<OkResponse>, ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    state
+        .control
+        .supervisor_mutation(&id, guard, None)
+        .await
+        .map_err(|error| ApiError::from_control(&error))?;
+    Ok(Json(OkResponse { ok: true }))
 }
 
 async fn kill(

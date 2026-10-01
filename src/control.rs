@@ -4419,6 +4419,91 @@ impl ControlPlane {
     /// # Errors
     ///
     /// Returns an error when the session is unknown or tmux rejects the request.
+    pub async fn supervisor_mutation(
+        &self,
+        id: &str,
+        guard: crate::supervisor::Guard,
+        text: Option<String>,
+    ) -> Result<()> {
+        if !crate::tmux::valid_session_key(&guard.session_key)
+            || guard.instance_id.is_empty()
+            || guard.instance_id.len() > 4096
+            || guard.content_hash.is_empty()
+            || guard.content_hash.len() > 128
+            || !matches!(guard.status.as_str(), "waiting" | "working")
+            || text
+                .as_ref()
+                .is_some_and(|t| t.is_empty() || t.len() > 2048)
+            || (text.is_none() && guard.status != "waiting")
+        {
+            return Err(bad_request("invalid supervisor mutation guard"));
+        }
+        match self.resolve(id)? {
+            Target::Local {
+                pane_id,
+                instance_id,
+                ..
+            } => {
+                validate_expected_pane_instance(Some(&guard.instance_id), &instance_id)?;
+                let prompt_lock = self.prompt_lock(&pane_id);
+                let control = self.clone();
+                local_tmux(tokio::task::spawn_blocking(move || {
+                    let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
+                    let mut state = prompt_lock.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let check = || -> Result<()> {
+                        let sessions = Tmux.sessions(&HashMap::new(), &control.inner.config.status)?;
+                        let live = sessions.iter().find(|s| s.pane_id == pane_id).ok_or_else(|| conflict("supervised pane disappeared"))?;
+                        if live.pane_identity != guard.instance_id || live.session_key.as_deref() != Some(&guard.session_key)
+                            || format!("{:016x}", observable_content_hash(&live.content)) != guard.content_hash
+                            || live.status.label() != guard.status {
+                            return Err(conflict("supervised pane changed before mutation"));
+                        }
+                        if text.is_none() && (live.attached || live.windows != 1 || sessions.iter().filter(|s| s.name == live.name).count() != 1) {
+                            return Err(conflict("supervisor only closes an unattached, single-pane idle session"));
+                        }
+                        Ok(())
+                    };
+                    check()?;
+                    begin_pane_mutation(&pane_id, &prompt_lock, &mut state)?;
+                    if let Some(text) = &text { Tmux::send_text_checked(&pane_id, text, true, check)?; }
+                    else { check()?; Tmux.kill_pane_session(&pane_id)?; }
+                    Ok(())
+                }).await)?;
+                self.inner.refresh_now.notify_one();
+            }
+            Target::Remote {
+                machine,
+                pane_id,
+                instance_id,
+                ..
+            } => {
+                validate_expected_pane_instance(Some(&guard.instance_id), &instance_id)?;
+                self.ensure_online(&machine.id)?;
+                let (operation, body) = match text {
+                    Some(text) => (
+                        "message",
+                        serde_json::to_value(crate::supervisor::GuardedMessage { guard, text })?,
+                    ),
+                    None => ("close", serde_json::to_value(guard)?),
+                };
+                machine
+                    .post_json(
+                        &format!(
+                            "/api/v1/supervisor/panes/{}/{operation}",
+                            encode_segment(&pane_id)
+                        ),
+                        &body,
+                    )
+                    .await
+                    .map_err(|error| upstream(&error))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Closes the tmux session containing the selected pane.
+    /// # Errors
+    /// Returns an error for an unknown pane or rejected owner mutation.
     pub async fn kill(&self, id: &str) -> Result<()> {
         match self.resolve(id)? {
             Target::Local {

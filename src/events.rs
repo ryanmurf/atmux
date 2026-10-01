@@ -122,6 +122,18 @@ const TYPES: &[&str] = &[
     "session.archived",
     "session.resumed",
     "node.started",
+    "supervisor.decision",
+    "supervisor.startup",
+    "supervisor.classified",
+    "supervisor.answered",
+    "supervisor.escalated",
+    "supervisor.completed",
+    "supervisor.project_updated",
+    "supervisor.archived",
+    "supervisor.orphan",
+    "supervisor.nudged",
+    "supervisor.digest",
+    "supervisor.error",
 ];
 const REASONS: &[&str] = &[
     "idle_prompt",

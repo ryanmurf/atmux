@@ -28,6 +28,7 @@ pub mod session_search;
 pub mod status;
 pub mod summarizer;
 mod summary;
+pub mod supervisor;
 mod systemd_scope;
 pub mod tls;
 pub mod tmux;
