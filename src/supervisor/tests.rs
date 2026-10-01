@@ -124,6 +124,7 @@ struct Fake {
     fail_renew: Mutex<bool>,
     ci_green: Mutex<Option<bool>>,
     model_calls: Mutex<usize>,
+    reassign_during_model: Mutex<Option<Job>>,
 }
 impl Agents for Fake {
     fn sessions(&self) -> Vec<SessionSummary> {
@@ -213,6 +214,9 @@ impl Model for Fake {
     fn classify<'a>(&'a self, _: &'a Context, _: &'a Job, _: &'a str) -> BoxFuture<'a, String> {
         Box::pin(async {
             *self.model_calls.lock().unwrap() += 1;
+            if let Some(job) = self.reassign_during_model.lock().unwrap().take() {
+                *self.jobs.lock().unwrap() = vec![job];
+            }
             Ok(self
                 .responses
                 .lock()
@@ -671,6 +675,31 @@ async fn ambiguous_renewal_suspends_answers_across_restart_until_fresh_lease() {
             .unwrap()
             .contains(&"send:y".into())
     );
+}
+#[tokio::test]
+async fn changed_fence_scope_or_expiry_during_classification_withholds_answer() {
+    for field in ["fence", "folder", "expiry", "state"] {
+        let fixture = Fixture::new();
+        let mut replacement = fixture.fake.jobs.lock().unwrap()[0].clone();
+        match field {
+            "fence" => replacement.fence += 1,
+            "folder" => replacement.folder = "/other".into(),
+            "expiry" => replacement.lease_expires_at = Some(100),
+            "state" => replacement.state = "ESCALATED".into(),
+            _ => unreachable!(),
+        }
+        *fixture.fake.reassign_during_model.lock().unwrap() = Some(replacement);
+        let mut sup = fixture.supervisor();
+        sup.event(&fixture.event("agent.needs_input", Some("permission")), 100)
+            .await
+            .unwrap();
+        let effects = fixture.fake.effects.lock().unwrap();
+        assert_eq!(effects.len(), 1, "{field}: {effects:?}");
+        assert!(
+            effects[0].contains("prompt answer withheld"),
+            "{field}: {effects:?}"
+        );
+    }
 }
 #[tokio::test]
 async fn completion_quiet_period_and_project_saga_precede_close() {

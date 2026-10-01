@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)] // Independent ledger verification requirements.
 pub struct Job {
     pub id: String,

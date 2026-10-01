@@ -1,6 +1,6 @@
 # A6: Supervisor (keep agents moving, finish jobs, close and archive)
 
-Status: implementing on branch `feat/supervisor`; core policy and durable state in place
+Status: A6 DONE on branch `feat/supervisor` (2026-10-01); merged lead integration through `ce77c67`
 
 Read `features/agent-control-plane.md` (especially "Phase 2") and `features/intake-router.md`.
 A5 (intake) is building the shared clients in `src/herodevs.rs`, `src/github.rs`, and
@@ -120,6 +120,14 @@ archived. Autonomy is approved; everything is audited.
   is observed. Focused acceptance passed 21 unit tests plus the configured disposable lifecycle;
   the reconciled full gate passed 935 Rust tests (7 ignored), 196 JavaScript tests and all 13
   browser cases. Formatting and all-target/all-feature clippy passed with zero warnings.
+- Prompt delivery re-reads the live assignment after classification and compares its fence, job
+  identity, folder, facts and verification flags. Changed/ambiguous assignments or elapsed leases
+  withhold the answer. A confirmed lease extension or CLAIMED-to-IN_PROGRESS transition preserves
+  authorization. Regression fixtures change the fence, folder, expiry and state during inference.
+- Dry run still reads the ledger and uses bounded classification, so its audit reflects actual
+  decisions. It suppresses prompt/ledger/project/close/notification effects, with separate durable
+  claims so switching to live mode can act on the same evidence. The kill switch also stops model
+  requests.
 - Intermediate full gate: `cargo fmt`, all-target/all-feature clippy with `-D warnings`, 901 Rust
   tests passed / 7 ignored, 193 JavaScript tests passed, and all 12 browser cases passed across
   the initial run and the isolated 9-case mobile-suite rerun. E2E used loopback OAuth/JWKS,
@@ -138,6 +146,11 @@ archived. Autonomy is approved; everything is audited.
 - Enable `[events]` and `[registry]` on the coordinator and owners, with durable private storage,
   and configure federation. Owners must include A6's new guarded endpoints; older owners reject
   automation with 404. Configure the existing coordinator Redpanda/search publication separately.
+- Supply the supervisor/shared-auth configuration and mounted secret files in the coordinator's
+  deployment configuration. The current Helm chart renders events, registry and summaries but has
+  no intake/supervisor or shared-auth values yet; that deployment wiring belongs to the lead.
+  Permit the 27B gateway's port and herodevs/GitHub HTTPS destinations through explicit egress rules.
+  Enable configured rolling summaries before enabling orphan archiving, which requires a digest.
 - Configure the shared `[herodevs]` device-auth provider from A5's record, mount private credentials,
   and perform Ryan's one-time device approval. Ledger job claiming and supervising must use the
   same acting identity and current fence. Supervisor renews dispatched leases; configure
@@ -164,3 +177,38 @@ archived. Autonomy is approved; everything is audited.
   Keep each configured nonterminal ledger scan under 100 rows (H4's bounded API); saturation and
   state-capacity exhaustion fail closed. Inspect `supervisor.error` events for ambiguous effects
   or failed notifications; no blind retries can double-submit a prompt or close an uncertain job.
+
+## Final acceptance
+
+- [x] Event subscription and periodic attention reconciliation on configured coordinators
+- [x] Strict classification, repo-scoped permission guard, startup handoff, grounded facts,
+  dual-destination escalation, persistent duplicate suppression and assignment revalidation
+- [x] Fenced lease renewal, completion/blocking, GitHub PR/CI verification and project status saga
+- [x] Quiet guarded close, intentional-close restore exclusion and A3 archive confirmation
+- [x] Stall nudge/escalation, opt-in summarized orphan cleanup and durable daily digest
+- [x] Disabled defaults, dry run, kill switch, action allowlist, budgets and fleet audit
+- [x] Merge shared clients unchanged from A5 and merge requested lead branch containing `08456e1`
+- [x] Final Rust, JavaScript and browser acceptance gates
+
+| Gate | Final result |
+| --- | --- |
+| `cargo fmt --check` and `git diff --check` | Passed |
+| `cargo clippy --all-targets --all-features -- -D warnings` | Passed, zero warnings |
+| `cargo test --all-features -- --test-threads=1` | 936 passed, zero failed; 7 declared ignored |
+| Focused supervisor tests (included in full gate) | 22 unit tests and configured disposable E2E passed |
+| `node --check web/app.js` | Passed |
+| `node --test web/*.test.mjs tests/navigation.test.mjs` | 196 passed, zero failed/skipped |
+| Four browser files: mobile viewport, navigation, Quick Talk, mobile/Pulse | 13 passed, zero failed/skipped |
+
+All commands used RTK. The final Rust gate set `ATMUX_REQUIRE_TMUX=1` and a unique
+`ATMUX_TMUX_SOCKET_NAME=atmux-ci-a6-final-<uuid>`, removed inherited TMUX variables, and restored
+the worktree's original 0775 mode in `finally`. Browser files ran separately to avoid cross-suite
+Chromium target races. Only loopback platform/model fixtures and explicitly disposable tmux
+sockets were used. No live probes, deploy, push, service restart, cluster/Keycloak changes or
+mutation of existing tmux sessions/agents occurred. The user's untracked `.atmux.toml` is preserved.
+
+Implementation commits: `0bc5caf` (core), `07156d1` (configured adapters/E2E), `d1bf29d`
+(intake overlay and lease handoff), and the final assignment-revalidation/acceptance commit.
+Integration merges: `1179541` and `0cf0041` (A5), `72aee1a` (lead through `ce77c67`, A4 reconciliation).
+The feature remains off by default. No implementation work is pending; deployment configuration
+and the one-time shared device login above remain the lead's handoff.

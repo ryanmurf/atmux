@@ -8,7 +8,9 @@ use crate::{control::SessionSummary, events::AgentEvent};
 use anyhow::{Result, bail};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
-use std::{collections::BTreeMap, future::Future, path::PathBuf, pin::Pin, sync::Arc};
+use std::{
+    collections::BTreeMap, future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Instant,
+};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 #[derive(Clone, Debug, Serialize)]
@@ -400,6 +402,29 @@ impl Supervisor {
                 .contains_key(&format!("confirmed:{key}")))
         .then_some(key)
     }
+    async fn assignment_current(&self, job: &Job, now: u64) -> Result<bool> {
+        let started = Instant::now();
+        let jobs = self.platform.jobs().await?;
+        if jobs.len() > 512 {
+            bail!("ledger job scan exceeds bounds");
+        }
+        let mut assigned = jobs
+            .into_iter()
+            .filter(|j| j.session_key == job.session_key && j.active());
+        let Some(mut current) = assigned.next() else {
+            return Ok(false);
+        };
+        if assigned.next().is_some()
+            || !current.leased(now.saturating_add(started.elapsed().as_secs()))
+            || self.pending_renewal(&current).is_some()
+        {
+            return Ok(false);
+        }
+        // A confirmed renewal or CLAIMED -> IN_PROGRESS does not change scope.
+        current.lease_expires_at = job.lease_expires_at;
+        current.state.clone_from(&job.state);
+        Ok(current == *job)
+    }
     async fn handle_job(
         &mut self,
         session: &SessionSummary,
@@ -467,6 +492,7 @@ impl Supervisor {
         fingerprint: &str,
         now: u64,
     ) -> Result<()> {
+        let started = Instant::now();
         let session = &context.session;
         if reason == "startup_prompt" {
             return self.decision(
@@ -575,6 +601,19 @@ impl Supervisor {
                     .await;
             }
         };
+        let authorization = self
+            .assignment_current(job, now.saturating_add(started.elapsed().as_secs()))
+            .await;
+        if !matches!(authorization, Ok(true)) {
+            return self
+                .escalate(
+                    session,
+                    "Job assignment changed or could not be revalidated; prompt answer withheld",
+                    fingerprint,
+                    now,
+                )
+                .await;
+        }
         if self.reserve(Some(session), action, &key, now)? && self.live(session) {
             self.store
                 .state
