@@ -1,7 +1,8 @@
 use super::{
     AgentEvent, EventLog, EventPage, EventQuery, EventsConfig, MAX_EVENT_BYTES, ProjectCache,
     hooks::{HookDelivery, map_hook, socket_path, validate_socket},
-    sink::{KafkaProducer, publish_page},
+    outbox::PublicationOutbox,
+    sink::{KafkaProducer, Producer, publish_page},
     spool::{atomic_json, private_directory, private_file},
 };
 use crate::{
@@ -49,6 +50,8 @@ pub struct EventService {
     pub owner: Arc<EventLog>,
     pub fleet: Arc<EventLog>,
     machine: String,
+    coordinator: bool,
+    outbox: Option<PublicationOutbox>,
     config: EventsConfig,
     panes: Mutex<HashMap<String, PaneState>>,
     projects: ProjectCache,
@@ -93,6 +96,9 @@ impl EventService {
         } else {
             owner.clone()
         };
+        let outbox = coordinator
+            .then(|| PublicationOutbox::open(directory.join("outbox"), config.max_bytes))
+            .transpose()?;
         let checkpoint_path = directory.join("checkpoints.json");
         let checkpoints = if checkpoint_path.exists() {
             private_file(&checkpoint_path)?;
@@ -107,6 +113,8 @@ impl EventService {
             owner,
             fleet,
             machine,
+            coordinator,
+            outbox,
             config,
             panes: Mutex::new(HashMap::new()),
             projects: ProjectCache::default(),
@@ -124,6 +132,94 @@ impl EventService {
             bail!("cannot emit another owner's event");
         }
         self.owner.append(event)
+    }
+
+    /// Coordinator-originated metadata/lifecycle events about any machine.
+    /// These never enter the owner feed or get re-exported through federation.
+    /// # Errors
+    /// Requires a coordinator, a valid envelope and a successful durable append.
+    pub fn append_fleet(&self, event: AgentEvent) -> Result<()> {
+        if !self.coordinator {
+            bail!("fleet append requires a coordinator");
+        }
+        self.fleet.append(event)
+    }
+
+    /// Durably queues bytes for the configured sink without contacting Kafka.
+    /// # Errors
+    /// Rejects owner nodes, invalid/oversized records, full capacity or I/O errors.
+    pub fn enqueue_publication(&self, topic: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        self.outbox
+            .as_ref()
+            .context("publication outbox requires a coordinator")?
+            .enqueue(topic, key, value)
+    }
+
+    /// Latest generation-bound lifecycle attention, with status as a fallback.
+    #[must_use]
+    pub fn needs_input_reason(&self, session: &crate::control::SessionSummary) -> Option<String> {
+        let fallback = || (session.status == "waiting").then(|| "idle_prompt".into());
+        let Some(key) = &session.session_key else {
+            return fallback();
+        };
+        let fleet = self
+            .fleet
+            .attention_event(&session.machine, key, &session.instance_id);
+        let owner = (session.machine == self.machine)
+            .then(|| {
+                self.owner
+                    .attention_event(&session.machine, key, &session.instance_id)
+            })
+            .flatten();
+        let latest = [fleet, owner].into_iter().flatten().max_by(|a, b| {
+            chrono::DateTime::parse_from_rfc3339(&a.time)
+                .ok()
+                .cmp(&chrono::DateTime::parse_from_rfc3339(&b.time).ok())
+        });
+        match latest.as_ref().map(|v| v.event_type.as_str()) {
+            Some("agent.needs_input") => latest.and_then(|v| v.reason),
+            Some("agent.turn_completed") => Some("idle_prompt".into()),
+            Some("agent.working" | "agent.exited" | "session.closed" | "session.archived") => None,
+            _ => fallback(),
+        }
+    }
+
+    pub(crate) async fn publish_pending(&self, producer: &dyn Producer) -> Result<()> {
+        let config = self
+            .config
+            .redpanda
+            .as_ref()
+            .context("Redpanda sink is disabled")?;
+        let after = self
+            .checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sink
+            .clone();
+        let events = match publish_page(&self.fleet, config, producer, after).await {
+            Ok(next) => {
+                let mut checkpoints = self
+                    .checkpoints
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let previous = checkpoints.sink.replace(next);
+                let saved = atomic_json(&self.directory.join("checkpoints.json"), &*checkpoints);
+                if saved.is_err() {
+                    checkpoints.sink = previous;
+                }
+                saved
+            }
+            Err(error) => Err(error),
+        };
+        // Attempt both streams even if one topic is offline. FIFO failures
+        // stop the outbox before a newer snapshot can pass its predecessor.
+        let publications = self
+            .outbox
+            .as_ref()
+            .context("publication outbox unavailable")?
+            .publish_pending(producer)
+            .await;
+        events.and(publications.map(|_| ()))
     }
 
     pub(crate) fn observe(&self, sessions: &[Session]) {
@@ -396,26 +492,11 @@ impl EventService {
                     if producer.is_none() {
                         producer = KafkaProducer::connect(&config).await.ok();
                     }
-                    let after = service
-                        .checkpoints
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .sink
-                        .clone();
                     let result = match &producer {
-                        Some(producer) => {
-                            publish_page(&service.fleet, &config, producer, after).await
-                        }
+                        Some(producer) => service.publish_pending(producer).await,
                         None => Err(anyhow::anyhow!("producer unavailable")),
                     };
-                    if let Ok(next) = result {
-                        let mut checkpoints = service
-                            .checkpoints
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        checkpoints.sink = Some(next);
-                        let _ =
-                            atomic_json(&service.directory.join("checkpoints.json"), &*checkpoints);
+                    if result.is_ok() {
                         delay = 1;
                     } else {
                         producer = None;

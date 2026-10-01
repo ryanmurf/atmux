@@ -253,3 +253,99 @@ processes and its disposable tmux server.
 - No deployment, push, service restart, Kubernetes mutation, live broker
   publication, or running tmux/agent interaction was performed. macOS/ARM
   cross-builds were not run on this Linux worktree.
+
+## A2 integration after c9effc0 (2026-09-30)
+
+The lead merged A1/A2 and requested the real summary/search integrations on
+`feat/agent-events`. Implementation and all integration acceptance checks are complete.
+
+- `AgentEvent::from_summary` preserves owner-reported machine, stable key,
+  pane and generation. `ControlPlane::append_fleet_agent_event` durably appends
+  coordinator-authored events about local or remote sessions with the existing
+  envelope validation, retained-id de-duplication and lifecycle sink checkpoint.
+  It never exports those events through the owner feed. Owner-only nodes reject
+  fleet append; `emit_agent_event` still rejects other owners' events.
+- `summary_updated_hook` appends agent.summary_updated with title, description,
+  digest and digest_version after digest persistence and before search enqueue.
+  A full search queue therefore cannot suppress a newly generated summary event.
+  Disabled telemetry is a no-op; event-write failure logs a fixed diagnostic
+  without discarding the persisted digest or logging its content.
+- `ControlPlane::enqueue_publication(topic, key_bytes, value_bytes)` is the
+  small durable byte seam for A2/A3/A4. Search uses its exact existing
+  SearchPublication value, without rebuilding or rewrapping the H2 envelope.
+  Enqueue success does not depend on broker availability or connection settings;
+  absent event storage, owner-only roles, invalid/big records, capacity and I/O
+  failures return errors. A2 advances its durable timestamp only after enqueue.
+- A new `outbox` directory beside owner/fleet logs holds fsynced atomic JSON
+  files with base64 bytes, protected by mode 0700/0600 and an exclusive lock.
+  Its serialized pending bytes are capped independently by events.max_bytes
+  and 4,096 records. No age/size eviction can discard an accepted unacknowledged
+  publication: capacity rejects new work, and lowering the limit below existing
+  pending storage fails startup rather than dropping records. Only file indexes
+  are held in memory. No dependencies were added.
+- One FIFO drain intentionally provides ordering stronger than per-key order,
+  with at most 25 records per pass. A failed head blocks later outbox records.
+  Persisted acknowledgements fence cleanup so old acknowledged files surviving
+  an interrupted deletion cannot replay after newer snapshots. Unrenamed temp
+  writes are discarded on reopen. Ambiguous broker/checkpoint failures can
+  replay the head before advancing, providing at-least-once delivery.
+- The existing Redpanda worker drains both lifecycle and non-event streams,
+  retrying/reconnecting with its bounded backoff. A failing topic does not skip
+  attempting the other stream. Lifecycle checkpoint write failures restore the
+  in-memory prior cursor instead of silently advancing past an unpersisted ack.
+- Public agent_summary responses join the latest applicable lifecycle state
+  from retained logs, matching machine, session_key and instance_id. This covers
+  remote permission/question/startup/plan events, working clears and idle turns;
+  metadata events do not clear attention. Local reads also see owner events
+  before federation copies them, and retained state survives restart. Missing
+  events, old generations or absent telemetry use the status fallback.
+- Discovery-enabled federators use the coordinator role too, matching A2's
+  existing enabled-summary policy. Otherwise their remote metadata would be
+  rejected, or their fleet log could alias and contaminate the owner feed.
+  This changes only classification for explicitly enabled discovery; federation
+  authentication/TLS validation remains in the existing startup path.
+- A3/A4 should use emit_agent_event for owner observations and
+  append_fleet_agent_event for coordinator observations, retaining the same id
+  when replaying an event. publish_digest_search still provides A2's ordered
+  search snapshot/high-water seam. Configure summaries.search_tenant_id
+  explicitly (normally matching events.redpanda.tenant_id), enable coordinator
+  event storage and sink, and ensure both topics exist before rollout.
+
+Integration checks:
+
+- [x] Remote summary event details, durable restart/id de-duplication, owner feed
+  isolation and lifecycle publication through the fake producer.
+- [x] Exact H2 created/updated/archived bytes, FIFO retry after an ambiguous ack,
+  restarts before/after publication and interrupted acknowledgement cleanup.
+- [x] Outbox capacity, byte/topic limits, permissions and single-writer exclusion;
+  a topic failure does not starve the other publication stream.
+- [x] Fake model/owner exercises both real summary seams; unchanged digests emit
+  once, and failed search enqueue cannot advance its durable timestamp.
+- [x] Remote/local reason joins, working clears, unrelated-machine/generation
+  rejection, status fallback and retained reason state after restart.
+- [x] Final format, clippy, full Rust, no-default-feature and Node commands.
+
+Final integration evidence (commands invoked through rtk):
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed |
+| `cargo clippy --all-targets --all-features -- -D warnings` | Passed, zero warnings |
+| `cargo test --all-features` with disposable socket, required tmux, serial tests | 853 passed, 7 existing ignored; 21 suites |
+| `cargo check --no-default-features` | Passed |
+| `node --check web/app.js` | Passed |
+| `node --test web/*.test.mjs tests/navigation.test.mjs` | 191 passed, zero failures/skips |
+| `git diff --check` | Passed |
+
+```sh
+rtk proxy env ATMUX_TMUX_SOCKET_NAME=atmux-test-a1-wiring-20260930 \
+  ATMUX_REQUIRE_TMUX=1 RUST_TEST_THREADS=1 rtk cargo test --all-features
+```
+
+The same previously documented serial-test and temporary worktree mode-0755
+accommodations were used; mode 0775 is restored after validation. This follow-up
+changes no UI code, so the required Node checks cover the merged dashboard
+without repeating browser suites. Every new transport/model test uses a fake
+producer, private temporary storage or loopback fixtures. No deployment, push,
+restart, cluster access/mutation, live broker or running tmux/agent operation
+was performed; the user's untracked .atmux.toml remains untouched.

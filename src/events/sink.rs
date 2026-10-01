@@ -97,7 +97,7 @@ impl RedpandaConfig {
     }
 }
 
-fn validate_topic(topic: &str) -> Result<()> {
+pub(crate) fn validate_topic(topic: &str) -> Result<()> {
     if topic.is_empty()
         || topic.len() > 249
         || matches!(topic, "." | "..")
@@ -106,6 +106,14 @@ fn validate_topic(topic: &str) -> Result<()> {
             .all(|v| v.is_ascii_alphanumeric() || matches!(v, b'.' | b'_' | b'-'))
     {
         bail!("invalid Kafka topic");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_publication(topic: &str, key: &[u8], value: &[u8]) -> Result<()> {
+    validate_topic(topic)?;
+    if key.len() > 4096 || value.len() > 128 * 1024 {
+        bail!("Kafka publication exceeds bounds");
     }
     Ok(())
 }
@@ -192,10 +200,7 @@ fn secret(env: Option<&str>, file: Option<&std::path::Path>) -> Result<String> {
 impl Producer for KafkaProducer {
     fn publish<'a>(&'a self, topic: &'a str, key: &'a [u8], value: &'a [u8]) -> PublishFuture<'a> {
         Box::pin(async move {
-            validate_topic(topic)?;
-            if key.len() > 4096 || value.len() > 128 * 1024 {
-                bail!("Kafka publication exceeds bounds");
-            }
+            validate_publication(topic, key, value)?;
             let operation = async {
                 let mut partitions = self.partitions.lock().await;
                 if !partitions.contains_key(topic) {

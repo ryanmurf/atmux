@@ -198,6 +198,7 @@ daily_request_budget = 500
 # api_key_env = "ATMUX_SUMMARY_API_KEY"
 # api_key_file = "~/.config/atmux/summary.key" # choose one key source
 # store_dir = "~/.local/share/atmux/summaries"
+# search_tenant_id = "95efe33d-fa71-53ce-8e0a-3fe45ac0e58a"
 ```
 
 Summaries are off by default. HTTPS verifies the server certificate. Plain
@@ -225,10 +226,14 @@ cursor returns a conflict requiring a reload. `agent_summary` immediately
 returns cached text and schedules stale work. `sessions_find` ranks live and
 recent sessions by name, title, description, and digest terms.
 
-The coordinator also has a transport-independent HeroDevs `ATMUX_SESSION`
-envelope builder and one producer hook. Search publication remains disabled
-unless `summaries.search_tenant_id` is explicitly configured; the lead must
-wire the hook to A1's durable `entity-change` producer before enabling it.
+The coordinator durably queues HeroDevs `ATMUX_SESSION` snapshots to the
+`entity-change` outbox when `summaries.search_tenant_id` is explicitly set.
+Enable `[events]` for its storage and `[events.redpanda]` to drain it; normally
+use the same tenant as `events.redpanda.tenant_id`. Enqueue success advances
+the summary store's per-session timestamp; failed enqueue leaves it retryable.
+Summary updates also emit `agent.summary_updated` in the fleet log, including
+remote sessions. `agent_summary.needs_input_reason` joins the latest matching
+machine/session/pane-generation event, falling back to status if unavailable.
 
 ### Automatic context compaction
 
@@ -915,11 +920,28 @@ retention is a storage bound, so outages longer than retention can lose events.
 Values use HdEventEnvelope v2 with tenantId in both securityContext and
 eventPayload, keyed by session_key. No topics are created by atmux.
 
-Rust integrations can emit owner events through `ControlPlane::emit_agent_event`
-and reuse `events::sink::{KafkaProducer, Producer}`: connect with a
-`RedpandaConfig`, then `publish(topic, key_bytes, value_bytes).await`. Each
-publication is bounded to 128 KiB with a ten-second timeout; callers retain
-their own retry/checkpoint policy for other topics such as `entity-change`.
+Rust integrations construct session events with `AgentEvent::from_session`
+or `AgentEvent::from_summary`. `ControlPlane::emit_agent_event` accepts only
+the local owner's events. `ControlPlane::append_fleet_agent_event` accepts
+validated coordinator-authored events about any machine, de-duplicates their
+ids, and writes only the fleet log. A3/A4 can use these APIs for `session.*`.
+
+`ControlPlane::enqueue_publication(topic, key_bytes, value_bytes)` writes the
+coordinator's durable non-event outbox without contacting Kafka. This separate
+mode-0700 directory holds mode-0600 records beside the event spools, capped by
+`events.max_bytes` (including serialized storage overhead) and 4,096 records.
+It never age-evicts unacknowledged records: full capacity rejects enqueue.
+The sink drains FIFO, preserving ordering per key, persists acknowledgements
+before deleting records, and retries with bounded backoff. Ambiguous failures
+can duplicate a publication; consumers must handle at-least-once delivery.
+A failed head blocks later outbox records, while lifecycle publication is
+attempted independently. Queued bytes survive sink outages and coordinator
+restarts.
+
+Direct transports may reuse `events::sink::{KafkaProducer, Producer}`: connect
+with a `RedpandaConfig`, then `publish(topic, key_bytes, value_bytes).await`.
+Each value is bounded to 128 KiB with a ten-second timeout. Direct callers
+retain their own retry/checkpoint policy; durable integrations use the outbox.
 
 An efficient coordinating agent should call `agents_list` once, retain its `revision` and each
 `content_hash`, wait with `agents_observe`, and call `agent_output` only for sessions whose hash

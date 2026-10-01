@@ -1,5 +1,6 @@
 //! Bounded agent lifecycle events. Native hook bodies never enter the log.
 mod hooks;
+mod outbox;
 mod runtime;
 pub mod sink;
 mod spool;
@@ -68,7 +69,7 @@ impl EventsConfig {
         if let Some(sink) = &self.redpanda {
             if !coordinator {
                 bail!(
-                    "[events.redpanda] requires a coordinator (coordinator_only or configured machines)"
+                    "[events.redpanda] requires a coordinator (coordinator_only, configured machines or discovery)"
                 );
             }
             sink.validate()?;
@@ -184,6 +185,39 @@ impl AgentEvent {
             profile: session.profile.clone(),
             model: None,
             cwd: session.path.to_string_lossy().into_owned(),
+            project: EventProject::default(),
+            event_type: event_type.into(),
+            reason: reason.map(str::to_owned),
+            summary: None,
+            detail: json!({}),
+        })
+    }
+
+    /// Builds an event from owner-reported metadata, including remote sessions.
+    /// The caller chooses the owner or coordinator fleet append API.
+    /// # Errors
+    /// Requires a stable session key and OS randomness.
+    pub fn from_summary(
+        session: &crate::control::SessionSummary,
+        event_type: &str,
+        reason: Option<&str>,
+    ) -> Result<Self> {
+        Ok(Self {
+            schema: SCHEMA.into(),
+            id: tmux::new_session_key()?,
+            time: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            machine: session.machine.clone(),
+            session_key: session
+                .session_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("session lacks a stable key"))?,
+            pane: format!("{}~{}", session.machine, session.pane_id),
+            instance_id: session.instance_id.clone(),
+            session_name: session.name.clone(),
+            harness: session.agent.clone(),
+            profile: session.profile.clone(),
+            model: None,
+            cwd: session.path.clone(),
             project: EventProject::default(),
             event_type: event_type.into(),
             reason: reason.map(str::to_owned),
