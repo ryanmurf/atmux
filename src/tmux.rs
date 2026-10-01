@@ -2166,7 +2166,7 @@ impl Tmux {
         Ok((output, summary))
     }
 
-    fn output<const N: usize>(args: [&str; N]) -> Result<String> {
+    pub(crate) fn output<const N: usize>(args: [&str; N]) -> Result<String> {
         let (output, summary) = Self::run(args)?;
         check_output(&output, &summary)
     }
@@ -4057,6 +4057,83 @@ mod tests {
             )),
             socket,
         }
+    }
+
+    #[test]
+    fn startup_development_dialog_is_answered_once_on_disposable_socket() -> Result<()> {
+        let probe = disposable_tmux("startup-dialog");
+        fs::create_dir_all(&probe.directory)?;
+        let script = probe.directory.join("fake-cli");
+        let recorder = probe.directory.join("answers");
+        let dialog = "--dangerously-load-development-channels is for local channel development only\n❯ 1. I am using this for local development\n  2. Exit\nEnter to confirm · Esc to cancel";
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/bash\nprintf '%s\\n' {}\nwhile read -r reply; do printf '%s\\n' \"$reply\" >> {}; printf '\\033[2J\\033[Hready\\n'; done\n",
+                shell_words::quote(dialog),
+                shell_words::quote(&recorder.to_string_lossy())
+            ),
+        )?;
+        Tmux::with_socket_for_test(&probe.socket, || {
+            let launch = shell_words::join([
+                "/bin/bash",
+                "-c",
+                &format!(
+                    "exec -a claude /bin/bash {} --dangerously-load-development-channels",
+                    shell_words::quote(&script.to_string_lossy())
+                ),
+            ]);
+            Tmux::output([
+                "new-session",
+                "-d",
+                "-s",
+                "startup",
+                "-c",
+                &probe.directory.to_string_lossy(),
+                &launch,
+            ])?;
+            let mut config = crate::config::Config::default();
+            config.startup_prompts.auto_answer = true;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let session = loop {
+                let sessions = Tmux.sessions(&HashMap::new(), &config.status)?;
+                if let Some(session) = sessions.into_iter().find(|session| {
+                    session.agent_pid.is_some() && session.content.contains("Enter to confirm")
+                }) {
+                    break session;
+                }
+                if Instant::now() > deadline {
+                    bail!("fake startup CLI did not print its dialog");
+                }
+                thread::sleep(Duration::from_millis(25));
+            };
+            crate::startup_prompts::handle(&config, &session);
+            crate::startup_prompts::handle(&config, &session);
+            while !recorder.exists() {
+                if Instant::now() > deadline {
+                    bail!(
+                        "startup answer did not reach fake CLI: agent={:?} text={:?}",
+                        session.agent,
+                        session.content
+                    );
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            assert_eq!(fs::read_to_string(&recorder)?, "1\n");
+            // Reprint the identical dialog in the same process: the durable
+            // claim survives another monitor / daemon restart.
+            Tmux::output(["send-keys", "-t", &session.pane_id, ""])?;
+            let marker = Tmux::output([
+                "show-options",
+                "-p",
+                "-v",
+                "-t",
+                &session.pane_id,
+                "@atmux_startup_development",
+            ])?;
+            assert!(!marker.trim().is_empty());
+            Tmux.kill("startup")
+        })
     }
 
     #[cfg(target_os = "linux")]

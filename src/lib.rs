@@ -19,6 +19,7 @@ pub mod pulse;
 pub mod recovery;
 pub mod remote;
 pub mod self_update;
+pub mod startup_prompts;
 pub mod status;
 mod summary;
 mod systemd_scope;

@@ -2155,6 +2155,7 @@ impl ControlPlane {
             Tmux.sessions_with_capture(&previous_hashes, &self.inner.config.status, capture_lines)?;
         for session in &mut sessions {
             truncate_front(&mut session.content, MAX_CAPTURE_BYTES);
+            crate::startup_prompts::handle(&self.inner.config, session);
         }
 
         self.apply_refresh(sessions);

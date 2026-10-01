@@ -186,6 +186,9 @@ impl App {
         let sessions = self
             .tmux
             .sessions(&self.previous_hashes, &self.config.status)?;
+        for session in &sessions {
+            crate::startup_prompts::handle(&self.config, session);
+        }
         self.previous_hashes = sessions
             .iter()
             .map(|session| (session.pane_id.clone(), session.content_hash))

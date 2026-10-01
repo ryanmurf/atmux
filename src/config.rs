@@ -218,6 +218,8 @@ pub struct Config {
     #[serde(default)]
     pub recovery: RecoveryConfig,
     #[serde(default)]
+    pub startup_prompts: crate::startup_prompts::StartupPromptConfig,
+    #[serde(default)]
     pub self_update: SelfUpdateConfig,
     #[serde(default)]
     pub node: NodeConfig,
