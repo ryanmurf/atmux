@@ -2338,4 +2338,65 @@ mod tests {
                 .is_none()
         );
     }
+    #[test]
+    fn archive_captures_final_git_head_branch_dirty_state_and_redacted_remote() {
+        let fixture = Fixture::new();
+        let project = fixture.directory.join("project");
+        fs::create_dir(&project).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args([
+                    "-c",
+                    "user.name=A3 fixture",
+                    "-c",
+                    "user.email=a3@example.test",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-q", "-b", "a3-fixture"]);
+        fs::write(project.join("tracked.txt"), "original").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-q", "-m", "fixture"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://user:password@example.test/org/repo?token=secret",
+        ]);
+        let head = git(&["rev-parse", "HEAD"]);
+        let registry = fixture.registry();
+        let mut session = session();
+        session.path = project.clone();
+        let key = session.session_key.clone().unwrap();
+        registry.observe(&[session], 1000).unwrap();
+        assert_eq!(
+            registry.get(&key).unwrap().unwrap().project.dirty,
+            Some(false)
+        );
+        fs::write(project.join("tracked.txt"), "changed").unwrap();
+        registry.observe(&[], 2000).unwrap();
+        let archived = registry.get(&key).unwrap().unwrap();
+        assert_eq!(archived.project.dirty, Some(true));
+        assert_eq!(archived.project.branch.as_deref(), Some("a3-fixture"));
+        assert_eq!(archived.project.head.as_deref(), Some(head.as_str()));
+        assert_eq!(
+            archived.project.remote.as_deref(),
+            Some("https://example.test/org/repo")
+        );
+        let manifest: BundleManifest =
+            serde_json::from_slice(&entries(&registry, &key)["manifest.json"]).unwrap();
+        assert_eq!(manifest.session.record.project, archived.project);
+    }
 }
