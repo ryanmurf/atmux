@@ -1,0 +1,46 @@
+{
+  "envelopeVersion": 2,
+  "eventType": "ENTITY_CHANGE",
+  "publishedAt": "2026-09-30T20:00:00Z",
+  "securityContext": {
+    "tenantId": "95efe33d-fa71-53ce-8e0a-3fe45ac0e58a",
+    "token": null,
+    "platform": "SYSTEM",
+    "userId": null,
+    "sessionId": null
+  },
+  "mdc": {},
+  "payloadRef": null,
+  "payloadSummary": null,
+  "eventPayload": {
+    "type": "ENTITY_CHANGE",
+    "entityType": "ATMUX_SESSION",
+    "entityId": "019f7bcd-8000-7000-8000-000000000002",
+    "changeType": "CREATED",
+    "eventTs": "2026-09-30T20:00:00Z",
+    "previous": null,
+    "current": {
+      "id": "019f7bcd-8000-7000-8000-000000000002",
+      "session_key": "019f7bcd-8000-7000-8000-000000000002",
+      "tenantId": "95efe33d-fa71-53ce-8e0a-3fe45ac0e58a",
+      "ownerType": "Tenant",
+      "ownerId": "95efe33d-fa71-53ce-8e0a-3fe45ac0e58a",
+      "scope": "tenant",
+      "createdBy": "00000000-0000-0000-0000-000000000000",
+      "updatedBy": "00000000-0000-0000-0000-000000000000",
+      "createdAt": "2026-09-30T20:00:00Z",
+      "updatedAt": "2026-09-30T20:00:00Z",
+      "archivedAt": null,
+      "title": "Index atmux sessions",
+      "description": "Make agent session digests searchable in HeroDevs.",
+      "digest": "Implemented the session index definition and producer contract. Next: verify tenant isolation and archive search.",
+      "machine": "tron",
+      "project_remote": "https://github.com/murphytek/hd-api-search",
+      "project_branch": "feat/atmux-session-index",
+      "cwd": "/home/ryan/IdeaProjects/herodevs.dev/hd-api-search-atmux",
+      "harness": "codex",
+      "profile": "hd",
+      "state": "working"
+    }
+  }
+}

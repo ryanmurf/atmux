@@ -43,7 +43,10 @@ pub struct ConversationPage {
     pub truncated: bool,
 }
 
-pub(crate) fn page(transcript: Transcript, request: &ConversationRequest) -> Result<ConversationPage> {
+pub(crate) fn page(
+    transcript: Transcript,
+    request: &ConversationRequest,
+) -> Result<ConversationPage> {
     let defaults = [
         Include::Human,
         Include::Agent,

@@ -1127,6 +1127,7 @@ mod tests {
             machine: machine.to_owned(),
             name: name.to_owned(),
             description: None,
+            description_source: None,
             pane_id: pane.to_owned(),
             status: "working".to_owned(),
             agent: "codex".to_owned(),

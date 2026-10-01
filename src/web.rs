@@ -842,6 +842,11 @@ fn routes(state: WebState) -> Router {
         .route("/api/v1/launch-sessions", get(launch_sessions))
         .route("/api/v1/panes/{id}", get(pane_output))
         .route("/api/v1/panes/{id}/transcript", get(pane_transcript))
+        .route("/api/v1/panes/{id}/summary", get(agent_summary))
+        .route(
+            "/api/v1/sessions/{id}/automatic-description",
+            post(automatic_description),
+        )
         .route(
             "/api/v1/panes/{id}/files",
             get(pane_files)
@@ -1098,6 +1103,30 @@ async fn pane_transcript(
         .map_err(|error| ApiError::from_control(&error))?
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("no agent pane matches {id}")))
+}
+
+async fn agent_summary(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::summarizer::AgentSummary>, ApiError> {
+    state
+        .control
+        .agent_summary(&id)
+        .map(Json)
+        .map_err(|error| ApiError::from_control(&error))
+}
+
+async fn automatic_description(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    Json(request): Json<crate::control::AutomaticDescriptionRequest>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .control
+        .automatic_description(&id, request)
+        .await
+        .map_err(|error| ApiError::from_control(&error))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn pane_files(

@@ -195,6 +195,8 @@ pub struct GitSummary {
     pub pane_id: String,
     pub available: bool,
     pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
     pub detached: bool,
     pub clean: bool,
     pub changes: Vec<GitChange>,
@@ -1168,6 +1170,7 @@ fn unavailable_git() -> GitSummary {
         pane_id: String::new(),
         available: false,
         branch: None,
+        remote: None,
         detached: false,
         clean: true,
         changes: Vec::new(),
@@ -1220,15 +1223,45 @@ async fn git_summary(context: &GitContext) -> WorkspaceResult<GitSummary> {
         .await?;
         (safe_git_label(&commit.stdout), commit.status.success())
     };
+    let origin = run_git_in(
+        &context.worktree,
+        Some(&context.git_dir),
+        &["config", "--get", "remote.origin.url"],
+        1024,
+    )
+    .await?;
+    let remote = safe_git_remote(&origin.stdout);
     Ok(GitSummary {
         pane_id: String::new(),
         available: true,
         branch,
+        remote,
         detached,
         clean: !parsed.saw_change,
         changes: parsed.changes,
         truncated: parsed.truncated,
     })
+}
+
+fn safe_git_remote(bytes: &[u8]) -> Option<String> {
+    let remote = std::str::from_utf8(bytes).ok()?.trim();
+    if remote.is_empty()
+        || remote.len() > 512
+        || remote.chars().any(char::is_control)
+        || remote.contains(['?', '#'])
+    {
+        return None;
+    }
+    // HTTPS userinfo can carry tokens; SSH's git@host:path is a repository identity.
+    if let Some((_, authority)) = remote.split_once("://")
+        && authority
+            .split('/')
+            .next()
+            .is_some_and(|host| host.contains('@'))
+    {
+        return None;
+    }
+    Some(remote.to_owned())
 }
 
 async fn git_context(

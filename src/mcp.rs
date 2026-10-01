@@ -66,6 +66,19 @@ struct ObserveRequest {
     machine: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SummaryRequest {
+    /// Pane reference or stable session key.
+    id: String,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SessionsFindRequest {
+    /// Plain terms matched against names, descriptions, titles and digests.
+    query: String,
+    /// Maximum matches, clamped to 1..=100 (default 20).
+    limit: Option<usize>,
+}
+
 #[derive(Clone, Debug)]
 pub struct AtmuxMcp {
     control: ControlPlane,
@@ -168,6 +181,36 @@ impl AtmuxMcp {
             .control
             .agent_conversation(request)
             .await
+            .map_err(|error| error.to_string())?;
+        serde_json::to_string(&response).map_err(|error| error.to_string())
+    }
+
+    #[tool(
+        name = "agent_summary",
+        description = "Get cached title, description and rolling tool-free digest, update time, status and needs_input_reason for a pane or session key. Stale digests schedule a refresh and return immediately with stale=true. enabled=false means summaries are not configured on this coordinator."
+    )]
+    async fn agent_summary(
+        &self,
+        Parameters(request): Parameters<SummaryRequest>,
+    ) -> Result<String, String> {
+        let response = self
+            .control
+            .agent_summary(&request.id)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_string(&response).map_err(|error| error.to_string())
+    }
+
+    #[tool(
+        name = "sessions_find",
+        description = "Find live and recently seen sessions by case-insensitive term matching over names, descriptions, auto titles and digests. Returns session_key, machine, pane, name, title, description, score and snippet. Recent matches may no longer have a live pane; archived sessions will be added by the registry workstream."
+    )]
+    async fn sessions_find(
+        &self,
+        Parameters(request): Parameters<SessionsFindRequest>,
+    ) -> Result<String, String> {
+        let response = self
+            .control
+            .sessions_find(&request.query, request.limit.unwrap_or(20))
             .map_err(|error| error.to_string())?;
         serde_json::to_string(&response).map_err(|error| error.to_string())
     }
@@ -578,6 +621,7 @@ mod tests {
             machine: machine.to_owned(),
             name: name.to_owned(),
             description: None,
+            description_source: None,
             pane_id: pane.to_owned(),
             status: "working".to_owned(),
             agent: "codex".to_owned(),
@@ -710,6 +754,7 @@ mod tests {
                 machine: "gpu-box".to_owned(),
                 name: "trainer".to_owned(),
                 description: None,
+                description_source: None,
                 pane_id: "%4".to_owned(),
                 status: "working".to_owned(),
                 agent: "claude".to_owned(),
@@ -818,5 +863,89 @@ mod tests {
             serde_json::from_str(r#"{"after_revision":3,"machine":"mini"}"#).unwrap();
         assert_eq!(observe.machine.as_deref(), Some("mini"));
         assert!(observe.wait_ms.is_none());
+    }
+    #[tokio::test]
+    async fn conversation_summary_and_find_tools_follow_federated_identity() {
+        use crate::{
+            config::{Config, MachineConfig},
+            control::test_control_with_config,
+        };
+        use axum::{Json, Router, routing::get};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/api/v1/panes/{id}/transcript", get(|| async {
+            Json(serde_json::json!({"available":true,"source":"claude","content_hash":"hash","changed":true,"truncated":false,
+                "messages":[{"id":"human","role":"user","kind":"message","markdown":"Review summaries"},
+                    {"id":"tool","role":"assistant","kind":"tool","markdown":"Bash", "tool_output":"[redacted]"},
+                    {"id":"agent","role":"assistant","kind":"message","markdown":"Ready to review"}]}))
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let config = Config {
+            machines: vec![MachineConfig {
+                id: "gpu-box".into(),
+                label: None,
+                url: format!("http://{address}"),
+                token_env: None,
+                token_file: None,
+            }],
+            ..Config::default()
+        };
+        let control = test_control_with_config(&["gpu-box"], config);
+        let mut session = federated_overview()
+            .sessions
+            .into_iter()
+            .find(|s| s.machine == "gpu-box")
+            .unwrap();
+        let key = crate::tmux::new_session_key().unwrap();
+        session.session_key = Some(key.clone());
+        session.name = "summaries-review".into();
+        session.status = "waiting".into();
+        control.apply_machine_sessions("gpu-box", vec![session], None);
+        let mcp = AtmuxMcp::new(control);
+        let request = serde_json::from_value(serde_json::json!({"id":key,"limit":1})).unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(&mcp.agent_conversation(Parameters(request)).await.unwrap())
+                .unwrap();
+        assert_eq!(first["entries"][0]["id"], "human");
+        assert_eq!(first["next"], "human");
+        assert_eq!(first["truncated"], true);
+        let request = serde_json::from_value(
+            serde_json::json!({"id":key,"after":"human","include":["agent"]}),
+        )
+        .unwrap();
+        let rest: serde_json::Value =
+            serde_json::from_str(&mcp.agent_conversation(Parameters(request)).await.unwrap())
+                .unwrap();
+        assert_eq!(rest["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(rest["entries"][0]["id"], "agent");
+        let summary: serde_json::Value = serde_json::from_str(
+            &mcp.agent_summary(Parameters(SummaryRequest { id: key }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(summary["enabled"], false);
+        assert_eq!(summary["needs_input_reason"], "idle_prompt");
+        let found: serde_json::Value = serde_json::from_str(
+            &mcp.sessions_find(Parameters(SessionsFindRequest {
+                query: "summaries".into(),
+                limit: Some(10),
+            }))
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(found[0]["name"], "summaries-review");
+        assert_eq!(found[0]["machine"], "gpu-box");
+        assert!(
+            mcp.agent_summary(Parameters(SummaryRequest {
+                id: "unknown".into()
+            }))
+            .await
+            .is_err()
+        );
+        server.abort();
     }
 }

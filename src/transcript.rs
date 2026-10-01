@@ -1934,6 +1934,11 @@ fn sensitive_key(key: &str) -> bool {
         || compact.ends_with("token")
 }
 
+/// Reuse nested-JSON and credential redaction for digest evidence and output.
+pub(crate) fn digest_text(text: &str) -> Option<String> {
+    sanitize_or_redact_string(text, 0)
+}
+
 fn sanitize_tool_text(text: &str) -> Option<String> {
     let mut sanitized = Vec::new();
     let mut inside_private_key = false;
@@ -1963,6 +1968,14 @@ fn sanitize_tool_text(text: &str) -> Option<String> {
 
 fn sensitive_tool_line(lower: &str) -> bool {
     lower.contains("bearer ")
+        || lower
+            .split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_'))
+            .any(|word| {
+                word.len() >= 16
+                    && ["sk-", "ghp_", "github_pat_", "akia"]
+                        .iter()
+                        .any(|prefix| word.starts_with(prefix))
+            })
         || [
             "authorization:",
             "proxy-authorization:",
@@ -2487,6 +2500,7 @@ mod tests {
         Session {
             name: "fixture".to_owned(),
             description: None,
+            description_source: None,
             attached: false,
             windows: 1,
             activity: 0,
