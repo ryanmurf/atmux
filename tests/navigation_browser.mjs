@@ -67,6 +67,8 @@ test("mobile navigation persists preferences and session actions retain the sele
   const mutations = [];
   const restartRequests = [];
   const modelRequests = [];
+  const resumeOnRequests = [];
+  const sessionKey = "019a06d9-8341-7654-8abc-0123456789ab";
   const paneContent = "first line\nsecond line ✓";
   const instance = (digit) => `pane-v1-${digit.repeat(64)}`;
   let eventPhase = "agent.needs_input";
@@ -77,7 +79,7 @@ test("mobile navigation persists preferences and session actions retain the sele
   ];
   let sessions = [
     { id: "local~%1", machine: "local", pane_id: "%1", name: "alpha", path: "/work/api", agent: "codex", status: "working", instance_id: instance("a"), session_key: agentSessionKey },
-    { id: "local~%2", machine: "local", pane_id: "%2", name: "zebra", path: "/work/web", agent: "claude", status: "waiting", instance_id: instance("b") },
+    { id: "local~%2", machine: "local", pane_id: "%2", session_key: sessionKey, name: "zebra", path: "/work/web", agent: "claude", status: "waiting", instance_id: instance("b") },
     { id: "max~%1", machine: "max", pane_id: "%1", name: "beta", path: "/work/api", agent: "claude", status: "waiting", instance_id: instance("c") },
   ];
   let revision = 1;
@@ -100,6 +102,19 @@ test("mobile navigation persists preferences and session actions retain the sele
       streams.add(response);
       response.write(snapshot());
       request.on("close", () => streams.delete(response));
+      return;
+    }
+    if (path === "/api/v1/session-history") {
+      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({sessions:[{ session_key: sessionKey, name: "archived-agent", machine: "local", state: "archived" }],next_cursor:null}));
+      return;
+    }
+    if (path === "/api/v1/registry/resume" && request.method === "POST") {
+      let body = "";
+      request.on("data", (chunk) => { body += chunk; });
+      request.on("end", () => {
+        const parsed = JSON.parse(body); resumeOnRequests.push(parsed);
+        response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ session_key: parsed.session_key, machine: parsed.machine, name: "resumed-agent", pane_id: "%9", verified: true }));
+      });
       return;
     }
     if (path === "/api/v1/fleet/updates") {
@@ -288,6 +303,21 @@ test("mobile navigation persists preferences and session actions retain the sele
     await cdp.evaluate("document.getElementById('quick-resume').click()");
     assert.equal(await cdp.evaluate("document.getElementById('resume-dialog').open"), true, "replacement requires a new confirmation");
     await cdp.evaluate("document.getElementById('resume-dialog').close()");
+    await cdp.evaluate("document.getElementById('quick-actions-open').click()");
+    await waitFor(() => cdp.evaluate("!document.getElementById('quick-resume-on').hidden"), "cross-machine resume action enabled");
+    await cdp.evaluate("document.getElementById('quick-resume-on').click()");
+    assert.equal(await cdp.evaluate("document.getElementById('resume-on-dialog').open"), true);
+    assert.deepEqual(await cdp.evaluate("[...document.getElementById('resume-on-machine').options].map(option => option.value)"), ["local", "max"]);
+    assert.equal(await cdp.evaluate("document.getElementById('resume-on-move').checked"), false);
+    await cdp.evaluate("document.getElementById('resume-on-machine').value = 'max'; document.getElementById('resume-on-confirm').click()");
+    await waitFor(() => resumeOnRequests.length === 1, "live-session resume sent to selected machine");
+    assert.deepEqual(resumeOnRequests[0], { session_key: sessionKey, machine: "max", move: false });
+    await waitFor(() => cdp.evaluate("!document.getElementById('resume-on-dialog').open"), "verified resume closes picker");
+    await cdp.evaluate("document.getElementById('history-open').click()");
+    await waitFor(() => cdp.evaluate("document.querySelector('[data-session-resume]')"), "A3 Sessions resume action");
+    await cdp.evaluate("document.querySelector('[data-session-resume]').click()");
+    assert.equal(await cdp.evaluate("document.getElementById('resume-on-session').textContent"), "archived-agent");
+    await cdp.evaluate("document.getElementById('resume-on-dialog').close()");
   } finally {
     cdp?.socket.close();
     if (chrome?.pid && chrome.exitCode === null && chrome.signalCode === null) {
@@ -322,7 +352,7 @@ test("session history supports filters, pagination, hostile text, resume hook an
     const url = new URL(request.url, "http://fixture");
     if (url.pathname === "/api/v1/events") {
       response.writeHead(200, { "Content-Type": "text/event-stream" }); streams.add(response);
-      response.write(`event: sessions.snapshot\ndata: ${JSON.stringify({ revision: 1, sessions: [], machines: [], health: null })}\n\n`);
+      response.write(`event: sessions.snapshot\ndata: ${JSON.stringify({ revision: 1, sessions: [], machines: [{id:"peer",label:"Peer",kind:"remote",online:true}], health: null })}\n\n`);
       request.on("close", () => streams.delete(response)); return;
     }
     if (url.pathname === "/api/v1/work") {
@@ -360,7 +390,7 @@ test("session history supports filters, pagination, hostile text, resume hook an
     assert.equal(await cdp.evaluate("new URL(location.href).searchParams.get('view')"), "sessions");
     assert.equal(await cdp.evaluate("document.querySelector('.session-history-row strong').textContent"), archived.name);
     assert.equal(await cdp.evaluate("Boolean(window.historyXss) || Boolean(document.querySelector('.session-history-row img'))"), false);
-    assert.equal(await cdp.evaluate("document.querySelector('[data-session-resume]').disabled"), true);
+    assert.equal(await cdp.evaluate("document.querySelector('[data-session-resume]').disabled"), false);
     await cdp.evaluate("window.atmuxSessionResume = (request) => window.resumeRequest = request; document.getElementById('history-refresh').click()");
     await waitFor(() => cdp.evaluate("!document.querySelector('[data-session-resume]').disabled"), "resume hook");
     await cdp.evaluate("document.querySelector('[data-session-resume]').click()");

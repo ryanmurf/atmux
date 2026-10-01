@@ -804,7 +804,7 @@ impl Tmux {
         // reused for another process generation.
         #[allow(clippy::needless_pass_by_value)] scope: PreparedScope,
     ) -> Result<()> {
-        Self::launch_inner(name, directory, profile, mode, None, None, scope)
+        Self::launch_inner(name, directory, profile, mode, None, None, None, scope)
     }
 
     /// Creates a detached session that resumes one owner-revalidated native
@@ -833,11 +833,38 @@ impl Tmux {
             mode,
             Some(resume),
             Some(resume_lease),
+            None,
             scope,
         )
     }
 
-    #[allow(clippy::needless_pass_by_value)] // Enforce one preflight per process generation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_imported(
+        name: &str,
+        directory: &Path,
+        profile: &AgentProfile,
+        mode: Option<&ProfileMode>,
+        resume: &ResumeCandidate,
+        resume_lease: &str,
+        session_key: &str,
+        scope: PreparedScope,
+    ) -> Result<()> {
+        if !valid_resume_lease(resume_lease) || !valid_session_key(session_key) {
+            bail!("invalid imported session identity");
+        }
+        Self::launch_inner(
+            name,
+            directory,
+            profile,
+            mode,
+            Some(resume),
+            Some(resume_lease),
+            Some(session_key),
+            scope,
+        )
+    }
+
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)] // One preflight per process generation.
     fn launch_inner(
         name: &str,
         directory: &Path,
@@ -845,6 +872,7 @@ impl Tmux {
         mode: Option<&ProfileMode>,
         resume: Option<&ResumeCandidate>,
         resume_lease: Option<&str>,
+        session_key: Option<&str>,
         scope: PreparedScope,
     ) -> Result<()> {
         if !command_available(&profile.command) {
@@ -905,6 +933,13 @@ impl Tmux {
                     return Err(error);
                 }
             }
+        }
+        if let Some(key) = session_key
+            && let Err(error) =
+                Self::output(["set-option", "-p", "-t", &pane_id, SESSION_KEY_OPTION, key])
+        {
+            let _ = Self::output(["kill-session", "-t", &session_id]);
+            return Err(error);
         }
         if let Some(lease) = resume_lease
             && let Err(error) = Self::output([
@@ -1244,6 +1279,23 @@ impl Tmux {
             bail!("invalid tmux pane id");
         }
         Self::output(["kill-session", "-t", pane_id]).map(|_| ())
+    }
+
+    /// Checks every pane, including shells omitted from agent discovery.
+    /// # Errors
+    /// Rejects attached sessions, extra windows/panes or a vanished target.
+    pub(crate) fn supervisor_close_allowed(pane_id: &str) -> Result<bool> {
+        if !valid_tmux_pane_id(pane_id) {
+            bail!("invalid tmux pane id");
+        }
+        let state = Self::output([
+            "display-message",
+            "-p",
+            "-t",
+            pane_id,
+            "#{session_attached}:#{session_windows}:#{window_panes}",
+        ])?;
+        Ok(state.trim() == "0:1:1")
     }
 
     /// Renames and/or describes the session that owns one pane in a single
@@ -2225,7 +2277,7 @@ impl Tmux {
         Ok((output, summary))
     }
 
-    fn output<const N: usize>(args: [&str; N]) -> Result<String> {
+    pub(crate) fn output<const N: usize>(args: [&str; N]) -> Result<String> {
         let (output, summary) = Self::run(args)?;
         check_output(&output, &summary)
     }
@@ -4117,6 +4169,128 @@ mod tests {
             )),
             socket,
         }
+    }
+
+    fn assert_startup_skips_busy_pane(
+        socket: &str,
+        config: &crate::config::Config,
+        session: &Session,
+    ) -> Result<()> {
+        let held = crate::auto_update::PaneProcessLock::acquire(&session.pane_id)?;
+        let busy_session = session.clone();
+        let busy_config = config.clone();
+        let busy_socket = socket.to_owned();
+        let (finished, received) = std::sync::mpsc::channel();
+        let contender = thread::spawn(move || {
+            Tmux::with_socket_for_test(&busy_socket, || {
+                crate::startup_prompts::handle(&busy_config, &busy_session);
+                finished.send(()).unwrap();
+                Ok(())
+            })
+        });
+        let skipped = received.recv_timeout(Duration::from_secs(2));
+        drop(held);
+        contender.join().unwrap()?;
+        assert!(
+            skipped.is_ok(),
+            "startup handling must not wait on a busy pane lock"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_development_dialog_is_answered_once_on_disposable_socket() -> Result<()> {
+        let probe = disposable_tmux("startup-dialog");
+        fs::create_dir_all(&probe.directory)?;
+        let script = probe.directory.join("fake-cli");
+        let recorder = probe.directory.join("answers");
+        let dialog = "--dangerously-load-development-channels is for local channel development only\n❯ 1. I am using this for local development\n  2. Exit\nEnter to confirm · Esc to cancel";
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/bash\nfixture_dialog={}\ntrap 'printf \"\\033[2J\\033[H%s\\n\" \"$fixture_dialog\"' USR1\nprintf '%s\\n' \"$fixture_dialog\"\nwhile true; do read -r reply || continue; printf '%s\\n' \"$reply\" >> {}; printf '\\033[2J\\033[Hready\\n'; done\n",
+                shell_words::quote(dialog),
+                shell_words::quote(&recorder.to_string_lossy())
+            ),
+        )?;
+        Tmux::with_socket_for_test(&probe.socket, || {
+            let launch = shell_words::join([
+                "/bin/bash",
+                "-c",
+                &format!(
+                    "exec -a claude /bin/bash {} --dangerously-load-development-channels",
+                    shell_words::quote(&script.to_string_lossy())
+                ),
+            ]);
+            Tmux::output([
+                "new-session",
+                "-d",
+                "-s",
+                "startup",
+                "-c",
+                &probe.directory.to_string_lossy(),
+                &launch,
+            ])?;
+            let mut config = crate::config::Config::default();
+            config.startup_prompts.auto_answer = true;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let session = loop {
+                let sessions = Tmux.sessions(&HashMap::new(), &config.status)?;
+                if let Some(session) = sessions.into_iter().find(|session| {
+                    session.agent_pid.is_some() && session.content.contains("Enter to confirm")
+                }) {
+                    break session;
+                }
+                if Instant::now() > deadline {
+                    bail!("fake startup CLI did not print its dialog");
+                }
+                thread::sleep(Duration::from_millis(25));
+            };
+            assert_startup_skips_busy_pane(&probe.socket, &config, &session)?;
+            assert!(!recorder.exists(), "a busy pane must not receive keys");
+            crate::startup_prompts::handle(&config, &session);
+            crate::startup_prompts::handle(&config, &session);
+            while !recorder.exists() {
+                if Instant::now() > deadline {
+                    bail!(
+                        "startup answer did not reach fake CLI: agent={:?} text={:?}",
+                        session.agent,
+                        session.content
+                    );
+                }
+                crate::startup_prompts::handle(&config, &session);
+                thread::sleep(Duration::from_millis(25));
+            }
+            assert_eq!(fs::read_to_string(&recorder)?, "1\n");
+            // Reprint the identical dialog in the same process: the durable
+            // claim survives another monitor / daemon restart.
+            let pid = rustix::process::Pid::from_raw(i32::try_from(session.agent_pid.unwrap())?)
+                .context("invalid fake CLI PID")?;
+            rustix::process::kill_process(pid, rustix::process::Signal::USR1)?;
+            while !Tmux
+                .capture(&session.pane_id, 80)?
+                .trim_end()
+                .ends_with("Enter to confirm · Esc to cancel")
+            {
+                if Instant::now() > deadline {
+                    bail!("fake CLI did not reprint the dialog");
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            crate::startup_prompts::handle(&config, &session);
+            thread::sleep(Duration::from_millis(50));
+            assert_eq!(fs::read_to_string(&recorder)?, "1\n");
+            let marker = Tmux::output([
+                "show-options",
+                "-p",
+                "-v",
+                "-t",
+                &session.pane_id,
+                "@atmux_startup_development",
+            ])?;
+            assert!(!marker.trim().is_empty());
+            Tmux.kill("startup")
+        })
     }
 
     #[cfg(target_os = "linux")]

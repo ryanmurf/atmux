@@ -220,6 +220,19 @@ pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
 /// Use the already-bounded durable spool as the deduplication ledger, including
 /// after restart, rather than an unbounded second cache.
 fn same_lifecycle_transition(previous: &AgentEvent, current: &AgentEvent) -> bool {
+    if current.event_type == "agent.startup_prompt_answered" {
+        return previous.event_type == current.event_type
+            && previous.machine == current.machine
+            && previous.session_key == current.session_key
+            && previous.instance_id == current.instance_id
+            && current
+                .detail
+                .get("process_start")
+                .is_some_and(serde_json::Value::is_string)
+            && ["agent_pid", "process_start", "dialog", "verified"]
+                .iter()
+                .all(|field| previous.detail.get(field) == current.detail.get(field));
+    }
     let attribute = match current.event_type.as_str() {
         "agent.exited" => "agent_pid",
         "session.closed" => "closed_ms",
@@ -410,7 +423,10 @@ impl EventLog {
         if state.ids.contains(&event.id)
             || matches!(
                 event.event_type.as_str(),
-                "agent.exited" | "session.closed" | "session.archived"
+                "agent.exited"
+                    | "session.closed"
+                    | "session.archived"
+                    | "agent.startup_prompt_answered"
             ) && state
                 .records
                 .iter()

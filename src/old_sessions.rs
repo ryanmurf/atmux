@@ -87,6 +87,17 @@ impl std::fmt::Debug for ResumeCandidate {
 }
 
 impl ResumeCandidate {
+    pub(crate) fn imported(harness: ResumeHarness, session_id: &str) -> Result<Self> {
+        if !valid_session_id(session_id) {
+            bail!("invalid native conversation id");
+        }
+        Ok(Self {
+            harness,
+            session_id: session_id.to_owned(),
+            updated_ms: 0,
+            preview: String::new(),
+        })
+    }
     pub(crate) const fn harness(&self) -> ResumeHarness {
         self.harness
     }
@@ -236,7 +247,10 @@ fn profile_harness(profile: &AgentProfile) -> Result<ResumeHarness> {
     }
 }
 
-fn profile_config_directory(profile: &AgentProfile, harness: ResumeHarness) -> Result<PathBuf> {
+pub(crate) fn profile_config_directory(
+    profile: &AgentProfile,
+    harness: ResumeHarness,
+) -> Result<PathBuf> {
     let (key, fallback) = match harness {
         ResumeHarness::Claude => (CLAUDE_CONFIG_KEY, ".claude"),
         ResumeHarness::Codex => (CODEX_CONFIG_KEY, ".codex"),

@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
-
-const [baseUrl = "http://127.0.0.1:7356", debugPort = "9224"] = process.argv.slice(2);
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 async function waitFor(predicate, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
@@ -11,6 +15,61 @@ async function waitFor(predicate, timeoutMs = 5000) {
   }
   throw new Error("timed out waiting for browser state");
 }
+
+
+async function quickTalkFixture() {
+  const profile = await mkdtemp(join(tmpdir(), "atmux-quick-talk-browser-"));
+  const streams = new Set();
+  const assets = new Map(await Promise.all(["index.html", "app.js", "app.css"].map(async (name) => [name, await readFile(new URL(`../web/${name}`, import.meta.url))])));
+  const sessions = [{ id: "fixture~%1", machine: "fixture", pane_id: "%1", name: "fixture-agent", agent: "claude", status: "waiting", instance_id: "pane-v1-" + "a".repeat(64), path: "/fixture" }];
+  const overview = { revision: 1, sessions, machines: [{ id: "fixture", kind: "local", label: "Fixture", online: true }], health: null };
+  const server = createServer((request, response) => {
+    const path = new URL(request.url, "http://fixture").pathname;
+    const json = (value) => response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(value));
+    if (path === "/api/v1/events" || path.endsWith("/events")) {
+      const payload = path === "/api/v1/events" ? overview : { revision: 1, content: "❯", content_hash: "a" };
+      const event = path === "/api/v1/events" ? "sessions.snapshot" : "pane.snapshot";
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+      streams.add(response); request.on("close", () => streams.delete(response)); return;
+    }
+    if (path === "/api/v1/sessions") return json(overview);
+    if (path.endsWith("/transcript")) return json({ available: false, source: "claude", messages: [] });
+    if (path.endsWith("/models")) return json({ harness: "claude", pane_id: sessions[0].id, models: [], model_options: [], effort_options: [] });
+    if (path.startsWith("/api/")) return json([]);
+    const name = path === "/" ? "index.html" : path.slice(1);
+    if (assets.has(name)) { response.writeHead(200, { "Content-Type": name.endsWith("js") ? "text/javascript" : name.endsWith("css") ? "text/css" : "text/html" }).end(assets.get(name)); return; }
+    response.writeHead(404).end();
+  });
+  server.listen(0, "127.0.0.1"); await once(server, "listening");
+  const chrome = spawn("google-chrome", ["--headless=new", "--no-sandbox", "--disable-gpu", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
+  let output = ""; let launchError;
+  chrome.on("error", (error) => { launchError = error; });
+  chrome.stderr.on("data", (chunk) => { output = (output + chunk).slice(-16384); });
+  const cleanup = async () => {
+    if (chrome.exitCode === null && chrome.signalCode === null) {
+      const exited = once(chrome, "exit"); const force = setTimeout(() => chrome.kill("SIGKILL"), 3000);
+      chrome.kill("SIGTERM"); try { await exited; } finally { clearTimeout(force); }
+    }
+    for (const response of streams) response.end();
+    server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
+    await rm(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  };
+  try {
+    const endpoint = await waitFor(() => {
+      if (launchError) throw launchError;
+      if (chrome.exitCode !== null) throw new Error(output);
+      return output.match(/DevTools listening on (ws:\/\/[^\s]+)/)?.[1];
+    });
+    return { baseUrl: `http://127.0.0.1:${server.address().port}`, debugPort: new URL(endpoint).port, cleanup };
+  } catch (error) { await cleanup(); throw error; }
+}
+
+
+const fixture = process.argv.length <= 2 ? await quickTalkFixture() : null;
+const [baseUrl = fixture?.baseUrl, debugPort = fixture?.debugPort || "9224"] = process.argv.slice(2);
+try {
+
 
 class Cdp {
   constructor(url) {
@@ -398,3 +457,5 @@ assert.equal(observed.sentImages[0].body.images.length, 1);
 
 cdp.close();
 console.log(`Quick Talk browser integration passed for ${paneId}`);
+
+} finally { await fixture?.cleanup(); }

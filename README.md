@@ -1412,8 +1412,47 @@ or require the Claude Pulse TypeScript service at runtime.
 
 MIT
 
+## Resume anywhere and startup dialogs
 
-### Durable session history (opt-in)
+Enable the same registry on coordinator and owners; use A3's `directory` and bundle limits.
+
+```toml
+[startup_prompts]
+auto_answer = true
+
+[registry]
+enabled = true
+directory = "/absolute/private/atmux/registry"
+# Coordinator only; requires [events] and configured owner ids:
+restore_on_start = true
+restore_machines = ["tron", "midnight"]
+
+[events]
+# Other event settings and token/mTLS federation remain owner configured.
+```
+
+Use **Resume on…** in **Sessions** or agent Actions. Pick an online owner; copy leaves the
+source running. Opt into closing the source after the target CLI verifies. MCP exposes
+`session_resume {session_key, machine, move?}` and the UI uses
+`POST /api/v1/registry/resume`. Target profile names must match and bind the correct native
+store (`CLAUDE_CONFIG_DIR` or `CODEX_HOME`). Repository lookup matches origin and branch under
+configured project roots; a missing repository is cloned without overwriting existing folders.
+
+Peer transport uses A3's `atmux.session.archive/v1` checksummed tar.gz bundles:
+`GET /api/v1/registry/{session_key}/record`, `GET /api/v1/registry/{session_key}/bundle`, and
+`POST /api/v1/registry/import` stream bounded archives. These endpoints require the owner's
+node bearer credential and reject browser requests. `POST /api/v1/registry/restore` restores
+only durable desired entries lost with the node/tmux server. A1's `node.started` is the
+phone-home signal; explicit closes persist in the same registry and remain excluded after restart.
+
+Startup handling accepts only exact recognized Claude development-channel, Claude workspace
+trust and Codex folder-trust dialogs. Development-channel acceptance requires the flag in the
+live process argv; trust requires a canonical cwd under a configured project root. Each answer
+is claimed once per process, verified, and recorded through the event service. Unknown dialogs
+remain visible with `agent.needs_input` reason `startup_prompt`. See
+[the feature record](features/resume-anywhere.md) for policy, bounds and verification evidence.
+
+## Durable session history (opt-in)
 
 `[registry] enabled = true` records owner-local agents under the platform state directory and
 archives their final native logs and Git position when panes disappear. Set `directory` to an
@@ -1431,8 +1470,9 @@ credential; browser/proxy access uses only the public history projection.
 Use the dashboard's **Sessions** view or MCP `sessions_search` / `session_get` to find current and
 archived work by stable session key. REST equivalents are `/api/v1/session-history` and
 `/api/v1/session-history/{session_key}`. Native provider ids and config roots are omitted from
-history responses. Resume wiring is supplied by the separate resume-anywhere workstream; the
-integration contract and acceptance evidence are in [the A3 record](features/session-registry-archive.md).
+history responses. **Resume on…** uses these same records and archives; the integration contract
+and acceptance evidence are in [the A3 record](features/session-registry-archive.md) and
+[the A4 record](features/resume-anywhere.md).
 
 ### Coordinator supervisor (opt-in)
 

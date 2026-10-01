@@ -33,6 +33,8 @@ struct PaneState {
     generation: String,
     status: Option<AgentStatus>,
     emitted: HashSet<String>,
+    startup_emitted: HashSet<String>,
+    startup_generation: String,
     hook_at: Option<std::time::Instant>,
     turn: Option<String>,
     needs_input: Option<String>,
@@ -44,6 +46,8 @@ struct PaneState {
 struct Checkpoints {
     sources: HashMap<String, String>,
     sink: Option<String>,
+    #[serde(default)]
+    node_boots: HashMap<String, String>,
 }
 #[derive(Debug)]
 pub struct EventService {
@@ -434,10 +438,87 @@ impl EventService {
         if checkpoints.sources.len() >= 256 && !checkpoints.sources.contains_key(machine) {
             bail!("too many event source checkpoints");
         }
+        for record in &page.events {
+            if record.event.event_type == "node.started"
+                && let Some(boot) = record
+                    .event
+                    .detail
+                    .get("boot_id")
+                    .and_then(serde_json::Value::as_str)
+                && crate::tmux::valid_session_key(boot)
+            {
+                checkpoints
+                    .node_boots
+                    .insert(machine.to_owned(), boot.to_owned());
+            }
+        }
         checkpoints
             .sources
             .insert(machine.to_owned(), page.next.clone());
         atomic_json(&self.directory.join("checkpoints.json"), &*checkpoints)
+    }
+
+    pub(crate) fn latest_node_boot(&self, machine: &str) -> Option<String> {
+        self.checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .node_boots
+            .get(machine)
+            .cloned()
+    }
+
+    pub(crate) fn startup_event(&self, session: &Session, answered: Option<(&str, bool)>) {
+        let marker = match answered {
+            Some((dialog, verified)) => format!("startup-answer:{dialog}:{verified}"),
+            None => "startup-input".to_owned(),
+        };
+        let mut panes = self
+            .panes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = panes.entry(session.pane_id.clone()).or_default();
+        // A separate marker includes the process stamp, so status observer resets
+        // cannot cause duplicate answers and PID reuse cannot suppress a new one.
+        let marker = format!(
+            "{marker}:{}:{:?}:{}",
+            session.pane_identity,
+            session.agent_pid,
+            session
+                .agent_pid
+                .and_then(crate::control::native_process_start_stamp)
+                .unwrap_or_default()
+        );
+        // Keep a fixed number of dialog outcomes for only the current process.
+        let generation = format!(
+            "{}:{:?}:{}",
+            session.pane_identity,
+            session.agent_pid,
+            session
+                .agent_pid
+                .and_then(crate::control::native_process_start_stamp)
+                .unwrap_or_default()
+        );
+        if state.startup_generation != generation {
+            state.startup_generation = generation;
+            state.startup_emitted.clear();
+        }
+        if state.startup_emitted.contains(&marker) {
+            return;
+        }
+        let (kind, reason) = if answered.is_some() {
+            ("agent.startup_prompt_answered", None)
+        } else {
+            ("agent.needs_input", Some("startup_prompt"))
+        };
+        if let Ok(mut event) = AgentEvent::from_session(&self.machine, session, kind, reason) {
+            if let Some((dialog, verified)) = answered {
+                event.detail = serde_json::json!({"dialog":dialog,"verified":verified,
+                    "agent_pid":session.agent_pid,"process_start":session.agent_pid.and_then(crate::control::native_process_start_stamp)});
+            }
+            if self.emit(event).is_ok() {
+                state.startup_emitted.insert(marker);
+            }
+        }
     }
 
     fn source_cursor(&self, machine: &str) -> Option<String> {
@@ -457,7 +538,13 @@ impl EventService {
     ) -> Result<()> {
         if owner {
             self.start_listener(control)?;
-            self.emit(AgentEvent::node_started(&self.machine)?)?;
+            let mut event = AgentEvent::node_started(&self.machine)?;
+            if let Some(boot) = control.registry_owner_boot() {
+                event.detail["boot_id"] = boot.clone().into();
+                event.session_key.clone_from(&boot);
+                event.instance_id = boot;
+            }
+            control.emit_agent_event(event)?;
         }
         if coordinator {
             let weak = Arc::downgrade(self);

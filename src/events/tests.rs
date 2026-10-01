@@ -1107,3 +1107,62 @@ async fn discovery_federators_keep_coordinator_events_out_of_the_owner_feed() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn startup_events_are_body_free_and_deduplicated_per_process_generation() {
+    let temp = Temp::new();
+    let service = EventService::open(
+        EventsConfig {
+            directory: Some(temp.0.join("spool")),
+            ..EventsConfig::default()
+        },
+        "tron".into(),
+        false,
+    )
+    .unwrap();
+    let mut session = pane_session();
+    session.agent_pid = Some(std::process::id());
+    session.content = "unrecognized startup secret".into();
+    service.startup_event(&session, None);
+    service.startup_event(&session, None);
+    service.startup_event(&session, Some(("@atmux_startup_codex_trust", true)));
+    service.startup_event(&session, Some(("@atmux_startup_codex_trust", true)));
+    let page = service.owner.read(&EventQuery::default()).await.unwrap();
+    assert_eq!(page.events.len(), 2);
+    assert_eq!(
+        page.events[0].event.reason.as_deref(),
+        Some("startup_prompt")
+    );
+    assert_eq!(
+        page.events[1].event.event_type,
+        "agent.startup_prompt_answered"
+    );
+    assert_eq!(page.events[1].event.detail["verified"], true);
+    assert!(!serde_json::to_string(&page).unwrap().contains("secret"));
+    let replay = page.events[1].event.clone();
+    let mut replayed = replay;
+    replayed.id = crate::tmux::new_session_key().unwrap();
+    service.emit(replayed).unwrap();
+    assert_eq!(
+        service
+            .owner
+            .read(&EventQuery::default())
+            .await
+            .unwrap()
+            .events
+            .len(),
+        2
+    );
+    session.agent_pid = Some(124);
+    service.startup_event(&session, None);
+    assert_eq!(
+        service
+            .owner
+            .read(&EventQuery::default())
+            .await
+            .unwrap()
+            .events
+            .len(),
+        3
+    );
+}

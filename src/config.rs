@@ -233,6 +233,8 @@ pub struct Config {
     #[serde(default)]
     pub recovery: RecoveryConfig,
     #[serde(default)]
+    pub startup_prompts: crate::startup_prompts::StartupPromptConfig,
+    #[serde(default)]
     pub self_update: SelfUpdateConfig,
     #[serde(default)]
     pub registry: crate::registry::RegistryConfig,
@@ -633,6 +635,9 @@ impl Config {
             .registry
             .validate()
             .context("invalid registry configuration")?;
+        if config.registry.restore_on_start && config.events.is_none() {
+            bail!("registry restore_on_start requires [events] for node.started");
+        }
         config.source_path = Some(path.clone());
         config
             .supervisor

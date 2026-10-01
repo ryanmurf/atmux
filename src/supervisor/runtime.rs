@@ -385,6 +385,21 @@ impl Supervisor {
         )
         .await
     }
+    fn pending_renewal(&self, job: &Job) -> Option<String> {
+        let key = format!(
+            "renew:{}:{}:{}",
+            job.id,
+            job.fence,
+            job.lease_expires_at.unwrap_or(0)
+        );
+        (self.store.state.claims.contains_key(&key)
+            && !self
+                .store
+                .state
+                .claims
+                .contains_key(&format!("confirmed:{key}")))
+        .then_some(key)
+    }
     async fn handle_job(
         &mut self,
         session: &SessionSummary,
@@ -393,6 +408,16 @@ impl Supervisor {
         reason: &str,
         now: u64,
     ) -> Result<()> {
+        if let Some(renewal) = self.pending_renewal(job) {
+            return self
+                .escalate(
+                    session,
+                    "Job lease renewal is unconfirmed; reconcile the ledger before continuing",
+                    &renewal,
+                    now,
+                )
+                .await;
+        }
         let context = self.agents.context(session).await?;
         if !self.live(session) || context.session != *session {
             return Ok(());
@@ -740,45 +765,8 @@ impl Supervisor {
                 .iter()
                 .filter(|j| &j.session_key == key && j.active())
                 .collect();
-            if assigned.len() == 1 {
-                let job = assigned[0];
-                if !job.leased(now) {
-                    self.escalate(
-                        session,
-                        "Job claim lease expired; reconcile before answering",
-                        &format!("expired:{}:{}", job.id, job.fence),
-                        now,
-                    )
-                    .await?;
-                    continue;
-                }
-                if let Some(expiry) = job.lease_expires_at
-                    && expiry.saturating_sub(now) <= self.config.lease_renew_before_seconds
-                {
-                    let renew_key = format!("renew:{}:{}:{expiry}", job.id, job.fence);
-                    if self.reserve(Some(session), Action::Renew, &renew_key, now)? {
-                        if self
-                            .platform
-                            .renew(job, self.config.lease_ttl_seconds)
-                            .await
-                            .is_err()
-                        {
-                            self.escalate(
-                                session,
-                                "Job lease renewal failed; inspect ledger before continuing",
-                                &renew_key,
-                                now,
-                            )
-                            .await?;
-                            continue;
-                        }
-                        self.decision(
-                            Some(session),
-                            "renewed",
-                            "assigned job lease renewed with current fence",
-                        )?;
-                    }
-                }
+            if assigned.len() == 1 && !self.maintain_lease(session, assigned[0], now).await? {
+                continue;
             }
             if session.status == "waiting"
                 && assigned.len() == 1
@@ -791,6 +779,70 @@ impl Supervisor {
         }
         self.digest(&jobs, now).await?;
         self.store.save()
+    }
+    async fn maintain_lease(
+        &mut self,
+        session: &SessionSummary,
+        job: &Job,
+        now: u64,
+    ) -> Result<bool> {
+        if let Some(renewal) = self.pending_renewal(job) {
+            self.escalate(
+                session,
+                "Job lease renewal is unconfirmed; reconcile the ledger before continuing",
+                &renewal,
+                now,
+            )
+            .await?;
+            return Ok(false);
+        }
+        if !job.leased(now) {
+            self.escalate(
+                session,
+                "Job claim lease expired; reconcile before answering",
+                &format!("expired:{}:{}", job.id, job.fence),
+                now,
+            )
+            .await?;
+            return Ok(false);
+        }
+        if let Some(expiry) = job.lease_expires_at
+            && expiry.saturating_sub(now) <= self.config.lease_renew_before_seconds
+        {
+            let key = format!("renew:{}:{}:{expiry}", job.id, job.fence);
+            if self.reserve(Some(session), Action::Renew, &key, now)? {
+                if self
+                    .platform
+                    .renew(job, self.config.lease_ttl_seconds)
+                    .await
+                    .is_err()
+                {
+                    self.escalate(
+                        session,
+                        "Job lease renewal failed; inspect ledger before continuing",
+                        &key,
+                        now,
+                    )
+                    .await?;
+                    return Ok(false);
+                }
+                self.decision(
+                    Some(session),
+                    "renewed",
+                    "assigned job lease renewed with current fence",
+                )?;
+                self.store.state.claims.insert(
+                    format!("confirmed:{key}"),
+                    Claim {
+                        at: now,
+                        session_key: session.session_key.clone(),
+                        instance: Some(session.instance_id.clone()),
+                    },
+                );
+                self.store.save()?;
+            }
+        }
+        Ok(true)
     }
     async fn close_finished(
         &mut self,

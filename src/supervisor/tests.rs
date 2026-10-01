@@ -121,6 +121,7 @@ struct Fake {
     audits: Mutex<Vec<String>>,
     fail_complete: Mutex<bool>,
     fail_project: Mutex<bool>,
+    fail_renew: Mutex<bool>,
     ci_green: Mutex<Option<bool>>,
     model_calls: Mutex<usize>,
 }
@@ -158,6 +159,9 @@ impl Platform for Fake {
     fn renew<'a>(&'a self, _job: &'a Job, _ttl: u32) -> BoxFuture<'a, ()> {
         Box::pin(async {
             self.effects.lock().unwrap().push("renew".into());
+            if *self.fail_renew.lock().unwrap() {
+                anyhow::bail!("ambiguous renewal");
+            }
             Ok(())
         })
     }
@@ -632,6 +636,41 @@ async fn permission_answer_is_durable_and_duplicates_do_not_answer_twice() {
     let mut sup = fixture.supervisor();
     sup.event(&event, 300).await.unwrap();
     assert_eq!(*fixture.fake.effects.lock().unwrap(), vec!["send:y"]);
+}
+#[tokio::test]
+async fn ambiguous_renewal_suspends_answers_across_restart_until_fresh_lease() {
+    let fixture = Fixture::new();
+    fixture.fake.jobs.lock().unwrap()[0].lease_expires_at = Some(300);
+    *fixture.fake.fail_renew.lock().unwrap() = true;
+    let mut sup = fixture.supervisor();
+    sup.tick(100).await.unwrap();
+    drop(sup);
+    let mut sup = fixture.supervisor();
+    sup.tick(180).await.unwrap();
+    let event = fixture.event("agent.needs_input", Some("permission"));
+    sup.event(&event, 200).await.unwrap();
+    assert_eq!(*fixture.fake.model_calls.lock().unwrap(), 0);
+    assert_eq!(
+        fixture
+            .fake
+            .effects
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|v| *v == "renew")
+            .count(),
+        1
+    );
+    fixture.fake.jobs.lock().unwrap()[0].lease_expires_at = Some(4000);
+    sup.event(&event, 201).await.unwrap();
+    assert!(
+        fixture
+            .fake
+            .effects
+            .lock()
+            .unwrap()
+            .contains(&"send:y".into())
+    );
 }
 #[tokio::test]
 async fn completion_quiet_period_and_project_saga_precede_close() {

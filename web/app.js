@@ -3936,6 +3936,16 @@ function savedSessionConfirmation({ machineId, machineLabel, profileLabel, direc
   ].join("\n");
 }
 
+// Stable-key resume controls are also reusable by A3's Sessions view.
+function resumeMachineOptions(machines) {
+  return (Array.isArray(machines) ? machines : []).filter((machine) => machine.online
+    && ["local", "remote"].includes(machine.kind) && /^[a-z0-9][a-z0-9_-]*$/.test(machine.id));
+}
+function sessionResumeIntent(session, machine, move = false) {
+  if (!session || !/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(session.session_key || "")
+    || !/^[a-z0-9][a-z0-9_-]*$/.test(machine || "")) return null;
+  return { session_key: session.session_key, machine, move: Boolean(move) };
+}
 function generatedSessionName(title) {
   const name = String(title || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
     .toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 100);
@@ -4018,6 +4028,7 @@ function bindInlineRenameGesture(node, open, timers = globalThis) {
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
+    resumeMachineOptions, sessionResumeIntent,
     generatedSessionName, inlineRenameAction, createInlineRenameEditor, bindInlineRenameGesture,
     MAX_MESSAGE_BYTES,
     MAX_IMAGE_ATTACHMENTS,
@@ -4458,6 +4469,9 @@ function initialize() {
     pendingKillId: null,
     pendingSessionEdit: null,
     pendingResumeId: null,
+    registryEnabled: false,
+    pendingResumeOn: null,
+    resumingOn: false,
     paneModels: null,
     paneModelsRequest: 0,
     modelSwitchingPaneId: null,
@@ -6859,14 +6873,12 @@ function initialize() {
       if (live) {
         const button = document.createElement("button"); button.className = "subtle"; button.textContent = "Open";
         button.addEventListener("click", () => selectSession(live.id)); item.append(button);
-      } else {
-        const button = document.createElement("button"); button.className = "subtle"; button.textContent = "Resume";
-        button.dataset.sessionResume = row.sessionKey;
-        // A4's clearly named hook owns destination selection and confirmation.
-        button.disabled = typeof window.atmuxSessionResume !== "function";
-        button.addEventListener("click", () => window.atmuxSessionResume?.(sessionHistoryResumeRequest(row)));
-        item.append(button);
       }
+      const button = document.createElement("button"); button.className = "subtle"; button.textContent = "Resume on…";
+      button.dataset.sessionResume = row.sessionKey;
+      button.disabled = !resumeMachineOptions(state.machines).length;
+      button.addEventListener("click", () => window.atmuxSessionResume(sessionHistoryResumeRequest(row)));
+      item.append(button);
       return item;
     });
     $("history-list").replaceChildren(...rows);
@@ -7019,6 +7031,8 @@ function initialize() {
     launch.textContent = launchCommand ? `tmux: ${launchCommand}` : "";
     renderModelControl(selected, controllable);
     renderAgentRestartAction(selected, controllable);
+    $("quick-resume-on").hidden = !state.registryEnabled || !sessionResumeIntent(selected, "local");
+    $("quick-resume-on").disabled = state.resumingOn || !resumeMachineOptions(state.machines).length;
     const resuming = Boolean(state.resumingPaneId);
     const preparingDuplicate = Boolean(state.duplicatingPaneId);
     for (const id of ["interrupt", "kill-open", "attach", "quick-duplicate", "quick-compact", "quick-interrupt", "quick-kill-open"]) $(id).disabled = !controllable || state.composerSending || resuming || preparingDuplicate;
@@ -9512,6 +9526,61 @@ function initialize() {
     $("quick-actions-dialog").close();
     $("resume-dialog").showModal();
   }
+  async function refreshRegistryCapability() {
+    try { await request("/api/v1/session-history?limit=1"); state.registryEnabled = true; render(); }
+    catch { state.registryEnabled = false; }
+  }
+  function openResumeOn(session) {
+    if (!state.registryEnabled || !sessionResumeIntent(session, "local")) return;
+    const machines = resumeMachineOptions(state.machines);
+    if (!machines.length) { toast("No machine is available to resume this session"); return; }
+    state.pendingResumeOn = { session_key: session.session_key, name: session.name, machine: session.machine };
+    $("quick-actions-dialog").close();
+    $("resume-on-machine").replaceChildren(...machines.map((machine) => {
+      const option = document.createElement("option"); option.value = machine.id; option.textContent = machine.label || machine.id;
+      return option;
+    }));
+    $("resume-on-machine").value = machines.find((machine) => machine.id !== session.machine)?.id || machines[0].id;
+    $("resume-on-session").textContent = session.name;
+    $("resume-on-move").checked = false;
+    $("resume-on-error").hidden = true;
+    $("resume-on-confirm").disabled = false;
+    $("resume-on-dialog").showModal();
+  }
+  $("quick-resume-on").addEventListener("click", () => openResumeOn(state.sessions.get(state.selected)));
+  window.atmuxSessionResume = (request) => {
+    state.registryEnabled = true;
+    const row = state.historyRows.find((row) => row.sessionKey === request.session_key);
+    openResumeOn({session_key:request.session_key,name:row?.name || request.session_key,machine:row?.machine});
+  };
+  document.addEventListener("atmux:session-resume", (event) => openResumeOn(event.detail));
+  $("resume-on-dialog").addEventListener("close", () => { state.pendingResumeOn = null; });
+  $("resume-on-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (state.resumingOn || !state.pendingResumeOn) return;
+    const session = state.pendingResumeOn;
+    const machine = $("resume-on-machine").value;
+    if (!resumeMachineOptions(state.machines).some((candidate) => candidate.id === machine)) {
+      $("resume-on-error").textContent = "The target machine is offline. Choose another machine.";
+      $("resume-on-error").hidden = false; return;
+    }
+    const body = sessionResumeIntent(session, machine, $("resume-on-move").checked);
+    if (!body) return;
+    state.resumingOn = true; $("resume-on-confirm").disabled = true;
+    try {
+      const result = await request("/api/v1/registry/resume", { method: "POST", body: JSON.stringify(body) });
+      if (!result.verified || result.session_key !== body.session_key || result.machine !== body.machine) throw new Error("The target could not verify this session");
+      if (state.pendingResumeOn === session) $("resume-on-dialog").close();
+      state.pendingSelectionName = { name: result.name, machine: result.machine };
+      reconcileSelection(); toast(`Resumed ${session.name} on ${result.machine}`);
+    } catch (error) {
+      if (state.pendingResumeOn === session) { $("resume-on-error").textContent = error.message; $("resume-on-error").hidden = false; }
+      else toast(error.message);
+    } finally {
+      state.resumingOn = false; $("resume-on-confirm").disabled = false; render();
+    }
+  });
+
   $("quick-resume").addEventListener("click", openRestartDialog);
   for (const [quickId, actionId] of [["quick-tmux-prefix-twice", "tmux-prefix-twice"], ["quick-interrupt", "interrupt"], ["quick-kill-open", "kill-open"]]) {
     $(quickId).addEventListener("click", () => {
@@ -11112,6 +11181,7 @@ function initialize() {
   if (state.historyOpen) void loadSessionHistory();
   void refreshFleetUpdates();
   void refreshFleetRecovery(false);
+  void refreshRegistryCapability();
   if (state.selected) connectPane();
   if (state.pulseOpen) void loadPulseAccounts();
 }

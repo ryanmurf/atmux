@@ -85,6 +85,7 @@ Event types (`type`), with `reason` where noted:
 | `agent.started` | A CLI process started in a pane (reason: `launch`, `relaunch`, `resume`, `restore`, `discovered`) |
 | `agent.turn_completed` | The agent finished a turn and is idle |
 | `agent.needs_input` | The agent is waiting on a human (reason: `idle_prompt`, `question`, `permission`, `startup_prompt`, `plan_approval`) |
+| `agent.startup_prompt_answered` | A known startup dialog was answered once (detail: dialog, verified, agent_pid, process_start; no dialog text or argv) |
 | `agent.working` | The agent resumed work after input |
 | `agent.compacted` | A native compaction happened (detail: trigger, pre/post tokens) |
 | `agent.summary_updated` | The rolling digest or title changed (detail: title, description, digest, digest_version) |

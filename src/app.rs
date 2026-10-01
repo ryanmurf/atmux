@@ -186,6 +186,9 @@ impl App {
         let sessions = self
             .tmux
             .sessions(&self.previous_hashes, &self.config.status)?;
+        for session in &sessions {
+            crate::startup_prompts::handle(&self.config, session);
+        }
         self.previous_hashes = sessions
             .iter()
             .map(|session| (session.pane_id.clone(), session.content_hash))
@@ -385,6 +388,12 @@ impl App {
                 if self.current_session.as_deref() == Some(&name) {
                     self.message = Some(("atmux cannot kill its own session".to_owned(), true));
                 } else {
+                    let fresh = self.tmux.sessions(&HashMap::new(), &self.config.status)?;
+                    let affected = fresh
+                        .into_iter()
+                        .filter(|session| session.name == name)
+                        .collect::<Vec<_>>();
+                    crate::registry::Registry::close_intents(&self.config.registry, &affected)?;
                     self.tmux.kill(&name)?;
                     self.message = Some((format!("killed {name}"), false));
                     self.refresh()?;

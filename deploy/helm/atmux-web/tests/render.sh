@@ -69,9 +69,42 @@ assert_unique_top_level_keys "$work/enabled.yaml"
 grep -Fq 'hostAliases:' "$work/events.yaml"
 grep -Fq 'ip: 10.152.183.23' "$work/events.yaml"
 grep -Fq 'directory = "/var/lib/atmux/data/events"' "$work/events.yaml"
+# Large integers must stay TOML integers, never floats like 1.6777216e+07.
+grep -Fq 'max_bytes = 16777216' "$work/events.yaml"
+grep -Fq 'retention_seconds = 604800' "$work/events.yaml"
+if grep -Eq '^[a-z_]+ = [0-9.]+e[+-]?[0-9]+$' "$work/events.yaml" "$work/control-plane.yaml" 2>/dev/null; then
+  echo "a numeric setting rendered in exponent form" >&2
+  exit 1
+fi
 grep -Fq 'brokers = ["redpanda.herodevs.svc.cluster.local:9092"]' "$work/events.yaml"
 grep -Fq 'tenant_id = "95efe33d-fa71-53ce-8e0a-3fe45ac0e58a"' "$work/events.yaml"
 grep -Fq 'matchLabels: {app: redpanda}' "$work/events.yaml"
+
+"$helm_bin" template atmux-web "$chart" --namespace murphytek "${enabled_values[@]}" \
+  --set server.summaries.enabled=true \
+  --set server.summaries.searchTenantId=95efe33d-fa71-53ce-8e0a-3fe45ac0e58a \
+  --set server.registry.enabled=true --set server.registry.restoreOnStart=true \
+  --set-json 'server.registry.restoreMachines=["midnight","clue"]' \
+  --set-json 'server.extraEgress=[{"cidr":"203.0.113.10/32","ports":[443]}]' \
+  >"$work/control-plane.yaml"
+assert_unique_top_level_keys "$work/control-plane.yaml"
+grep -Fq '[summaries]' "$work/control-plane.yaml"
+grep -Fq 'endpoint = "http://192.168.0.124:8091/v1"' "$work/control-plane.yaml"
+grep -Fq 'store_dir = "/var/lib/atmux/data/summaries"' "$work/control-plane.yaml"
+grep -Fq 'search_tenant_id = "95efe33d-fa71-53ce-8e0a-3fe45ac0e58a"' "$work/control-plane.yaml"
+grep -Fq '[registry]' "$work/control-plane.yaml"
+grep -Fq 'directory = "/var/lib/atmux/data/registry"' "$work/control-plane.yaml"
+grep -Fq 'bundle_quota_bytes = 21474836480' "$work/control-plane.yaml"
+grep -Fq 'restore_machines = ["midnight","clue"]' "$work/control-plane.yaml"
+grep -Fq 'cidr: "192.168.0.124/32"' "$work/control-plane.yaml"
+grep -Fq 'port: 8091' "$work/control-plane.yaml"
+grep -Fq 'cidr: "203.0.113.10/32"' "$work/control-plane.yaml"
+for section in '[summaries]' '[registry]' 'port: 8091'; do
+  if grep -Fq "$section" "$work/enabled.yaml"; then
+    echo "disabled $section unexpectedly rendered" >&2
+    exit 1
+  fi
+done
 if grep -Fq '[events]' "$work/enabled.yaml"; then
   echo "disabled event telemetry unexpectedly rendered configuration" >&2
   exit 1

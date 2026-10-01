@@ -121,6 +121,7 @@ const TYPES: &[&str] = &[
     "session.closed",
     "session.archived",
     "session.resumed",
+    "agent.startup_prompt_answered",
     "node.started",
     "supervisor.decision",
     "supervisor.startup",

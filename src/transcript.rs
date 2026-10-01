@@ -468,10 +468,9 @@ pub(crate) struct ClaudeResumeTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NativeResumeTarget {
     pub(crate) config_dir: PathBuf,
+    pub(crate) log_path: PathBuf,
     pub(crate) session_id: String,
     pub(crate) session_fingerprint: String,
-    /// Exact log selected by the existing native identity checks (registry/A4).
-    pub(crate) log_path: PathBuf,
 }
 
 /// Resolves the exact native saved conversation currently held open by a pane.
@@ -508,9 +507,50 @@ pub(crate) fn native_resume_target(session: &Session) -> Option<NativeResumeTarg
     digest.update(canonical.to_string_lossy().as_bytes());
     Some(NativeResumeTarget {
         config_dir,
+        log_path,
         session_id,
         session_fingerprint: format!("{:x}", digest.finalize()),
+    })
+}
+
+/// Registry transport uses a configured profile binding, which may be outside
+/// the conventional home stores. The caller must validate that binding first.
+pub(crate) fn native_resume_target_in_store(
+    session: &Session,
+    root: &Path,
+) -> Option<NativeResumeTarget> {
+    let (session_id, log_path) = match session.agent {
+        AgentKind::Claude => match claude_metadata_in_root(session, session.agent_pid?, root) {
+            ClaudeMetadata::Matched {
+                target,
+                log_exists: true,
+            } => (target.session_id, target.log_path),
+            _ => return None,
+        },
+        AgentKind::Codex => {
+            let path = locate_codex(session, root)?;
+            let name = path.file_name()?.to_str()?;
+            let id = first_json_values(&path, 8)?.iter().find_map(|row| {
+                (row.get("type").and_then(Value::as_str) == Some("session_meta"))
+                    .then(|| row.pointer("/payload/id").and_then(Value::as_str))
+                    .flatten()
+                    .filter(|id| valid_session_id(id) && name.ends_with(&format!("{id}.jsonl")))
+                    .map(str::to_owned)
+            })?;
+            (id, path)
+        }
+        AgentKind::Other => return None,
+    };
+    let canonical = log_path.canonicalize().ok()?;
+    let mut digest = Sha256::new();
+    digest.update(session.agent.to_string().to_ascii_lowercase().as_bytes());
+    digest.update([0]);
+    digest.update(canonical.to_string_lossy().as_bytes());
+    Some(NativeResumeTarget {
+        config_dir: root.to_owned(),
         log_path,
+        session_id,
+        session_fingerprint: format!("{:x}", digest.finalize()),
     })
 }
 

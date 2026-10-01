@@ -6,7 +6,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde::Deserialize;
 
@@ -16,6 +16,10 @@ pub(crate) fn routes(control: ControlPlane) -> Router {
         .route("/api/v1/session-history/{key}", get(record))
         .route("/api/v1/registry", get(changes))
         .route("/api/v1/registry/{key}/bundle", get(bundle))
+        .route("/api/v1/registry/{key}/record", get(export_record))
+        .route("/api/v1/registry/import", post(import_bundle))
+        .route("/api/v1/registry/restore", post(restore))
+        .route("/api/v1/registry/stop-source", post(stop_source))
         .with_state(control)
 }
 fn error(status: StatusCode, message: &'static str) -> Response {
@@ -72,6 +76,7 @@ fn peer(control: &ControlPlane, headers: &HeaderMap) -> bool {
 struct ChangesQuery {
     after: Option<String>,
     wait_ms: Option<u64>,
+    restore_boot: Option<String>,
 }
 async fn changes(
     State(control): State<ControlPlane>,
@@ -85,6 +90,12 @@ async fn changes(
         Ok(value) => value,
         Err(error) => return history_error(&error),
     };
+    if let Some(boot) = query.restore_boot {
+        return match registry.pending_restore_page(&boot, query.after.as_deref()) {
+            Ok(page) => Json(page).into_response(),
+            Err(_) => error_response(StatusCode::BAD_REQUEST),
+        };
+    }
     match registry
         .changes(query.after.as_deref(), query.wait_ms.unwrap_or(10_000))
         .await
@@ -129,4 +140,175 @@ async fn bundle(
         response.headers_mut().insert(header::CONTENT_LENGTH, value);
     }
     response
+}
+
+async fn export_record(
+    State(control): State<ControlPlane>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+) -> Response {
+    if !peer(&control, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED);
+    }
+    match control.registry_export_record(&key).await {
+        Ok(record) => Json(record).into_response(),
+        Err(error) => history_error(&error),
+    }
+}
+async fn import_bundle(
+    State(control): State<ControlPlane>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if !peer(&control, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED);
+    }
+    let Some(generation) = headers
+        .get("x-atmux-resume-generation")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    else {
+        return error_response(StatusCode::BAD_REQUEST);
+    };
+    let registry = match control.registry() {
+        Ok(value) => value,
+        Err(error) => return history_error(&error),
+    };
+    let Ok(staged) = crate::resume_anywhere::StagedFile::new(&registry) else {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let Ok(file) = staged.file.try_clone() else {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let mut file = tokio::fs::File::from_std(file);
+    let received = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        use http_body_util::BodyExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        let mut body = body;
+        let mut bytes = 0_u64;
+        while let Some(frame) = body.frame().await {
+            let frame = frame?;
+            if let Ok(data) = frame.into_data() {
+                bytes = bytes
+                    .checked_add(data.len() as u64)
+                    .ok_or_else(|| anyhow::anyhow!("archive size overflow"))?;
+                anyhow::ensure!(bytes <= registry.bundle_limit(), "archive exceeds cap");
+                file.write_all(&data).await?;
+            }
+        }
+        file.sync_all().await?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+    if !matches!(received, Ok(Ok(()))) {
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    match control
+        .registry_import(
+            staged.file.try_clone().expect("owned staging descriptor"),
+            generation,
+            false,
+        )
+        .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => history_error(&error),
+    }
+}
+async fn restore(
+    State(control): State<ControlPlane>,
+    headers: HeaderMap,
+    Json(request): Json<crate::resume_anywhere::RestoreRequest>,
+) -> Response {
+    if !peer(&control, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED);
+    }
+    match control.registry_restore(request).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => history_error(&error),
+    }
+}
+async fn stop_source(
+    State(control): State<ControlPlane>,
+    headers: HeaderMap,
+    Json(request): Json<crate::resume_anywhere::StopSourceRequest>,
+) -> Response {
+    if !peer(&control, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED);
+    }
+    match control
+        .registry_stop_source(request, control.local_id())
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => history_error(&error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, os::unix::fs::PermissionsExt as _};
+    use tower::ServiceExt as _;
+    #[tokio::test]
+    async fn peer_import_requires_owner_credential_rejects_browsers_and_bounds_streams() {
+        let root = std::env::temp_dir().join(format!(
+            "atmux-a4-peer-{}",
+            crate::tmux::new_session_key().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let token = root.join("token");
+        fs::write(&token, "fixture-owner-token").unwrap();
+        fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut config = crate::config::Config::default();
+        config.registry.enabled = true;
+        config.registry.directory = Some(root.join("registry"));
+        config.registry.bundle_max_bytes = 64 * 1024;
+        config.node.token_file = Some(token);
+        let control = crate::control::test_control_with_config(&[], config);
+        let app = routes(control);
+        for browser in [true, false] {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/registry/import")
+                .header(header::AUTHORIZATION, "Bearer fixture-owner-token")
+                .header("x-atmux-resume-generation", "1");
+            if browser {
+                request = request.header(header::ORIGIN, "http://fixture");
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(vec![0; 64 * 1024 + 1])).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if browser {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                }
+            );
+        }
+        let request = axum::http::Request::builder()
+            .uri("/api/v1/registry")
+            .header(header::AUTHORIZATION, "Bearer fixture-owner-token")
+            .header("sec-fetch-mode", "navigate")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let request = axum::http::Request::builder()
+            .uri("/api/v1/registry")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

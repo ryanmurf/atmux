@@ -41,6 +41,28 @@ server:
   # Production overrides use the reviewed private IPs whose IP SANs are in the
   # host certificates. DNS aliases and mDNS are intentionally not used in K8s.
   machines: []
+  # Rolling Qwen digests, automatic descriptions and (with searchTenantId)
+  # ATMUX_SESSION search documents. Egress to the endpoint is opened only when
+  # enabled.
+  summaries:
+    enabled: false
+    endpoint: http://192.168.0.124:8091/v1
+    model: qwen3.8-flash-next
+    allowHttpHosts: [192.168.0.124]
+    egressCidr: 192.168.0.124/32
+    egressPort: 8091
+    minIntervalSeconds: 300
+    dailyRequestBudget: 500
+    searchTenantId: ""
+  # Central session registry and archive bundles on the existing PVC.
+  registry:
+    enabled: false
+    bundleQuotaBytes: 21474836480
+    restoreOnStart: false
+    restoreMachines: []
+  # Additional coordinator egress, for example the herodevs gateway or GitHub
+  # API for intake: [{cidr: 203.0.113.10/32, ports: [443]}]
+  extraEgress: []
   events:
     enabled: false
     # The coordinator stores its bounded owner/fleet logs on the existing PVC.

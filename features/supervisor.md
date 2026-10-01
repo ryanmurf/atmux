@@ -110,6 +110,16 @@ archived. Autonomy is approved; everything is audited.
 - Channel notification request IDs use A5's deterministic UUIDv8 helper, matching H4's UUID schema.
   The new assignment and lease paths passed all 20 focused supervisor tests and all-target,
   all-feature clippy with `-D warnings`.
+- Merged the requested lead integration through `ce77c67` (including `08456e1` and A4). Guarded
+  closes now persist A3's intentional-close tombstone before killing a pane and release the native
+  resume lease, so A4 phone-home restore cannot reopen completed jobs. The owner checks tmux's
+  actual pane count, including shell panes omitted from agent discovery. The disposable E2E
+  confirms stale-output refusal, neighboring-shell preservation, fenced renewal, both escalation
+  destinations, verified completion, project update, close/archive and the restore exclusion.
+- Unconfirmed renewal claims remain suspended across restarts until a fresh ledger expiry/fence
+  is observed. Focused acceptance passed 21 unit tests plus the configured disposable lifecycle;
+  the reconciled full gate passed 935 Rust tests (7 ignored), 196 JavaScript tests and all 13
+  browser cases. Formatting and all-target/all-feature clippy passed with zero warnings.
 - Intermediate full gate: `cargo fmt`, all-target/all-feature clippy with `-D warnings`, 901 Rust
   tests passed / 7 ignored, 193 JavaScript tests passed, and all 12 browser cases passed across
   the initial run and the isolated 9-case mobile-suite rerun. E2E used loopback OAuth/JWKS,

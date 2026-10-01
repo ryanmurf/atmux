@@ -2065,7 +2065,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       compactInComposer: document.getElementById('compact') !== null,
     })`);
     assert.equal(quickActions.modelControl, true, JSON.stringify(quickActions));
-    assert.deepEqual(quickActions.actions, ["Duplicate agent", "Copy agent link", "Restart session", "Compact", "Download raw output", "Ctrl+B ×2", "Interrupt", "Kill agent"]);
+    assert.deepEqual(quickActions.actions, ["Duplicate agent", "Copy agent link", "Restart session", "Resume on…", "Compact", "Download raw output", "Ctrl+B ×2", "Interrupt", "Kill agent"]);
     assert.equal(quickActions.compactInComposer, false, JSON.stringify(quickActions));
 
     const keyLayout = await cdp.evaluate(`(() => ({

@@ -216,6 +216,22 @@ impl AtmuxMcp {
     }
 
     #[tool(
+        name = "session_resume",
+        description = "Resume a durable session_key on a configured machine with its native conversation and profile. Source stays running by default; move=true closes its exact exported pane generation only after the target CLI verifies. Registry resume must be enabled on coordinator and owners."
+    )]
+    async fn session_resume(
+        &self,
+        Parameters(request): Parameters<crate::resume_anywhere::SessionResumeRequest>,
+    ) -> Result<String, String> {
+        let result = self
+            .control
+            .session_resume(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        serde_json::to_string(&result).map_err(|error| error.to_string())
+    }
+
+    #[tool(
         name = "agent_conversation",
         description = "Read a bounded, owner-redacted Claude or Codex conversation by pane or stable session key. Default includes human, agent, subagent and compaction; tool inputs/outputs require include: [tools]. after is an entry id, applied before filtering; an expired cursor errors. next is the last returned entry for pagination or tailing. A byte ceiling too small for the next entry returns an empty truncated page; increase max_bytes."
     )]

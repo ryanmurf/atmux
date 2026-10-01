@@ -11,7 +11,7 @@ use atmux::{
     machine::now_ms,
     registry::{RegistryPage, SessionState},
     remote::RemoteMachine,
-    supervisor::{ProjectStatus, SupervisorConfig},
+    supervisor::{Guard, GuardedMessage, ProjectStatus, SupervisorConfig},
 };
 use axum::{
     Json, Router,
@@ -209,6 +209,19 @@ async fn hd(State(s): State<Fixtures>, Json(v): Json<Value>) -> Json<Value> {
     let query = v["query"].as_str().unwrap();
     if query.contains("listJobs") {
         Json(json!({"data":{"tenant":{"listJobs":s.jobs.lock().unwrap().clone()}}}))
+    } else if query.contains("renewClaim") {
+        let mut jobs = s.jobs.lock().unwrap();
+        let job = jobs
+            .iter_mut()
+            .find(|j| j["id"] == v["variables"]["id"])
+            .unwrap();
+        assert_eq!(v["variables"]["fence"], job["fenceToken"]);
+        assert_eq!(v["variables"]["detail"], 3600);
+        job["leaseExpiresAt"] =
+            json!(chrono::DateTime::from_timestamp(
+            i64::try_from(now_ms() / 1000 + 3600).unwrap(), 0,
+        ).unwrap().to_rfc3339());
+        Json(json!({"data":{"channelMutations":{"renewClaim":job.clone()}}}))
     } else if query.contains("completeJob") {
         let mut jobs = s.jobs.lock().unwrap();
         let job = jobs
@@ -318,9 +331,65 @@ async fn configured_supervisor_answers_verifies_closes_and_archives_disposable_a
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
+    let permission = sessions.iter().find(|s| s.name == "permission").unwrap();
+    let stale = GuardedMessage {
+        guard: Guard {
+            session_key: permission.session_key.clone().unwrap(),
+            instance_id: permission.instance_id.clone(),
+            content_hash: "0000000000000000".into(),
+            status: "waiting".into(),
+        },
+        text: "y".into(),
+    };
+    assert!(
+        remote
+            .post_json(
+                &format!("/api/v1/supervisor/panes/{}/message", permission.pane_id),
+                &stale
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        !root.join("answered").exists(),
+        "stale evidence must not send input"
+    );
+    let danger = sessions.iter().find(|s| s.name == "danger").unwrap();
+    let extra = owner.tmux(&[
+        "split-window",
+        "-d",
+        "-t",
+        &danger.pane_id,
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "sleep 300",
+    ]);
+    let guard = Guard {
+        session_key: danger.session_key.clone().unwrap(),
+        instance_id: danger.instance_id.clone(),
+        content_hash: danger.content_hash.clone(),
+        status: "waiting".into(),
+    };
+    assert!(
+        remote
+            .post_json(
+                &format!("/api/v1/supervisor/panes/{}/close", danger.pane_id),
+                &guard
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        owner
+            .tmux(&["list-panes", "-t", "danger", "-F", "#{pane_id}"])
+            .contains(&extra)
+    );
+    owner.tmux(&["kill-pane", "-t", &extra]);
     let fixtures = Fixtures::default();
     for session in &sessions {
         fixtures.jobs.lock().unwrap().push(json!({"id":format!("message-{}",session.name),"jobId":format!("job-{}",session.name),"channelId":"board","jobState":"IN_PROGRESS","fenceToken":7,
+            "leaseExpiresAt":chrono::DateTime::from_timestamp(i64::try_from(now_ms()/1000+800).unwrap(),0).unwrap().to_rfc3339(),
             "metadata":{"session_key":session.session_key,"folder":root.join("project"),"repo_remote":"https://github.com/org/repo","goal":"Fix tests","completion_criteria":"PR open, CI green, tests reported",
                 "project_id":"project","project_item_id":"item","require_pr":true,"require_ci":true,"require_tests":true}}));
     }
@@ -430,9 +499,15 @@ async fn configured_supervisor_answers_verifies_closes_and_archives_disposable_a
                 .as_str()
                 .is_some_and(|q| q.contains("slackMutations"))
         });
+        let renewed = calls.iter().any(|v| {
+            v["query"]
+                .as_str()
+                .is_some_and(|q| q.contains("renewClaim"))
+        });
         if fs::read_to_string(root.join("answered")).ok().as_deref() == Some("y")
             && archived
             && notified
+            && renewed
         {
             break;
         }
@@ -454,6 +529,19 @@ async fn configured_supervisor_answers_verifies_closes_and_archives_disposable_a
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     fs::write(stop, "").unwrap();
+    let closed: Value = serde_json::from_slice(
+        &fs::read(
+            root.join("registry/records")
+                .join(format!("{done_key}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        closed["desired_running"], false,
+        "completed sessions must not be restored"
+    );
+    assert_eq!(closed["close_reason"], "user");
     assert_eq!(
         fixtures
             .jobs
@@ -493,6 +581,7 @@ async fn configured_supervisor_answers_verifies_closes_and_archives_disposable_a
         "supervisor.project_updated",
         "supervisor.closed",
         "supervisor.escalated",
+        "supervisor.renewed",
     ] {
         assert!(
             events.events.iter().any(|e| e.event.event_type == kind),
