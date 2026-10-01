@@ -187,3 +187,35 @@ off in production. H4 adds job creation and enables the sweeper.
 `main`; a merged module ships only after hd-api's Publish Image workflow runs, and new
 `trigger.*` RLS-ignored tables must be mirrored in `hd-api/src/main/resources/service.yml` and
 `hd-helm` `charts/local/values.yaml`.
+
+## Phase 2: intake router and supervisor (A5, A6), after A1–A4 and H4 merge
+
+Runs inside the atmux coordinator (Kubernetes, federates every owner), enabled by `[intake]` with a
+`dry_run` switch and a kill switch. Free local Qwen does the per-item work so no single agent holds
+everything in context: Flash Next (`192.168.0.124:8091`, 262K context) for triage and digests, the
+27B (`192.168.0.124:8096`, router on Max) for routing and supervision decisions. Hard or ambiguous
+decisions escalate to Ryan.
+
+**A5 intake (sources, ledger, router).**
+- Sources: GitHub ProjectsV2 boards `neverendingsupport` #40 NES Factorio and #51 NES Java Team v2
+  (GraphQL polling, token from a mounted secret); Gather meeting transcripts already indexed in
+  herodevs search (new `FileUpload` Markdown since a cursor, Qwen extracts Ryan's action items);
+  Slack via existing herodevs Slack triggers posting to an intake channel; atmux sessions that went
+  idle with unfinished work.
+- Ledger: herodevs channel jobs (H4), one channel per board or source, job metadata carrying the
+  source URL, project item id, repo remote, folder, machine, and assigned `session_key`.
+- Router: for each new job, candidates are live sessions whose project matches (registry) plus
+  digest search (`sessions_find`, herodevs `search.query` over `ATMUX_SESSION`); Qwen chooses to
+  hand the job to an existing session or launch a new one in the right folder (found by repo remote
+  under the configured project roots, cloning if absent) with the right profile and mode, then
+  sends a kickoff prompt carrying the job context and completion criteria.
+
+**A6 supervisor.**
+- On `agent.needs_input`: read `agent_summary` and the last turn; answer routine prompts (continue,
+  permission within the job's scope, questions answerable from the job) or escalate to Ryan via
+  Slack and the `ryan-tron` channel, with a link to the pane.
+- On `agent.turn_completed`: check the job's completion criteria (PR opened or merged, CI green,
+  tests reported), complete or fail the job, update the GitHub project item status, and close the
+  tmux session (which archives it through A3) once the job is done and the session is idle.
+- Nudge stalled sessions; enforce budgets (sessions per machine, Qwen calls per hour); publish
+  every decision as an event so the audit trail lives in Redpanda and search.
