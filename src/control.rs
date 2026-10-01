@@ -4551,6 +4551,15 @@ impl ControlPlane {
             .ok_or_else(|| not_found(format!("no agent session matches {id}")))
     }
 
+    pub(crate) fn conversation_reference(&self, id: &str) -> Result<String> {
+        match self.resolve(id)? {
+            Target::Local { pane_id, .. } => Ok(self.local_identity(&pane_id)),
+            Target::Remote {
+                machine, pane_id, ..
+            } => Ok(composite_id(&machine.id, &pane_id)),
+        }
+    }
+
     /// Resolves a composite id, a bare pane id, or a session name to its owner.
     ///
     /// Bare identifiers keep working exactly as they did before federation: a

@@ -157,6 +157,22 @@ impl AtmuxMcp {
     }
 
     #[tool(
+        name = "agent_conversation",
+        description = "Read a bounded, owner-redacted Claude or Codex conversation by pane or stable session key. Default includes human, agent, subagent and compaction; tool inputs/outputs require include: [tools]. after is an entry id, applied before filtering; an expired cursor errors. next is the last returned entry for pagination or tailing. A byte ceiling too small for the next entry returns an empty truncated page; increase max_bytes."
+    )]
+    async fn agent_conversation(
+        &self,
+        Parameters(request): Parameters<crate::conversation::ConversationRequest>,
+    ) -> Result<String, String> {
+        let response = self
+            .control
+            .agent_conversation(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        serde_json::to_string(&response).map_err(|error| error.to_string())
+    }
+
+    #[tool(
         name = "machines_list",
         description = "List federated machines with their online state, session counts, health, and last contact time. An offline machine never blocks the others."
     )]

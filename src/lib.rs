@@ -7,6 +7,7 @@ mod auto_update;
 pub mod code_nav;
 pub mod config;
 pub mod control;
+pub mod conversation;
 pub mod discovery;
 mod launch_directory;
 pub mod machine;

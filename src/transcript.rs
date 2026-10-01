@@ -2292,6 +2292,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn conversation_pages_filter_both_native_harness_fixtures() {
+        use crate::conversation::{ConversationRequest, Include, page};
+        for (source, log) in [
+            ("claude", include_str!("../tests/fixtures/a2-claude.jsonl")),
+            ("codex", include_str!("../tests/fixtures/a2-codex.jsonl")),
+        ] {
+            let (messages, truncated) = if source == "claude" {
+                parse_claude(&tail(log))
+            } else {
+                parse_codex(&tail(log))
+            };
+            let transcript = Transcript {
+                available: true,
+                source: source.into(),
+                content_hash: "fixture".into(),
+                changed: true,
+                truncated,
+                messages: Some(messages),
+                note: None,
+            };
+            let mut request = ConversationRequest {
+                id: "%1".into(),
+                include: None,
+                after: None,
+                limit: Some(1),
+                max_bytes: None,
+            };
+            let first = page(transcript.clone(), &request).unwrap();
+            assert_eq!(first.entries[0].role, "user");
+            request.after = first.next;
+            request.include = Some(vec![Include::Agent]);
+            request.limit = Some(240);
+            let rest = page(transcript.clone(), &request).unwrap();
+            assert_eq!(rest.entries.len(), 2);
+            assert!(
+                rest.entries
+                    .iter()
+                    .all(|entry| entry.kind == "message" && entry.tool_output.is_none())
+            );
+            request.after = None;
+            request.include = Some(vec![Include::Tools]);
+            assert!(!page(transcript, &request).unwrap().entries.is_empty());
+        }
+    }
+
+    #[test]
     fn claude_native_context_uses_latest_complete_assistant_usage_and_reset_order() {
         let first = serde_json::json!({
             "type": "assistant",
