@@ -770,7 +770,7 @@ impl Tmux {
         // reused for another process generation.
         #[allow(clippy::needless_pass_by_value)] scope: PreparedScope,
     ) -> Result<()> {
-        Self::launch_inner(name, directory, profile, mode, None, None, scope)
+        Self::launch_inner(name, directory, profile, mode, None, None, None, scope)
     }
 
     /// Creates a detached session that resumes one owner-revalidated native
@@ -799,11 +799,38 @@ impl Tmux {
             mode,
             Some(resume),
             Some(resume_lease),
+            None,
             scope,
         )
     }
 
-    #[allow(clippy::needless_pass_by_value)] // Enforce one preflight per process generation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_imported(
+        name: &str,
+        directory: &Path,
+        profile: &AgentProfile,
+        mode: Option<&ProfileMode>,
+        resume: &ResumeCandidate,
+        resume_lease: &str,
+        session_key: &str,
+        scope: PreparedScope,
+    ) -> Result<()> {
+        if !valid_resume_lease(resume_lease) || !valid_session_key(session_key) {
+            bail!("invalid imported session identity");
+        }
+        Self::launch_inner(
+            name,
+            directory,
+            profile,
+            mode,
+            Some(resume),
+            Some(resume_lease),
+            Some(session_key),
+            scope,
+        )
+    }
+
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)] // One preflight per process generation.
     fn launch_inner(
         name: &str,
         directory: &Path,
@@ -811,6 +838,7 @@ impl Tmux {
         mode: Option<&ProfileMode>,
         resume: Option<&ResumeCandidate>,
         resume_lease: Option<&str>,
+        session_key: Option<&str>,
         scope: PreparedScope,
     ) -> Result<()> {
         if !command_available(&profile.command) {
@@ -871,6 +899,13 @@ impl Tmux {
                     return Err(error);
                 }
             }
+        }
+        if let Some(key) = session_key
+            && let Err(error) =
+                Self::output(["set-option", "-p", "-t", &pane_id, SESSION_KEY_OPTION, key])
+        {
+            let _ = Self::output(["kill-session", "-t", &session_id]);
+            return Err(error);
         }
         if let Some(lease) = resume_lease
             && let Err(error) = Self::output([
@@ -4069,7 +4104,7 @@ mod tests {
         fs::write(
             &script,
             format!(
-                "#!/bin/bash\nprintf '%s\\n' {}\nwhile read -r reply; do printf '%s\\n' \"$reply\" >> {}; printf '\\033[2J\\033[Hready\\n'; done\n",
+                "#!/bin/bash\nfixture_dialog={}\ntrap 'printf \"\\033[2J\\033[H%s\\n\" \"$fixture_dialog\"' USR1\nprintf '%s\\n' \"$fixture_dialog\"\nwhile true; do read -r reply || continue; printf '%s\\n' \"$reply\" >> {}; printf '\\033[2J\\033[Hready\\n'; done\n",
                 shell_words::quote(dialog),
                 shell_words::quote(&recorder.to_string_lossy())
             ),
@@ -4122,7 +4157,22 @@ mod tests {
             assert_eq!(fs::read_to_string(&recorder)?, "1\n");
             // Reprint the identical dialog in the same process: the durable
             // claim survives another monitor / daemon restart.
-            Tmux::output(["send-keys", "-t", &session.pane_id, ""])?;
+            let pid = rustix::process::Pid::from_raw(i32::try_from(session.agent_pid.unwrap())?)
+                .context("invalid fake CLI PID")?;
+            rustix::process::kill_process(pid, rustix::process::Signal::USR1)?;
+            while !Tmux
+                .capture(&session.pane_id, 80)?
+                .trim_end()
+                .ends_with("Enter to confirm · Esc to cancel")
+            {
+                if Instant::now() > deadline {
+                    bail!("fake CLI did not reprint the dialog");
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            crate::startup_prompts::handle(&config, &session);
+            thread::sleep(Duration::from_millis(50));
+            assert_eq!(fs::read_to_string(&recorder)?, "1\n");
             let marker = Tmux::output([
                 "show-options",
                 "-p",

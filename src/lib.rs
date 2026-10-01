@@ -18,6 +18,7 @@ pub mod project;
 pub mod pulse;
 pub mod recovery;
 pub mod remote;
+pub mod resume_anywhere;
 pub mod self_update;
 pub mod startup_prompts;
 pub mod status;

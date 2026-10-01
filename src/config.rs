@@ -220,6 +220,8 @@ pub struct Config {
     #[serde(default)]
     pub startup_prompts: crate::startup_prompts::StartupPromptConfig,
     #[serde(default)]
+    pub registry: crate::resume_anywhere::RegistryResumeConfig,
+    #[serde(default)]
     pub self_update: SelfUpdateConfig,
     #[serde(default)]
     pub node: NodeConfig,
@@ -604,6 +606,7 @@ impl Config {
             .validate()
             .with_context(|| format!("invalid Pulse configuration in {}", path.display()))?;
         config.source_path = Some(path.clone());
+        config.registry.validate()?;
         Ok((config, path))
     }
 
@@ -925,6 +928,11 @@ impl Config {
     }
 
     fn normalize(&mut self) {
+        self.registry.store_dir = self
+            .registry
+            .store_dir
+            .as_ref()
+            .map(|path| expand_tilde(path));
         self.general.refresh_ms = self.general.refresh_ms.clamp(100, 10_000);
         self.general.preview_lines = self.general.preview_lines.clamp(20, 2_000);
         for path in &mut self.general.project_roots {

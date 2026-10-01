@@ -821,6 +821,11 @@ enum ResumeLeaseAcquireError {
 #[derive(Debug)]
 struct Inner {
     config: Config,
+    resume_store: Option<Arc<crate::resume_anywhere::ResumeStore>>,
+    registry_gate: tokio::sync::Mutex<()>,
+    registry_online: Mutex<BTreeSet<String>>,
+    #[cfg(test)]
+    registry_test_socket: Option<String>,
     local_id: String,
     local_label: String,
     /// With no `[[machines]]` configured or discovery enabled there is nothing
@@ -940,6 +945,8 @@ impl ControlPlane {
     /// Returns an error when tmux is unavailable or the initial scan fails.
     pub async fn start(config: Config) -> Result<Self> {
         config.validate_coordinator_only()?;
+        let resume_store =
+            crate::resume_anywhere::ResumeStore::open(&config.registry)?.map(Arc::new);
         if !config.node.coordinator_only {
             Tmux::check()?;
         }
@@ -974,6 +981,11 @@ impl ControlPlane {
         let updater = SelfUpdater::production(&config.self_update)?;
         let control = Self {
             inner: Arc::new(Inner {
+                resume_store,
+                registry_gate: tokio::sync::Mutex::new(()),
+                registry_online: Mutex::new(BTreeSet::new()),
+                #[cfg(test)]
+                registry_test_socket: None,
                 local_id: config.node.id.clone(),
                 local_label: config.node_label(),
                 bare_local_ids,
@@ -1017,6 +1029,7 @@ impl ControlPlane {
         for machine in control.remote_machines() {
             control.start_watcher(machine);
         }
+        control.spawn_resume_registry();
         Ok(control)
     }
 
@@ -4078,17 +4091,35 @@ impl ControlPlane {
                 resume_lease,
                 ..
             } => {
+                let control = self.clone();
                 let prompt_lock = self.prompt_lock(&pane_id);
                 local_tmux(
                     tokio::task::spawn_blocking(move || {
-                        let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
-                        let mut guard = prompt_lock
-                            .state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
-                        Tmux.kill_pane_session(&pane_id)?;
-                        Ok(())
+                        control.with_registry_tmux(|| {
+                            let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
+                            let mut guard = prompt_lock
+                                .state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
+                            if let Some(store) = &control.inner.resume_store {
+                                let fresh =
+                                    Tmux.sessions(&HashMap::new(), &control.inner.config.status)?;
+                                let name = fresh
+                                    .iter()
+                                    .find(|session| session.pane_id == pane_id)
+                                    .map(|session| session.name.as_str())
+                                    .ok_or_else(|| conflict("pane disappeared before close"))?;
+                                crate::resume_anywhere::record_named_close(
+                                    store,
+                                    &control.inner.config,
+                                    &fresh,
+                                    name,
+                                )?;
+                            }
+                            Tmux.kill_pane_session(&pane_id)?;
+                            Ok(())
+                        })
                     })
                     .await,
                 )?;
@@ -6275,9 +6306,596 @@ fn now_epoch_seconds() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
-/// Builds a control plane whose remote machines are registered but never
-/// contacted, so routing, health, identity, and the HTTP surface can be
-/// exercised without a tmux server or a network.
+// A4 additions: A3 can feed its durable archive records into NativeBundle and
+// replace the fallback snapshot store without changing the transport contract.
+impl ControlPlane {
+    #[allow(clippy::unused_self)] // Production is fixed to the owner socket; tests supply an isolated one.
+    fn with_registry_tmux<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        #[cfg(test)]
+        if let Some(socket) = &self.inner.registry_test_socket {
+            return Tmux::with_socket_for_test(socket, operation);
+        }
+        operation()
+    }
+
+    fn resume_store(&self) -> Result<Arc<crate::resume_anywhere::ResumeStore>> {
+        self.inner
+            .resume_store
+            .clone()
+            .ok_or_else(|| conflict("registry resume is disabled"))
+    }
+
+    fn spawn_resume_registry(&self) {
+        if self.inner.resume_store.is_none() {
+            return;
+        }
+        let control = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if !control.inner.config.node.coordinator_only
+                    && let Err(error) = control.owner_registry_snapshot().await
+                {
+                    eprintln!("atmux registry owner snapshot failed: {error}");
+                }
+                for remote in control.remote_machines() {
+                    if let Err(error) = control.reconcile_registry_owner(&remote).await {
+                        control
+                            .inner
+                            .registry_online
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&remote.id);
+                        eprintln!("atmux registry owner {} unavailable: {error}", remote.id);
+                    }
+                }
+            }
+        });
+    }
+
+    async fn reconcile_registry_owner(&self, remote: &Arc<RemoteMachine>) -> Result<()> {
+        use crate::resume_anywhere::{DesiredState, OwnerSnapshot, RestoreRequest, select_restore};
+        let current: OwnerSnapshot = remote.get_json("/api/v1/registry/snapshot").await?;
+        crate::resume_anywhere::validate_snapshot(&current)?;
+        if current.desired.len() > 512
+            || current.running.len() > 512
+            || !crate::tmux::valid_session_key(&current.boot_id)
+        {
+            return Err(bad_request("unsafe owner registry snapshot"));
+        }
+        let store = self.resume_store()?;
+        let previous = store.snapshot(&remote.id)?;
+        let reconnected = self
+            .inner
+            .registry_online
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(remote.id.clone());
+        // insert returns false on first contact. Pending missing desired entries
+        // survive a failed restore request and are retried on the next poll.
+        let pending = current.desired.iter().any(|entry| {
+            entry.state == DesiredState::Running && !current.running.contains(&entry.session_key)
+        });
+        let restore = select_restore(&previous, &current, !reconnected || pending);
+        for entry in &current.desired {
+            if !crate::tmux::valid_session_key(&entry.session_key) || entry.machine != remote.id {
+                return Err(bad_request("unsafe desired session record"));
+            }
+            // Even a just-closed owner retains its latest exported bundle. This
+            // continuously fills the coordinator's PV while the owner is online.
+            let path = format!("/api/v1/registry/export/{}", entry.session_key);
+            match remote
+                .get_json::<crate::resume_anywhere::NativeBundle>(&path)
+                .await
+            {
+                Ok(bundle) => {
+                    if bundle.manifest.session_key != entry.session_key
+                        || bundle.manifest.machine != remote.id
+                    {
+                        return Err(bad_request("owner returned a different bundle identity"));
+                    }
+                    let store = store.clone();
+                    tokio::task::spawn_blocking(move || store.save_bundle(&bundle)).await??;
+                }
+                Err(error) => eprintln!(
+                    "atmux registry bundle unavailable for {}: {error}",
+                    entry.session_key
+                ),
+            }
+        }
+        store.save_snapshot(&remote.id, &current)?;
+        if self.inner.config.registry.restore_on_start
+            && self
+                .inner
+                .config
+                .registry
+                .restore_machines
+                .contains(&remote.id)
+            && !restore.is_empty()
+        {
+            let _: Vec<crate::resume_anywhere::ResumeResult> = remote
+                .post_json_response_with_timeout(
+                    "/api/v1/registry/restore",
+                    &RestoreRequest {
+                        session_keys: restore,
+                    },
+                    Duration::from_secs(10 * 60 + 30),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Owner-only desired session state. Disabled unless registry is configured.
+    /// # Errors
+    /// Returns an error for a disabled store or a bounded filesystem failure.
+    pub async fn owner_registry_snapshot(&self) -> Result<crate::resume_anywhere::OwnerSnapshot> {
+        self.ensure_local_owner_enabled()?;
+        let store = self.resume_store()?;
+        let config = self.inner.config.clone();
+        let sessions = self.read_state().sessions.clone();
+        let control = self.clone();
+        tokio::task::spawn_blocking(move || {
+            control.with_registry_tmux(|| {
+                crate::resume_anywhere::observe_owner(&store, &config, &sessions)
+            })
+        })
+        .await?
+    }
+
+    /// Durable running/closed records for the Sessions picker (A3 adapter seam).
+    /// # Errors
+    /// Returns an error for disabled registry or unsafe storage.
+    pub fn registry_sessions(&self) -> Result<Vec<crate::resume_anywhere::DesiredSession>> {
+        let store = self.resume_store()?;
+        let mut entries = Vec::new();
+        for machine in std::iter::once(self.inner.local_id.clone()).chain(
+            self.remote_machines()
+                .iter()
+                .map(|remote| remote.id.clone()),
+        ) {
+            entries.extend(store.snapshot(&machine)?.desired);
+        }
+        if entries.len() > 4096 {
+            return Err(conflict("registry listing exceeds limit"));
+        }
+        Ok(entries)
+    }
+
+    /// Owner export, copying a live native log or reading its retained archive.
+    /// # Errors
+    /// Returns an error for unknown sessions, disabled registry, or oversized logs.
+    pub async fn registry_export(&self, key: &str) -> Result<crate::resume_anywhere::NativeBundle> {
+        self.ensure_local_owner_enabled()?;
+        let store = self.resume_store()?;
+        if !crate::tmux::valid_session_key(key) {
+            return Err(bad_request("invalid session key"));
+        }
+        let session = self
+            .read_state()
+            .sessions
+            .iter()
+            .find(|session| session.session_key.as_deref() == Some(key))
+            .cloned();
+        let config = self.inner.config.clone();
+        let key = key.to_owned();
+        let control = self.clone();
+        tokio::task::spawn_blocking(move || {
+            control.with_registry_tmux(|| {
+                if let Some(session) = session {
+                    let live = Tmux::live_pane_identity(&session.pane_id)?
+                        .ok_or_else(|| conflict("source pane disappeared"))?;
+                    if live.pane_identity != session.pane_identity
+                        || live.pane_pid != session.pane_pid
+                    {
+                        return Err(conflict("source pane generation changed"));
+                    }
+                    let bundle = crate::resume_anywhere::export(&config, &session, store.limit)?;
+                    store.save_bundle(&bundle)?;
+                    Ok(bundle)
+                } else {
+                    let cached = store.load_bundle(&key)?;
+                    let bundle =
+                        crate::resume_anywhere::refresh_archive(&config, cached, store.limit)?;
+                    store.save_bundle(&bundle)?;
+                    Ok(bundle)
+                }
+            })
+        })
+        .await?
+    }
+
+    /// Imports and launches through the native resume launcher, preserving key.
+    /// # Errors
+    /// Returns an error for unsafe bundles/profiles, conflicting logs, or failed launch.
+    pub async fn registry_import(
+        &self,
+        bundle: crate::resume_anywhere::NativeBundle,
+    ) -> Result<crate::resume_anywhere::ResumeResult> {
+        self.registry_import_inner(bundle, false).await
+    }
+
+    #[allow(clippy::too_many_lines)] // One cancellation-safe native launch transaction.
+    async fn registry_import_inner(
+        &self,
+        bundle: crate::resume_anywhere::NativeBundle,
+        restoring: bool,
+    ) -> Result<crate::resume_anywhere::ResumeResult> {
+        use crate::resume_anywhere::{DesiredSession, DesiredState, ResumeResult};
+        self.ensure_local_owner_enabled()?;
+        let store = self.resume_store()?;
+        let _gate = self.inner.registry_gate.lock().await;
+        let control = self.clone();
+        let result =
+            tokio::task::spawn_blocking(move || {
+                control.with_registry_tmux(|| {
+                let transaction_lock = store.lock()?;
+                crate::resume_anywhere::validate(&bundle, store.limit)?;
+                let bundle = if restoring {
+                    if !store.snapshot(&control.inner.local_id)?.desired.iter().any(|entry| {
+                        entry.session_key == bundle.manifest.session_key
+                            && entry.state == DesiredState::Running
+                    }) {
+                        return Err(conflict("session was closed/archived before restore"));
+                    }
+                    // Native files can contain turns newer than the last snapshot.
+                    // Preserve them without relaxing import's no-overwrite rule.
+                    crate::resume_anywhere::refresh_archive(
+                        &control.inner.config, bundle, store.limit,
+                    )?
+                } else {
+                    bundle
+                };
+                let fresh = Tmux.sessions(&HashMap::new(), &control.inner.config.status)?;
+                if let Some(existing) = fresh.iter().find(|session| {
+                    session.session_key.as_deref() == Some(&bundle.manifest.session_key)
+                }) {
+                    let profile = profile_for_session(
+                        &control.inner.config.profiles,
+                        existing.agent,
+                        &existing.profile,
+                    )
+                    .ok_or_else(|| conflict("target profile does not match imported session"))?;
+                    let root = crate::old_sessions::profile_config_directory(
+                        profile,
+                        if existing.agent == AgentKind::Claude {
+                            crate::old_sessions::ResumeHarness::Claude
+                        } else {
+                            crate::old_sessions::ResumeHarness::Codex
+                        },
+                    )?;
+                    if existing.agent_pid.is_none()
+                        || profile.name != bundle.manifest.profile
+                        || !profile.harness.eq_ignore_ascii_case(&bundle.manifest.harness)
+                        || crate::transcript::native_resume_target_in_store(existing, &root)
+                            .is_none_or(|native| native.session_id != bundle.manifest.native_id)
+                    {
+                        return Err(conflict(
+                            "target pane with this key does not verify the imported conversation",
+                        ));
+                    }
+                    // A live target with the same native id can still have a
+                    // divergent log. Verify exact translated content before
+                    // treating this as a retry, especially before a source move.
+                    let prepared = crate::resume_anywhere::import(
+                        &control.inner.config, &bundle, store.limit,
+                    )?;
+                    if prepared.directory != existing.path {
+                        return Err(conflict("target cwd differs from imported conversation"));
+                    }
+                    return Ok(ResumeResult {
+                        session_key: bundle.manifest.session_key,
+                        machine: control.inner.local_id.clone(),
+                        name: existing.name.clone(),
+                        pane_id: existing.pane_id.clone(),
+                        verified: true,
+                    });
+                }
+                let prepared =
+                    crate::resume_anywhere::import(&control.inner.config, &bundle, store.limit)?;
+                let lease = persistent_resume_lease(
+                    &prepared.profile,
+                    &prepared.directory,
+                    &prepared.candidate,
+                );
+                let _lease_lock = acquire_persistent_resume_lock(&lease).map_err(|_| {
+                    conflict("native conversation launch is already reserved or lock unavailable")
+                })?;
+                if Tmux::resume_lease_active(&lease)? {
+                    return Err(conflict("native conversation is already running on target"));
+                }
+                let key = &bundle.manifest.session_key;
+                let name = if fresh
+                    .iter()
+                    .any(|session| session.name == bundle.manifest.name)
+                {
+                    format!(
+                        "{}-{}",
+                        bundle.manifest.name.chars().take(60).collect::<String>(),
+                        &key[..8]
+                    )
+                } else {
+                    bundle.manifest.name.clone()
+                };
+                let scope =
+                    crate::systemd_scope::prepare(&control.inner.config.agent_resources, &name)?;
+                store.save_bundle(&prepared.local_bundle)?;
+                Tmux::launch_imported(
+                    &name,
+                    &prepared.directory,
+                    &prepared.profile,
+                    bundle.manifest.mode.as_ref(),
+                    &prepared.candidate,
+                    &lease,
+                    key,
+                    scope,
+                )?;
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let launched = loop {
+                    let sessions = Tmux.sessions(&HashMap::new(), &control.inner.config.status)?;
+                    if let Some(session) = sessions.into_iter().find(|session| {
+                        session.session_key.as_deref() == Some(key)
+                            && session.name == name
+                            && session
+                                .agent
+                                .to_string()
+                                .eq_ignore_ascii_case(&bundle.manifest.harness)
+                            && session.path == prepared.directory
+                            && session.agent_pid.is_some()
+                    }) {
+                        crate::startup_prompts::handle(&control.inner.config, &session);
+                        let root = crate::old_sessions::profile_config_directory(
+                            &prepared.profile,
+                            prepared.candidate.harness(),
+                        )?;
+                        if crate::transcript::native_resume_target_in_store(&session, &root)
+                            .is_some_and(|native| native.session_id == bundle.manifest.native_id)
+                        {
+                            break session;
+                        }
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(conflict(
+                            "target CLI did not verify; source was left running",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                };
+                let mut snapshot = store.snapshot(&control.inner.local_id)?;
+                snapshot.boot_id.clone_from(&store.boot_id);
+                snapshot.server_id = crate::resume_anywhere::server_id();
+                snapshot.desired.retain(|entry| entry.session_key != *key);
+                snapshot.desired.push(DesiredSession {
+                    session_key: key.clone(),
+                    machine: control.inner.local_id.clone(),
+                    name: name.clone(),
+                    harness: bundle.manifest.harness.clone(),
+                    state: DesiredState::Running,
+                });
+                snapshot.running.retain(|existing| existing != key);
+                snapshot.running.push(key.clone());
+                store.save_snapshot(&control.inner.local_id, &snapshot)?;
+                drop(transaction_lock);
+                crate::startup_prompts::handle(&control.inner.config, &launched);
+                Ok(ResumeResult {
+                    session_key: key.clone(),
+                    machine: control.inner.local_id.clone(),
+                    name,
+                    pane_id: launched.pane_id,
+                    verified: true,
+                })
+            })
+            })
+            .await??;
+        self.inner.refresh_now.notify_one();
+        Ok(result)
+    }
+
+    /// Restores only missing entries whose durable owner state still wants running.
+    /// # Errors
+    /// Returns an error for invalid/closed keys or unsafe native state.
+    pub async fn registry_restore(
+        &self,
+        request: crate::resume_anywhere::RestoreRequest,
+    ) -> Result<Vec<crate::resume_anywhere::ResumeResult>> {
+        use crate::resume_anywhere::DesiredState;
+        self.ensure_local_owner_enabled()?;
+        let store = self.resume_store()?;
+        if request.session_keys.len() > 512 {
+            return Err(bad_request("restore request exceeds limit"));
+        }
+        let snapshot = store.snapshot(&self.inner.local_id)?;
+        let mut bundles = Vec::new();
+        for key in request.session_keys.into_iter().collect::<BTreeSet<_>>() {
+            if !snapshot
+                .desired
+                .iter()
+                .any(|entry| entry.session_key == key && entry.state == DesiredState::Running)
+            {
+                return Err(conflict(
+                    "session was closed/archived or is not desired on this machine",
+                ));
+            }
+            bundles.push(store.load_bundle(&key)?);
+        }
+        let mut results = Vec::new();
+        for bundle in bundles {
+            results.push(self.registry_import_inner(bundle, true).await?);
+        }
+        Ok(results)
+    }
+
+    /// Coordinator resume on any trusted owner, leaving the source by default.
+    /// # Errors
+    /// Returns an error for unknown/offline owners, missing bundles, or unsafe imports.
+    pub async fn session_resume(
+        &self,
+        request: crate::resume_anywhere::SessionResumeRequest,
+    ) -> Result<crate::resume_anywhere::ResumeResult> {
+        let store = self.resume_store()?;
+        if !crate::tmux::valid_session_key(&request.session_key)
+            || !self.has_machine(&request.machine)
+        {
+            return Err(bad_request("invalid session key or target machine"));
+        }
+        let sources: Vec<_> = self
+            .overview()
+            .sessions
+            .into_iter()
+            .filter(|session| session.session_key.as_deref() == Some(&request.session_key))
+            .collect();
+        let source = sources
+            .iter()
+            .find(|session| session.machine != request.machine)
+            .or_else(|| sources.first());
+        let bundle = if let Some(source) = source {
+            if source.machine == self.inner.local_id {
+                self.registry_export(&request.session_key).await?
+            } else {
+                self.remote_machine(&source.machine)?
+                    .get_json(&format!("/api/v1/registry/export/{}", request.session_key))
+                    .await?
+            }
+        } else {
+            store.load_bundle(&request.session_key)?
+        };
+        if bundle.manifest.session_key != request.session_key {
+            return Err(bad_request("bundle identity differs from request"));
+        }
+        let source_proof = bundle.manifest.source_binding.clone().map(|binding| {
+            crate::resume_anywhere::StopSourceRequest {
+                session_key: bundle.manifest.session_key.clone(),
+                native_id: bundle.manifest.native_id.clone(),
+                binding,
+            }
+        });
+        let result = if request.machine == self.inner.local_id {
+            self.registry_import(bundle).await?
+        } else {
+            self.remote_machine(&request.machine)?
+                .post_json_response_with_timeout(
+                    "/api/v1/registry/import",
+                    &bundle,
+                    Duration::from_secs(10 * 60 + 30),
+                )
+                .await?
+        };
+        if !result.verified
+            || result.session_key != request.session_key
+            || result.machine != request.machine
+        {
+            return Err(conflict(
+                "target did not verify the requested session; source left running",
+            ));
+        }
+        if request.move_source
+            && let Some(source) = source
+            && source.machine != result.machine
+        {
+            self.registry_stop_source(
+                source_proof.ok_or_else(|| {
+                    conflict("source did not provide its CLI binding; source left running")
+                })?,
+                &source.machine,
+            )
+            .await?;
+        }
+        Ok(result)
+    }
+
+    /// Stops only the exported source generation after a successful target resume.
+    /// # Errors
+    /// Returns an error if the source generation changed or the owner rejects it.
+    pub async fn registry_stop_source(
+        &self,
+        request: crate::resume_anywhere::StopSourceRequest,
+        machine: &str,
+    ) -> Result<()> {
+        if machine != self.inner.local_id {
+            return self
+                .remote_machine(machine)?
+                .post_json("/api/v1/registry/stop-source", &request)
+                .await;
+        }
+        self.ensure_local_owner_enabled()?;
+        let session = self
+            .read_state()
+            .sessions
+            .iter()
+            .find(|session| {
+                session.session_key.as_deref() == Some(request.session_key.as_str())
+                    && session.pane_identity == request.binding.instance_id
+            })
+            .cloned()
+            .ok_or_else(|| conflict("source generation changed"))?;
+        let store = self.resume_store()?;
+        let machine = self.inner.local_id.clone();
+        let key = request.session_key.clone();
+        let control = self.clone();
+        tokio::task::spawn_blocking(move || {
+            control.with_registry_tmux(|| {
+                let _lock = auto_update::PaneProcessLock::acquire(&session.pane_id)?;
+                let live = Tmux::live_pane_identity(&session.pane_id)?
+                    .ok_or_else(|| conflict("source disappeared"))?;
+                if live.pane_identity != session.pane_identity || live.pane_pid != session.pane_pid
+                {
+                    return Err(conflict("source generation changed"));
+                }
+                let session = Tmux
+                    .sessions(&HashMap::new(), &control.inner.config.status)?
+                    .into_iter()
+                    .find(|fresh| {
+                        fresh.pane_id == session.pane_id
+                            && fresh.pane_identity == session.pane_identity
+                    })
+                    .ok_or_else(|| conflict("source pane generation changed"))?;
+                if session.agent_pid != Some(request.binding.agent_pid)
+                    || native_process_start_stamp(request.binding.agent_pid).as_deref()
+                        != Some(request.binding.process_start.as_str())
+                    || profile_for_session(
+                        &control.inner.config.profiles,
+                        session.agent,
+                        &session.profile,
+                    )
+                    .and_then(|profile| {
+                        crate::old_sessions::profile_config_directory(
+                            profile,
+                            if session.agent == AgentKind::Claude {
+                                crate::old_sessions::ResumeHarness::Claude
+                            } else {
+                                crate::old_sessions::ResumeHarness::Codex
+                            },
+                        )
+                        .ok()
+                    })
+                    .and_then(|root| {
+                        crate::transcript::native_resume_target_in_store(&session, &root)
+                    })
+                    .is_none_or(|native| native.session_id != request.native_id)
+                {
+                    return Err(conflict("source CLI/conversation generation changed"));
+                }
+                let current =
+                    crate::resume_anywhere::export(&control.inner.config, &session, store.limit)?;
+                if crate::resume_anywhere::content_digest(&current)
+                    != request.binding.content_digest
+                {
+                    return Err(conflict(
+                        "source conversation advanced after export; source left running",
+                    ));
+                }
+                store.close(&machine, &key)?;
+                Tmux::output(["kill-pane", "-t", &session.pane_id]).map(|_| ())
+            })
+        })
+        .await??;
+        self.inner.refresh_now.notify_one();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_control(machines: &[&str]) -> ControlPlane {
     test_control_with_config(machines, Config::default())
@@ -6319,7 +6937,13 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
     let (revisions, _) = watch::channel(0);
     ControlPlane {
         inner: Arc::new(Inner {
+            resume_store: crate::resume_anywhere::ResumeStore::open(&config.registry)
+                .unwrap()
+                .map(Arc::new),
             config,
+            registry_gate: tokio::sync::Mutex::new(()),
+            registry_online: Mutex::new(BTreeSet::new()),
+            registry_test_socket: None,
             local_id: local_id.clone(),
             local_label,
             bare_local_ids: handles.is_empty(),
@@ -6395,6 +7019,398 @@ pub(crate) fn test_session(name: &str, pane_id: &str, content: &str) -> Session 
         systemd_scope: None,
         memory_max_bytes: None,
         status: crate::status::AgentStatus::Working,
+    }
+}
+
+#[cfg(test)]
+mod resume_federation_tests {
+    use super::*;
+    use crate::resume_anywhere::{
+        BundleManifest, DesiredState, NativeBundle, RegistryResumeConfig, RestoreRequest,
+        SessionResumeRequest,
+    };
+    use axum::{
+        Router,
+        extract::Request,
+        http::{StatusCode, header},
+        middleware::{self, Next},
+        response::Response,
+    };
+    use std::{io::Write as _, os::unix::fs::PermissionsExt, process::Command};
+
+    struct DisposableOwner {
+        root: PathBuf,
+        socket: String,
+    }
+    impl DisposableOwner {
+        fn new(id: &str) -> Self {
+            let key = crate::tmux::new_session_key().unwrap();
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("atmux-a4-owner-{id}-{key}"));
+            fs::create_dir_all(&root).unwrap();
+            Self {
+                root,
+                socket: format!("atmux-test-a4-{id}-{key}"),
+            }
+        }
+        fn control(&self, id: &str, home: &str) -> ControlPlane {
+            let project = self.root.join(home).join("IdeaProjects/atmux");
+            let native = self.root.join(home).join(".claude-hd");
+            fs::create_dir_all(&project).unwrap();
+            fs::create_dir_all(&native).unwrap();
+            for args in [
+                vec!["init", "-q", "-b", "main"],
+                vec![
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/ryanmurf/atmux.git",
+                ],
+            ] {
+                assert!(
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(&project)
+                        .args(args)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            let script = self.root.join("claude");
+            fs::write(&script, "#!/bin/bash\nif [ \"${ATMUX_FIXTURE_REEXEC:-}\" != yes ]; then export ATMUX_FIXTURE_REEXEC=yes; exec -a claude /bin/bash \"$0\" \"$@\"; fi\nprintf '%s\\n' \"$PWD\" \"$@\" > \"$CLAUDE_CONFIG_DIR/received\"\nmkdir -p \"$CLAUDE_CONFIG_DIR/sessions\"\nrecorded_ms=$(($(date +%s)*1000))\nprintf '{\"pid\":%s,\"cwd\":\"%s\",\"startedAt\":%s,\"sessionId\":\"019a06d9-8341-7654-8abc-0123456789ab\"}' \"$$\" \"$PWD\" \"$recorded_ms\" > \"$CLAUDE_CONFIG_DIR/sessions/$$.json\"\nwhile true; do sleep 1; done\n").unwrap();
+            let mut config = Config::default();
+            config.node.id = id.to_owned();
+            config.general.project_roots = vec![project.parent().unwrap().to_owned()];
+            config.general.favorite_dirs.clear();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+            config.profiles = vec![AgentProfile {
+                name: "hd".to_owned(),
+                harness: "claude".to_owned(),
+                command: script.to_string_lossy().into_owned(),
+                args: Vec::new(),
+                env: BTreeMap::from([(
+                    "CLAUDE_CONFIG_DIR".to_owned(),
+                    native.to_string_lossy().into_owned(),
+                )]),
+                inherit_discovered: false,
+                claude_relaunch_permissions: None,
+                modes: Vec::new(),
+            }];
+            config.registry = RegistryResumeConfig {
+                enabled: true,
+                store_dir: Some(self.root.join("registry")),
+                ..RegistryResumeConfig::default()
+            };
+            let mut control = test_control_with_config(&[], config);
+            Arc::get_mut(&mut control.inner)
+                .unwrap()
+                .registry_test_socket = Some(self.socket.clone());
+            control
+        }
+    }
+    impl Drop for DisposableOwner {
+        fn drop(&mut self) {
+            assert!(self.socket.starts_with("atmux-test-"));
+            let _ = Command::new("tmux")
+                .args(["-L", &self.socket, "kill-server"])
+                .output();
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+    async fn authenticated_fixture(control: ControlPlane) -> (String, tokio::task::JoinHandle<()>) {
+        async fn auth(request: Request, next: Next) -> Response {
+            if request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                != Some("Bearer a4-fixture-token")
+            {
+                return axum::response::IntoResponse::into_response(StatusCode::UNAUTHORIZED);
+            }
+            next.run(request).await
+        }
+        let (_, shutdown) = watch::channel(false);
+        let app: Router =
+            crate::web::api_router(control, vec!["http://fixture".to_owned()], shutdown)
+                .layer(middleware::from_fn(auth));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), server)
+    }
+    fn sync_owner(control: &ControlPlane) -> Result<()> {
+        let sessions = control
+            .with_registry_tmux(|| Tmux.sessions(&HashMap::new(), &control.inner.config.status))?;
+        control.apply_refresh(sessions);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // End-to-end owner/coordinator lifecycle fixture.
+    async fn federation_exports_imports_and_launches_in_another_home_then_verifies_move()
+    -> Result<()> {
+        let source_fixture = DisposableOwner::new("tron");
+        let target_fixture = DisposableOwner::new("mac");
+        let source = source_fixture.control("tron", "home/ryan");
+        let target = target_fixture.control("mac", "Users/ryan");
+        let cwd = source.inner.config.general.project_roots[0].join("atmux");
+        let native_id = "019a06d9-8341-7654-8abc-0123456789ab";
+        let key = crate::tmux::new_session_key()?;
+        let bundle = NativeBundle {
+            manifest: BundleManifest {
+                schema: "atmux.native-bundle/v1".to_owned(),
+                session_key: key.clone(),
+                machine: "tron".to_owned(),
+                name: "a4-recorder".to_owned(),
+                harness: "claude".to_owned(),
+                profile: "hd".to_owned(),
+                mode: Some(ProfileMode {
+                    id: "recorded:opus".to_owned(),
+                    model: "opus".to_owned(),
+                    effort: Some("high".to_owned()),
+                    ..ProfileMode::default()
+                }),
+                native_id: native_id.to_owned(),
+                project_root: cwd.clone(),
+                cwd: cwd.clone(),
+                remote: Some("https://github.com/ryanmurf/atmux.git".to_owned()),
+                branch: Some("main".to_owned()),
+                native_path: PathBuf::from(format!("projects/source/{native_id}.jsonl")),
+                source_binding: None,
+            },
+            native_log: format!(
+                "{{\"sessionId\":\"{native_id}\",\"cwd\":\"{}\",\"type\":\"user\",\"message\":{{\"content\":\"fixture conversation\"}}}}\n",
+                cwd.display()
+            ),
+            siblings: Vec::new(),
+        };
+        let launched = source.registry_import(bundle).await?;
+        assert_eq!(launched.session_key, key);
+        sync_owner(&source)?;
+        let native = PathBuf::from(&source.inner.config.profiles[0].env["CLAUDE_CONFIG_DIR"]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let export = source.registry_export(&key).await;
+            if export.is_ok() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("fixture recorder did not publish native conversation metadata");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            sync_owner(&source)?;
+        }
+        assert!(native.join("received").exists());
+        let exported = source.registry_export(&key).await?;
+        let mut stale = crate::resume_anywhere::StopSourceRequest {
+            session_key: key.clone(),
+            native_id: exported.manifest.native_id,
+            binding: exported.manifest.source_binding.unwrap(),
+        };
+        stale.binding.agent_pid += 1;
+        assert!(
+            source.registry_stop_source(stale, "tron").await.is_err(),
+            "stale CLI binding must leave the source running"
+        );
+        let (source_url, source_server) = authenticated_fixture(source.clone()).await;
+        let (target_url, target_server) = authenticated_fixture(target.clone()).await;
+        let coordinator_fixture = DisposableOwner::new("home");
+        let token_file = coordinator_fixture.root.join("token");
+        fs::write(&token_file, "a4-fixture-token")?;
+        fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600))?;
+        let mut config = Config::default();
+        config.node.id = "home".to_owned();
+        config.node.coordinator_only = true;
+        config.profiles.clear();
+        config.general.project_roots.clear();
+        config.general.favorite_dirs.clear();
+        config.general.switch_on_launch = false;
+        config.registry = RegistryResumeConfig {
+            enabled: true,
+            store_dir: Some(coordinator_fixture.root.join("registry")),
+            restore_on_start: true,
+            restore_machines: vec!["mac".to_owned()],
+            ..RegistryResumeConfig::default()
+        };
+        let coordinator = test_control_with_config(&["tron", "mac"], config);
+        for (id, url) in [("tron", source_url), ("mac", target_url)] {
+            let remote = RemoteMachine::from_config(&crate::config::MachineConfig {
+                id: id.to_owned(),
+                label: None,
+                url,
+                token_env: None,
+                token_file: Some(token_file.clone()),
+            })?;
+            coordinator
+                .inner
+                .machines
+                .write()
+                .unwrap()
+                .insert(id.to_owned(), Arc::new(remote));
+        }
+        coordinator.apply_machine_sessions("tron", source.overview().sessions, None);
+        coordinator.apply_machine_sessions("mac", Vec::new(), None);
+        let result = coordinator
+            .session_resume(SessionResumeRequest {
+                session_key: key.clone(),
+                machine: "mac".to_owned(),
+                move_source: false,
+            })
+            .await?;
+        assert!(result.verified);
+        sync_owner(&target)?;
+        let recorded = fs::read_to_string(
+            PathBuf::from(&target.inner.config.profiles[0].env["CLAUDE_CONFIG_DIR"])
+                .join("received"),
+        )?;
+        assert!(
+            recorded
+                .lines()
+                .next()
+                .unwrap()
+                .contains("Users/ryan/IdeaProjects/atmux")
+        );
+        assert!(recorded.contains(&format!("--resume\n{native_id}\n")));
+        assert!(recorded.contains("--model\nopus\n--effort\nhigh\n"));
+        coordinator.apply_machine_sessions("mac", target.overview().sessions, None);
+        // An idempotent target must contain the exact translated conversation.
+        // Sharing a native id alone cannot justify discarding newer source turns.
+        let source_bundle = source.registry_export(&key).await?;
+        let source_native = native.join(&source_bundle.manifest.native_path);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source_native)?
+            .write_all(b"{\"type\":\"assistant\",\"message\":\"source advanced after copy\"}\n")?;
+        assert!(
+            source
+                .registry_stop_source(
+                    crate::resume_anywhere::StopSourceRequest {
+                        session_key: key.clone(),
+                        native_id: source_bundle.manifest.native_id.clone(),
+                        binding: source_bundle.manifest.source_binding.clone().unwrap(),
+                    },
+                    "tron"
+                )
+                .await
+                .is_err(),
+            "source advancement must invalidate a verified move snapshot"
+        );
+        assert!(
+            coordinator
+                .session_resume(SessionResumeRequest {
+                    session_key: key.clone(),
+                    machine: "mac".to_owned(),
+                    move_source: true,
+                })
+                .await
+                .is_err(),
+            "divergent target must refuse move"
+        );
+        fs::write(&source_native, &source_bundle.native_log)?;
+        assert_eq!(
+            source
+                .with_registry_tmux(|| Tmux.sessions(&HashMap::new(), &source.inner.config.status))?
+                .len(),
+            1,
+            "copy leaves source running"
+        );
+        let first = result.pane_id;
+        let source_pane = source.overview().sessions[0].pane_id.clone();
+        let neighbor = source.with_registry_tmux(|| {
+            Tmux::output([
+                "split-window",
+                "-d",
+                "-t",
+                &source_pane,
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "sleep 30",
+            ])
+        })?;
+        let repeated = coordinator
+            .session_resume(SessionResumeRequest {
+                session_key: key.clone(),
+                machine: "mac".to_owned(),
+                move_source: true,
+            })
+            .await?;
+        assert_eq!(repeated.pane_id, first, "retry is idempotent on target");
+        assert!(
+            source
+                .with_registry_tmux(|| Tmux.sessions(&HashMap::new(), &source.inner.config.status))?
+                .iter()
+                .all(|session| session.session_key.as_deref() != Some(&key)),
+            "move stops source only after target verification"
+        );
+        assert!(
+            source
+                .with_registry_tmux(|| Tmux::live_pane_identity(neighbor.trim()))?
+                .is_some(),
+            "move preserves other panes in the source tmux session"
+        );
+        // Loss after a restart preserves desired intent. Exercise actual
+        // coordinator pull/restore against the authenticated fixture owner.
+        target.owner_registry_snapshot().await?;
+        let remote = coordinator.remote_machine("mac")?;
+        coordinator.reconcile_registry_owner(&remote).await?;
+        let target_bundle = target.registry_export(&key).await?;
+        let target_native =
+            PathBuf::from(&target.inner.config.profiles[0].env["CLAUDE_CONFIG_DIR"])
+                .join(&target_bundle.manifest.native_path);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&target_native)?
+            .write_all(b"{\"type\":\"assistant\",\"message\":\"turn after cached snapshot\"}\n")?;
+        target.with_registry_tmux(|| Tmux.kill("a4-recorder"))?;
+        target.apply_refresh(Vec::new());
+        let store = target.resume_store()?;
+        let mut snapshot = store.snapshot("mac")?;
+        snapshot.boot_id = crate::tmux::new_session_key()?;
+        store.save_snapshot("mac", &snapshot)?;
+        // Direct restore must also retain native turns without a coordinator
+        // export refreshing the owner cache first.
+        target
+            .registry_restore(RestoreRequest {
+                session_keys: vec![key.clone()],
+            })
+            .await?;
+        assert!(fs::read_to_string(&target_native)?.contains("turn after cached snapshot"));
+        target.with_registry_tmux(|| Tmux.kill("a4-recorder"))?;
+        target.apply_refresh(Vec::new());
+        let mut snapshot = store.snapshot("mac")?;
+        snapshot.boot_id = crate::tmux::new_session_key()?;
+        store.save_snapshot("mac", &snapshot)?;
+        coordinator.reconcile_registry_owner(&remote).await?;
+        sync_owner(&target)?;
+        assert!(fs::read_to_string(&target_native)?.contains("turn after cached snapshot"));
+        assert_eq!(
+            target.overview().sessions[0].session_key.as_deref(),
+            Some(key.as_str())
+        );
+        // An explicit close is excluded even if a coordinator has older intent.
+        let target_pane = target.overview().sessions[0].pane_id.clone();
+        target.kill(&composite_id("mac", &target_pane)).await?;
+        assert_eq!(
+            store.snapshot("mac")?.desired[0].state,
+            DesiredState::Closed
+        );
+        assert!(
+            target
+                .registry_restore(RestoreRequest {
+                    session_keys: vec![key]
+                })
+                .await
+                .is_err()
+        );
+        source_server.abort();
+        target_server.abort();
+        Ok(())
     }
 }
 

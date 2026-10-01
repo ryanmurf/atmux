@@ -13,6 +13,7 @@ use crate::{
 
 const MAX_DIALOG_BYTES: usize = 16 * 1024;
 const DEV_FLAG: &str = "--dangerously-load-development-channels";
+const CODEX_TRUST_DISCLOSURE: &str = "Trust this folder? Codex can read, edit, and run files here, subject to your permission settings. Folder settings can run code automatically, even without a model request. Continue only if you trust these files. Your trust decision will be saved.";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -49,6 +50,19 @@ fn recognize(text: &str) -> Option<Dialog> {
         return None;
     }
     let rows = lines(text);
+    // Current Codex wraps its disclosure to terminal width. Rejoin only this
+    // exact paragraph; do not treat a partial sentence as a trust dialog.
+    if rows.contains(&"Folder access")
+        && rows.last() == Some(&"enter continue · esc quit")
+        && let Some(option) = rows.iter().position(|row| *row == "1. Trust and continue")
+        && rows.get(option + 1) == Some(&"2. Quit")
+        && let Some(disclosure) = rows[..option]
+            .iter()
+            .position(|row| row.starts_with("Trust this folder? "))
+        && rows[disclosure..option].join(" ") == CODEX_TRUST_DISCLOSURE
+    {
+        return Some(Dialog::CodexTrust);
+    }
     // Require complete native dialog rows, never a substring in an agent reply.
     let confirm = rows.last().is_some_and(|row| {
         matches!(
@@ -73,13 +87,9 @@ fn recognize(text: &str) -> Option<Dialog> {
     }
     if rows.contains(&"1. Trust and continue")
         && rows.iter().any(|row| matches!(*row, "2. Quit" | "2. Exit"))
-        && rows.iter().any(|row| {
-            matches!(
-                *row,
-                "Do you trust the contents of this directory?"
-                    | "Do you trust the contents of this directory? Working with untrusted contents"
-            )
-        })
+        && rows
+            .iter()
+            .any(|row| matches!(*row, "Do you trust the contents of this directory?"))
     {
         return Some(Dialog::CodexTrust);
     }
@@ -105,7 +115,7 @@ fn trusted_cwd(config: &Config, cwd: &Path) -> bool {
         .any(|root| cwd.starts_with(root))
 }
 
-fn process(pid: u32) -> Option<(String, Vec<std::ffi::OsString>)> {
+fn process(pid: u32) -> Option<(String, Vec<std::ffi::OsString>, std::path::PathBuf)> {
     let pid = Pid::from_u32(pid);
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -114,6 +124,7 @@ fn process(pid: u32) -> Option<(String, Vec<std::ffi::OsString>)> {
         ProcessRefreshKind::nothing()
             .without_tasks()
             .with_cmd(UpdateKind::Always)
+            .with_cwd(UpdateKind::Always)
             .with_user(UpdateKind::Always),
     );
     let process = system.process(pid)?;
@@ -123,9 +134,19 @@ fn process(pid: u32) -> Option<(String, Vec<std::ffi::OsString>)> {
     {
         return None;
     }
+    if process.cmd().len() > 512
+        || process.cmd().iter().map(|arg| arg.len()).sum::<usize>() > 64 * 1024
+    {
+        return None;
+    }
     Some((
-        format!("{}:{}", pid.as_u32(), process.start_time()),
+        format!(
+            "{}:{}",
+            pid.as_u32(),
+            crate::control::native_process_start_stamp(pid.as_u32())?
+        ),
         process.cmd().to_vec(),
+        process.cwd()?.canonicalize().ok()?,
     ))
 }
 
@@ -136,7 +157,7 @@ fn answer(config: &Config, session: &Session) -> Result<()> {
     let Some(pid) = session.agent_pid else {
         return Ok(());
     };
-    let Some((generation, args)) = process(pid) else {
+    let Some((generation, args, agent_cwd)) = process(pid) else {
         return Ok(());
     };
     let _lock = crate::auto_update::PaneProcessLock::acquire(&session.pane_id)?;
@@ -158,7 +179,8 @@ fn answer(config: &Config, session: &Session) -> Result<()> {
         || !config.startup_prompts.auto_answer
         || (dialog == Dialog::DevelopmentChannels && !has_flag(&args))
         || (matches!(dialog, Dialog::WorkspaceTrust | Dialog::CodexTrust)
-            && !trusted_cwd(config, &live.path))
+            && (!trusted_cwd(config, &live.path)
+                || live.path.canonicalize().ok().as_ref() != Some(&agent_cwd)))
     {
         report(session, "startup dialog requires input");
         return Ok(());
@@ -185,7 +207,11 @@ fn answer(config: &Config, session: &Session) -> Result<()> {
         dialog.option(),
         &generation,
     ])?;
-    if process(pid).is_none_or(|(current, _)| current != generation) {
+    if process(pid).is_none_or(|(current, current_args, cwd)| {
+        current != generation
+            || cwd != agent_cwd
+            || (dialog == Dialog::DevelopmentChannels && !has_flag(&current_args))
+    }) {
         bail!("startup process changed");
     }
     match dialog {
@@ -216,7 +242,8 @@ fn looks_like_startup(text: &str) -> bool {
     text.len() <= MAX_DIALOG_BYTES
         && (text.contains("Security guide")
             || text.contains(DEV_FLAG)
-            || text.contains("Do you trust the contents of this directory?"))
+            || text.contains("Do you trust the contents of this directory?")
+            || text.contains("Folder access"))
 }
 
 // A1 integration point: replace this single, body-free log with
@@ -268,6 +295,28 @@ mod tests {
         );
         assert_eq!(recognize(&text.replace("2. Quit", "2. Run command")), None);
         assert_eq!(recognize(&format!("{text}\n› user draft")), None);
+    }
+    #[test]
+    fn codex_current_folder_access_matches_wrapped_disclosure_exactly() {
+        // Official Codex 40-column onboarding snapshot, including a long worktree path.
+        let text = "  Folder access\n  workspace/…/repository\n  Trust this folder? Codex can read,\n  edit, and run files here, subject to\n  your permission settings. Folder\n  settings can run code automatically,\n  even without a model request.\n  Continue only if you trust these\n  files. Your trust decision will be\n  saved.\n› 1. Trust and continue\n  2. Quit\n  enter continue · esc quit\n";
+        assert_eq!(recognize(text), Some(Dialog::CodexTrust));
+        let unwrapped = format!(
+            "Folder access\n/worktree\n{CODEX_TRUST_DISCLOSURE}\n› 1. Trust and continue\n2. Quit\nenter continue · esc quit"
+        );
+        assert_eq!(recognize(&unwrapped), Some(Dialog::CodexTrust));
+        for changed in [
+            text.replace("Trust and continue", "Open restricted"),
+            text.replace("2. Quit", "2. Keep current directory"),
+            text.replace(
+                "Your trust decision will be\n  saved.",
+                "Your decision changed.",
+            ),
+            text.replace("enter continue · esc quit", "enter run · esc quit"),
+            format!("{text}user draft"),
+        ] {
+            assert_eq!(recognize(&changed), None);
+        }
     }
     #[test]
     fn trust_is_limited_to_canonical_project_roots() {

@@ -85,8 +85,81 @@ Agents never sit at a startup prompt.
   flag must be a complete active argv token read from the live process; launch-command labels
   are insufficient. Workspace trust uses canonical configured project roots. The scanner's
   cwd can briefly lag a just-started CLI, so trust checks use freshly queried pane metadata.
+- Codex's current [folder trust renderer](https://github.com/openai/codex/blob/main/codex-rs/tui/src/onboarding/trust_directory.rs)
+  uses **Folder access**, an exact wrapped trust disclosure, **1. Trust and continue**, **2. Quit**,
+  and `enter continue · esc quit`. The fixture follows its official 40-column onboarding snapshot;
+  recognition rejoins only the complete exact disclosure so narrow worktree dialogs work. Restricted
+  folder actions, altered disclosures/choices, and changed confirmation footers are near misses.
 - A1 integration: `src/startup_prompts.rs::report` is the single body-free log call site for
   `agent.needs_input/startup_prompt`; replace it with the event emitter after integration.
+- A3 was absent in this worktree, so `src/resume_anywhere.rs` defines
+  `atmux.native-bundle/v1`, `[registry]` resume configuration, a bounded bundle cache, and
+  owner desired-state snapshots. The lead should adapt A3's archive record to `NativeBundle`
+  and consolidate the store/config. The manifest carries the original session key, harness,
+  profile/mode, native id, source project/cwd, credential-free git remote/branch, relative native
+  path, and optional source process binding. Native logs and base64 Claude sibling files are
+  transported together; no source command, environment, credentials, or target path is accepted.
+- Reads and requests are bounded: 8 MiB maximum serialized bundle (configurable downward),
+  256 KiB per native JSONL row, 128 sibling files, 512 desired sessions per owner, 512 KiB desired
+  snapshot, and 4,096 listed records. Repository lookup checks at most 4,096 entries, depth four,
+  and ten seconds; native sibling traversal has its own count/depth/time bounds. All native/cache
+  file access opens each path component with `NOFOLLOW`; files must be regular, singly linked,
+  and owned by the current user. Native publication uses exclusive staging plus hard links;
+  identical content is a no-op. Preflight checks all files before publication. Cache state uses
+  atomic rename, an owner-only root, and an advisory transaction lock.
+- Only verified metadata is translated: top-level Claude `cwd`, including subagent JSONL, and
+  Codex `session_meta.payload.cwd`. Message/tool bodies and binary siblings retain their content.
+  Codex keeps its rollout date and filename. Explicit configured profile stores are supported
+  without weakening the conventional-home transcript locator.
+- Target repository selection requires both the normalized origin remote and recorded branch.
+  Ambiguity and an existing repository on a different branch are refused to preserve existing
+  workspaces; the user can configure a matching worktree. Only a newly created clone is checked
+  out. Cross-machine projects without a git remote are refused because a folder-name guess
+  cannot prove identity; same-owner restoration can reuse the configured local project.
+- Imports use the existing resume launcher and native-conversation lease. The stable key is set
+  on the placeholder pane before respawn or discovery. Target verification requires the expected
+  harness, configured profile, cwd, and native conversation metadata within five seconds. The
+  startup handler runs during that verification window. Retry of an already verified target is
+  idempotent only when its translated native files match exactly; a divergent running copy is
+  refused so a move cannot discard newer source turns. Source selection prefers a running owner
+  other than the target. A move rechecks the exported pane, PID, kernel process-start stamp, native id,
+  and a SHA-256 digest of the source log and siblings
+  under the process lock before recording a close and stopping the source.
+  Move kills only the exported pane, preserving neighboring panes in that tmux session.
+- Web and TUI explicit closes save tombstones for every affected Claude/Codex pane before
+  killing the named tmux session, including panes not yet captured by the periodic observer.
+  Final native exports are retained when available. This closes the restart-between-close-and-scan
+  gap and gives A3 a common `record_named_close` integration point.
+- The coordinator pulls owner snapshots and bundles every 15 seconds over the existing mTLS /
+  bearer-token federation client. Snapshot boot ids, tmux-server identity changes, and health
+  reconnections substitute for A1's future `node.started` signal. Restore requires both
+  `restore_on_start` and `restore_machines`; pending desired entries survive failed requests.
+  Missing panes on an unchanged boot/server are treated as intentional closes, a fail-closed
+  choice where intent cannot otherwise be proven. Closed/archived tombstones win over stale
+  coordinator intent and are rechecked inside the restore launch transaction.
+- Restore refreshes the owner's native log before import so complete turns newer than the last
+  cached snapshot survive. If the native file is gone, the retained bundle is used; unsafe or
+  oversized local files remain errors. Export ignores an incomplete final appended JSONL row
+  until that row completes, and a closed-session export refreshes the final complete native log.
+- A3's Sessions view was absent, so a working **Saved sessions** picker supplies the durable
+  running/closed list alongside agent Actions. A3 can dispatch the document event
+  `atmux:session-resume` with its selected durable record to open the same machine picker, then
+  replace the fallback list/API with its richer archive/search view. Requests capture the
+  durable key when the dialog opens, independent of changing live selection; copy is the default.
+- A1/A3 own the final event plumbing: connect startup reporting to A1's emitter, use its
+  `node.started` as an additional restore signal, and emit A3's `session.resumed` / archive events
+  around these successful operations. A4 deliberately keeps the current log and federation
+  fallback runnable before those branches land. Shared Rust/web files contain insertion points
+  and small wiring additions rather than reorganizing their existing implementations.
+- Copy intentionally allows one stable key to be live on multiple owners. The fallback keeps
+  desired state per machine and the last pulled bundle per key; live resume prefers a non-target
+  owner. A3 should reconcile its primary-location and per-owner bundle/version model for these
+  running copies. Divergent native logs are refused rather than merged, and a source that advances
+  after export is left running when a move's content digest no longer matches.
+- The Quick Talk browser suite previously required an external running atmux and Chrome. Its
+  default invocation now starts a private HTTP fixture and disposable Chrome profile, preserving
+  explicit external arguments for existing workflows. This makes the required browser gate
+  reproducible without contacting a running agent or service.
 
 ### Removing the development-channel prompt at its source
 
@@ -102,13 +175,21 @@ managed settings are changed by A4.
 ## Gates and evidence
 
 - [x] Startup dialog fixtures, near misses, exact argv check, and disposable-tmux idempotence
-- [ ] Native bundle translation, conflict/size/profile/symlink refusal
-- [ ] Coordinator API, MCP, and UI resume on another machine
-- [ ] Durable phone-home selection and restore
-- [ ] Federation export/import/translated recorder launch
+- [x] Native bundle translation, conflict/size/profile/symlink refusal
+- [x] Coordinator API, MCP, and UI resume on another machine
+- [x] Durable phone-home selection and restore
+- [x] Federation export/import/translated recorder launch
 - [ ] Required Rust, JavaScript, and browser gates
 
 Startup evidence: `cargo test --lib startup_` passed 6 tests (including the disposable fake
 CLI); `cargo clippy --all-targets --all-features` reported zero warnings. Lead scope update:
 Codex option `1. Trust and continue` is recognized under the same root/claim/verification
 policy, with its own exact fixture and near-miss tests.
+
+Backend completion evidence: `cargo test --lib startup_` passed 7 tests;
+`cargo test --lib resume_anywhere` passed 8 tests; `cargo test --lib federation_exports_imports`
+passed the authenticated two-owner fixture (native profile/mode/cwd/key verification, copy,
+divergent-target refusal, advanced-source refusal, neighboring-pane preservation, direct and
+coordinator restore, and explicit-close exclusion). `cargo test --lib registry_mutations`
+passed cross-origin and body-limit checks. `cargo clippy --all-targets --all-features -- -D warnings`
+reported zero warnings, and `cargo fmt --check` / `git diff --check` passed.

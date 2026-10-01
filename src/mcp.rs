@@ -157,6 +157,22 @@ impl AtmuxMcp {
     }
 
     #[tool(
+        name = "session_resume",
+        description = "Resume a durable session_key on a configured machine with its native conversation and profile. Source stays running by default; move=true closes its exact exported pane generation only after the target CLI verifies. Registry resume must be enabled on coordinator and owners."
+    )]
+    async fn session_resume(
+        &self,
+        Parameters(request): Parameters<crate::resume_anywhere::SessionResumeRequest>,
+    ) -> Result<String, String> {
+        let result = self
+            .control
+            .session_resume(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        serde_json::to_string(&result).map_err(|error| error.to_string())
+    }
+
+    #[tool(
         name = "machines_list",
         description = "List federated machines with their online state, session counts, health, and last contact time. An offline machine never blocks the others."
     )]

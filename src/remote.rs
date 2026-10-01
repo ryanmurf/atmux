@@ -341,7 +341,14 @@ impl RemoteMachine {
         let status = response.status();
         let collected = tokio::time::timeout(
             timeout,
-            collect_bounded(response.into_body(), MAX_RESPONSE_BYTES),
+            collect_bounded(
+                response.into_body(),
+                if path.starts_with("/api/v1/registry/") {
+                    crate::resume_anywhere::MAX_BUNDLE_BYTES
+                } else {
+                    MAX_RESPONSE_BYTES
+                },
+            ),
         )
         .await
         .with_context(|| format!("machine {} timed out sending {path}", self.id))??;

@@ -827,6 +827,18 @@ fn routes(state: WebState) -> Router {
             post(machine_update),
         )
         .route("/api/v1/sessions", get(sessions).post(launch))
+        .route("/api/v1/registry/sessions", get(registry_sessions))
+        .route("/api/v1/registry/snapshot", get(registry_snapshot))
+        .route("/api/v1/registry/export/{key}", get(registry_export))
+        .route(
+            "/api/v1/registry/import",
+            post(registry_import).layer(DefaultBodyLimit::max(
+                crate::resume_anywhere::MAX_BUNDLE_BYTES,
+            )),
+        )
+        .route("/api/v1/registry/restore", post(registry_restore))
+        .route("/api/v1/registry/stop-source", post(registry_stop_source))
+        .route("/api/v1/registry/resume", post(session_resume_anywhere))
         .route("/api/v1/memory-launches/v1", post(launch_with_memory))
         .route("/api/v1/events", get(overview_events))
         .route("/api/v1/launch-options", get(launch_options))
@@ -1905,8 +1917,139 @@ fn extend_unique(values: &mut Vec<String>, extra: Vec<String>) {
     }
 }
 
+async fn registry_sessions(
+    State(state): State<WebState>,
+) -> Result<Json<Vec<crate::resume_anywhere::DesiredSession>>, ApiError> {
+    state
+        .control
+        .registry_sessions()
+        .map(Json)
+        .map_err(|error| ApiError::from_control(&error))
+}
+async fn registry_snapshot(
+    State(state): State<WebState>,
+) -> Result<Json<crate::resume_anywhere::OwnerSnapshot>, ApiError> {
+    state
+        .control
+        .owner_registry_snapshot()
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::from_control(&error))
+}
+async fn registry_export(
+    State(state): State<WebState>,
+    Path(key): Path<String>,
+) -> Result<Json<crate::resume_anywhere::NativeBundle>, ApiError> {
+    state
+        .control
+        .registry_export(&key)
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::from_control(&error))
+}
+async fn registry_import(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(bundle): Json<crate::resume_anywhere::NativeBundle>,
+) -> Result<Json<crate::resume_anywhere::ResumeResult>, ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    state
+        .control
+        .registry_import(bundle)
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::from_control(&error))
+}
+async fn registry_restore(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(request): Json<crate::resume_anywhere::RestoreRequest>,
+) -> Result<Json<Vec<crate::resume_anywhere::ResumeResult>>, ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    state
+        .control
+        .registry_restore(request)
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::from_control(&error))
+}
+async fn session_resume_anywhere(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(request): Json<crate::resume_anywhere::SessionResumeRequest>,
+) -> Result<Json<crate::resume_anywhere::ResumeResult>, ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    state
+        .control
+        .session_resume(request)
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::from_control(&error))
+}
+async fn registry_stop_source(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(request): Json<crate::resume_anywhere::StopSourceRequest>,
+) -> Result<StatusCode, ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    let local = state
+        .control
+        .machines()
+        .into_iter()
+        .find(|machine| machine.kind == crate::machine::MachineKind::Local)
+        .ok_or_else(|| ApiError::from_control(&anyhow::anyhow!("owner unavailable")))?;
+    state
+        .control
+        .registry_stop_source(request, &local.id)
+        .await
+        .map_err(|error| ApiError::from_control(&error))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn registry_mutations_reject_cross_origin_and_oversized_imports() {
+        use tower::ServiceExt;
+        let control = crate::control::test_control(&[]);
+        let (_, shutdown) = tokio::sync::watch::channel(false);
+        let app = super::api_router(control, vec!["http://fixture".to_owned()], shutdown);
+        let key = "019a06d9-8341-7654-8abc-0123456789ab";
+        for (path, body) in [
+            (
+                "/api/v1/registry/resume",
+                serde_json::json!({"session_key": key, "machine": "local"}),
+            ),
+            (
+                "/api/v1/registry/restore",
+                serde_json::json!({"session_keys": [key]}),
+            ),
+        ] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("origin", "http://evil")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                axum::http::StatusCode::FORBIDDEN
+            );
+        }
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/registry/import")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                "x".repeat(crate::resume_anywhere::MAX_BUNDLE_BYTES + 1),
+            ))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
     use super::*;
     use axum::{http::Request as HttpRequest, routing::get};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
