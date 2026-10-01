@@ -120,7 +120,9 @@ pub fn configure_profiles(config: &mut crate::config::Config) -> Result<()> {
     let Some(events) = &config.events else {
         return Ok(());
     };
-    events.validate(config.node.coordinator_only || !config.machines.is_empty())?;
+    events.validate(
+        config.node.coordinator_only || !config.machines.is_empty() || config.discovery.enabled,
+    )?;
     if !events.inject_hooks {
         return Ok(());
     }

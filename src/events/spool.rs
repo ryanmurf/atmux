@@ -217,6 +217,41 @@ pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 impl EventLog {
+    pub(crate) fn attention_event(
+        &self,
+        machine: &str,
+        session_key: &str,
+        instance: &str,
+    ) -> Option<AgentEvent> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.retain(&mut state).ok()?;
+        state
+            .records
+            .iter()
+            .rev()
+            .find(|record| {
+                let event = &record.event;
+                event.machine == machine
+                    && event.session_key == session_key
+                    && event.instance_id == instance
+                    && matches!(
+                        event.event_type.as_str(),
+                        "agent.needs_input"
+                            | "agent.working"
+                            | "agent.turn_completed"
+                            | "agent.started"
+                            | "agent.exited"
+                            | "session.closed"
+                            | "session.archived"
+                            | "session.resumed"
+                    )
+            })
+            .map(|record| record.event.clone())
+    }
+
     /// # Errors
     /// Rejects insecure directories, concurrent owners and damaged records.
     #[allow(clippy::too_many_lines)] // Validates every on-disk record before exposing the log.

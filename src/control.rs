@@ -996,6 +996,30 @@ impl ControlPlane {
             .emit(event)
     }
 
+    /// Durably appends coordinator-authored metadata/lifecycle events about
+    /// local or remote sessions to the fleet log, never the owner feed.
+    /// # Errors
+    /// Rejects disabled telemetry, owner-only nodes or invalid/failed writes.
+    pub fn append_fleet_agent_event(&self, event: crate::events::AgentEvent) -> Result<()> {
+        self.inner
+            .events
+            .as_ref()
+            .ok_or_else(|| not_found("agent events are disabled"))?
+            .append_fleet(event)
+    }
+
+    /// Success means a bounded byte publication is durably queued. The
+    /// coordinator sink handles broker availability, retries and ordering.
+    /// # Errors
+    /// Rejects disabled storage, owner-only nodes, invalid records or full/I/O failure.
+    pub fn enqueue_publication(&self, topic: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        self.inner
+            .events
+            .as_ref()
+            .ok_or_else(|| not_found("agent events are disabled"))?
+            .enqueue_publication(topic, key, value)
+    }
+
     /// Reads the owner feed for federation, or the fleet feed for MCP/UI.
     /// # Errors
     /// Rejects disabled telemetry, invalid cursors or failed spool reads.
@@ -1060,7 +1084,8 @@ impl ControlPlane {
         let summarizer = crate::summarizer::Summarizer::configured(&config)?;
         let recovery = RecoveryRunner::production(&config);
         let updater = SelfUpdater::production(&config.self_update)?;
-        let coordinator = config.node.coordinator_only || !config.machines.is_empty();
+        let coordinator =
+            config.node.coordinator_only || !config.machines.is_empty() || config.discovery.enabled;
         let events = config
             .events
             .clone()
@@ -4200,19 +4225,24 @@ impl ControlPlane {
     /// Returns an error for an unknown or ambiguous session reference.
     pub fn agent_summary(&self, id: &str) -> Result<crate::summarizer::AgentSummary> {
         let session = self.conversation_session(id)?;
-        Ok(self.inner.summarizer.as_ref().map_or_else(
+        let mut summary = self.inner.summarizer.as_ref().map_or_else(
             || crate::summarizer::AgentSummary {
                 title: String::new(),
                 description: session.description.clone().unwrap_or_default(),
                 digest: String::new(),
                 digest_updated_at: None,
                 status: session.status.clone(),
-                needs_input_reason: (session.status == "waiting").then(|| "idle_prompt".into()),
+                needs_input_reason: None,
                 stale: false,
                 enabled: false,
             },
             |service| service.cached(&session),
-        ))
+        );
+        summary.needs_input_reason = self.inner.events.as_ref().map_or_else(
+            || (session.status == "waiting").then(|| "idle_prompt".into()),
+            |events| events.needs_input_reason(&session),
+        );
+        Ok(summary)
     }
 
     /// Ranks live and recently summarized sessions using bounded term matching.
@@ -4311,23 +4341,35 @@ impl ControlPlane {
         Ok(())
     }
 
-    /// A1 integration seam. Replace the body with one durable event append.
-    #[allow(clippy::unused_self)] // A1 will append through this control instance.
-    pub(crate) fn summary_updated_hook(
-        &self,
-        _session: &SessionSummary,
-        _detail: serde_json::Value,
-    ) {
+    /// Called after durable digest persistence. Coordinator-authored summary
+    /// events enter the fleet feed for local and remote sessions alike.
+    /// Disabled telemetry remains a no-op; append failures do not discard a digest.
+    pub(crate) fn summary_updated_hook(&self, session: &SessionSummary, detail: serde_json::Value) {
+        if self.inner.events.is_none() {
+            return;
+        }
+        let result =
+            crate::events::AgentEvent::from_summary(session, "agent.summary_updated", None)
+                .and_then(|mut event| {
+                    event.detail = detail;
+                    self.append_fleet_agent_event(event)
+                });
+        if result.is_err() {
+            eprintln!("atmux summary event append failed");
+        }
     }
 
-    /// A1's producer replaces this hook with a durable, ordered enqueue to
-    /// `entity-change`. Returning an error leaves the snapshot eligible for retry.
-    #[allow(clippy::unused_self, clippy::unnecessary_wraps)] // Transport is wired by the lead.
+    /// Durable ordered enqueue; broker errors are handled asynchronously.
+    /// Enqueue failure leaves A2's timestamp high-water mark eligible for retry.
     pub(crate) fn summary_search_document_hook(
         &self,
-        _publication: &crate::session_search::SearchPublication,
+        publication: &crate::session_search::SearchPublication,
     ) -> Result<()> {
-        Ok(())
+        self.enqueue_publication(
+            publication.topic,
+            publication.key.as_bytes(),
+            &publication.value()?,
+        )
     }
 
     /// Retrieves bounded cached digest context for A3 archive/resume indexing.
@@ -6630,7 +6672,9 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
                     crate::events::EventService::open(
                         events,
                         local_id.clone(),
-                        !machines.is_empty() || config.node.coordinator_only,
+                        !machines.is_empty()
+                            || config.node.coordinator_only
+                            || config.discovery.enabled,
                     )
                 })
                 .transpose()
