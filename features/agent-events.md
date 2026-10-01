@@ -150,6 +150,11 @@ A4 will consume your `needs_input/startup_prompt` events; keep that type stable.
   `ControlPlane::emit_agent_event`, `ControlPlane::agent_events(query, owner)`,
   and `events::sink::{KafkaProducer, Producer, PublishFuture}` with
   `publish(topic, key, value)` and `platform_envelope`.
+- Dashboard changes append lifecycle polling and a bounded state map to the
+  existing UI. Badges require matching machine and pane generation; working
+  clears attention, cursor reset clears cached state, and status supplies a
+  fallback for older owners. The rail reserves a badge slot so changing
+  attention does not move click targets. Hidden pages stop long-polling.
 
 ## Gates
 
@@ -163,6 +168,6 @@ A4 will consume your `needs_input/startup_prompt` events; keep that type stable.
 - [x] Fake-producer retry/checkpoint and exact platform wrapper tests.
 - [x] MCP enabled/disabled/filter tool tests.
 - [x] Launch/resume/maintenance/Quick Resume hook propagation coverage.
-- [ ] Dashboard reason badges and browser suites.
+- [x] Dashboard reason badges and browser suites.
 - [ ] Helm hostAliases rendering/default and documented broker resolution.
 - [ ] Full format, zero-warning clippy, Rust and JavaScript acceptance commands.
