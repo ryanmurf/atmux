@@ -876,6 +876,14 @@ pub(crate) struct PaneProcessLock {
 
 impl PaneProcessLock {
     pub(crate) fn acquire(pane_id: &str) -> Result<Self> {
+        Self::acquire_for_pane(pane_id, false)?.context("pane mutation lock was unexpectedly busy")
+    }
+
+    pub(crate) fn try_acquire(pane_id: &str) -> Result<Option<Self>> {
+        Self::acquire_for_pane(pane_id, true)
+    }
+
+    fn acquire_for_pane(pane_id: &str, nonblocking: bool) -> Result<Option<Self>> {
         if !pane_id
             .strip_prefix('%')
             .is_some_and(|tail| !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()))
@@ -888,7 +896,7 @@ impl PaneProcessLock {
             .state_dir()
             .unwrap_or_else(|| dirs.data_local_dir())
             .join("pane-locks");
-        Self::acquire_in(&root, pane_id, false)?.context("pane mutation lock was unexpectedly busy")
+        Self::acquire_in(&root, pane_id, nonblocking)
     }
 
     #[cfg(test)]

@@ -81,6 +81,8 @@ Agents never sit at a startup prompt.
   tmux option claims the exact native PID/start-time generation before sending any keys,
   under the existing owner process lock. This trades a missed answer on a crash for never
   answering twice. Failed verification leaves the claim intact and reports input needed.
+  Startup scans try the pane lock without waiting; a busy pane is revisited on a later scan.
+  This avoids a registry/pane lock inversion when resume verification overlaps an explicit close.
 - Recognition uses bounded native rows and a terminal confirmation footer. The development
   flag must be a complete active argv token read from the live process; launch-command labels
   are insufficient. Workspace trust uses canonical configured project roots. The scanner's

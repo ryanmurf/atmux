@@ -160,7 +160,11 @@ fn answer(config: &Config, session: &Session) -> Result<()> {
     let Some((generation, args, agent_cwd)) = process(pid) else {
         return Ok(());
     };
-    let _lock = crate::auto_update::PaneProcessLock::acquire(&session.pane_id)?;
+    // A resume transaction can hold the registry lock while a concurrent close
+    // holds the pane lock. Skip this scan rather than invert that lock order.
+    let Some(_lock) = crate::auto_update::PaneProcessLock::try_acquire(&session.pane_id)? else {
+        return Ok(());
+    };
     let Some(live) = Tmux::live_pane_identity(&session.pane_id)? else {
         return Ok(());
     };

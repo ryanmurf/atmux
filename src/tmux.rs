@@ -4094,6 +4094,33 @@ mod tests {
         }
     }
 
+    fn assert_startup_skips_busy_pane(
+        socket: &str,
+        config: &crate::config::Config,
+        session: &Session,
+    ) -> Result<()> {
+        let held = crate::auto_update::PaneProcessLock::acquire(&session.pane_id)?;
+        let busy_session = session.clone();
+        let busy_config = config.clone();
+        let busy_socket = socket.to_owned();
+        let (finished, received) = std::sync::mpsc::channel();
+        let contender = thread::spawn(move || {
+            Tmux::with_socket_for_test(&busy_socket, || {
+                crate::startup_prompts::handle(&busy_config, &busy_session);
+                finished.send(()).unwrap();
+                Ok(())
+            })
+        });
+        let skipped = received.recv_timeout(Duration::from_secs(2));
+        drop(held);
+        contender.join().unwrap()?;
+        assert!(
+            skipped.is_ok(),
+            "startup handling must not wait on a busy pane lock"
+        );
+        Ok(())
+    }
+
     #[test]
     fn startup_development_dialog_is_answered_once_on_disposable_socket() -> Result<()> {
         let probe = disposable_tmux("startup-dialog");
@@ -4142,6 +4169,8 @@ mod tests {
                 }
                 thread::sleep(Duration::from_millis(25));
             };
+            assert_startup_skips_busy_pane(&probe.socket, &config, &session)?;
+            assert!(!recorder.exists(), "a busy pane must not receive keys");
             crate::startup_prompts::handle(&config, &session);
             crate::startup_prompts::handle(&config, &session);
             while !recorder.exists() {
@@ -4152,6 +4181,7 @@ mod tests {
                         session.content
                     );
                 }
+                crate::startup_prompts::handle(&config, &session);
                 thread::sleep(Duration::from_millis(25));
             }
             assert_eq!(fs::read_to_string(&recorder)?, "1\n");
