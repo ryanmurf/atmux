@@ -6683,6 +6683,7 @@ pub(crate) fn test_control(machines: &[&str]) -> ControlPlane {
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_lines)] // One literal mirrors every Inner field.
 pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> ControlPlane {
     let local_id = config.node.id.clone();
     let local_label = config.node_label();
