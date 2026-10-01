@@ -2,9 +2,9 @@
 //! browser/MCP responses use `SessionRecord`, which cannot contain an identity.
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
+    fs::File,
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
@@ -551,6 +551,34 @@ impl Registry {
         self.commit(&mut state, stored)
     }
 
+    /// A1 can attach a precise prompt reason to the durable waiting record.
+    /// # Errors
+    /// Rejects unknown reasons/keys and persistence failures.
+    pub fn set_needs_input_reason(&self, key: &str, reason: Option<String>) -> Result<()> {
+        ensure!(tmux::valid_session_key(key), "invalid session key");
+        ensure!(
+            reason.as_deref().is_none_or(|value| matches!(
+                value,
+                "idle_prompt" | "question" | "permission" | "startup_prompt" | "plan_approval"
+            )),
+            "invalid needs-input reason"
+        );
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stored = state
+            .records
+            .get(key)
+            .cloned()
+            .context("unknown registry session")?;
+        if stored.record.needs_input_reason == reason {
+            return Ok(());
+        }
+        stored.record.needs_input_reason = reason;
+        self.commit(&mut state, stored)
+    }
+
     pub fn set_event_sink(&self, sink: EventSink) {
         self.state
             .lock()
@@ -631,8 +659,13 @@ impl Registry {
                     .min(at_ms),
             );
             session.status.label().clone_into(&mut record.last_status);
-            record.needs_input_reason =
-                (session.status == AgentStatus::Waiting).then(|| "idle_prompt".to_owned());
+            if session.status == AgentStatus::Waiting {
+                if record.needs_input_reason.is_none() {
+                    record.needs_input_reason = Some("idle_prompt".to_owned());
+                }
+            } else {
+                record.needs_input_reason = None;
+            }
             record.state = if session.agent == AgentKind::Other || session.agent_pid.is_none() {
                 SessionState::Exited
             } else {
@@ -878,15 +911,18 @@ impl Registry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let reset = epoch != self.epoch || revision > state.revision;
         let revision = if reset { 0 } else { revision };
-        let mut records = state
+        let mut matches = state
             .records
             .values()
             .filter(|s| s.record.machine == self.owner && s.revision > revision)
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|s| s.revision);
+        let more = matches.len() > PAGE_SIZE;
+        let records = matches
+            .into_iter()
+            .take(PAGE_SIZE)
             .cloned()
             .collect::<Vec<_>>();
-        records.sort_by_key(|s| s.revision);
-        let more = records.len() > PAGE_SIZE;
-        records.truncate(PAGE_SIZE);
         let next = if more {
             records.last().map_or(revision, |s| s.revision)
         } else {
@@ -1374,12 +1410,23 @@ fn atomic_write(dir: &File, name: &str, bytes: &[u8]) -> Result<()> {
     result
 }
 fn private_directory(path: &Path) -> Result<()> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)?;
-    let file = workspace::open_absolute_directory(path)?;
-    let metadata = file.metadata()?;
+    ensure!(path.is_absolute(), "registry directory must be absolute");
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
+    let mut current = workspace::open_absolute_directory(Path::new("/"))?;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                match rustix::fs::mkdirat(&current, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                current = open_at(&current, name, flags, 0)?;
+            }
+            _ => bail!("unsafe registry directory component"),
+        }
+    }
+    let metadata = current.metadata()?;
     ensure!(
         metadata.uid() == rustix::process::geteuid().as_raw()
             && metadata.permissions().mode().trailing_zeros() >= 6,
@@ -1387,6 +1434,7 @@ fn private_directory(path: &Path) -> Result<()> {
     );
     Ok(())
 }
+
 fn hash_reader(reader: &mut impl Read, limit: u64) -> Result<(String, u64)> {
     let mut digest = Sha256::new();
     let mut buffer = vec![0; 64 * 1024];
@@ -1601,6 +1649,7 @@ pub(crate) fn spawn_pull(
 mod tests {
     use super::*;
     use flate2::read::GzDecoder;
+    use std::fs;
     use std::os::unix::fs::symlink;
 
     struct Fixture {
@@ -2152,6 +2201,41 @@ mod tests {
         .unwrap();
         pull_once(&receiver, &remote, None).await.unwrap();
         assert!(receiver.bundle_file(&key).is_ok());
+        fs::remove_file(
+            receiver_fixture
+                .config
+                .directory
+                .as_ref()
+                .unwrap()
+                .join(format!("bundles/{}.tar.gz", info.id)),
+        )
+        .unwrap();
+        fs::remove_file(
+            fixture
+                .config
+                .directory
+                .as_ref()
+                .unwrap()
+                .join(format!("bundles/{}.tar.gz", info.id)),
+        )
+        .unwrap();
+        let after_missing = pull_once(&receiver, &remote, None).await.unwrap();
+        assert!(
+            !receiver
+                .get(&key)
+                .unwrap()
+                .unwrap()
+                .bundle
+                .unwrap()
+                .available
+        );
+        let source = control.registry().unwrap();
+        let second_key = seed(&source, fixture.native("codex"), "codex");
+        source.observe(&[], 3000).unwrap();
+        pull_once(&receiver, &remote, Some(&after_missing))
+            .await
+            .unwrap();
+        assert!(receiver.bundle_file(&second_key).is_ok());
         server.abort();
     }
 
@@ -2203,6 +2287,55 @@ mod tests {
                 .unwrap()
                 .join(format!("bundles/{}.tar.gz", last.id))
                 .exists()
+        );
+    }
+    #[test]
+    fn storage_creation_rejects_symlink_ancestors_before_writing() {
+        let mut fixture = Fixture::new();
+        let outside = fixture.directory.join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, fixture.directory.join("link")).unwrap();
+        fixture.config.directory = Some(fixture.directory.join("link/uncreated/registry"));
+        assert!(Registry::open(&fixture.config, "owner").is_err());
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn digest_reference_and_precise_input_reason_survive_waiting_scans() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        let mut session = session();
+        session.status = AgentStatus::Waiting;
+        let key = session.session_key.clone().unwrap();
+        registry
+            .observe(std::slice::from_ref(&session), 1000)
+            .unwrap();
+        registry
+            .set_digest_reference(&key, Some("digest-v3".to_owned()))
+            .unwrap();
+        registry
+            .set_needs_input_reason(&key, Some("permission".to_owned()))
+            .unwrap();
+        registry
+            .observe(std::slice::from_ref(&session), 2000)
+            .unwrap();
+        let record = registry.get(&key).unwrap().unwrap();
+        assert_eq!(record.needs_input_reason.as_deref(), Some("permission"));
+        assert_eq!(record.digest_ref.as_deref(), Some("digest-v3"));
+        assert!(
+            registry
+                .set_needs_input_reason(&key, Some("arbitrary".to_owned()))
+                .is_err()
+        );
+        session.status = AgentStatus::Working;
+        registry.observe(&[session], 3000).unwrap();
+        assert!(
+            registry
+                .get(&key)
+                .unwrap()
+                .unwrap()
+                .needs_input_reason
+                .is_none()
         );
     }
 }

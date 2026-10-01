@@ -70,7 +70,8 @@ Bundle import/resume and phone-home restore (A4); summaries (A2); events (A1).
 
 - Storage is one private, bounded JSON record per stable key, with descriptor-relative temporary
   writes, file sync, rename, directory sync, and a process ownership lock. A corrupt committed
-  file fails startup; torn temporary files are removed. This avoids a new database dependency
+  file fails startup; torn temporary files are removed. Directory creation itself also walks pinned descriptors,
+  refusing symlink ancestors before any descendant can be created. This avoids a new database dependency
   and works independently of the optional Pulse feature.
 - `[registry]` is optional and disabled by default. `directory` defaults to the platform state
   directory's `registry/`; `max_owner_records = 10000`, `archived_retention_days = 90`,
@@ -109,7 +110,8 @@ Bundle import/resume and phone-home restore (A4); summaries (A2); events (A1).
   serialize and reserve space before writing, keeping staged bytes within the total quota.
   Local archiving reserves the configured maximum, a conservative choice that can evict a
   bundle earlier than strictly necessary; this avoids exceeding quota during compression.
-  `bundle.available` reports actual artifact availability in browser/MCP history responses.
+  `bundle.available` reports local descriptor presence/size in browser/MCP history responses;
+  SHA-256 is verified when opening/transferring the artifact.
 - REST history: `GET /api/v1/session-history` and `GET /api/v1/session-history/{session_key}`.
   MCP: `sessions_search` and `session_get`. Search parameters are `state`, `machine`, `project`
   (remote/root substring), `text` (name/description/title substring), `cursor` (last stable key),
@@ -122,7 +124,9 @@ Bundle import/resume and phone-home restore (A4); summaries (A2); events (A1).
   navigation preserves the existing draft/editor guards and mobile Back behavior.
 - A1: call `Registry::set_event_sink` once after constructing the control plane. One emission
   call site invokes it after durable `session.closed` / `session.archived` transitions. The
-  callback receives a public record and can construct A1's envelope; A3 does not add an event
+  callback receives a public record and can construct A1's envelope;
+  `Registry::set_needs_input_reason` accepts the five contract reasons and waiting scans retain
+  that precise reason until work resumes; A3 does not add an event
   spool or Redpanda sink. This is the explicitly deferred wiring in the brief.
 - A2: `Registry::set_digest_reference` persists a bounded digest id/version; scans retain it.
   Reconcile `[summaries]`/`[events]` config additions and MCP/history naming at integration.
@@ -138,7 +142,7 @@ Bundle import/resume and phone-home restore (A4); summaries (A2); events (A1).
 ## Gates and evidence
 
 - [x] Implementation: registry, archive, federation, REST/MCP, and Sessions history are present.
-- [x] Focused Rust: `cargo test --all-features --lib registry::tests` — 12 passed.
+- [x] Focused Rust: `cargo test --all-features --lib registry::tests` — 14 passed (plus a separate actual MCP-tool redaction test).
 - [x] Disposable owner: `ATMUX_REQUIRE_TMUX=1 cargo test --all-features --test session_registry`
   — external and dashboard closes both archived the correct fixture native log/key (1 passed).
 - [x] `cargo fmt`; `cargo clippy --all-targets --all-features -- -D warnings` — clean.
@@ -154,3 +158,12 @@ Bundle import/resume and phone-home restore (A4); summaries (A2); events (A1).
 - [ ] Platform runtime matrix / independent security and Fable/Claude review: lead-owned release
   gates per `features/README.md`. This record stays active; no running fleet, services, cluster,
   agents, or default tmux server were touched.
+
+
+### Completed implementation commits
+
+- `2d36953` — durable records, native archives, federation, REST/MCP, Sessions view and tests.
+- Follow-up storage/paging hardening: bounded pages clone only returned records; storage mkdir
+  refuses symlink ancestors; precise A1 reasons/digest references survive scans; a streamed 404
+  retains its HTTP classification and cannot block later registry changes. Focused tests and
+  zero-warning clippy pass before the commit; full frozen-source verification follows.

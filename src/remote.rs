@@ -1121,7 +1121,15 @@ impl RemoteMachine {
             .body(Full::new(Bytes::new()))?;
         let response =
             tokio::time::timeout(self.request_timeout, sender.send_request(request)).await??;
-        check_status(&self.id, path, response.status())?;
+        if !response.status().is_success() {
+            return Err(RemoteResponseError {
+                machine: self.id.clone(),
+                path: path.to_owned(),
+                status: response.status(),
+                detail: String::new(),
+            }
+            .into());
+        }
         if let Some(length) = response.headers().get(header::CONTENT_LENGTH) {
             anyhow::ensure!(
                 length.to_str()?.parse::<u64>()? == expected_bytes,
