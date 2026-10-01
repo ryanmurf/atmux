@@ -122,7 +122,8 @@ Bundle import/resume and phone-home restore (A4); summaries (A2); events (A1).
   30s refresh, Open for a live pane, and a disabled Resume until A4 installs the clearly named
   `window.atmuxSessionResume({ session_key, machine })` hook. Rendering uses text nodes and
   navigation preserves the existing draft/editor guards and mobile Back behavior.
-- A1: call `Registry::set_event_sink` once after constructing the control plane. One emission
+- Initial A1 handoff (superseded by the integration follow-up below): call
+  `Registry::set_event_sink` once after constructing the control plane. One emission
   call site invokes it after durable `session.closed` / `session.archived` transitions. The
   callback receives a public record and can construct A1's envelope;
   `Registry::set_needs_input_reason` accepts the five contract reasons and waiting scans retain
@@ -188,9 +189,9 @@ Bundle import/resume and phone-home restore (A4); summaries (A2); events (A1).
 
 ### Merge reconciliation and bounded limitations
 
-- A1 must install the lifecycle callback and feed precise needs-input reasons; A2 must feed
-  digest references and reconcile automatic description provenance with scan-derived user
-  descriptions. None of the other workstreams' event spool, summaries, or resume behavior is
+- A1 must preserve the installed lifecycle bridge and feed precise needs-input reasons; A2
+  must feed digest references. Automatic description provenance is now preserved by scans,
+  and the integration adapter overlays authoritative descriptions on cached digest context. None of the other workstreams' event spool, summaries, or resume behavior is
   duplicated here.
 - A4 must wire the named browser Resume hook, use server-only native identity/verified bundle
   descriptors, and preserve the stable key before scanning a restored pane. Registry imports
@@ -214,7 +215,7 @@ Bundle import/resume and phone-home restore (A4); summaries (A2); events (A1).
 
 ## Lead integration follow-up (base `13fe19a`)
 
-Status: event/search wiring implemented; frozen acceptance run pending.
+Status: event/search wiring complete and locally accepted on `a52d968` (2026-09-30).
 
 - `registry_integration.rs` installs a weak control-plane callback before the first owner scan.
   Every durable registry commit, including authenticated remote imports, carries a public
@@ -230,7 +231,7 @@ Status: event/search wiring implemented; frozen acceptance run pending.
 - Native SessionEnd and status-derived exits carry the same process id. The existing bounded
   durable event spool deduplicates exits by key/generation/PID and terminal session events by
   key/generation/transition timestamp, so registry-first, native-first, scan-first and retry
-  delivery cannot append duplicate lifecycle events; distinct relaunches still emit exits.
+  delivery cannot append duplicate lifecycle events within the retained spool; distinct relaunches still emit exits.
 - Search uses `ControlPlane::session_digest_record` and `publish_digest_search`. Registry
   metadata overlays cached model title/digest and cursors; without a digest the title is the
   session name, description comes from the registry, and digest is empty. Explicitly cleared
@@ -252,11 +253,32 @@ Status: event/search wiring implemented; frozen acceptance run pending.
   left unchanged. No UI edits, deployment, push, service restart, cluster change or running
   tmux/agent operation is included in this follow-up.
 
-Follow-up focused evidence so far: `cargo test --all-features --lib registry` (23 passed,
-including 7 integration tests plus bounded retry coverage); `events::` (12 passed),
-`summarizer::` (9 passed), `session_search::` (4 passed); JavaScript syntax check passed and
-`node --test web/*.test.mjs tests/navigation.test.mjs` passed all 193 tests. Final fmt/clippy
-and full-suite evidence will be recorded after freezing the implementation.
+Follow-up acceptance evidence on frozen implementation `a52d968`:
+
+- [x] `cargo fmt -- --check` — passed.
+- [x] `cargo clippy --all-targets --all-features -- -D warnings` — zero warnings.
+- [x] `cargo test --all-features --lib registry` — 23 passed, including 7 integration tests
+  and bounded retry coverage. Focused `events::` — 12 passed, `summarizer::` — 9 passed,
+  `session_search::` — 4 passed; all are also included in the final complete suite.
+- [x] `ATMUX_REQUIRE_TMUX=1 cargo test --all-features --test session_registry` — passed,
+  with both fixture close paths and their real owner event feeds verified.
+- [x] `cargo test --all-features` — 867 passed, 7 existing ignored, zero failures. The same
+  private validation checkout and serial-test prerequisites documented above were used,
+  with `ATMUX_REQUIRE_TMUX=1`, `ATMUX_TMUX_SOCKET_NAME=atmux-ci-a3-wired-20260930`,
+  `RUST_TEST_THREADS=1`, and `TMUX`/`TMUX_PANE` removed. Full log:
+  `/home/ryan/atmux-a3-validation-20260930/a3-wired-all-features.log`.
+- [x] `node --check web/app.js` — passed;
+  `node --test web/*.test.mjs tests/navigation.test.mjs` — 193 passed.
+- [x] Protected A1 hook comparison with `13fe19a` — unchanged. No UI changes were made, so
+  the conditional browser-suite rerun was unnecessary; original browser evidence remains above.
+- [x] Commit `a52d968` — `Wire registry lifecycle events and complete search snapshots`.
+
+Lead merge points for this follow-up: preserve the ordered callback installation before the
+first scan and its projection-only contract; merge the new DigestRecord adapter and accepted
+snapshot metadata/high-water logic in `summarizer.rs`; retain the exit PID in A1 native/status
+emission and lifecycle deduplication in the event spool. A1 still supplies the search transport
+and remote fleet-append behavior through its own hook bodies. The existing platform/runtime
+and independent release reviews remain lead-owned.
 
 The disposable owner integration also enables its own events store and private runtime directory
 (`XDG_RUNTIME_DIR`/`TMPDIR`), then checks the real HTTP owner feed for exactly one exit, close and
