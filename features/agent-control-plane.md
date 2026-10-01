@@ -143,3 +143,47 @@ additions so merges stay mechanical.
   and the browser suites when the UI changes.
 - Commit on your branch with clear messages. Keep a feature record under `features/` with
   acceptance criteria, gates, and evidence.
+
+## herodevs platform contract (verified 2026-09-30 against origin/main and the live cluster)
+
+**Redpanda.** In-cluster broker `redpanda.herodevs.svc.cluster.local:9092`, PLAINTEXT, no SASL/TLS,
+single node (`--mode=dev-container`), `auto_create_topics_enabled=true` (1 partition, RF 1). The
+broker advertises `redpanda:9092`, so a client outside namespace `herodevs` must resolve
+`redpanda` (the atmux coordinator Deployment needs `hostAliases: [{ip: <redpanda ClusterIP>,
+hostnames: [redpanda]}]`; ClusterIP today is `10.152.183.23`). There is no HTTP proxy and no LAN
+path; only the coordinator publishes. Anything in the cluster can publish any tenant's events: that
+is the platform's existing trust model.
+
+**Envelope.** Platform listeners unwrap a message only when it has both `envelopeVersion` and
+`eventPayload`. atmux publishes to `atmux.agent.events.v1`, key `session_key`, value:
+
+```json
+{"envelopeVersion": 2, "eventType": "atmux.agent.event.v1", "publishedAt": "<RFC 3339>",
+ "securityContext": {"tenantId": "<tenant>", "token": null, "platform": "SYSTEM", "userId": null, "sessionId": null},
+ "mdc": {}, "payloadRef": null, "payloadSummary": null,
+ "eventPayload": { "...the atmux.agent.event/v1 object...": "...", "tenantId": "<tenant>" }}
+```
+
+`tenantId` must be inside `eventPayload` as well: without a JWT the platform cannot resolve a
+tenant otherwise and drops the event. HQ tenant: `95efe33d-fa71-53ce-8e0a-3fe45ac0e58a`
+(configurable, `[events.redpanda] tenant_id`). `platform` must be one of
+`ANDROID|API|IOS|SYSTEM|UNKNOWN|WEB|WORKFLOW`. Keep values well under 800 KB.
+
+**Search.** hd-api-search has no ingestion API; documents enter only through `entity-change`
+events with an index definition for the entity type. atmux session digests are indexed as entity
+type `ATMUX_SESSION`, `entityId` = `session_key` (a UUID), by the coordinator publishing an
+`HdEntityChangeEvent` envelope to topic `entity-change` (exact shape in the H2 record). Embeddings
+are OpenAI `text-embedding-3-small`; keep each digest document under 8 KB for one clean vector.
+Search is exposed as MCP `search.query` with `entityTypes: ["ATMUX_SESSION"]` (source `atmux`).
+Gather transcripts are already indexed as `FileUpload` Markdown.
+
+**Triggers.** The generic `event` trigger has no generic topic consumer and never evaluates its
+filter, so `atmux.agent` is a dedicated first-class type (H1) with its own listener and selector.
+
+**Jobs.** hd-api-channel can claim/complete jobs but cannot create them, and its lease sweeper is
+off in production. H4 adds job creation and enables the sweeper.
+
+**Shipping herodevs changes.** Production runs the `hd-api` monolith built from every module's
+`main`; a merged module ships only after hd-api's Publish Image workflow runs, and new
+`trigger.*` RLS-ignored tables must be mirrored in `hd-api/src/main/resources/service.yml` and
+`hd-helm` `charts/local/values.yaml`.
