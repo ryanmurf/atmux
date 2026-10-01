@@ -188,6 +188,20 @@ impl RemoteMachine {
             .with_context(|| format!("machine {} returned an unreadable {path} payload", self.id))
     }
 
+    /// Bounded JSON read for durable event long-polls.
+    /// # Errors
+    /// Rejects transport, status, size or JSON errors like `get_json`.
+    pub async fn get_json_with_timeout<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        timeout: Duration,
+    ) -> Result<T> {
+        let body = self
+            .request_with_timeout(Method::GET, path, None, timeout)
+            .await?;
+        serde_json::from_slice(&body).context("unreadable federated long-poll payload")
+    }
+
     /// Sends a JSON command to the node.
     ///
     /// # Errors

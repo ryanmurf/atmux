@@ -149,6 +149,21 @@ impl AtmuxMcp {
 #[tool_router]
 impl AtmuxMcp {
     #[tool(
+        name = "agent_events",
+        description = "Read durable agent lifecycle events across all owners. Long-poll up to 30 seconds with an opaque cursor and exact types, machine, session_key or reasons filters. Pages are bounded to 100 events and 512 KiB; reset signals retention gaps or spool replacement."
+    )]
+    async fn agent_events(
+        &self,
+        Parameters(request): Parameters<crate::events::EventQuery>,
+    ) -> Result<String, String> {
+        let page = self
+            .control
+            .agent_events(request, false)
+            .await
+            .map_err(|error| error.to_string())?;
+        serde_json::to_string(&page).map_err(|error| error.to_string())
+    }
+    #[tool(
         name = "agents_list",
         description = "List compact live agent/session state for every federated machine. Each session carries an opaque machine-qualified id plus its machine, and the machines array reports online/offline health. Save revision and content_hash values for efficient follow-up calls."
     )]
@@ -437,6 +452,71 @@ pub fn service_with_pulse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn agent_events_tool_is_optional_bounded_and_filtered() {
+        let disabled = AtmuxMcp::new(crate::control::test_control(&[]));
+        assert!(
+            disabled
+                .agent_events(Parameters(crate::events::EventQuery::default()))
+                .await
+                .unwrap_err()
+                .contains("disabled")
+        );
+        let directory = std::env::temp_dir().join(format!(
+            "atmux-mcp-events-{}",
+            crate::tmux::new_session_key().unwrap()
+        ));
+        let mut config: crate::config::Config =
+            toml::from_str(crate::config::DEFAULT_CONFIG).unwrap();
+        config.events = Some(crate::events::EventsConfig {
+            directory: Some(directory.clone()),
+            ..Default::default()
+        });
+        let control = crate::control::test_control_with_config(&[], config);
+        let mut event = crate::events::AgentEvent::node_started("local").unwrap();
+        event.event_type = "agent.needs_input".into();
+        event.reason = Some("startup_prompt".into());
+        let session_key = event.session_key.clone();
+        control.emit_agent_event(event).unwrap();
+        let mcp = AtmuxMcp::new(control);
+        let response = mcp
+            .agent_events(Parameters(crate::events::EventQuery {
+                types: Some("agent.needs_input".into()),
+                session_key: Some(session_key),
+                reasons: Some("startup_prompt".into()),
+                limit: Some(1),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["events"].as_array().unwrap().len(), 1);
+        assert_eq!(response["events"][0]["event"]["reason"], "startup_prompt");
+        let empty = mcp
+            .agent_events(Parameters(crate::events::EventQuery {
+                after: Some(response["next"].as_str().unwrap().into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&empty).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            mcp.agent_events(Parameters(crate::events::EventQuery {
+                wait: Some(31),
+                ..Default::default()
+            }))
+            .await
+            .is_err()
+        );
+        drop(mcp);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn output_line_contract_defaults_and_clamps() {

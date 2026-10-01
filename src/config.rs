@@ -231,6 +231,9 @@ pub struct Config {
     /// Explicitly trusted remote atmux nodes aggregated by this coordinator.
     #[serde(default)]
     pub machines: Vec<MachineConfig>,
+    /// Agent lifecycle telemetry is disabled unless this section exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<crate::events::EventsConfig>,
     /// The file this configuration was loaded from, when it came from one.
     ///
     /// Owner-local features which must agree with the policy in effect (for
@@ -602,6 +605,7 @@ impl Config {
             .validate()
             .with_context(|| format!("invalid Pulse configuration in {}", path.display()))?;
         config.source_path = Some(path.clone());
+        crate::events::configure_profiles(&mut config)?;
         Ok((config, path))
     }
 

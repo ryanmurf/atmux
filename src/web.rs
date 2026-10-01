@@ -829,6 +829,8 @@ fn routes(state: WebState) -> Router {
         .route("/api/v1/sessions", get(sessions).post(launch))
         .route("/api/v1/memory-launches/v1", post(launch_with_memory))
         .route("/api/v1/events", get(overview_events))
+        .route("/api/v1/agent-events", get(owner_agent_events))
+        .route("/api/v1/fleet/agent-events", get(fleet_agent_events))
         .route("/api/v1/launch-options", get(launch_options))
         .route("/api/v1/launch-directories", get(launch_directories))
         .route(
@@ -903,6 +905,32 @@ pub fn api_router(
         allowed_origins: allowed_origins.into(),
         shutdown,
     })
+}
+
+async fn owner_agent_events(
+    State(state): State<WebState>,
+    Query(query): Query<crate::events::EventQuery>,
+) -> Result<Json<crate::events::EventPage>, ApiError> {
+    Ok(Json(
+        state
+            .control
+            .agent_events(query, true)
+            .await
+            .map_err(|error| ApiError::from_control(&error))?,
+    ))
+}
+
+async fn fleet_agent_events(
+    State(state): State<WebState>,
+    Query(query): Query<crate::events::EventQuery>,
+) -> Result<Json<crate::events::EventPage>, ApiError> {
+    Ok(Json(
+        state
+            .control
+            .agent_events(query, false)
+            .await
+            .map_err(|error| ApiError::from_control(&error))?,
+    ))
 }
 
 async fn shutdown_signal(shutdown: watch::Sender<bool>) {

@@ -483,6 +483,13 @@ impl Tmux {
                 &pane_id,
             )?
         };
+        let command = crate::events::inject_command(
+            command,
+            config
+                .events
+                .as_ref()
+                .is_some_and(|events| events.inject_hooks),
+        )?;
         let invocation = scope.wrap(command)?;
         publish_scope_metadata(&pane_id, &scope)?;
         let (program, arguments) = invocation
@@ -1056,6 +1063,7 @@ impl Tmux {
         // Consume the one-launch plan so a successful preflight cannot be
         // reused for another process generation.
         scope: PreparedScope,
+        inject_hooks: bool,
     ) -> Result<()> {
         let claude_program = crate::config::revalidate_resume_claude_program(claude_program)
             .ok_or_else(|| {
@@ -1067,6 +1075,7 @@ impl Tmux {
             .to_str()
             .with_context(|| format!("directory is not valid UTF-8: {}", directory.display()))?;
         let invocation = claude_resume_invocation(&claude_program, config_dir, session_id)?;
+        let invocation = crate::events::inject_command(invocation, inject_hooks)?;
         let invocation = scope.wrap(invocation)?;
         let command = escape_tmux_argument(&shell_words::join(invocation)).into_owned();
         let directory = escape_tmux_argument(directory);
@@ -5652,6 +5661,7 @@ mod tests {
             Path::new("/tmp/.claude"),
             "11111111-1111-1111-1111-111111111111",
             systemd_scope::prepare(&AgentResourcesConfig::default(), "missing-claude").unwrap(),
+            false,
         )
         .unwrap_err();
         assert!(
@@ -5660,6 +5670,54 @@ mod tests {
                 .any(<dyn std::error::Error>::is::<ClaudeResumeUnavailable>)
         );
         assert!(!error.to_string().contains("tmux respawn-pane"));
+    }
+
+    #[test]
+    fn configured_event_hooks_survive_fresh_and_native_relaunch_builders() {
+        let mut config: crate::config::Config =
+            toml::from_str(crate::config::DEFAULT_CONFIG).unwrap();
+        config.events = Some(crate::events::EventsConfig::default());
+        crate::events::configure_profiles(&mut config).unwrap();
+        for profile in &config.profiles {
+            let invocation = Tmux::build_launch_invocation(profile, None, None).unwrap();
+            assert!(invocation.iter().any(|arg| arg.contains(" hook ")));
+            let harness = if profile.harness == "claude" {
+                crate::auto_update::Harness::Claude
+            } else {
+                crate::auto_update::Harness::Codex
+            };
+            let mode = ProfileMode {
+                id: "fixture".into(),
+                model: if profile.harness == "claude" {
+                    "sonnet".into()
+                } else {
+                    "gpt-6.1-sol".into()
+                },
+                ..Default::default()
+            };
+            let resume = crate::auto_update::resume_arguments(
+                harness,
+                "11111111-1111-1111-1111-111111111111",
+            )
+            .unwrap();
+            let relaunched =
+                build_native_relaunch_invocation(profile, &mode, harness, resume).unwrap();
+            assert!(relaunched.iter().any(|arg| arg.contains(" hook ")));
+            assert!(
+                relaunched
+                    .iter()
+                    .any(|arg| arg == "--resume" || arg == "resume")
+            );
+        }
+        let claude = claude_resume_invocation(
+            Path::new("/usr/local/bin/claude"),
+            Path::new("/tmp/claude-max"),
+            "11111111-1111-1111-1111-111111111111",
+        )
+        .unwrap();
+        let resumed = crate::events::inject_command(claude, true).unwrap();
+        assert!(resumed.contains(&"--settings".into()));
+        assert!(resumed.iter().any(|arg| arg.contains(" hook ")));
     }
 
     #[test]
