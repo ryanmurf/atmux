@@ -3468,7 +3468,7 @@ function sessionEditRequest(session, nameValue, descriptionValue) {
   if (/[\u0000-\u001f\u007f-\u009f]/.test(description)) return { error: "The description must be a single line." };
   const body = { instance_id: session.instance_id };
   if (renamed) body.name = name;
-  if (description !== (session.description || "")) body.description = description;
+  if (description !== (session.description || "") || session.description_source === "auto") body.description = description;
   if (!("name" in body) && !("description" in body)) return { unchanged: true };
   return { id: session.id, body };
 }
@@ -3910,8 +3910,89 @@ function savedSessionConfirmation({ machineId, machineLabel, profileLabel, direc
   ].join("\n");
 }
 
+function generatedSessionName(title) {
+  const name = String(title || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 100);
+  return SESSION_NAME_PATTERN.test(name) && name !== RESERVED_SERVICE_SESSION ? name : "";
+}
+
+function inlineRenameAction(event, { selected = false, dialogOpen = false } = {}) {
+  if (event.key === "Escape") return "cancel";
+  if (event.key === "Enter" && !event.isComposing) return "save";
+  if (event.key === "F2" && !event.isComposing && selected && !dialogOpen && !event.ctrlKey && !event.metaKey && !event.altKey
+    && !event.target?.closest?.("input, textarea, select, [contenteditable]")) return "open";
+  return null;
+}
+
+/// The same editor is used by header and rail, with a captured pane generation.
+function createInlineRenameEditor({ document, host, anchor, session, save, suggest, close }) {
+  const snapshot = { id: session.id, instance_id: session.instance_id, name: session.name, description: session.description || "" };
+  const form = document.createElement("form"); form.className = "inline-rename";
+  form.setAttribute("aria-label", `Rename ${snapshot.name}`);
+  const input = document.createElement("input"); input.className = "inline-rename-name";
+  input.value = snapshot.name; input.maxLength = 100; input.autocomplete = "off";
+  input.setAttribute("aria-label", "Session name"); input.spellcheck = false;
+  const note = document.createElement("span"); note.className = "inline-rename-note"; note.setAttribute("role", "alert");
+  let closed = false; let saving = false; let suggesting = false;
+  const finish = () => { if (closed) return; closed = true; form.remove(); anchor.style.visibility = ""; close?.(); };
+  const submit = async () => {
+    if (closed || saving) return;
+    const edit = sessionEditRequest(snapshot, input.value, snapshot.description);
+    if (edit.error) { note.textContent = edit.error; return; }
+    if (edit.unchanged) { finish(); return; }
+    saving = true; input.disabled = true; saveButton.disabled = true; suggestButton.disabled = true;
+    try { await save(edit, snapshot); finish(); }
+    catch (error) { if (!closed) note.textContent = error.message; }
+    finally { saving = false; input.disabled = false; saveButton.disabled = false; suggestButton.disabled = false; }
+  };
+  const button = (label, action) => {
+    const node = document.createElement("button"); node.type = "button"; node.textContent = label;
+    node.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); action(); }); return node;
+  };
+  const suggestButton = button("Suggest", async () => {
+    if (closed || saving || suggesting) return;
+    suggesting = true; suggestButton.disabled = true;
+    try {
+      const title = generatedSessionName(await suggest(snapshot));
+      if (!closed) { if (title) { input.value = title; note.textContent = ""; input.focus(); input.select(); }
+        else note.textContent = "No generated title yet. Try again after a summary is available."; }
+    } catch (error) { if (!closed) note.textContent = error.message; }
+    finally { suggesting = false; suggestButton.disabled = saving; }
+  });
+  const saveButton = button("Save", () => { void submit(); });
+  const cancelButton = button("Cancel", () => { if (!saving) finish(); });
+  input.addEventListener("keydown", (event) => {
+    const action = inlineRenameAction(event); if (!action) return;
+    event.preventDefault(); event.stopPropagation();
+    if (action === "save") void submit(); else if (!saving) finish();
+  });
+  form.addEventListener("submit", (event) => { event.preventDefault(); void submit(); });
+  form.addEventListener("click", (event) => event.stopPropagation());
+  form.append(input, suggestButton, saveButton, cancelButton, note); host.append(form);
+  anchor.style.visibility = "hidden"; input.focus(); input.select();
+  return { id: snapshot.id, instance_id: snapshot.instance_id, close: finish, input };
+}
+
+function bindInlineRenameGesture(node, open, timers = globalThis) {
+  let timer = null; let origin = null; let held = false;
+  const cancel = () => { if (timer !== null) timers.clearTimeout(timer); timer = null; };
+  node.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); open(); });
+  node.addEventListener("pointerdown", (event) => {
+    if (event.pointerType !== "touch") return;
+    cancel(); held = false; origin = { x: event.clientX, y: event.clientY };
+    timer = timers.setTimeout(() => { timer = null; held = true; open(); }, 600);
+  });
+  node.addEventListener("pointermove", (event) => {
+    if (origin && Math.hypot(event.clientX - origin.x, event.clientY - origin.y) > 10) cancel();
+  });
+  for (const name of ["pointerup", "pointercancel", "pointerleave"]) node.addEventListener(name, cancel);
+  node.addEventListener("click", (event) => { if (held) { event.preventDefault(); event.stopPropagation(); held = false; } });
+  node.addEventListener("contextmenu", (event) => { if (held) event.preventDefault(); });
+}
+
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
+    generatedSessionName, inlineRenameAction, createInlineRenameEditor, bindInlineRenameGesture,
     MAX_MESSAGE_BYTES,
     MAX_IMAGE_ATTACHMENTS,
     MAX_IMAGE_BYTES,
@@ -4610,6 +4691,7 @@ function initialize() {
     state.paneModels = null;
     state.transcript = { available: false, source: "agent", messages: [], truncated: false, error: null };
     state.transcriptHash = "";
+    state.agentSummary = null; state.summaryOpen = false;
     state.transcriptRequest += 1;
     state.transcriptPointerDown = false;
     state.pendingTranscriptRender = false;
@@ -4765,13 +4847,19 @@ function initialize() {
     state.transcriptPoll = createTranscriptPoller({
       load(signal) {
         const suffix = state.transcriptHash ? `?known_hash=${encodeURIComponent(state.transcriptHash)}` : "";
-        return request(`/api/v1/panes/${encodeURIComponent(paneId)}/transcript${suffix}`, { signal });
+        return Promise.all([
+          request(`/api/v1/panes/${encodeURIComponent(paneId)}/transcript${suffix}`, { signal }),
+          request(`/api/v1/panes/${encodeURIComponent(paneId)}/summary`, { signal }).catch(() => undefined),
+        ]).then(([transcript, summary]) => ({ ...transcript, summary }));
       },
       onData(data) {
         if (!current()) return;
         state.transcriptRequest += 1;
         const next = reduceTranscript(state.transcript, data);
-        const shouldDraw = next.transcript.messages !== state.transcript.messages
+        const summary = data.summary === undefined ? state.agentSummary : data.summary?.enabled ? data.summary : null;
+        const summaryChanged = JSON.stringify(state.agentSummary) !== JSON.stringify(summary);
+        state.agentSummary = summary;
+        const shouldDraw = summaryChanged || next.transcript.messages !== state.transcript.messages
           || next.transcript.available !== state.transcript.available
           || next.transcript.source !== state.transcript.source
           || next.transcript.truncated !== state.transcript.truncated
@@ -4973,6 +5061,15 @@ function initialize() {
         .filter(Boolean),
     );
     const nodes = [];
+    if (state.agentSummary?.digest) {
+      const summary = document.createElement("details"); summary.className = "conversation-summary";
+      summary.open = Boolean(state.summaryOpen);
+      summary.addEventListener("toggle", () => { if (summary.isConnected) state.summaryOpen = summary.open; });
+      const label = document.createElement("summary"); label.textContent = `Summary${state.agentSummary.stale ? " · refreshing" : ""}`;
+      const title = document.createElement("p"); title.className = "summary-title"; title.textContent = state.agentSummary.title;
+      const body = document.createElement("p"); body.textContent = state.agentSummary.digest;
+      summary.append(label, title, body); nodes.push(summary);
+    }
     if (state.transcript.available && state.transcript.note) {
       const notice = document.createElement("p");
       notice.className = "transcript-notice transcript-owner-note";
@@ -6563,6 +6660,7 @@ function initialize() {
   }
 
   function selectSession(id, historyMode = "push") {
+    if (state.inlineRename && state.inlineRename.id !== id) state.inlineRename.close();
     const changed = state.selected !== id || state.selectedMachine !== null || state.pulseOpen;
     const paneChanged = state.selected !== id;
     if (changed && !confirmDiscardFileEdit()) return false;
@@ -6702,6 +6800,7 @@ function initialize() {
   }
 
   function render() {
+    if (state.inlineRename && !paneOutputMatchesSession(state.inlineRename, state.sessions.get(state.inlineRename.id))) state.inlineRename.close();
     clearTimeout(state.statusTimer);
     state.statusTimer = null;
     const presented = presentSessionStatuses(
@@ -6763,6 +6862,7 @@ function initialize() {
     agentName.title = launchCommand ? `tmux launch: ${launchCommand}` : "";
     const agentDescription = $("agent-description");
     agentDescription.textContent = selected.description || "";
+    agentDescription.dataset.source = selected.description_source || "";
     agentDescription.hidden = !selected.description;
     renderAgentBranch();
     const folder = sessionFolderLabel(selected);
@@ -7212,6 +7312,8 @@ function initialize() {
     dot.setAttribute("aria-hidden", "true");
     const copy = document.createElement("span"); copy.className = "session-copy";
     const name = textSpan("", "session-name");
+    bindInlineRenameGesture(name, () => openInlineRename(id, name));
+    name.title = "Double-click or hold to rename (F2 for selected session)";
     const description = textSpan("", "session-description");
     description.hidden = true;
     const sub = textSpan("", "session-sub");
@@ -7276,6 +7378,7 @@ function initialize() {
     node.name.textContent = session.name;
     node.description.textContent = session.description || "";
     node.description.title = session.description || "";
+    node.description.dataset.source = session.description_source || "";
     node.description.hidden = !session.description;
     node.sub.textContent = [folder, profile, session.status, session.agent].filter(Boolean).join(" · ");
     node.sub.title = session.path || "";
@@ -9725,6 +9828,35 @@ function initialize() {
     $("kill-dialog").showModal();
   }
 
+  function openInlineRename(id, anchor = $("agent-name")) {
+    const session = state.sessions.get(id);
+    if (!session || !PANE_INSTANCE_PATTERN.test(String(session.instance_id || "")) || !isMachineControllable(machineOf(session))) return;
+    state.inlineRename?.close();
+    const previousName = session.name;
+    const host = anchor.closest(".session-row") || anchor.parentElement;
+    state.inlineRename = createInlineRenameEditor({ document, host, anchor, session,
+      save: async (edit) => {
+        await request(sessionDeletePath(edit.id), { method: "PATCH", body: JSON.stringify(edit.body) });
+        const current = state.sessions.get(edit.id);
+        if (current?.instance_id === session.instance_id) { current.name = edit.body.name; render(); }
+        toast(`Renamed ${previousName} to ${edit.body.name}`);
+      },
+      suggest: async (snapshot) => {
+        const summary = await request(`/api/v1/panes/${encodeURIComponent(snapshot.id)}/summary`);
+        if (state.sessions.get(snapshot.id)?.instance_id !== snapshot.instance_id) throw new Error("The session changed; open rename again.");
+        return summary.title;
+      },
+      close: () => { state.inlineRename = null; },
+    });
+  }
+  bindInlineRenameGesture($("agent-name"), () => openInlineRename(state.selected));
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "F2") return;
+    if (inlineRenameAction(event, { selected: Boolean(state.selected), dialogOpen: Boolean(document.querySelector("dialog[open]")) }) === "open") {
+      event.preventDefault(); openInlineRename(state.selected);
+    }
+  });
+
   function openSessionEditDialog(id) {
     const session = state.sessions.get(id);
     if (!session || !isMachineControllable(machineOf(session))) return;
@@ -9735,6 +9867,7 @@ function initialize() {
       instance_id: session.instance_id,
       name: session.name,
       description: session.description || "",
+      description_source: session.description_source,
     };
     $("session-edit-current").textContent = session.name;
     $("session-edit-name").value = session.name;

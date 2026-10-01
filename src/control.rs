@@ -265,6 +265,8 @@ pub struct SessionSummary {
     /// Optional short note set from the dashboard; absent from older owners.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description_source: Option<String>,
     pub pane_id: String,
     pub status: String,
     pub agent: String,
@@ -300,6 +302,7 @@ impl SessionSummary {
             machine: machine.to_owned(),
             name: session.name.clone(),
             description: session.description.clone(),
+            description_source: session.description_source.clone(),
             pane_id: session.pane_id.clone(),
             status: session.status.label().to_owned(),
             agent: session.agent.to_string().to_lowercase(),
@@ -433,6 +436,14 @@ pub struct SessionUpdateRequest {
     /// Pane generation the caller saw. A pane that has since been replaced is
     /// refused instead of renaming whatever now holds its tmux id.
     pub instance_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutomaticDescriptionRequest {
+    pub instance_id: String,
+    pub session_key: String,
+    pub description: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -821,6 +832,7 @@ enum ResumeLeaseAcquireError {
 #[derive(Debug)]
 struct Inner {
     config: Config,
+    summarizer: Option<Arc<crate::summarizer::Summarizer>>,
     local_id: String,
     local_label: String,
     /// With no `[[machines]]` configured or discovery enabled there is nothing
@@ -970,6 +982,7 @@ impl ControlPlane {
         let (revisions, _) = watch::channel(0);
         let bare_local_ids = machines.is_empty() && !config.discovery.enabled;
         let configured_machine_ids = machines.keys().cloned().collect();
+        let summarizer = crate::summarizer::Summarizer::configured(&config)?;
         let recovery = RecoveryRunner::production(&config);
         let updater = SelfUpdater::production(&config.self_update)?;
         let control = Self {
@@ -981,6 +994,7 @@ impl ControlPlane {
                 configured_machine_ids,
                 watchers: std::sync::Mutex::new(BTreeMap::new()),
                 config,
+                summarizer,
                 state: RwLock::new(State {
                     revision: 0,
                     sessions: Vec::new(),
@@ -1016,6 +1030,9 @@ impl ControlPlane {
         control.inner.updater.spawn_background();
         for machine in control.remote_machines() {
             control.start_watcher(machine);
+        }
+        if let Some(service) = &control.inner.summarizer {
+            tokio::spawn(service.clone().run(control.clone()));
         }
         Ok(control)
     }
@@ -4065,6 +4082,171 @@ impl ControlPlane {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_summarizer(&self) -> Option<Arc<crate::summarizer::Summarizer>> {
+        self.inner.summarizer.clone()
+    }
+
+    /// Reads a cached digest and schedules stale work without waiting for Qwen.
+    ///
+    /// # Errors
+    /// Returns an error for an unknown or ambiguous session reference.
+    pub fn agent_summary(&self, id: &str) -> Result<crate::summarizer::AgentSummary> {
+        let session = self.conversation_session(id)?;
+        Ok(self.inner.summarizer.as_ref().map_or_else(
+            || crate::summarizer::AgentSummary {
+                title: String::new(),
+                description: session.description.clone().unwrap_or_default(),
+                digest: String::new(),
+                digest_updated_at: None,
+                status: session.status.clone(),
+                needs_input_reason: (session.status == "waiting").then(|| "idle_prompt".into()),
+                stale: false,
+                enabled: false,
+            },
+            |service| service.cached(&session),
+        ))
+    }
+
+    /// Ranks live and recently summarized sessions using bounded term matching.
+    ///
+    /// # Errors
+    /// Returns an error for an oversized or empty search query.
+    pub fn sessions_find(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::summarizer::FoundSession>> {
+        let recent = self
+            .inner
+            .summarizer
+            .as_ref()
+            .map_or_else(Vec::new, |service| service.recent());
+        crate::summarizer::find_sessions(&self.overview().sessions, recent, query, limit)
+    }
+
+    pub(crate) async fn apply_automatic_description(
+        &self,
+        session: &SessionSummary,
+        description: &str,
+    ) -> Result<()> {
+        let Some(key) = &session.session_key else {
+            return Ok(());
+        };
+        self.automatic_description(
+            &session.id,
+            AutomaticDescriptionRequest {
+                instance_id: session.instance_id.clone(),
+                session_key: key.clone(),
+                description: description.into(),
+            },
+        )
+        .await
+    }
+
+    /// Owner endpoint for coordinator-generated metadata. Source and generation
+    /// are checked inside tmux's conditional command list; user edits win races.
+    ///
+    /// # Errors
+    /// Returns an error for invalid text, stale identity, offline owners, or tmux failures.
+    pub async fn automatic_description(
+        &self,
+        id: &str,
+        request: AutomaticDescriptionRequest,
+    ) -> Result<()> {
+        if !crate::tmux::valid_session_description(&request.description)
+            || !crate::tmux::valid_session_key(&request.session_key)
+        {
+            return Err(bad_request("invalid automatic description"));
+        }
+        let session = self.conversation_session(id)?;
+        if session.session_key.as_deref() != Some(&request.session_key) {
+            return Err(conflict("session key changed"));
+        }
+        match self.resolve(id)? {
+            Target::Local {
+                pane_id,
+                instance_id,
+                ..
+            } => {
+                validate_session_update_instance(&request.instance_id, &instance_id)?;
+                tokio::task::spawn_blocking(move || {
+                    Tmux::apply_automatic_description(
+                        &pane_id,
+                        &request.instance_id,
+                        &request.session_key,
+                        &request.description,
+                    )
+                })
+                .await??;
+                self.inner.refresh_now.notify_one();
+            }
+            Target::Remote {
+                machine,
+                pane_id,
+                instance_id,
+                ..
+            } => {
+                validate_session_update_instance(&request.instance_id, &instance_id)?;
+                self.ensure_online(&machine.id)?;
+                machine
+                    .post_json(
+                        &format!(
+                            "/api/v1/sessions/{}/automatic-description",
+                            encode_segment(&pane_id)
+                        ),
+                        &request,
+                    )
+                    .await
+                    .map_err(|error| remote_mutation_error(&error))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A1 integration seam. Replace the body with one durable event append.
+    #[allow(clippy::unused_self)] // A1 will append through this control instance.
+    pub(crate) fn summary_updated_hook(
+        &self,
+        _session: &SessionSummary,
+        _detail: serde_json::Value,
+    ) {
+    }
+
+    /// A1's producer replaces this hook with a durable, ordered enqueue to
+    /// `entity-change`. Returning an error leaves the snapshot eligible for retry.
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)] // Transport is wired by the lead.
+    pub(crate) fn summary_search_document_hook(
+        &self,
+        _publication: &crate::session_search::SearchPublication,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Retrieves bounded cached digest context for A3 archive/resume indexing.
+    #[must_use]
+    pub fn session_digest_record(&self, key: &str) -> Option<crate::summarizer::DigestRecord> {
+        self.inner
+            .summarizer
+            .as_ref()
+            .and_then(|service| service.digest_record(key))
+    }
+
+    /// Ordered full-snapshot search publication seam for registry lifecycle changes.
+    ///
+    /// # Errors
+    /// Returns an error for invalid identity/tenant/time or failed durable publication.
+    pub fn publish_digest_search(
+        &self,
+        record: &crate::summarizer::DigestRecord,
+        change: crate::session_search::SearchChange,
+        timestamp_ms: u64,
+    ) -> Result<bool> {
+        self.inner.summarizer.as_ref().map_or(Ok(false), |service| {
+            service.publish_search(self, record, change, timestamp_ms)
+        })
+    }
+
     /// Kills one named agent session.
     ///
     /// # Errors
@@ -4549,6 +4731,15 @@ impl ControlPlane {
     fn resolve(&self, id: &str) -> Result<Target> {
         self.find_target(id)?
             .ok_or_else(|| not_found(format!("no agent session matches {id}")))
+    }
+
+    pub(crate) fn conversation_reference(&self, id: &str) -> Result<String> {
+        match self.resolve(id)? {
+            Target::Local { pane_id, .. } => Ok(self.local_identity(&pane_id)),
+            Target::Remote {
+                machine, pane_id, ..
+            } => Ok(composite_id(&machine.id, &pane_id)),
+        }
     }
 
     /// Resolves a composite id, a bare pane id, or a session name to its owner.
@@ -5723,6 +5914,7 @@ fn observable_sessions_equal(previous: &[Session], current: &[Session]) -> bool 
 fn observable_session_equal(left: &Session, right: &Session) -> bool {
     left.name == right.name
         && left.description == right.description
+        && left.description_source == right.description_source
         && left.pane_id == right.pane_id
         && left.pane_identity == right.pane_identity
         && left.status == right.status
@@ -6302,23 +6494,30 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
     let handles: BTreeMap<String, Arc<RemoteMachine>> = machines
         .iter()
         .map(|id| {
-            let machine = Arc::new(
-                RemoteMachine::from_config(&crate::config::MachineConfig {
-                    id: (*id).to_owned(),
+            let definition = config
+                .machines
+                .iter()
+                .find(|m| m.id == *id)
+                .cloned()
+                .unwrap_or_else(|| crate::config::MachineConfig {
+                    id: (*id).into(),
                     label: Some(format!("{id} label")),
                     url: format!("http://{id}.invalid:7345"),
                     token_env: None,
                     token_file: None,
-                })
-                .unwrap(),
-            );
-            ((*id).to_owned(), machine)
+                });
+            (
+                (*id).to_owned(),
+                Arc::new(RemoteMachine::from_config(&definition).unwrap()),
+            )
         })
         .collect();
+    let summarizer = crate::summarizer::Summarizer::configured(&config).unwrap();
     let (revisions, _) = watch::channel(0);
     ControlPlane {
         inner: Arc::new(Inner {
             config,
+            summarizer,
             local_id: local_id.clone(),
             local_label,
             bare_local_ids: handles.is_empty(),
@@ -6370,6 +6569,7 @@ pub(crate) fn test_session(name: &str, pane_id: &str, content: &str) -> Session 
     Session {
         name: name.to_owned(),
         description: None,
+        description_source: None,
         attached: false,
         windows: 1,
         activity: 1,
@@ -6413,6 +6613,7 @@ mod tests {
             machine: LOCAL_MACHINE_ID.to_owned(),
             name: format!("session-{id}"),
             description: None,
+            description_source: None,
             pane_id: id.to_owned(),
             status: status.to_owned(),
             agent: "codex".to_owned(),
@@ -6468,6 +6669,7 @@ mod tests {
         Session {
             name: "agent".to_owned(),
             description: None,
+            description_source: None,
             attached: false,
             windows: 1,
             activity: 1,
@@ -6602,6 +6804,7 @@ mod tests {
             machine: machine.to_owned(),
             name: name.to_owned(),
             description: None,
+            description_source: None,
             pane_id: pane.to_owned(),
             status: "working".to_owned(),
             agent: "claude".to_owned(),

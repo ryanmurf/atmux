@@ -176,6 +176,60 @@ Python `def`/`class`/module assignments, and similar shapes. Files of the
 requesting file's language family are searched first, nearest directories
 first. Nothing in the project is executed or evaluated.
 
+### Conversation digests and easy rename
+
+An optional coordinator worker keeps a rolling digest for Claude and Codex
+sessions. It reads owner-redacted conversations through federation, includes
+human/agent messages and compaction context, and excludes tool records and
+system prompts. A model response is validated as bounded text before being
+stored or displayed. Enable it on a federating or coordinator-only node:
+
+```toml
+[summaries]
+enabled = true
+endpoint = "http://192.168.0.124:8091/v1"
+model = "qwen3.8-flash-next"
+allow_http_hosts = ["192.168.0.124"]
+timeout_seconds = 90
+concurrency = 1 # 1 or 2 global requests
+min_interval_seconds = 300
+poll_seconds = 30
+daily_request_budget = 500
+# api_key_env = "ATMUX_SUMMARY_API_KEY"
+# api_key_file = "~/.config/atmux/summary.key" # choose one key source
+# store_dir = "~/.local/share/atmux/summaries"
+```
+
+Summaries are off by default. HTTPS verifies the server certificate. Plain
+HTTP requires an exact `allow_http_hosts` match and every resolved address
+must be private or loopback; public and link-local addresses are rejected.
+API keys and response bodies are never included in error logs. The worker
+reserves its daily UTC request budget before sending, counts failed requests,
+and preserves the last successful digest on failure.
+
+Private JSON files in the platform data directory persist digests by stable
+`session_key`, rolling cursors, attempts, and budgets. The store admits one
+worker, retains up to 2,000 records for 30 days, and works without Pulse or
+SQLite. Owners need the automatic-description route to apply generated notes;
+an older owner can still serve its existing transcript API.
+
+Conversation shows the cached digest in a collapsible **Summary** block.
+Generated notes have an **auto** marker; saving or clearing a description
+makes it user-owned. Double-click or touch-and-hold a session name in the rail
+or header to rename inline. **F2** edits the selected session, **Enter** saves,
+**Escape** cancels, and **Suggest** fills a name from the generated title.
+
+MCP exposes `agent_conversation` with include filters, an entry-id `after`
+cursor, `limit`, and `max_bytes`; tools are excluded by default. An expired
+cursor returns a conflict requiring a reload. `agent_summary` immediately
+returns cached text and schedules stale work. `sessions_find` ranks live and
+recent sessions by name, title, description, and digest terms.
+
+The coordinator also has a transport-independent HeroDevs `ATMUX_SESSION`
+envelope builder and one producer hook. Search publication remains disabled
+unless `summaries.search_tenant_id` is explicitly configured; the lead must
+wire the hook to A1's durable `entity-change` producer before enabling it.
+
 ### Automatic context compaction
 
 Each atmux node can compact its own inactive Claude and Codex panes. The

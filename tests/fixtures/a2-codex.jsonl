@@ -1,0 +1,5 @@
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Implement bounded session summaries."}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I will use durable JSON and preserve user descriptions."}]}}
+{"type":"response_item","payload":{"type":"function_call","call_id":"tool-1","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}"}}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"tool-1","output":"tool output must stay out of digests"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The implementation is ready for review. Next: run acceptance checks."}]}}

@@ -99,6 +99,21 @@ interval_minutes = 30
 update_timeout_seconds = 180
 relaunch_limit = 4
 
+# Rolling conversation digests run only on a federating/coordinator node.
+# Enable plain HTTP only for explicitly allowed private/LAN hosts.
+[summaries]
+enabled = false
+# endpoint = "http://192.168.0.124:8091/v1"
+# model = "qwen3.8-flash-next"
+# allow_http_hosts = ["192.168.0.124"]
+# timeout_seconds = 90
+# concurrency = 1
+# min_interval_seconds = 300
+# poll_seconds = 30
+# daily_request_budget = 500
+# api_key_env = "ATMUX_SUMMARY_API_KEY"
+# api_key_file = "~/.config/atmux/summary.key" # choose env OR file
+
 # Quick Resume: one owner-validated roster script per machine which recreates
 # missing tmux sessions after a reboot. The dashboard offers it for every
 # machine whose script passes atmux's safety checks. The default location is
@@ -231,6 +246,8 @@ pub struct Config {
     /// Explicitly trusted remote atmux nodes aggregated by this coordinator.
     #[serde(default)]
     pub machines: Vec<MachineConfig>,
+    #[serde(default)]
+    pub summaries: crate::summarizer::SummariesConfig,
     /// The file this configuration was loaded from, when it came from one.
     ///
     /// Owner-local features which must agree with the policy in effect (for
@@ -943,6 +960,12 @@ impl Config {
             tls.cert_file = expand_tilde(&tls.cert_file);
             tls.key_file = expand_tilde(&tls.key_file);
             tls.ca_file = expand_tilde(&tls.ca_file);
+        }
+        if let Some(path) = &mut self.summaries.api_key_file {
+            *path = expand_tilde(path);
+        }
+        if let Some(path) = &mut self.summaries.store_dir {
+            *path = expand_tilde(path);
         }
         if let Some(path) = &mut self.discovery.token_file {
             *path = expand_tilde(path);

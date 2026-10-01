@@ -138,6 +138,7 @@ mod tests {
         Session {
             name: "agent".to_owned(),
             description: None,
+            description_source: None,
             attached: false,
             windows: 1,
             activity,
