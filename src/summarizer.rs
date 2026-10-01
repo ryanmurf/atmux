@@ -7,15 +7,11 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use fs2::FileExt as _;
-use http_body_util::{BodyExt as _, Full};
-use hyper::{Request, body::Bytes, header};
-use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
     io::{Read, Write},
-    net::IpAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -27,7 +23,6 @@ const RETENTION_SECONDS: u64 = 30 * 86_400;
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
 const MAX_PROMPT_BYTES: usize = 96 * 1024;
 const MAX_DIGEST_CHARS: usize = 16_000;
-const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const INSTRUCTIONS: &str = "Write a rolling compaction-style digest of a coding conversation. \
 Return only a JSON object with exactly title, description, digest (strings). Title: at most six \
 words. Description: one line, at most 120 characters. Digest: at most 1500 words covering goals, \
@@ -105,182 +100,41 @@ impl SummariesConfig {
         {
             bail!("invalid summary search tenant UUID");
         }
-        Endpoint::parse(self)?;
+        crate::platform_http::endpoint(&self.endpoint, &self.allow_http_hosts)?;
         Ok(())
     }
 }
 
-#[derive(Debug)]
-struct Endpoint {
-    host: String,
-    authority: String,
-    port: u16,
-    target: String,
-    tls: bool,
-}
-impl Endpoint {
-    fn parse(config: &SummariesConfig) -> Result<Self> {
-        if config.endpoint.len() > 2048 || config.endpoint.contains(['?', '#', '@']) {
-            bail!("summary endpoint must be a base URL without credentials, query or fragment");
-        }
-        let uri: hyper::Uri = config
-            .endpoint
-            .parse()
-            .context("invalid summary endpoint")?;
-        let tls = match uri.scheme_str() {
-            Some("https") => true,
-            Some("http") => false,
-            _ => bail!("summary endpoint must use HTTP or HTTPS"),
-        };
-        let authority = uri
-            .authority()
-            .context("summary endpoint has no host")?
-            .as_str()
-            .to_owned();
-        let host = uri
-            .host()
-            .context("summary endpoint has no host")?
-            .trim_matches(['[', ']'])
-            .to_owned();
-        if !tls
-            && !config
-                .allow_http_hosts
-                .iter()
-                .any(|allowed| allowed == &host)
-        {
-            bail!("plain HTTP summary host must be explicitly listed in allow_http_hosts");
-        }
-        if !tls && host.parse::<IpAddr>().is_ok_and(|ip| !private_address(ip)) {
-            bail!("plain HTTP summary host is not private/LAN");
-        }
-        Ok(Self {
-            host,
-            authority,
-            port: uri.port_u16().unwrap_or(if tls { 443 } else { 80 }),
-            target: format!("{}/chat/completions", uri.path().trim_end_matches('/')),
-            tls,
-        })
-    }
-}
-fn private_address(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback(),
-        IpAddr::V6(ip) => ip.is_loopback() || (ip.segments()[0] & 0xfe00 == 0xfc00),
-    }
-}
-
 struct CompletionClient {
-    endpoint: Endpoint,
-    model: String,
-    key: Option<String>,
-    timeout: Duration,
+    client: crate::llm::LlmClient,
 }
 impl CompletionClient {
     fn new(config: &SummariesConfig) -> Result<Self> {
-        let key = if let Some(name) = &config.api_key_env {
-            Some(std::env::var(name).context("summary API key environment variable is missing")?)
-        } else if let Some(path) = &config.api_key_file {
-            Some(
-                String::from_utf8(read_bounded(path, 4096)?)
-                    .context("summary API key is not UTF-8")?,
-            )
-        } else {
-            None
+        let mut client_config = crate::llm::LlmConfig {
+            endpoint: config.endpoint.clone(),
+            model: config.model.clone(),
+            api_key_file: config.api_key_file.clone(),
+            allow_http_hosts: config.allow_http_hosts.clone(),
+            timeout_seconds: config.timeout_seconds,
+            max_tokens: 4096,
         };
-        let key = key.map(|key| key.trim().to_owned());
-        if key.as_ref().is_some_and(|key| {
-            key.is_empty()
-                || key.len() > 4096
-                || !key.is_ascii()
-                || key.chars().any(char::is_control)
-        }) {
-            bail!("invalid summary API key");
+        if let Some(name) = &config.api_key_env {
+            let key =
+                std::env::var(name).context("summary API key environment variable is missing")?;
+            client_config.api_key_file = None;
+            return Ok(Self {
+                client: crate::llm::LlmClient::with_key(
+                    client_config,
+                    crate::herodevs::Secret::new(key)?,
+                )?,
+            });
         }
         Ok(Self {
-            endpoint: Endpoint::parse(config)?,
-            model: config.model.clone(),
-            key,
-            timeout: Duration::from_secs(config.timeout_seconds),
+            client: crate::llm::LlmClient::new(client_config)?,
         })
     }
     async fn complete(&self, prompt: &str) -> Result<Generated> {
-        tokio::time::timeout(self.timeout, self.request(prompt))
-            .await
-            .context("summary request timed out")?
-    }
-    async fn request(&self, prompt: &str) -> Result<Generated> {
-        if prompt.len() > MAX_PROMPT_BYTES {
-            bail!("summary prompt exceeded its bound");
-        }
-        let endpoint = &self.endpoint;
-        let addresses: Vec<_> = tokio::net::lookup_host((endpoint.host.as_str(), endpoint.port))
-            .await?
-            .take(32)
-            .collect();
-        if addresses.is_empty()
-            || (!endpoint.tls && addresses.iter().any(|addr| !private_address(addr.ip())))
-        {
-            bail!("summary HTTP host resolved outside private/LAN addresses");
-        }
-        let stream = tokio::net::TcpStream::connect(addresses.as_slice()).await?;
-        let mut request = Request::builder()
-            .method("POST")
-            .uri(&endpoint.target)
-            .header(header::HOST, &endpoint.authority)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::CONNECTION, "close");
-        if let Some(key) = &self.key {
-            request = request.header(header::AUTHORIZATION, format!("Bearer {key}"));
-        }
-        let body =
-            serde_json::to_vec(&serde_json::json!({"model": self.model, "temperature": 0.2,
-            "max_tokens": 4096, "messages": [{"role": "system", "content": INSTRUCTIONS},
-            {"role": "user", "content": prompt}]}))?;
-        let request = request.body(Full::new(Bytes::from(body)))?;
-        let response = if endpoint.tls {
-            let mut roots = rustls::RootCertStore::empty();
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let tls = tokio_rustls::TlsConnector::from(Arc::new(
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(roots)
-                    .with_no_client_auth(),
-            ));
-            let name = rustls::pki_types::ServerName::try_from(endpoint.host.clone())?;
-            let stream = tls.connect(name, stream).await?;
-            let (mut sender, connection) =
-                hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            sender.send_request(request).await?
-        } else {
-            let (mut sender, connection) =
-                hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            sender.send_request(request).await?
-        };
-        if !response.status().is_success() {
-            bail!("summary endpoint returned {}", response.status());
-        }
-        let mut body = response.into_body();
-        let mut bytes = Vec::new();
-        while let Some(frame) = body.frame().await {
-            if let Ok(data) = frame?.into_data() {
-                if bytes.len() + data.len() > MAX_RESPONSE_BYTES {
-                    bail!("summary response exceeded 64 KiB");
-                }
-                bytes.extend_from_slice(&data);
-            }
-        }
-        let value: serde_json::Value =
-            serde_json::from_slice(&bytes).context("invalid completion JSON")?;
-        let content = value
-            .pointer("/choices/0/message/content")
-            .and_then(serde_json::Value::as_str)
-            .context("summary completion contains no text")?;
-        sanitize_output(content)
+        sanitize_output(&self.client.complete(INSTRUCTIONS, prompt).await?)
     }
 }
 
@@ -1873,7 +1727,7 @@ mod tests {
     #[tokio::test]
     async fn fake_server_rejects_bad_output_oversize_and_deadlines() {
         let (url,_server)=server(Router::new().route("/v1/chat/completions",post(|| async {
-            Json(serde_json::json!({"choices":[{"message":{"content":"x".repeat(MAX_RESPONSE_BYTES+1)}}]}))
+            Json(serde_json::json!({"choices":[{"message":{"content":"x".repeat(64 * 1024 + 1)}}]}))
         }))).await;
         let temp = Temp::new();
         let config = settings(&url, &temp.0);
