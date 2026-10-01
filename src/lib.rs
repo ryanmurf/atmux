@@ -40,3 +40,5 @@ pub mod github;
 pub mod herodevs;
 pub mod llm;
 mod platform_http;
+
+pub mod intake;
