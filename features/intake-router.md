@@ -1,6 +1,6 @@
 # A5: Intake router (sources, ledger, routing) and shared platform clients
 
-Status: assigned to a Sol 6.1 agent on branch `feat/intake`
+Status: implemented and locally verified on branch `feat/intake`; ready for lead integration (2026-10-01)
 
 Read `features/agent-control-plane.md` (all sections, especially "Phase 2") first. The events,
 conversation/summaries, registry, and resume workstreams are merged on this base: use their APIs
@@ -255,7 +255,7 @@ allow_clone = true
 
 ### Acceptance evidence
 
-- Eleven intake tests cover idempotent board creation/updates/closure, durable cursors, Gather/
+- Twelve intake tests cover idempotent board creation/updates/closure, durable cursors, Gather/
   Slack extraction and malformed JSON, owner filtering, existing/launch/clone decisions, durable
   budgets and budget exhaustion, dry-run/kill-switch enforcement, invalid choice escalation,
   interrupted kickoff recovery, follow-up deduplication and actual repository-remote lookup.
@@ -264,3 +264,23 @@ allow_clone = true
 - Work unit test and mobile Chromium fixture verify source/state filters, session links, hostile
   text, and narrow-screen layout. All 12 existing browser suites passed before this added check.
 - Final full gates and commit ids are recorded below after the private-checkout run completes.
+
+
+Final gates (2026-10-01): `cargo fmt --check` and `git diff --check` passed;
+`cargo clippy --all-targets --all-features -- -D warnings` passed with zero warnings;
+`cargo test --all-features -- --test-threads=4` passed in a private disposable checkout with
+private TMPDIR: **893 passed, 7 ignored**, including 758 library tests, the four shared-client
+integration tests and the initial device-login/JWT fixture. Counts exclude the two nested
+subprocess helper-result lines. Normal group-writable-worktree runs consistently fail ten
+pre-existing recovery ancestry tests; no production safety checks were weakened.
+`node --check web/app.js` and `node --check web/work.js` passed; Node unit/navigation tests
+**194/194** passed; Chromium browser suites **12/12** passed, including Work filters, links,
+hostile-text handling and mobile width. Private gate artifacts remain at
+`/home/ryan/.cache/atmux-a5-gates-364he5kb/`.
+
+Commits: `ca03a48` (shared clients, auth CLI, summarizer reuse and fake servers),
+`c8cf2f9` (shared gateway/UUID contracts, job type, polling/file safety and device/JWT fixture),
+`64f782b` (durable sources/router, safety controls, Work dashboard and fixture end-to-end coverage).
+A6 should consume both shared-client commits. All implementation remains local; no deployment,
+push, service restart, Kubernetes/Keycloak mutation or running-session/agent interaction occurred.
+The user-owned untracked `.atmux.toml` was left untouched.
