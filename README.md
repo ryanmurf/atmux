@@ -176,6 +176,60 @@ Python `def`/`class`/module assignments, and similar shapes. Files of the
 requesting file's language family are searched first, nearest directories
 first. Nothing in the project is executed or evaluated.
 
+### Conversation digests and easy rename
+
+An optional coordinator worker keeps a rolling digest for Claude and Codex
+sessions. It reads owner-redacted conversations through federation, includes
+human/agent messages and compaction context, and excludes tool records and
+system prompts. A model response is validated as bounded text before being
+stored or displayed. Enable it on a federating or coordinator-only node:
+
+```toml
+[summaries]
+enabled = true
+endpoint = "http://192.168.0.124:8091/v1"
+model = "qwen3.8-flash-next"
+allow_http_hosts = ["192.168.0.124"]
+timeout_seconds = 90
+concurrency = 1 # 1 or 2 global requests
+min_interval_seconds = 300
+poll_seconds = 30
+daily_request_budget = 500
+# api_key_env = "ATMUX_SUMMARY_API_KEY"
+# api_key_file = "~/.config/atmux/summary.key" # choose one key source
+# store_dir = "~/.local/share/atmux/summaries"
+```
+
+Summaries are off by default. HTTPS verifies the server certificate. Plain
+HTTP requires an exact `allow_http_hosts` match and every resolved address
+must be private or loopback; public and link-local addresses are rejected.
+API keys and response bodies are never included in error logs. The worker
+reserves its daily UTC request budget before sending, counts failed requests,
+and preserves the last successful digest on failure.
+
+Private JSON files in the platform data directory persist digests by stable
+`session_key`, rolling cursors, attempts, and budgets. The store admits one
+worker, retains up to 2,000 records for 30 days, and works without Pulse or
+SQLite. Owners need the automatic-description route to apply generated notes;
+an older owner can still serve its existing transcript API.
+
+Conversation shows the cached digest in a collapsible **Summary** block.
+Generated notes have an **auto** marker; saving or clearing a description
+makes it user-owned. Double-click or touch-and-hold a session name in the rail
+or header to rename inline. **F2** edits the selected session, **Enter** saves,
+**Escape** cancels, and **Suggest** fills a name from the generated title.
+
+MCP exposes `agent_conversation` with include filters, an entry-id `after`
+cursor, `limit`, and `max_bytes`; tools are excluded by default. An expired
+cursor returns a conflict requiring a reload. `agent_summary` immediately
+returns cached text and schedules stale work. `sessions_find` ranks live and
+recent sessions by name, title, description, and digest terms.
+
+The coordinator also has a transport-independent HeroDevs `ATMUX_SESSION`
+envelope builder and one producer hook. Search publication remains disabled
+unless `summaries.search_tenant_id` is explicitly configured; the lead must
+wire the hook to A1's durable `entity-change` producer before enabling it.
+
 ### Automatic context compaction
 
 Each atmux node can compact its own inactive Claude and Codex panes. The
@@ -794,6 +848,7 @@ server-side MCP sessions or standalone GET/DELETE streams.
 | `agents_list` | Read compact state for every machine, plus revision and output hashes |
 | `machines_list` | Read every federated machine's online state, health, and last contact |
 | `agents_observe` | Long-poll a previous revision for up to 30 seconds, for the federation or one machine |
+| `agent_events` | Read durable lifecycle events with an epoch:sequence cursor, up to 30-second wait, and types/machine/session_key/reasons filters |
 | `agent_output` | Read a bounded tail, omitting content when its supplied hash still matches |
 | `agent_send` | Paste and optionally submit a literal message to another agent |
 | `agent_interrupt` | Interrupt an agent's current operation |
@@ -802,6 +857,69 @@ server-side MCP sessions or standalone GET/DELETE streams.
 | `agent_stop` | Terminate a tmux session |
 | `pulse_read` | Read bounded, explicit-account Pulse usage, health, reports, profiles, alerts, limits, machines, and receiver metadata |
 | `pulse_mutate` | Change bounded profile settings, queue account/profile collection, manage alerts/subscriptions/pricing, or administer receiver tokens without accepting raw secrets or paths |
+
+Agent event telemetry is off until `[events]` exists. Owners persist mode-0600
+JSONL segments beneath the atmux state directory; `directory` may select an
+absolute private directory. Native hooks use a user-owned Unix socket, return
+silently within a 160 ms deadline, and never retain native message/tool bodies.
+Profiles receive process-scoped Claude `--settings` or Codex `-c hooks.*`
+overrides, including native resume, maintenance and Quick Resume bridges.
+`inject_hooks = false` keeps status-derived telemetry without hook injection.
+
+```toml
+[events]
+inject_hooks = true
+max_bytes = 16777216
+segment_bytes = 1048576
+retention_seconds = 604800
+
+# Coordinator only; omit this block on owners.
+[events.redpanda]
+brokers = ["redpanda.herodevs.svc.cluster.local:9092"]
+topic = "atmux.agent.events.v1"
+tenant_id = "95efe33d-fa71-53ce-8e0a-3fe45ac0e58a"
+# Platform defaults: PLAINTEXT, no auth. Other installations may use:
+# tls = true
+# ca_file = "/etc/atmux/kafka-ca.pem"
+# sasl = "scram-sha-256" # or plain / scram-sha-512
+# username_env = "ATMUX_KAFKA_USERNAME" # alternatively username_file
+# password_file = "/etc/atmux/kafka-password" # alternatively password_env
+```
+
+Codex 0.159.x requires hook trust for inline overrides. Atmux adds the native
+`--dangerously-bypass-hook-trust` flag for configured injection so its vetted
+bridge runs without a startup approval. This invocation-wide flag also applies
+to other loaded native hooks; disable injection if that policy is unsuitable.
+Codex preserves hooks from lower native configuration layers. Targeted tool
+hooks report questions and plan approval without retaining their message bodies.
+Codex `notify` is left intact: its legacy turn-completion callback is redundant
+with `Stop`, and replacing it would discard the user's notification program.
+
+`GET /api/v1/agent-events` is the **owner-only** feed used by federation;
+`GET /api/v1/fleet/agent-events` and MCP `agent_events` read the aggregated feed.
+Both HTTP routes share the existing auth policy. Query parameters are `after`
+(opaque cursor), `wait` (0..30), `limit` (1..100, default 50), and exact filters
+`types`, `machine`, `session_key`, `reasons` (type/reason lists are comma separated).
+Responses are `{epoch, events: [{seq, event}], next, reset}` and at most 512 KiB.
+Use `next` even on filtered empty pages. `reset` means an epoch changed, a cursor
+was ahead, or retention removed its preceding records; resume at the returned
+cursor after reconciling a fresh state snapshot. Owner spool loss mints a new
+epoch; sequence numbers remain monotonic through ordinary rotation and restart.
+
+The coordinator checkpoints each durable imported batch, de-duplicates event
+ids, tolerates offline/older owners, and publishes outside the request path.
+Broker acknowledgements precede its durable publication checkpoint. Delivery
+is at least once; consumers should de-duplicate `eventPayload.id`. The same
+bounded fleet spool is the sink backlog. Size/age eviction reports cursor gaps;
+retention is a storage bound, so outages longer than retention can lose events.
+Values use HdEventEnvelope v2 with tenantId in both securityContext and
+eventPayload, keyed by session_key. No topics are created by atmux.
+
+Rust integrations can emit owner events through `ControlPlane::emit_agent_event`
+and reuse `events::sink::{KafkaProducer, Producer}`: connect with a
+`RedpandaConfig`, then `publish(topic, key_bytes, value_bytes).await`. Each
+publication is bounded to 128 KiB with a ten-second timeout; callers retain
+their own retry/checkpoint policy for other topics such as `entity-change`.
 
 An efficient coordinating agent should call `agents_list` once, retain its `revision` and each
 `content_hash`, wait with `agents_observe`, and call `agent_output` only for sessions whose hash
@@ -1274,8 +1392,7 @@ MIT
 
 ## Resume anywhere and startup dialogs
 
-Both capabilities are optional and off by default. Enable native bundle storage on each owner
-and on the coordinator; give the coordinator a persistent, owner-only directory:
+Enable the same registry on coordinator and owners; use A3's `directory` and bundle limits.
 
 ```toml
 [startup_prompts]
@@ -1283,40 +1400,53 @@ auto_answer = true
 
 [registry]
 enabled = true
-store_dir = "~/.local/state/atmux/registry"
-max_bundle_bytes = 8388608
-# Coordinator only: opt into recovery for these owners.
+directory = "/absolute/private/atmux/registry"
+# Coordinator only; requires [events] and configured owner ids:
 restore_on_start = true
 restore_machines = ["tron", "midnight"]
+
+[events]
+# Other event settings and token/mTLS federation remain owner configured.
 ```
 
-Owners can omit `restore_on_start` and `restore_machines`. Configure project roots and a matching
-named Claude or Codex profile on each target, including its `CLAUDE_CONFIG_DIR` or `CODEX_HOME`.
-Resume finds a repository by its credential-free origin remote and recorded branch. When absent,
-it uses the existing clone path and checks out the branch in the new clone. Existing repositories
-on another branch require a matching worktree. Ambiguous repositories, missing profiles, symlinks,
-oversized bundles, and native files with different content are refused.
+Use **Resume on…** in **Sessions** or agent Actions. Pick an online owner; copy leaves the
+source running. Opt into closing the source after the target CLI verifies. MCP exposes
+`session_resume {session_key, machine, move?}` and the UI uses
+`POST /api/v1/registry/resume`. Target profile names must match and bind the correct native
+store (`CLAUDE_CONFIG_DIR` or `CODEX_HOME`). Repository lookup matches origin and branch under
+configured project roots; a missing repository is cloned without overwriting existing folders.
 
-Use **Resume on…** in agent Actions or **Saved sessions**, select an online owner, and leave
-**Close the source after the resumed agent starts** unchecked to keep the source running. The MCP tool is
-`session_resume {session_key, machine, move?: false}`; the HTTP equivalent is
-`POST /api/v1/registry/resume`. A move verifies the target's native conversation before closing
-the exported source process generation. The original UUIDv7 session key survives the transfer.
+Peer transport uses A3's `atmux.session.archive/v1` checksummed tar.gz bundles:
+`GET /api/v1/registry/{session_key}/record`, `GET /api/v1/registry/{session_key}/bundle`, and
+`POST /api/v1/registry/import` stream bounded archives. These endpoints require the owner's
+node bearer credential and reject browser requests. `POST /api/v1/registry/restore` restores
+only durable desired entries lost with the node/tmux server. A1's `node.started` is the
+phone-home signal; explicit closes persist in the same registry and remain excluded after restart.
 
-Owner transport uses `GET /api/v1/registry/export/{session_key}` and
-`POST /api/v1/registry/import`, with the existing federation mTLS and bearer-token policy.
-`GET /api/v1/registry/snapshot` and `POST /api/v1/registry/restore {session_keys}` support
-coordinator recovery. Recovery requires an allowlisted owner restart, tmux-server change, or
-reconnection; explicit close/archive tombstones take precedence. A missing pane on an otherwise
-unchanged owner is treated as a close. Native logs stay in their CLI stores, while bounded
-`atmux.native-bundle/v1` snapshots retain native logs, Claude siblings, profile/mode, and git
-remote/branch. Claude `cwd` metadata and Codex `session_meta.payload.cwd` are translated; message
-and tool output text are preserved.
+Startup handling accepts only exact recognized Claude development-channel, Claude workspace
+trust and Codex folder-trust dialogs. Development-channel acceptance requires the flag in the
+live process argv; trust requires a canonical cwd under a configured project root. Each answer
+is claimed once per process, verified, and recorded through the event service. Unknown dialogs
+remain visible with `agent.needs_input` reason `startup_prompt`. See
+[the feature record](features/resume-anywhere.md) for policy, bounds and verification evidence.
 
-Startup handling answers exact recognized Claude development-channel and folder-trust dialogs,
-and Codex's option **1. Trust and continue**. Development-channel confirmation requires the
-flag in the live CLI argv. Folder trust requires the pane and process cwd under a configured
-project root, including worktrees. Each dialog is claimed once per process generation before
-keys are sent, and its disappearance is checked. Other dialogs remain for human input.
-Implementation decisions, verification, and integration seams are recorded in
-[features/resume-anywhere.md](features/resume-anywhere.md).
+## Durable session history (opt-in)
+
+`[registry] enabled = true` records owner-local agents under the platform state directory and
+archives their final native logs and Git position when panes disappear. Set `directory` to an
+absolute private (0700) directory to choose another location. Owners retain up to 10,000 records
+and 90 days of archived history; bundles default to 256 MiB each and a 4 GiB total quota. Override
+`max_owner_records`, `archived_retention_days`, `bundle_max_bytes`, or `bundle_quota_bytes` in the
+same section. A bundle failure leaves a closed record available for search and retries locally.
+
+A configured coordinator pulls registry changes and checksummed tar.gz archives from trusted
+owners over the existing federation transport. Its records remain durable after owner retention
+and bundle eviction. Give the coordinator a persistent writable volume and set its registry
+`directory` to that mount before enabling it. Private exports require the owner's node bearer
+credential; browser/proxy access uses only the public history projection.
+
+Use the dashboard's **Sessions** view or MCP `sessions_search` / `session_get` to find current and
+archived work by stable session key. REST equivalents are `/api/v1/session-history` and
+`/api/v1/session-history/{session_key}`. Native provider ids and config roots are omitted from
+history responses. Resume wiring is supplied by the separate resume-anywhere workstream; the
+integration contract and acceptance evidence are in [the A3 record](features/session-registry-archive.md).

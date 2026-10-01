@@ -23,6 +23,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Internal, best-effort lifecycle telemetry bridge.
+    #[command(hide = true)]
+    Hook {
+        harness: String,
+        event: Option<String>,
+    },
     /// Create the default configuration file and print its path.
     Init {
         /// Replace an existing configuration file.
@@ -137,10 +143,15 @@ enum PulseCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    atmux::tls::install_crypto_provider()?;
     let cli = Cli::parse();
+    if let Some(Commands::Hook { harness, event }) = &cli.command {
+        atmux::events::hook_client(harness.clone(), event.clone()).await;
+        return Ok(());
+    }
+    atmux::tls::install_crypto_provider()?;
     let config_path = cli.config.unwrap_or(Config::path()?);
     match cli.command {
+        Some(Commands::Hook { .. }) => unreachable!(),
         Some(Commands::Init { force }) => {
             Config::write_default(&config_path, force)?;
             println!("{}", config_path.display());

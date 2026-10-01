@@ -9,6 +9,11 @@
 {{- fail "server must be a map when configured" -}}
 {{- end -}}
 {{- $serverEnabled := get $server "enabled" | default false -}}
+{{- $events := get $server "events" | default dict -}}
+{{- $redpanda := get $events "redpanda" | default dict -}}
+{{- if and (get $redpanda "enabled") (not (get $events "enabled")) -}}
+{{- fail "server.events.redpanda.enabled requires server.events.enabled" -}}
+{{- end -}}
 {{- if and (hasKey $server "enabled") (not (kindIs "bool" (get $server "enabled"))) -}}
 {{- fail "server.enabled must be a boolean" -}}
 {{- end -}}
@@ -327,6 +332,10 @@ spec:
         atmux.dev/secret-revision: {{ $serverSecretRevision | quote }}
         {{- end }}
     spec:
+      {{- with .Values.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: 30
       securityContext:
@@ -638,6 +647,14 @@ spec:
             matchLabels: {name: nginx-ingress-microk8s}
       ports: [{protocol: TCP, port: 4180}]
   egress:
+    {{- if and $serverEnabled (get $events "enabled") (get $redpanda "enabled") }}
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: herodevs}
+          podSelector:
+            matchLabels: {app: redpanda}
+      ports: [{protocol: TCP, port: 9092}]
+    {{- end }}
     {{- if $serverEnabled }}
     {{- range $machine := $serverMachines }}
     - to:

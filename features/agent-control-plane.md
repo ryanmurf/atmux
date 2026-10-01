@@ -143,3 +143,79 @@ additions so merges stay mechanical.
   and the browser suites when the UI changes.
 - Commit on your branch with clear messages. Keep a feature record under `features/` with
   acceptance criteria, gates, and evidence.
+
+## herodevs platform contract (verified 2026-09-30 against origin/main and the live cluster)
+
+**Redpanda.** In-cluster broker `redpanda.herodevs.svc.cluster.local:9092`, PLAINTEXT, no SASL/TLS,
+single node (`--mode=dev-container`), `auto_create_topics_enabled=true` (1 partition, RF 1). The
+broker advertises `redpanda:9092`, so a client outside namespace `herodevs` must resolve
+`redpanda` (the atmux coordinator Deployment needs `hostAliases: [{ip: <redpanda ClusterIP>,
+hostnames: [redpanda]}]`; ClusterIP today is `10.152.183.23`). There is no HTTP proxy and no LAN
+path; only the coordinator publishes. Anything in the cluster can publish any tenant's events: that
+is the platform's existing trust model.
+
+**Envelope.** Platform listeners unwrap a message only when it has both `envelopeVersion` and
+`eventPayload`. atmux publishes to `atmux.agent.events.v1`, key `session_key`, value:
+
+```json
+{"envelopeVersion": 2, "eventType": "atmux.agent.event.v1", "publishedAt": "<RFC 3339>",
+ "securityContext": {"tenantId": "<tenant>", "token": null, "platform": "SYSTEM", "userId": null, "sessionId": null},
+ "mdc": {}, "payloadRef": null, "payloadSummary": null,
+ "eventPayload": { "...the atmux.agent.event/v1 object...": "...", "tenantId": "<tenant>" }}
+```
+
+`tenantId` must be inside `eventPayload` as well: without a JWT the platform cannot resolve a
+tenant otherwise and drops the event. HQ tenant: `95efe33d-fa71-53ce-8e0a-3fe45ac0e58a`
+(configurable, `[events.redpanda] tenant_id`). `platform` must be one of
+`ANDROID|API|IOS|SYSTEM|UNKNOWN|WEB|WORKFLOW`. Keep values well under 800 KB.
+
+**Search.** hd-api-search has no ingestion API; documents enter only through `entity-change`
+events with an index definition for the entity type. atmux session digests are indexed as entity
+type `ATMUX_SESSION`, `entityId` = `session_key` (a UUID), by the coordinator publishing an
+`HdEntityChangeEvent` envelope to topic `entity-change` (exact shape in the H2 record). Embeddings
+are OpenAI `text-embedding-3-small`; keep each digest document under 8 KB for one clean vector.
+Search is exposed as MCP `search.query` with `entityTypes: ["ATMUX_SESSION"]` (source `atmux`).
+Gather transcripts are already indexed as `FileUpload` Markdown.
+
+**Triggers.** The generic `event` trigger has no generic topic consumer and never evaluates its
+filter, so `atmux.agent` is a dedicated first-class type (H1) with its own listener and selector.
+
+**Jobs.** hd-api-channel can claim/complete jobs but cannot create them, and its lease sweeper is
+off in production. H4 adds job creation and enables the sweeper.
+
+**Shipping herodevs changes.** Production runs the `hd-api` monolith built from every module's
+`main`; a merged module ships only after hd-api's Publish Image workflow runs, and new
+`trigger.*` RLS-ignored tables must be mirrored in `hd-api/src/main/resources/service.yml` and
+`hd-helm` `charts/local/values.yaml`.
+
+## Phase 2: intake router and supervisor (A5, A6), after A1–A4 and H4 merge
+
+Runs inside the atmux coordinator (Kubernetes, federates every owner), enabled by `[intake]` with a
+`dry_run` switch and a kill switch. Free local Qwen does the per-item work so no single agent holds
+everything in context: Flash Next (`192.168.0.124:8091`, 262K context) for triage and digests, the
+27B (`192.168.0.124:8096`, router on Max) for routing and supervision decisions. Hard or ambiguous
+decisions escalate to Ryan.
+
+**A5 intake (sources, ledger, router).**
+- Sources: GitHub ProjectsV2 boards `neverendingsupport` #40 NES Factorio and #51 NES Java Team v2
+  (GraphQL polling, token from a mounted secret); Gather meeting transcripts already indexed in
+  herodevs search (new `FileUpload` Markdown since a cursor, Qwen extracts Ryan's action items);
+  Slack via existing herodevs Slack triggers posting to an intake channel; atmux sessions that went
+  idle with unfinished work.
+- Ledger: herodevs channel jobs (H4), one channel per board or source, job metadata carrying the
+  source URL, project item id, repo remote, folder, machine, and assigned `session_key`.
+- Router: for each new job, candidates are live sessions whose project matches (registry) plus
+  digest search (`sessions_find`, herodevs `search.query` over `ATMUX_SESSION`); Qwen chooses to
+  hand the job to an existing session or launch a new one in the right folder (found by repo remote
+  under the configured project roots, cloning if absent) with the right profile and mode, then
+  sends a kickoff prompt carrying the job context and completion criteria.
+
+**A6 supervisor.**
+- On `agent.needs_input`: read `agent_summary` and the last turn; answer routine prompts (continue,
+  permission within the job's scope, questions answerable from the job) or escalate to Ryan via
+  Slack and the `ryan-tron` channel, with a link to the pane.
+- On `agent.turn_completed`: check the job's completion criteria (PR opened or merged, CI green,
+  tests reported), complete or fail the job, update the GitHub project item status, and close the
+  tmux session (which archives it through A3) once the job is done and the session is idle.
+- Nudge stalled sessions; enforce budgets (sessions per machine, Qwen calls per hour); publish
+  every decision as an event so the audit trail lives in Redpanda and search.

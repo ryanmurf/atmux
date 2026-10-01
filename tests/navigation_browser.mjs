@@ -71,12 +71,14 @@ test("mobile navigation persists preferences and session actions retain the sele
   const sessionKey = "019a06d9-8341-7654-8abc-0123456789ab";
   const paneContent = "first line\nsecond line ✓";
   const instance = (digit) => `pane-v1-${digit.repeat(64)}`;
+  let eventPhase = "agent.needs_input";
+  const agentSessionKey = "00000000-0000-7000-8000-000000000001";
   const machines = [
     { id: "local", label: "Workstation", kind: "local", online: true, sessions: 2 },
     { id: "max", label: "Max", kind: "remote", online: true, sessions: 1 },
   ];
   let sessions = [
-    { id: "local~%1", machine: "local", pane_id: "%1", name: "alpha", path: "/work/api", agent: "codex", status: "working", instance_id: instance("a") },
+    { id: "local~%1", machine: "local", pane_id: "%1", name: "alpha", path: "/work/api", agent: "codex", status: "working", instance_id: instance("a"), session_key: agentSessionKey },
     { id: "local~%2", machine: "local", pane_id: "%2", session_key: sessionKey, name: "zebra", path: "/work/web", agent: "claude", status: "waiting", instance_id: instance("b") },
     { id: "max~%1", machine: "max", pane_id: "%1", name: "beta", path: "/work/api", agent: "claude", status: "waiting", instance_id: instance("c") },
   ];
@@ -86,6 +88,14 @@ test("mobile navigation persists preferences and session actions retain the sele
     [name, await readFile(new URL(`../web/${name}`, import.meta.url))])));
   const server = createServer((request, response) => {
     const path = new URL(request.url, "http://fixture").pathname;
+    if (path === "/api/v1/fleet/agent-events") {
+      const seq = eventPhase === "agent.needs_input" ? 1 : 2;
+      const next = `${agentSessionKey}:${seq}`;
+      const after = new URL(request.url, "http://fixture").searchParams.get("after");
+      const events = after === next ? [] : [{ seq, event: { type: eventPhase, reason: "permission", machine: "local", instance_id: instance("a"), session_key: agentSessionKey } }];
+      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ epoch: agentSessionKey, events, next, reset: false }));
+      return;
+    }
     if (request.method !== "GET") mutations.push({ path, method: request.method });
     if (path === "/api/v1/events") {
       response.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
@@ -94,8 +104,8 @@ test("mobile navigation persists preferences and session actions retain the sele
       request.on("close", () => streams.delete(response));
       return;
     }
-    if (path === "/api/v1/registry/sessions") {
-      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify([{ session_key: sessionKey, name: "archived-agent", machine: "local", state: "closed" }]));
+    if (path === "/api/v1/session-history") {
+      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({sessions:[{ session_key: sessionKey, name: "archived-agent", machine: "local", state: "archived" }],next_cursor:null}));
       return;
     }
     if (path === "/api/v1/registry/resume" && request.method === "POST") {
@@ -179,6 +189,12 @@ test("mobile navigation persists preferences and session actions retain the sele
       await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [point] });
       await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
     };
+    await waitFor(() => cdp.evaluate("document.querySelector('.session-button[data-session-id=\"local~%1\"] .needs-input-badge')?.textContent === 'Needs input · permission'"), "event badge on working agent in rail");
+    await tap("document.querySelector('.session-button[data-session-id=\"local~%1\"]')");
+    await waitFor(() => cdp.evaluate("document.getElementById('agent-needs-input')?.textContent === 'Needs input · permission' && !document.getElementById('agent-needs-input').hidden"), "event reason in selected agent header");
+    eventPhase = "agent.working";
+    await waitFor(() => cdp.evaluate("document.getElementById('agent-needs-input')?.hidden && document.querySelector('.session-button[data-session-id=\"local~%1\"] .needs-input-badge')?.hidden"), "working event clears header and rail attention");
+    await cdp.evaluate("document.getElementById('mobile-back').click()");
     assert.deepEqual(await cdp.evaluate(`(() => {
       const toggle = ${disclosure};
       const controls = [toggle, ${pin}, document.getElementById('filter-status'), document.getElementById('filter-harness')];
@@ -297,9 +313,9 @@ test("mobile navigation persists preferences and session actions retain the sele
     await waitFor(() => resumeOnRequests.length === 1, "live-session resume sent to selected machine");
     assert.deepEqual(resumeOnRequests[0], { session_key: sessionKey, machine: "max", move: false });
     await waitFor(() => cdp.evaluate("!document.getElementById('resume-on-dialog').open"), "verified resume closes picker");
-    await cdp.evaluate("document.getElementById('registry-sessions-open').click()");
-    await waitFor(() => cdp.evaluate("document.getElementById('registry-sessions-dialog').open"), "saved session list opens");
-    await cdp.evaluate("document.querySelector('#registry-sessions-list button').click()");
+    await cdp.evaluate("document.getElementById('history-open').click()");
+    await waitFor(() => cdp.evaluate("document.querySelector('[data-session-resume]')"), "A3 Sessions resume action");
+    await cdp.evaluate("document.querySelector('[data-session-resume]').click()");
     assert.equal(await cdp.evaluate("document.getElementById('resume-on-session').textContent"), "archived-agent");
     await cdp.evaluate("document.getElementById('resume-on-dialog').close()");
   } finally {
@@ -318,6 +334,84 @@ test("mobile navigation persists preferences and session actions retain the sele
       server.closeAllConnections();
       await closed;
     }
+    await rm(profileDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+
+test("session history supports filters, pagination, hostile text, resume hook and mobile Back", { timeout: 60_000 }, async () => {
+  const profileDirectory = await mkdtemp(join(tmpdir(), "atmux-history-browser-"));
+  const streams = new Set();
+  const queries = [];
+  const files = new Map(await Promise.all(["index.html", "app.js", "app.css"].map(async (name) =>
+    [name, await readFile(new URL(`../web/${name}`, import.meta.url))])));
+  const archived = { session_key: "0199a5b7-5560-7abc-8def-0123456789ab", machine: "peer", name: "<img src=x onerror=window.historyXss=true>", description: "Archived task", project: { remote: "https://github.com/org/repo" }, state: "archived", last_active_ms: 1000 };
+  let hold = false;
+  const pending = [];
+  const server = createServer((request, response) => {
+    const url = new URL(request.url, "http://fixture");
+    if (url.pathname === "/api/v1/events") {
+      response.writeHead(200, { "Content-Type": "text/event-stream" }); streams.add(response);
+      response.write(`event: sessions.snapshot\ndata: ${JSON.stringify({ revision: 1, sessions: [], machines: [{id:"peer",label:"Peer",kind:"remote",online:true}], health: null })}\n\n`);
+      request.on("close", () => streams.delete(response)); return;
+    }
+    if (url.pathname === "/api/v1/session-history") {
+      queries.push(url.searchParams);
+      const page = url.searchParams.has("cursor") ? { sessions: [{ ...archived, session_key: "0199a5b7-5560-7abc-8def-0123456789ac", name: "Second task", state: "closed" }], next_cursor: null }
+        : { sessions: [archived], next_cursor: archived.session_key };
+      const send = () => response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(page));
+      if (hold) pending.push(send); else send(); return;
+    }
+    const name = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
+    if (files.has(name)) { response.writeHead(200, { "Content-Type": name.endsWith("js") ? "text/javascript" : name.endsWith("css") ? "text/css" : "text/html" }).end(files.get(name)); return; }
+    response.writeHead(200, { "Content-Type": "application/json" }).end("[]");
+  });
+  let chrome;
+  let cdp;
+  try {
+    server.listen(0, "127.0.0.1"); await once(server, "listening");
+    chrome = spawn("google-chrome", ["--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--remote-debugging-port=0", `--user-data-dir=${profileDirectory}`, "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
+    let output = "";
+    chrome.stderr.setEncoding("utf8"); chrome.stderr.on("data", (chunk) => { output = `${output}${chunk}`.slice(-16_384); });
+    const browserSocket = await waitFor(() => output.match(/DevTools listening on (ws:\/\/[^\s]+)/)?.[1], "Chrome startup");
+    cdp = await connectCdp(browserSocket);
+    await cdp.send("Page.enable");
+    await cdp.send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+    await cdp.send("Page.navigate", { url: `http://127.0.0.1:${server.address().port}/` });
+    await waitFor(() => cdp.evaluate("document.getElementById('overview-status')?.textContent === 'Live'"), "history button");
+    await cdp.evaluate("document.getElementById('history-open').click()");
+    await waitFor(() => cdp.evaluate("document.querySelectorAll('.session-history-row').length === 1"), "history first page");
+    assert.equal(await cdp.evaluate("new URL(location.href).searchParams.get('view')"), "sessions");
+    assert.equal(await cdp.evaluate("document.querySelector('.session-history-row strong').textContent"), archived.name);
+    assert.equal(await cdp.evaluate("Boolean(window.historyXss) || Boolean(document.querySelector('.session-history-row img'))"), false);
+    assert.equal(await cdp.evaluate("document.querySelector('[data-session-resume]').disabled"), false);
+    await cdp.evaluate("window.atmuxSessionResume = (request) => window.resumeRequest = request; document.getElementById('history-refresh').click()");
+    await waitFor(() => cdp.evaluate("!document.querySelector('[data-session-resume]').disabled"), "resume hook");
+    await cdp.evaluate("document.querySelector('[data-session-resume]').click()");
+    assert.deepEqual(await cdp.evaluate("window.resumeRequest"), { session_key: archived.session_key, machine: "peer" });
+    await cdp.evaluate("document.getElementById('history-more').click()");
+    await waitFor(() => cdp.evaluate("document.querySelectorAll('.session-history-row').length === 2"), "history pagination");
+    assert.equal(queries.at(-1).get("cursor"), archived.session_key);
+    await cdp.evaluate("document.getElementById('history-text').value = 'task & context'; document.getElementById('history-state').value = 'archived'; document.getElementById('history-machine').value = 'peer'; document.getElementById('history-project').value = 'repo'; document.getElementById('history-filters').requestSubmit()");
+    await waitFor(() => queries.at(-1).get("text") === "task & context", "history search");
+    assert.equal(queries.at(-1).get("state"), "archived"); assert.equal(queries.at(-1).get("machine"), "peer");
+    assert.equal(queries.at(-1).get("project"), "repo"); assert.equal(queries.at(-1).has("cursor"), false);
+    hold = true;
+    await cdp.evaluate("document.getElementById('history-refresh').click()");
+    await waitFor(() => pending.length === 1, "pending history refresh");
+    await cdp.evaluate("document.getElementById('history-back').click()");
+    pending.shift()();
+    await waitFor(() => cdp.evaluate("document.getElementById('history-view').hidden && !document.body.classList.contains('has-selection')"), "history Back");
+    assert.equal(await cdp.evaluate("new URL(location.href).searchParams.get('view')"), null);
+    assert.equal(await cdp.evaluate("document.documentElement.scrollWidth <= innerWidth"), true);
+  } finally {
+    cdp?.socket.close();
+    if (chrome?.pid && chrome.exitCode === null && chrome.signalCode === null) {
+      const exited = once(chrome, "exit"); const force = setTimeout(() => chrome.kill("SIGKILL"), 3_000);
+      chrome.kill("SIGTERM"); try { await exited; } finally { clearTimeout(force); }
+    }
+    for (const response of streams) response.end();
+    if (server.listening) { const closed = once(server, "close"); server.close(); server.closeAllConnections(); await closed; }
     await rm(profileDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });

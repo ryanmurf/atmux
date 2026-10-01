@@ -1,0 +1,4 @@
+{"type":"user","uuid":"human-1","message":{"role":"user","content":"Implement bounded session summaries."}}
+{"type":"assistant","uuid":"agent-1","message":{"role":"assistant","content":[{"type":"text","text":"I will use durable JSON and preserve user descriptions."},{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"cargo test"}}]}}
+{"type":"user","uuid":"result-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"tool output must stay out of digests"}]}}
+{"type":"assistant","uuid":"agent-2","message":{"role":"assistant","content":[{"type":"text","text":"The implementation is ready for review. Next: run acceptance checks."}]}}

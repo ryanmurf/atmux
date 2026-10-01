@@ -3468,7 +3468,7 @@ function sessionEditRequest(session, nameValue, descriptionValue) {
   if (/[\u0000-\u001f\u007f-\u009f]/.test(description)) return { error: "The description must be a single line." };
   const body = { instance_id: session.instance_id };
   if (renamed) body.name = name;
-  if (description !== (session.description || "")) body.description = description;
+  if (description !== (session.description || "") || session.description_source === "auto") body.description = description;
   if (!("name" in body) && !("description" in body)) return { unchanged: true };
   return { id: session.id, body };
 }
@@ -3867,12 +3867,38 @@ function agentSearchShortcut(event, { dialogOpen = false, searchVisible = true }
   return "focus";
 }
 
+// Shared A3 history contract; A4 can consume sessionHistoryResumeRequest.
+function sessionHistoryQuery(filters = {}, cursor = null) {
+  const query = new URLSearchParams({ limit: "100" });
+  for (const key of ["state", "machine", "project", "text"]) {
+    const value = String(filters[key] || "").trim().slice(0, 2048);
+    if (value) query.set(key, value);
+  }
+  if (cursor) query.set("cursor", String(cursor));
+  return `/api/v1/session-history?${query}`;
+}
+function sessionHistoryRow(record) {
+  return {
+    sessionKey: String(record?.session_key || ""),
+    name: String(record?.name || "Untitled session"),
+    description: String(record?.description || ""),
+    machine: String(record?.machine || ""),
+    project: String(record?.project?.remote || record?.project?.root || record?.cwd || ""),
+    lastActiveMs: Number(record?.last_active_ms || 0),
+    state: ["running", "exited", "closed", "archived"].includes(record?.state) ? record.state : "unknown",
+  };
+}
+function sessionHistoryResumeRequest(record) {
+  return { session_key: String(record?.session_key || record?.sessionKey || ""), machine: String(record?.machine || "") };
+}
+
 function appRoute(urlValue) {
   const url = urlValue instanceof URL ? urlValue : new URL(String(urlValue), "https://atmux.invalid/");
   const session = url.searchParams.get("session");
   if (session) return { view: "session", id: session };
   const machine = url.searchParams.get("machine");
   if (machine) return { view: "machine", id: machine };
+  if (url.searchParams.get("view") === "sessions") return { view: "sessions", id: null };
   if (url.searchParams.get("view") === "usage") return { view: "usage", id: null };
   return { view: "menu", id: null };
 }
@@ -3920,10 +3946,90 @@ function sessionResumeIntent(session, machine, move = false) {
     || !/^[a-z0-9][a-z0-9_-]*$/.test(machine || "")) return null;
   return { session_key: session.session_key, machine, move: Boolean(move) };
 }
+function generatedSessionName(title) {
+  const name = String(title || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 100);
+  return SESSION_NAME_PATTERN.test(name) && name !== RESERVED_SERVICE_SESSION ? name : "";
+}
+
+function inlineRenameAction(event, { selected = false, dialogOpen = false } = {}) {
+  if (event.key === "Escape") return "cancel";
+  if (event.key === "Enter" && !event.isComposing) return "save";
+  if (event.key === "F2" && !event.isComposing && selected && !dialogOpen && !event.ctrlKey && !event.metaKey && !event.altKey
+    && !event.target?.closest?.("input, textarea, select, [contenteditable]")) return "open";
+  return null;
+}
+
+/// The same editor is used by header and rail, with a captured pane generation.
+function createInlineRenameEditor({ document, host, anchor, session, save, suggest, close }) {
+  const snapshot = { id: session.id, instance_id: session.instance_id, name: session.name, description: session.description || "" };
+  const form = document.createElement("form"); form.className = "inline-rename";
+  form.setAttribute("aria-label", `Rename ${snapshot.name}`);
+  const input = document.createElement("input"); input.className = "inline-rename-name";
+  input.value = snapshot.name; input.maxLength = 100; input.autocomplete = "off";
+  input.setAttribute("aria-label", "Session name"); input.spellcheck = false;
+  const note = document.createElement("span"); note.className = "inline-rename-note"; note.setAttribute("role", "alert");
+  let closed = false; let saving = false; let suggesting = false;
+  const finish = () => { if (closed) return; closed = true; form.remove(); anchor.style.visibility = ""; close?.(); };
+  const submit = async () => {
+    if (closed || saving) return;
+    const edit = sessionEditRequest(snapshot, input.value, snapshot.description);
+    if (edit.error) { note.textContent = edit.error; return; }
+    if (edit.unchanged) { finish(); return; }
+    saving = true; input.disabled = true; saveButton.disabled = true; suggestButton.disabled = true;
+    try { await save(edit, snapshot); finish(); }
+    catch (error) { if (!closed) note.textContent = error.message; }
+    finally { saving = false; input.disabled = false; saveButton.disabled = false; suggestButton.disabled = false; }
+  };
+  const button = (label, action) => {
+    const node = document.createElement("button"); node.type = "button"; node.textContent = label;
+    node.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); action(); }); return node;
+  };
+  const suggestButton = button("Suggest", async () => {
+    if (closed || saving || suggesting) return;
+    suggesting = true; suggestButton.disabled = true;
+    try {
+      const title = generatedSessionName(await suggest(snapshot));
+      if (!closed) { if (title) { input.value = title; note.textContent = ""; input.focus(); input.select(); }
+        else note.textContent = "No generated title yet. Try again after a summary is available."; }
+    } catch (error) { if (!closed) note.textContent = error.message; }
+    finally { suggesting = false; suggestButton.disabled = saving; }
+  });
+  const saveButton = button("Save", () => { void submit(); });
+  const cancelButton = button("Cancel", () => { if (!saving) finish(); });
+  input.addEventListener("keydown", (event) => {
+    const action = inlineRenameAction(event); if (!action) return;
+    event.preventDefault(); event.stopPropagation();
+    if (action === "save") void submit(); else if (!saving) finish();
+  });
+  form.addEventListener("submit", (event) => { event.preventDefault(); void submit(); });
+  form.addEventListener("click", (event) => event.stopPropagation());
+  form.append(input, suggestButton, saveButton, cancelButton, note); host.append(form);
+  anchor.style.visibility = "hidden"; input.focus(); input.select();
+  return { id: snapshot.id, instance_id: snapshot.instance_id, close: finish, input };
+}
+
+function bindInlineRenameGesture(node, open, timers = globalThis) {
+  let timer = null; let origin = null; let held = false;
+  const cancel = () => { if (timer !== null) timers.clearTimeout(timer); timer = null; };
+  node.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); open(); });
+  node.addEventListener("pointerdown", (event) => {
+    if (event.pointerType !== "touch") return;
+    cancel(); held = false; origin = { x: event.clientX, y: event.clientY };
+    timer = timers.setTimeout(() => { timer = null; held = true; open(); }, 600);
+  });
+  node.addEventListener("pointermove", (event) => {
+    if (origin && Math.hypot(event.clientX - origin.x, event.clientY - origin.y) > 10) cancel();
+  });
+  for (const name of ["pointerup", "pointercancel", "pointerleave"]) node.addEventListener(name, cancel);
+  node.addEventListener("click", (event) => { if (held) { event.preventDefault(); event.stopPropagation(); held = false; } });
+  node.addEventListener("contextmenu", (event) => { if (held) event.preventDefault(); });
+}
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     resumeMachineOptions, sessionResumeIntent,
+    generatedSessionName, inlineRenameAction, createInlineRenameEditor, bindInlineRenameGesture,
     MAX_MESSAGE_BYTES,
     MAX_IMAGE_ATTACHMENTS,
     MAX_IMAGE_BYTES,
@@ -3937,6 +4043,9 @@ if (typeof module !== "undefined" && module.exports) {
     attachmentSelectionMatches,
     agentMenuUrl,
     appRoute,
+    sessionHistoryQuery,
+    sessionHistoryRow,
+    sessionHistoryResumeRequest,
     paneOutputBinding,
     paneOutputMatchesSession,
     overviewConnectionPresentation,
@@ -4250,6 +4359,17 @@ function initialize() {
   const requestedPulseAccount = pulseAccountId(pageUrl.searchParams.get("pulseAccount"));
   const state = {
     revision: 0,
+    agentEventStates: new Map(),
+    agentEventCursor: null,
+    agentEventController: null,
+    agentEventTimer: null,
+    agentEventAvailable: true,
+    historyOpen: initialRoute.view === "sessions",
+    historyRows: [],
+    historyCursor: null,
+    historyGeneration: 0,
+    historyController: null,
+    historyTimer: null,
     sessions: new Map(),
     machines: [],
     selected: initialRoute.view === "session" ? initialRoute.id : null,
@@ -4625,6 +4745,7 @@ function initialize() {
     state.paneModels = null;
     state.transcript = { available: false, source: "agent", messages: [], truncated: false, error: null };
     state.transcriptHash = "";
+    state.agentSummary = null; state.summaryOpen = false;
     state.transcriptRequest += 1;
     state.transcriptPointerDown = false;
     state.pendingTranscriptRender = false;
@@ -4780,13 +4901,19 @@ function initialize() {
     state.transcriptPoll = createTranscriptPoller({
       load(signal) {
         const suffix = state.transcriptHash ? `?known_hash=${encodeURIComponent(state.transcriptHash)}` : "";
-        return request(`/api/v1/panes/${encodeURIComponent(paneId)}/transcript${suffix}`, { signal });
+        return Promise.all([
+          request(`/api/v1/panes/${encodeURIComponent(paneId)}/transcript${suffix}`, { signal }),
+          request(`/api/v1/panes/${encodeURIComponent(paneId)}/summary`, { signal }).catch(() => undefined),
+        ]).then(([transcript, summary]) => ({ ...transcript, summary }));
       },
       onData(data) {
         if (!current()) return;
         state.transcriptRequest += 1;
         const next = reduceTranscript(state.transcript, data);
-        const shouldDraw = next.transcript.messages !== state.transcript.messages
+        const summary = data.summary === undefined ? state.agentSummary : data.summary?.enabled ? data.summary : null;
+        const summaryChanged = JSON.stringify(state.agentSummary) !== JSON.stringify(summary);
+        state.agentSummary = summary;
+        const shouldDraw = summaryChanged || next.transcript.messages !== state.transcript.messages
           || next.transcript.available !== state.transcript.available
           || next.transcript.source !== state.transcript.source
           || next.transcript.truncated !== state.transcript.truncated
@@ -4988,6 +5115,15 @@ function initialize() {
         .filter(Boolean),
     );
     const nodes = [];
+    if (state.agentSummary?.digest) {
+      const summary = document.createElement("details"); summary.className = "conversation-summary";
+      summary.open = Boolean(state.summaryOpen);
+      summary.addEventListener("toggle", () => { if (summary.isConnected) state.summaryOpen = summary.open; });
+      const label = document.createElement("summary"); label.textContent = `Summary${state.agentSummary.stale ? " · refreshing" : ""}`;
+      const title = document.createElement("p"); title.className = "summary-title"; title.textContent = state.agentSummary.title;
+      const body = document.createElement("p"); body.textContent = state.agentSummary.digest;
+      summary.append(label, title, body); nodes.push(summary);
+    }
     if (state.transcript.available && state.transcript.note) {
       const notice = document.createElement("p");
       notice.className = "transcript-notice transcript-owner-note";
@@ -6578,7 +6714,8 @@ function initialize() {
   }
 
   function selectSession(id, historyMode = "push") {
-    const changed = state.selected !== id || state.selectedMachine !== null || state.pulseOpen;
+    if (state.inlineRename && state.inlineRename.id !== id) state.inlineRename.close();
+    const changed = state.selected !== id || state.selectedMachine !== null || state.pulseOpen || state.historyOpen;
     const paneChanged = state.selected !== id;
     if (changed && !confirmDiscardFileEdit()) return false;
     if (changed) {
@@ -6588,6 +6725,7 @@ function initialize() {
     state.selected = id;
     state.selectedMachine = null;
     state.pulseOpen = false;
+    closeSessionHistory();
     bindComposerDraftToSelection();
     stopPulseRefresh();
     stopPulseEvents();
@@ -6606,7 +6744,7 @@ function initialize() {
   }
 
   function selectMachine(id, historyMode = "push") {
-    const changed = state.selected !== null || state.selectedMachine !== id || state.pulseOpen;
+    const changed = state.selected !== null || state.selectedMachine !== id || state.pulseOpen || state.historyOpen;
     if (changed && !confirmDiscardFileEdit()) return false;
     if (changed) {
       persistBoundComposerDraft(true);
@@ -6615,6 +6753,7 @@ function initialize() {
     state.selected = null;
     state.selectedMachine = id;
     state.pulseOpen = false;
+    closeSessionHistory();
     bindComposerDraftToSelection();
     resetProjectView();
     stopPulseRefresh();
@@ -6634,12 +6773,13 @@ function initialize() {
 
   function selectPulse(open, historyMode = "push") {
     const nextOpen = Boolean(open);
-    const changed = state.selected !== null || state.selectedMachine !== null || state.pulseOpen !== nextOpen;
+    const changed = state.selected !== null || state.selectedMachine !== null || state.pulseOpen !== nextOpen || state.historyOpen;
     if (changed && !confirmDiscardFileEdit()) return false;
     if (changed) {
       persistBoundComposerDraft(true);
       invalidateLaunchDialog();
     }
+    closeSessionHistory();
     state.pulseOpen = nextOpen;
     state.selected = null;
     state.selectedMachine = null;
@@ -6669,6 +6809,82 @@ function initialize() {
     return true;
   }
 
+  function closeSessionHistory() {
+    state.historyOpen = false;
+    state.historyGeneration += 1;
+    state.historyController?.abort();
+    clearTimeout(state.historyTimer);
+  }
+
+  function selectSessionHistory(open, historyMode = "push") {
+    const changed = state.historyOpen !== Boolean(open) || state.selected !== null || state.selectedMachine !== null || state.pulseOpen;
+    if (!selectSession(null, "none")) return false;
+    state.historyOpen = Boolean(open);
+    const url = agentMenuUrl(location.href);
+    if (open) url.searchParams.set("view", "sessions");
+    updateSelectionHistory(url, historyMode, changed);
+    render();
+    if (open) void loadSessionHistory();
+    return true;
+  }
+
+  async function loadSessionHistory(more = false) {
+    if (!state.historyOpen) return;
+    state.historyController?.abort();
+    clearTimeout(state.historyTimer);
+    const controller = new AbortController();
+    state.historyController = controller;
+    const generation = ++state.historyGeneration;
+    const filters = { text: $("history-text").value, state: $("history-state").value,
+      machine: $("history-machine").value, project: $("history-project").value };
+    $("history-status").textContent = "Loading sessions…";
+    $("history-more").disabled = true;
+    try {
+      const page = await request(sessionHistoryQuery(filters, more ? state.historyCursor : null), { signal: controller.signal });
+      if (!state.historyOpen || generation !== state.historyGeneration) return;
+      const rows = (Array.isArray(page.sessions) ? page.sessions : []).slice(0, 100).map(sessionHistoryRow);
+      const combined = more ? [...state.historyRows, ...rows] : rows;
+      state.historyRows = [...new Map(combined.map((row) => [row.sessionKey, row])).values()].slice(0, 1000);
+      state.historyCursor = state.historyRows.length < 1000 ? page.next_cursor : null;
+      renderSessionHistory();
+      $("history-status").textContent = state.historyRows.length ? `${state.historyRows.length} sessions${page.next_cursor ? " · more available" : ""}` : "No matching sessions.";
+    } catch (error) {
+      if (generation !== state.historyGeneration || controller.signal.aborted) return;
+      $("history-status").textContent = error.status === 404 ? "Session history is disabled on this node." : `Session history unavailable: ${error.message}`;
+    } finally {
+      if (generation === state.historyGeneration) {
+        $("history-more").disabled = false;
+        state.historyTimer = setTimeout(() => { if (state.historyOpen && !document.hidden) void loadSessionHistory(); }, 30_000);
+      }
+    }
+  }
+
+  function renderSessionHistory() {
+    const rows = state.historyRows.map((row) => {
+      const item = document.createElement("li"); item.className = "session-history-row";
+      item.dataset.sessionKey = row.sessionKey;
+      const name = document.createElement("strong"); name.textContent = row.name;
+      const description = document.createElement("p"); description.textContent = row.description;
+      const metadata = document.createElement("p"); metadata.className = "meta";
+      const date = row.lastActiveMs ? new Date(row.lastActiveMs) : null;
+      metadata.textContent = [row.machine, row.project, date && Number.isFinite(date.getTime()) ? date.toLocaleString() : "No activity recorded", row.state].filter(Boolean).join(" · ");
+      item.append(name, description, metadata);
+      const live = [...state.sessions.values()].find((session) => session.session_key === row.sessionKey);
+      if (live) {
+        const button = document.createElement("button"); button.className = "subtle"; button.textContent = "Open";
+        button.addEventListener("click", () => selectSession(live.id)); item.append(button);
+      }
+      const button = document.createElement("button"); button.className = "subtle"; button.textContent = "Resume on…";
+      button.dataset.sessionResume = row.sessionKey;
+      button.disabled = !resumeMachineOptions(state.machines).length;
+      button.addEventListener("click", () => window.atmuxSessionResume(sessionHistoryResumeRequest(row)));
+      item.append(button);
+      return item;
+    });
+    $("history-list").replaceChildren(...rows);
+    $("history-more").hidden = !state.historyCursor;
+  }
+
   function backToAgentMenu() {
     const route = appRoute(location.href);
     if (route.view === "menu") return;
@@ -6681,6 +6897,7 @@ function initialize() {
     const route = appRoute(location.href);
     const accepted = route.view === "session" ? selectSession(route.id, "none")
       : route.view === "machine" ? selectMachine(route.id, "none")
+        : route.view === "sessions" ? selectSessionHistory(true, "none")
         : route.view === "usage" ? selectPulse(true, "none")
           : selectSession(null, "none");
     if (accepted === false) {
@@ -6689,6 +6906,7 @@ function initialize() {
       if (state.selected) url.searchParams.set("session", state.selected);
       else if (state.selectedMachine) url.searchParams.set("machine", state.selectedMachine);
       else if (state.pulseOpen) url.searchParams.set("view", "usage");
+      else if (state.historyOpen) url.searchParams.set("view", "sessions");
       // Back already exposed the existing Agents entry. Put the rejected
       // editor detail back above it; replacing here would consume that only
       // in-app escape hatch and make the next Back leave atmux/login origin.
@@ -6717,6 +6935,7 @@ function initialize() {
   }
 
   function render() {
+    if (state.inlineRename && !paneOutputMatchesSession(state.inlineRename, state.sessions.get(state.inlineRename.id))) state.inlineRename.close();
     clearTimeout(state.statusTimer);
     state.statusTimer = null;
     const presented = presentSessionStatuses(
@@ -6754,13 +6973,17 @@ function initialize() {
 
     const selected = state.sessions.get(state.selected);
     const selectedMachine = state.machines.find((machine) => machine.id === state.selectedMachine) || null;
-    $("welcome").hidden = Boolean(selected || selectedMachine || state.pulseOpen);
+    $("welcome").hidden = Boolean(selected || selectedMachine || state.pulseOpen || state.historyOpen);
     $("machine-view").hidden = !selectedMachine || Boolean(selected);
     $("agent-view").hidden = !selected;
+    $("history-view").hidden = !state.historyOpen;
+    $("history-open").setAttribute("aria-pressed", String(state.historyOpen));
+    $("history-open").classList.toggle("selected", state.historyOpen);
     $("pulse-view").hidden = !state.pulseOpen;
     $("pulse-open").classList.toggle("selected", state.pulseOpen);
     $("pulse-open").setAttribute("aria-pressed", String(state.pulseOpen));
-    document.body.classList.toggle("has-selection", Boolean(selected || selectedMachine || state.pulseOpen));
+    document.body.classList.toggle("has-selection", Boolean(selected || selectedMachine || state.pulseOpen || state.historyOpen));
+    if (state.historyOpen) return;
     if (state.pulseOpen) {
       renderPulse();
       return;
@@ -6778,6 +7001,7 @@ function initialize() {
     agentName.title = launchCommand ? `tmux launch: ${launchCommand}` : "";
     const agentDescription = $("agent-description");
     agentDescription.textContent = selected.description || "";
+    agentDescription.dataset.source = selected.description_source || "";
     agentDescription.hidden = !selected.description;
     renderAgentBranch();
     const folder = sessionFolderLabel(selected);
@@ -6792,6 +7016,16 @@ function initialize() {
         : `Memory ${formatMemoryLimit(selected.memory_max_bytes)}`,
     ].filter(Boolean).join(" · ");
     $("agent-meta").title = selected.path || "";
+    let inputBadge = $("agent-needs-input");
+    if (!inputBadge) {
+      inputBadge = document.createElement("span");
+      inputBadge.id = "agent-needs-input";
+      inputBadge.className = "needs-input-badge";
+      $("agent-meta").before(inputBadge);
+    }
+    const inputReason = needsInputReason(selected, state.agentEventStates);
+    inputBadge.hidden = !inputReason;
+    inputBadge.textContent = needsInputLabel(inputReason);
     const launch = $("agent-launch");
     launch.hidden = !launchCommand;
     launch.textContent = launchCommand ? `tmux: ${launchCommand}` : "";
@@ -7229,6 +7463,8 @@ function initialize() {
     dot.setAttribute("aria-hidden", "true");
     const copy = document.createElement("span"); copy.className = "session-copy";
     const name = textSpan("", "session-name");
+    bindInlineRenameGesture(name, () => openInlineRename(id, name));
+    name.title = "Double-click or hold to rename (F2 for selected session)";
     const description = textSpan("", "session-description");
     description.hidden = true;
     const sub = textSpan("", "session-sub");
@@ -7293,9 +7529,19 @@ function initialize() {
     node.name.textContent = session.name;
     node.description.textContent = session.description || "";
     node.description.title = session.description || "";
+    node.description.dataset.source = session.description_source || "";
     node.description.hidden = !session.description;
     node.sub.textContent = [folder, profile, session.status, session.agent].filter(Boolean).join(" · ");
     node.sub.title = session.path || "";
+    if (!node.inputBadge) {
+      node.inputBadge = document.createElement("span");
+      node.inputBadge.className = "needs-input-badge";
+      node.sub.after(node.inputBadge);
+    }
+    const reason = needsInputReason(session, state.agentEventStates);
+    node.inputBadge.hidden = !reason;
+    node.inputBadge.textContent = needsInputLabel(reason);
+    if (reason) node.button.setAttribute("aria-label", `${node.button.getAttribute("aria-label")}, ${needsInputLabel(reason)}`);
   }
 
   async function request(url, options = {}) {
@@ -8522,6 +8768,11 @@ function initialize() {
   $("overview-retry").addEventListener("click", () => {
     if (!$("overview-retry").disabled) connectOverview();
   });
+  $("history-open").addEventListener("click", () => selectSessionHistory(!state.historyOpen));
+  $("history-back").addEventListener("click", backToAgentMenu);
+  $("history-refresh").addEventListener("click", () => void loadSessionHistory());
+  $("history-more").addEventListener("click", () => void loadSessionHistory(true));
+  $("history-filters").addEventListener("submit", (event) => { event.preventDefault(); void loadSessionHistory(); });
   $("pulse-open").addEventListener("click", () => selectPulse(!state.pulseOpen));
   function stopRecoveryPolling() {
     if (state.recoveryPoll !== null) clearTimeout(state.recoveryPoll);
@@ -9275,29 +9526,9 @@ function initialize() {
     $("quick-actions-dialog").close();
     $("resume-dialog").showModal();
   }
-  async function refreshRegistrySessions(show = false) {
-    try {
-      const entries = await request("/api/v1/registry/sessions");
-      if (!Array.isArray(entries)) throw new Error("Saved sessions are unavailable");
-      state.registryEnabled = true;
-      $("registry-sessions-open").hidden = false;
-      if (show) {
-        const rows = entries.slice(0, 4096).map((session) => {
-          const row = document.createElement("div"); row.className = "registry-session-row";
-          const label = document.createElement("span"); label.textContent = `${session.name} · ${session.machine} · ${session.state}`;
-          const button = document.createElement("button"); button.type = "button"; button.className = "subtle"; button.textContent = "Resume on…";
-          button.disabled = !sessionResumeIntent(session, "local") || !resumeMachineOptions(state.machines).length;
-          button.addEventListener("click", () => { $("registry-sessions-dialog").close(); openResumeOn(session); });
-          row.append(label, button); return row;
-        });
-        $("registry-sessions-list").replaceChildren(...rows);
-        $("registry-sessions-status").textContent = entries.length ? "" : "No saved sessions yet.";
-        $("registry-sessions-dialog").showModal();
-      }
-      render();
-    } catch (error) {
-      if (show) toast(error.message);
-    }
+  async function refreshRegistryCapability() {
+    try { await request("/api/v1/session-history?limit=1"); state.registryEnabled = true; render(); }
+    catch { state.registryEnabled = false; }
   }
   function openResumeOn(session) {
     if (!state.registryEnabled || !sessionResumeIntent(session, "local")) return;
@@ -9316,9 +9547,12 @@ function initialize() {
     $("resume-on-confirm").disabled = false;
     $("resume-on-dialog").showModal();
   }
-  $("registry-sessions-open").addEventListener("click", () => { void refreshRegistrySessions(true); });
   $("quick-resume-on").addEventListener("click", () => openResumeOn(state.sessions.get(state.selected)));
-  // A3's Sessions view can dispatch this event with its selected durable record.
+  window.atmuxSessionResume = (request) => {
+    state.registryEnabled = true;
+    const row = state.historyRows.find((row) => row.sessionKey === request.session_key);
+    openResumeOn({session_key:request.session_key,name:row?.name || request.session_key,machine:row?.machine});
+  };
   document.addEventListener("atmux:session-resume", (event) => openResumeOn(event.detail));
   $("resume-on-dialog").addEventListener("close", () => { state.pendingResumeOn = null; });
   $("resume-on-form").addEventListener("submit", async (event) => {
@@ -9814,6 +10048,35 @@ function initialize() {
     $("kill-dialog").showModal();
   }
 
+  function openInlineRename(id, anchor = $("agent-name")) {
+    const session = state.sessions.get(id);
+    if (!session || !PANE_INSTANCE_PATTERN.test(String(session.instance_id || "")) || !isMachineControllable(machineOf(session))) return;
+    state.inlineRename?.close();
+    const previousName = session.name;
+    const host = anchor.closest(".session-row") || anchor.parentElement;
+    state.inlineRename = createInlineRenameEditor({ document, host, anchor, session,
+      save: async (edit) => {
+        await request(sessionDeletePath(edit.id), { method: "PATCH", body: JSON.stringify(edit.body) });
+        const current = state.sessions.get(edit.id);
+        if (current?.instance_id === session.instance_id) { current.name = edit.body.name; render(); }
+        toast(`Renamed ${previousName} to ${edit.body.name}`);
+      },
+      suggest: async (snapshot) => {
+        const summary = await request(`/api/v1/panes/${encodeURIComponent(snapshot.id)}/summary`);
+        if (state.sessions.get(snapshot.id)?.instance_id !== snapshot.instance_id) throw new Error("The session changed; open rename again.");
+        return summary.title;
+      },
+      close: () => { state.inlineRename = null; },
+    });
+  }
+  bindInlineRenameGesture($("agent-name"), () => openInlineRename(state.selected));
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "F2") return;
+    if (inlineRenameAction(event, { selected: Boolean(state.selected), dialogOpen: Boolean(document.querySelector("dialog[open]")) }) === "open") {
+      event.preventDefault(); openInlineRename(state.selected);
+    }
+  });
+
   function openSessionEditDialog(id) {
     const session = state.sessions.get(id);
     if (!session || !isMachineControllable(machineOf(session))) return;
@@ -9824,6 +10087,7 @@ function initialize() {
       instance_id: session.instance_id,
       name: session.name,
       description: session.description || "",
+      description_source: session.description_source,
     };
     $("session-edit-current").textContent = session.name;
     $("session-edit-name").value = session.name;
@@ -10874,13 +11138,82 @@ function initialize() {
   });
   window.addEventListener("pagehide", () => { persistBoundComposerDraft(true); });
   window.addEventListener("pagehide", stopTranscriptPolling);
+  window.addEventListener("pagehide", stopAgentEvents);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopAgentEvents();
+    else void pollAgentEvents();
+  });
   window.addEventListener("pageshow", startTranscriptPolling);
+  window.addEventListener("pageshow", () => { void pollAgentEvents(); });
+
+  function stopAgentEvents() {
+    clearTimeout(state.agentEventTimer);
+    state.agentEventTimer = null;
+    state.agentEventController?.abort();
+  }
+
+  async function pollAgentEvents() {
+    if (document.hidden || !state.agentEventAvailable || state.agentEventController) return;
+    clearTimeout(state.agentEventTimer);
+    const controller = new AbortController();
+    state.agentEventController = controller;
+    let delay = 100;
+    try {
+      const query = new URLSearchParams({ wait: "25", limit: "100" });
+      if (state.agentEventCursor) query.set("after", state.agentEventCursor);
+      const response = await fetch(`/api/v1/fleet/agent-events?${query}`, { signal: controller.signal });
+      if (response.status === 404) { state.agentEventAvailable = false; return; }
+      if (!response.ok) throw new Error("Agent events unavailable");
+      const page = await response.json();
+      state.agentEventStates = reconcileAgentEvents(state.agentEventStates, page);
+      state.agentEventCursor = typeof page.next === "string" ? page.next : null;
+      render();
+    } catch { delay = 5000; }
+    finally {
+      state.agentEventController = null;
+      if (!document.hidden && state.agentEventAvailable) state.agentEventTimer = setTimeout(() => { void pollAgentEvents(); }, delay);
+    }
+  }
 
   render();
+  void pollAgentEvents();
   connectOverview();
+  if (state.historyOpen) void loadSessionHistory();
   void refreshFleetUpdates();
   void refreshFleetRecovery(false);
-  void refreshRegistrySessions();
+  void refreshRegistryCapability();
   if (state.selected) connectPane();
   if (state.pulseOpen) void loadPulseAccounts();
 }
+
+// Durable lifecycle signals supplement the status classifier. Keep only
+// generation-bound state; event bodies are never rendered as HTML.
+function reconcileAgentEvents(previous, page) {
+  const next = page?.reset ? new Map() : new Map(previous instanceof Map ? previous : []);
+  for (const record of Array.isArray(page?.events) ? page.events.slice(0, 100) : []) {
+    const event = record?.event;
+    if (!event || typeof event.session_key !== "string" || typeof event.machine !== "string") continue;
+    const type = event.type;
+    if (!["agent.needs_input", "agent.working", "agent.turn_completed", "agent.started", "agent.exited", "session.closed", "session.archived", "session.resumed"].includes(type)) continue;
+    next.delete(event.session_key);
+    next.set(event.session_key, { instance: event.instance_id, machine: event.machine, type, reason: type === "agent.needs_input" ? event.reason : type === "agent.turn_completed" ? "idle_prompt" : null });
+    if (next.size > 4096) next.delete(next.keys().next().value);
+  }
+  return next;
+}
+
+function needsInputReason(session, events) {
+  const event = events?.get(session?.session_key);
+  if (event && event.machine === session.machine && event.instance === session.instance_id) {
+    if (["agent.working", "agent.exited", "session.closed", "session.archived"].includes(event.type)) return null;
+    if (["idle_prompt", "question", "permission", "startup_prompt", "plan_approval"].includes(event.reason)) return event.reason;
+  }
+  return session?.status === "waiting" ? "idle_prompt" : null;
+}
+
+function needsInputLabel(reason) {
+  const labels = { idle_prompt: "idle", question: "question", permission: "permission", startup_prompt: "startup prompt", plan_approval: "plan approval" };
+  return labels[reason] ? `Needs input · ${labels[reason]}` : "";
+}
+
+if (typeof module !== "undefined" && module.exports) Object.assign(module.exports, { reconcileAgentEvents, needsInputReason, needsInputLabel });

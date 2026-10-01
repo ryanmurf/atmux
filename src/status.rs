@@ -97,6 +97,9 @@ pub fn classify(
     if kind == AgentKind::Other {
         return AgentStatus::Other;
     }
+    if startup_prompt(kind, content) {
+        return AgentStatus::Waiting;
+    }
 
     let recent = content.lines().rev().take(18).collect::<Vec<_>>();
     let lower = recent
@@ -154,6 +157,103 @@ pub fn classify(
     } else {
         AgentStatus::Waiting
     }
+}
+
+/// Startup dialogs have stable event semantics shared with resume automation.
+#[must_use]
+pub fn startup_prompt(kind: AgentKind, content: &str) -> bool {
+    if current_empty_composer(kind, content) {
+        return false;
+    }
+    let tail = content
+        .lines()
+        .rev()
+        .take(40)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    kind == AgentKind::Claude
+        && [
+            "development channels",
+            "development channel",
+            "do you trust the files in this folder",
+            "trust this folder",
+            "trust this workspace",
+            "yes, i trust this folder",
+            "accessing workspace",
+        ]
+        .iter()
+        .any(|marker| tail.contains(marker))
+}
+
+/// Explicit visible input dialogs supplement native lifecycle hooks.
+#[must_use]
+pub fn input_reason(kind: AgentKind, content: &str) -> Option<&'static str> {
+    if current_empty_composer(kind, content) {
+        return None;
+    }
+    if startup_prompt(kind, content) {
+        return Some("startup_prompt");
+    }
+    if kind == AgentKind::Other {
+        return None;
+    }
+    let tail = content
+        .lines()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    if [
+        "implement this plan?",
+        "approve this plan",
+        "would you like to implement",
+    ]
+    .iter()
+    .any(|v| tail.contains(v))
+    {
+        Some("plan_approval")
+    } else if [
+        "yes, allow",
+        "allow this command",
+        "requires approval",
+        "permission required",
+    ]
+    .iter()
+    .any(|v| tail.contains(v))
+    {
+        Some("permission")
+    } else if WAITING_MARKERS.iter().any(|v| tail.contains(v)) {
+        Some("question")
+    } else {
+        None
+    }
+}
+
+fn current_empty_composer(kind: AgentKind, content: &str) -> bool {
+    let glyph = match kind {
+        AgentKind::Claude => '❯',
+        AgentKind::Codex => '›',
+        AgentKind::Other => return false,
+    };
+    let lines = visible_tail(content);
+    let Some(prompt) = lines
+        .iter()
+        .rposition(|line| line.trim_start().starts_with(glyph))
+    else {
+        return false;
+    };
+    let footer = &lines[prompt + 1..];
+    let body = lines[prompt]
+        .trim_start()
+        .strip_prefix(glyph)
+        .unwrap_or_default();
+    empty_composer(kind, body, footer)
+        && footer.iter().all(|v| footer_row(v))
+        && !footer
+            .iter()
+            .any(|v| v.to_lowercase().contains("enter to confirm"))
 }
 
 /// Characters the harnesses use to rule off the composer box.

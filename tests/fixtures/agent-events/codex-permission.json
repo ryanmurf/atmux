@@ -1,0 +1,1 @@
+{"session_id":"thr_123","transcript_path":"/work/.codex/rollout.jsonl","cwd":"/work/demo","hook_event_name":"PermissionRequest","model":"gpt-6.1-sol","permission_mode":"default","turn_id":"turn_123","tool_name":"Bash","tool_input":{"command":"echo secret-token","description":"Raw permission request must not be retained"}}

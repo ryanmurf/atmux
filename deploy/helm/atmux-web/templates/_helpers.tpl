@@ -4,6 +4,8 @@
 {{- $pulse := get $server "pulse" | default dict -}}
 {{- $accounts := get $pulse "accounts" | default list -}}
 {{- $machines := get $server "machines" | default list -}}
+{{- $events := get $server "events" | default dict -}}
+{{- $redpanda := get $events "redpanda" | default dict -}}
 [general]
 project_roots = []
 favorite_dirs = []
@@ -39,6 +41,23 @@ enabled = false
 [web]
 allow_unauthenticated_loopback = false
 proxy_token_file = "/etc/atmux/proxy-token/token"
+
+{{- if get $events "enabled" }}
+
+[events]
+inject_hooks = false
+directory = "/var/lib/atmux/data/events"
+max_bytes = {{ get $events "maxBytes" }}
+segment_bytes = {{ get $events "segmentBytes" }}
+retention_seconds = {{ get $events "retentionSeconds" }}
+{{- if get $redpanda "enabled" }}
+
+[events.redpanda]
+brokers = {{ get $redpanda "brokers" | toJson }}
+topic = {{ get $redpanda "topic" | quote }}
+tenant_id = {{ get $redpanda "tenantId" | quote }}
+{{- end }}
+{{- end }}
 
 [pulse]
 collect = false

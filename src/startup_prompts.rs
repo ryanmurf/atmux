@@ -150,7 +150,11 @@ fn process(pid: u32) -> Option<(String, Vec<std::ffi::OsString>, std::path::Path
     ))
 }
 
-fn answer(config: &Config, session: &Session) -> Result<()> {
+fn answer(
+    config: &Config,
+    session: &Session,
+    events: Option<&crate::events::EventService>,
+) -> Result<()> {
     if !matches!(session.agent, AgentKind::Claude | AgentKind::Codex) {
         return Ok(());
     }
@@ -174,7 +178,7 @@ fn answer(config: &Config, session: &Session) -> Result<()> {
     let text = Tmux.capture(&session.pane_id, 80)?;
     let Some(dialog) = recognize(&text) else {
         if looks_like_startup(&text) {
-            report(session, "unrecognized dialog");
+            report(session, "unrecognized dialog", events);
         }
         return Ok(());
     };
@@ -186,7 +190,7 @@ fn answer(config: &Config, session: &Session) -> Result<()> {
             && (!trusted_cwd(config, &live.path)
                 || live.path.canonicalize().ok().as_ref() != Some(&agent_cwd)))
     {
-        report(session, "startup dialog requires input");
+        report(session, "startup dialog requires input", events);
         return Ok(());
     }
     let marker = Tmux::output([
@@ -235,10 +239,24 @@ fn answer(config: &Config, session: &Session) -> Result<()> {
     for _ in 0..10 {
         thread::sleep(Duration::from_millis(25));
         if recognize(&Tmux.capture(&session.pane_id, 80)?) != Some(dialog) {
+            if let Some(events) = events {
+                events.startup_event(session, Some((dialog.option(), true)));
+            }
+            Tmux::output([
+                "set-option",
+                "-p",
+                "-t",
+                &session.pane_id,
+                "@atmux_startup_answered",
+                &format!("{generation}|{}", dialog.option()),
+            ])?;
             return Ok(());
         }
     }
-    report(session, "dialog remained after one answer");
+    if let Some(events) = events {
+        events.startup_event(session, Some((dialog.option(), false)));
+    }
+    report(session, "dialog remained after one answer", events);
     Ok(())
 }
 
@@ -250,23 +268,50 @@ fn looks_like_startup(text: &str) -> bool {
             || text.contains("Folder access"))
 }
 
-// A1 integration point: replace this single, body-free log with
-// agent.needs_input, reason=startup_prompt. Never log captured pane text/argv.
-fn report(session: &Session, reason: &str) {
-    eprintln!(
-        "atmux agent.needs_input/startup_prompt pane={} session_key={} reason={reason}",
-        session.pane_id,
-        session.session_key.as_deref().unwrap_or("unknown")
-    );
+// Captured text and argv never enter logs or the event spool.
+fn report(session: &Session, reason: &str, events: Option<&crate::events::EventService>) {
+    if let Some(events) = events {
+        events.startup_event(session, None);
+    } else {
+        eprintln!(
+            "atmux agent.needs_input/startup_prompt pane={} session_key={} reason={reason}",
+            session.pane_id,
+            session.session_key.as_deref().unwrap_or("unknown")
+        );
+    }
 }
 
 pub(crate) fn handle(config: &Config, session: &Session) {
-    // Absence of the section preserves existing behaviour, including logging.
-    if !config.startup_prompts.auto_answer {
+    handle_with_events(config, session, None);
+}
+
+pub(crate) fn handle_with_events(
+    config: &Config,
+    session: &Session,
+    events: Option<&crate::events::EventService>,
+) {
+    if let Some(events) = events
+        && let Some(pid) = session.agent_pid
+        && let Some((generation, _, _)) = process(pid)
+        && let Ok(marker) = Tmux::output([
+            "show-options",
+            "-p",
+            "-v",
+            "-q",
+            "-t",
+            &session.pane_id,
+            "@atmux_startup_answered",
+        ])
+        && let Some((answered, dialog)) = marker.trim().split_once('|')
+        && answered == generation
+    {
+        events.startup_event(session, Some((dialog, true)));
+    }
+    if !config.startup_prompts.auto_answer && events.is_none() {
         return;
     }
-    if let Err(error) = answer(config, session) {
-        report(session, &error.to_string());
+    if let Err(error) = answer(config, session, events) {
+        report(session, &error.to_string(), events);
     }
 }
 

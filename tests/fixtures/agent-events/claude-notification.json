@@ -1,0 +1,1 @@
+{"session_id":"abc123","transcript_path":"/home/user/.claude/projects/demo/abc123.jsonl","cwd":"/work/demo","hook_event_name":"Notification","message":"Raw human prompt must not be retained","notification_type":"permission_prompt"}

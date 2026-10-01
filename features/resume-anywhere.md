@@ -1,6 +1,6 @@
 # A4: Resume anywhere, phone-home restore, no startup prompts
 
-Status: A4 complete on branch `feat/resume-anywhere`; acceptance gates passed 2026-09-30
+Status: A4 integration in progress on `feat/resume-anywhere` (2026-09-30)
 
 Read `features/agent-control-plane.md` first. This record is your brief; keep it updated with
 progress, evidence, and gate checkboxes.
@@ -76,94 +76,64 @@ Agents never sit at a startup prompt.
   `node --test web/*.test.mjs tests/navigation.test.mjs`, and the browser suites if the UI
   changes.
 
-## Engineering decisions and merge contract
+## Engineering decisions and integration contract
 
-- Startup handling runs in both owner scan paths (web/MCP and TUI), covering launches,
-  relaunches, Quick Resume, and newly discovered panes. It is off by default. A per-dialog
-  tmux option claims the exact native PID/start-time generation before sending any keys,
-  under the existing owner process lock. This trades a missed answer on a crash for never
-  answering twice. Failed verification leaves the claim intact and reports input needed.
-  Startup scans try the pane lock without waiting; a busy pane is revisited on a later scan.
-  This avoids a registry/pane lock inversion when resume verification overlaps an explicit close.
-- Recognition uses bounded native rows and a terminal confirmation footer. The development
-  flag must be a complete active argv token read from the live process; launch-command labels
-  are insufficient. Workspace trust uses canonical configured project roots. The scanner's
-  cwd can briefly lag a just-started CLI, so trust checks use freshly queried pane metadata.
-- Codex's current [folder trust renderer](https://github.com/openai/codex/blob/main/codex-rs/tui/src/onboarding/trust_directory.rs)
-  uses **Folder access**, an exact wrapped trust disclosure, **1. Trust and continue**, **2. Quit**,
-  and `enter continue · esc quit`. The fixture follows its official 40-column onboarding snapshot;
-  recognition rejoins only the complete exact disclosure so narrow worktree dialogs work. Restricted
-  folder actions, altered disclosures/choices, and changed confirmation footers are near misses.
-- A1 integration: `src/startup_prompts.rs::report` is the single body-free log call site for
-  `agent.needs_input/startup_prompt`; replace it with the event emitter after integration.
-- A3 was absent in this worktree, so `src/resume_anywhere.rs` defines
-  `atmux.native-bundle/v1`, `[registry]` resume configuration, a bounded bundle cache, and
-  owner desired-state snapshots. The lead should adapt A3's archive record to `NativeBundle`
-  and consolidate the store/config. The manifest carries the original session key, harness,
-  profile/mode, native id, source project/cwd, credential-free git remote/branch, relative native
-  path, and optional source process binding. Native logs and base64 Claude sibling files are
-  transported together; no source command, environment, credentials, or target path is accepted.
-- Reads and requests are bounded: 8 MiB maximum serialized bundle (configurable downward),
-  256 KiB per native JSONL row, 128 sibling files, 512 desired sessions per owner, 512 KiB desired
-  snapshot, and 4,096 listed records. Repository lookup checks at most 4,096 entries, depth four,
-  and ten seconds; native sibling traversal has its own count/depth/time bounds. All native/cache
-  file access opens each path component with `NOFOLLOW`; files must be regular, singly linked,
-  and owned by the current user. Native publication uses exclusive staging plus hard links;
-  identical content is a no-op. Preflight checks all files before publication. Cache state uses
-  atomic rename, an owner-only root, and an advisory transaction lock.
-- Only verified metadata is translated: top-level Claude `cwd`, including subagent JSONL, and
-  Codex `session_meta.payload.cwd`. Message/tool bodies and binary siblings retain their content.
-  Codex keeps its rollout date and filename. Explicit configured profile stores are supported
-  without weakening the conventional-home transcript locator.
-- Target repository selection requires both the normalized origin remote and recorded branch.
-  Ambiguity and an existing repository on a different branch are refused to preserve existing
-  workspaces; the user can configure a matching worktree. Only a newly created clone is checked
-  out. Cross-machine projects without a git remote are refused because a folder-name guess
-  cannot prove identity; same-owner restoration can reuse the configured local project.
-- Imports use the existing resume launcher and native-conversation lease. The stable key is set
-  on the placeholder pane before respawn or discovery. Target verification requires the expected
-  harness, configured profile, cwd, and native conversation metadata within five seconds. The
-  startup handler runs during that verification window. Retry of an already verified target is
-  idempotent only when its translated native files match exactly; a divergent running copy is
-  refused so a move cannot discard newer source turns. Source selection prefers a running owner
-  other than the target. A move rechecks the exported pane, PID, kernel process-start stamp, native id,
-  and a SHA-256 digest of the source log and siblings
-  under the process lock before recording a close and stopping the source.
-  Move kills only the exported pane, preserving neighboring panes in that tmux session.
-- Web and TUI explicit closes save tombstones for every affected Claude/Codex pane before
-  killing the named tmux session, including panes not yet captured by the periodic observer.
-  Final native exports are retained when available. This closes the restart-between-close-and-scan
-  gap and gives A3 a common `record_named_close` integration point.
-- The coordinator pulls owner snapshots and bundles every 15 seconds over the existing mTLS /
-  bearer-token federation client. Snapshot boot ids, tmux-server identity changes, and health
-  reconnections substitute for A1's future `node.started` signal. Restore requires both
-  `restore_on_start` and `restore_machines`; pending desired entries survive failed requests.
-  Missing panes on an unchanged boot/server are treated as intentional closes, a fail-closed
-  choice where intent cannot otherwise be proven. Closed/archived tombstones win over stale
-  coordinator intent and are rechecked inside the restore launch transaction.
-- Restore refreshes the owner's native log before import so complete turns newer than the last
-  cached snapshot survive. If the native file is gone, the retained bundle is used; unsafe or
-  oversized local files remain errors. Export ignores an incomplete final appended JSONL row
-  until that row completes, and a closed-session export refreshes the final complete native log.
-- A3's Sessions view was absent, so a working **Saved sessions** picker supplies the durable
-  running/closed list alongside agent Actions. A3 can dispatch the document event
-  `atmux:session-resume` with its selected durable record to open the same machine picker, then
-  replace the fallback list/API with its richer archive/search view. Requests capture the
-  durable key when the dialog opens, independent of changing live selection; copy is the default.
-- A1/A3 own the final event plumbing: connect startup reporting to A1's emitter, use its
-  `node.started` as an additional restore signal, and emit A3's `session.resumed` / archive events
-  around these successful operations. A4 deliberately keeps the current log and federation
-  fallback runnable before those branches land. Shared Rust/web files contain insertion points
-  and small wiring additions rather than reorganizing their existing implementations.
-- Copy intentionally allows one stable key to be live on multiple owners. The fallback keeps
-  desired state per machine and the last pulled bundle per key; live resume prefers a non-target
-  owner. A3 should reconcile its primary-location and per-owner bundle/version model for these
-  running copies. Divergent native logs are refused rather than merged, and a source that advances
-  after export is left running when a move's content digest no longer matches.
-- The Quick Talk browser suite previously required an external running atmux and Chrome. Its
-  default invocation now starts a private HTTP fixture and disposable Chrome profile, preserving
-  explicit external arguments for existing workflows. This makes the required browser gate
-  reproducible without contacting a running agent or service.
+- A3's `src/registry.rs` is the only record, store, configuration and archive owner. A4's
+  parallel `ResumeStore`, desired snapshots, `RegistryResumeConfig`, JSON/base64 manifest and
+  Saved sessions view are removed. Resume derives translation inputs from A3's private
+  `StoredRecord` and `atmux.session.archive/v1` manifest. The public SessionRecord remains
+  unchanged and does not expose native ids/config roots. Temporary imports live in the registry's
+  existing staging area; transfer, decompression and native translation stream through bounded
+  descriptors instead of whole-conversation JSON buffers.
+- A3 private records add owner boot/server identity, desired-running intent, close reason,
+  process-start stamp and resume generation. These distinguish node loss from intentional close
+  without a second store. A monotonic resume generation prevents a still-running source copy's
+  later heartbeat from stealing the primary Sessions location back from the target. Each owner
+  retains its own source record and archive; divergent conversations are refused, never merged.
+- Peer import/export/restore/stop use A3's node-token guard, reject browser Origin/Sec-Fetch,
+  and retain existing mTLS transport. The browser/MCP submits only stable key, configured machine
+  and optional move. Archive entry types, relative paths, compressed/decompressed caps and
+  per-file checksums are verified before native publication. Native paths are opened component
+  by component with NOFOLLOW, same-user regular single-link files, exclusive staging and
+  no-overwrite hard links. Identical translated content is a no-op.
+- Limits follow A3's configured bundle maximum/quota (default 256 MiB/4 GiB), with 256 KiB
+  JSONL rows, 4 MiB archive manifests, 4,096 entries and 512 restore keys. Repository search
+  remains bounded to 4,096 entries/depth four/ten seconds. Only verified Claude top-level cwd
+  (including subagent JSONL) and Codex session_meta.payload.cwd change; message/tool bodies,
+  binary siblings and Codex rollout date/filename remain intact. Empty Claude sibling directories
+  are preserved. An incomplete final live JSONL row is deferred until it completes.
+- Target profile must match name and harness, using its configured native store. Repository
+  identity requires origin and recorded branch. Ambiguous repositories or an existing checkout
+  on a different branch are refused to preserve workspaces; only new clones are checked out.
+  The existing credential-free git URL policy is reused. Projects without a remote can be
+  restored on their owner, but cannot be guessed on another machine.
+- Import uses the existing native resume lease and launcher, setting the original session key
+  before discovery. Launch verification checks harness/profile/cwd/native identity within five
+  seconds. The transaction lock lives inside the blocking worker so request cancellation cannot
+  release it during launch. Copy is the default. Move rechecks pane identity, PID/kernel start
+  stamp, native id and log/sibling content digest under the process lock, and kills only the
+  exported pane after target verification. Advanced sources stay running.
+- Explicit web closes write authoritative user tombstones before tmux mutation. TUI closes
+  atomically queue generation-bound intents in the same registry's private close-intents mailbox;
+  the single registry writer consumes these before observing panes, including on restart. This
+  avoids opening a second writer and closes the restart-before-scan gap. No mailbox contains
+  conversation content. Native files are refreshed before restore to retain post-archive turns.
+- A1 EventService records unknown startup dialogs as agent.needs_input/startup_prompt and
+  auto-answers as agent.startup_prompt_answered with dialog/verification only. The TUI's existing
+  per-process tmux claim and bounded outcome marker let the owner emit a TUI answer as well.
+  session.resumed goes through ControlPlane::emit_agent_event. A1 node.started carries A3's
+  owner boot id; tmux server changes emit another node.started. The existing durable event
+  checkpoint retains latest imported node boots. An allowlisted coordinator retries missing
+  desired node-loss entries every 15 seconds using that signal and A3 federation records.
+- Resume on… is integrated into A3's Sessions rows for both live and archived sessions, and
+  remains in agent Actions. The picker captures the stable key independently of live selection.
+  A lightweight history query detects registry availability; no fallback listing/API remains.
+- Startup recognition is bounded and exact; the live process owns the pane generation and cwd.
+  Development-channel acceptance requires the exact active argv flag. Claude/Codex trust requires
+  canonical configured project roots, including new worktrees. Claim before minimal keys; never
+  answer the same dialog twice per process, and verify it cleared. Try-locking skips busy panes
+  until a later scan to avoid lock inversion. Codex's exact Folder access disclosure, option 1,
+  Quit option and confirmation footer are covered by fixtures and near misses.
 
 ### Removing the development-channel prompt at its source
 
@@ -178,59 +148,24 @@ managed settings are changed by A4.
 
 ## Gates and evidence
 
-- [x] Startup dialog fixtures, near misses, exact argv check, and disposable-tmux idempotence
-- [x] Native bundle translation, conflict/size/profile/symlink refusal
-- [x] Coordinator API, MCP, and UI resume on another machine
-- [x] Durable phone-home selection and restore
-- [x] Federation export/import/translated recorder launch
-- [x] Required Rust, JavaScript, and browser gates
+Initial A4 implementation commits: `b5ee2ba`, `5c27e31`, `88140ba`, `66c5d0c`.
+Those commits passed 823 Rust tests, 186 JS tests and 11 browser tests before integration.
+The original worktree is mode 775, so the full Rust suite uses an identical private source
+snapshot and shared Cargo target directory; existing recovery security fixtures require this.
+The user's untracked .atmux.toml and original permissions are preserved. Self-update fixtures
+use four test threads to avoid the previously observed ETXTBSY flake.
 
-Startup evidence: `cargo test --lib startup_` passed 6 tests (including the disposable fake
-CLI); `cargo clippy --all-targets --all-features` reported zero warnings. Lead scope update:
-Codex option `1. Trust and continue` is recognized under the same root/claim/verification
-policy, with its own exact fixture and near-miss tests.
+First integration evidence: A3 Claude/Codex translation, damaged/oversized archive and
+profile/branch/symlink refusal fixtures pass; authenticated disposable two-owner federation
+export/import, recorder launch, copy, changed-source/divergent-target move refusal, neighboring
+pane preservation, native-tail restore, event-triggered coordinator restore and explicit-close
+exclusion pass. JavaScript unit tests pass (195); browser navigation/history passes.
 
-Backend completion evidence: `cargo test --lib startup_` passed 7 tests;
-`cargo test --lib resume_anywhere` passed 8 tests; `cargo test --lib federation_exports_imports`
-passed the authenticated two-owner fixture (native profile/mode/cwd/key verification, copy,
-divergent-target refusal, advanced-source refusal, neighboring-pane preservation, direct and
-coordinator restore, and explicit-close exclusion). `cargo test --lib registry_mutations`
-passed cross-origin and body-limit checks. `cargo clippy --all-targets --all-features -- -D warnings`
-reported zero warnings, and `cargo fmt --check` / `git diff --check` passed.
+- [x] Consolidate onto A3 registry/config/archive/peer API/Sessions view
+- [x] A1 startup input/auto-answer/resumed/node-started wiring
+- [ ] Merge lead's latest lifecycle/search/fleet wiring
+- [ ] Final cargo fmt, strict clippy, full all-features Rust suite
+- [ ] Final JS and full browser suites
 
-Final acceptance evidence (all shell commands executed through RTK):
-
-| Command | Result |
-| --- | --- |
-| `cargo fmt --check` | Passed |
-| `cargo clippy --all-targets --all-features -- -D warnings` | Passed, zero warnings |
-| `cargo test --all-features -- --test-threads=4` | 823 passed, zero failed, seven declared ignored; includes disposable tmux/federation fixtures |
-| `node --check web/app.js` | Passed |
-| `node --test web/*.test.mjs tests/navigation.test.mjs` | 186 passed, zero failed |
-| `node --test tests/mobile_viewport_browser.mjs tests/navigation_browser.mjs tests/quick_talk_browser.mjs tests/web_mobile_pulse_browser.mjs` | 11 passed, zero failed |
-| `git diff --check` | Passed |
-
-The full Rust gate ran from an identical private source snapshot at
-`/home/ryan/.cache/atmux-a4-gates-n0kf5ct5`, reusing this worktree's Cargo target directory and
-excluding the user's untracked `.atmux.toml`. Environment:
-`ATMUX_REQUIRE_TMUX=1 ATMUX_TMUX_SOCKET_NAME=atmux-ci-a4-final-1790835100`.
-The original worktree is mode 775, which existing recovery tests reject for their executable
-roster fixtures. Its permissions were preserved. One later default-parallelism run hit an
-unrelated self-update fixture `ETXTBSY`; the complete final suite passed with four threads.
-The declared ignored cases require ambient native/systemd conditions or are private child helpers
-invoked by parent tests. No opt-in live-pane or service-manager probes were run. A transient browser
-navigation-context failure passed both its focused rerun and the complete final browser suite.
-
-Implementation commits: `b5ee2ba` (startup policy), `5c27e31` (native transport/recovery),
-`88140ba` (nonblocking startup lock/fixture). The UI and this final acceptance record accompany
-the completion commit. No deployment, push, service restart, cluster change, or mutation of an
-existing user tmux session/agent occurred; tmux mutation tests used disposable sockets.
-
-Brief deviations and merge reconciliation: A3's absent registry/view are supplied by the permitted
-versioned manifest, fallback durable store, and Saved sessions picker. Consolidate those with A3,
-including its `[registry]` config, archive/event hooks, primary location and per-owner bundle
-versions; wire `atmux:session-resume` into its Sessions view. Connect A1's startup-input emitter and
-`node.started` signal to the documented seams. The existing-repository branch refusal and strict
-divergent-log refusal are deliberate preservation rules; no existing workspace is checked out and
-no native logs are merged. The private Rust gate snapshot and four-thread run are the test-environment
-deviations described above. Remaining work is lead integration with those workstreams.
+No deployment, push, service restart, cluster change or mutation of existing tmux/agents.
+All tmux mutation fixtures use explicitly disposable sockets.

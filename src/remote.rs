@@ -17,7 +17,7 @@ use std::{
 use std::{io, process::Stdio};
 
 use anyhow::{Context, Result, bail};
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::{
     Method, Request, StatusCode,
     body::{Bytes, Incoming},
@@ -188,6 +188,20 @@ impl RemoteMachine {
             .with_context(|| format!("machine {} returned an unreadable {path} payload", self.id))
     }
 
+    /// Bounded JSON read for durable event long-polls.
+    /// # Errors
+    /// Rejects transport, status, size or JSON errors like `get_json`.
+    pub async fn get_json_with_timeout<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        timeout: Duration,
+    ) -> Result<T> {
+        let body = self
+            .request_with_timeout(Method::GET, path, None, timeout)
+            .await?;
+        serde_json::from_slice(&body).context("unreadable federated long-poll payload")
+    }
+
     /// Sends a JSON command to the node.
     ///
     /// # Errors
@@ -297,7 +311,7 @@ impl RemoteMachine {
         let request = self
             .build(Method::GET, path)
             .header(header::ACCEPT, "text/event-stream")
-            .body(Full::new(Bytes::new()))
+            .body(axum::body::Body::empty())
             .context("failed to build a federated stream request")?;
         let response = tokio::time::timeout(self.request_timeout, sender.send_request(request))
             .await
@@ -332,7 +346,7 @@ impl RemoteMachine {
             builder = builder.header(header::CONTENT_TYPE, "application/json");
         }
         let request = builder
-            .body(Full::new(Bytes::from(body.unwrap_or_default())))
+            .body(axum::body::Body::from(body.unwrap_or_default()))
             .context("failed to build a federated request")?;
         let response = tokio::time::timeout(timeout, sender.send_request(request))
             .await
@@ -341,14 +355,7 @@ impl RemoteMachine {
         let status = response.status();
         let collected = tokio::time::timeout(
             timeout,
-            collect_bounded(
-                response.into_body(),
-                if path.starts_with("/api/v1/registry/") {
-                    crate::resume_anywhere::MAX_BUNDLE_BYTES
-                } else {
-                    MAX_RESPONSE_BYTES
-                },
-            ),
+            collect_bounded(response.into_body(), MAX_RESPONSE_BYTES),
         )
         .await
         .with_context(|| format!("machine {} timed out sending {path}", self.id))??;
@@ -656,7 +663,7 @@ fn routed_source(target: SocketAddr) -> Option<IpAddr> {
     Some(socket.local_addr().ok()?.ip())
 }
 
-type SendRequest = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
+type SendRequest = hyper::client::conn::http1::SendRequest<axum::body::Body>;
 
 /// Owns a spawned hyper connection driver and aborts it on drop.
 ///
@@ -1112,6 +1119,96 @@ async fn fetch_launch_options(control: &ControlPlane, machine: &Arc<RemoteMachin
     }
 }
 
+// A3: stream archive bytes through the existing mTLS + bearer transport. The
+// connection guard stays alive through EOF and no whole bundle is buffered.
+impl RemoteMachine {
+    pub(crate) async fn upload_registry_bundle(
+        &self,
+        file: std::fs::File,
+        generation: u64,
+    ) -> Result<crate::resume_anywhere::ImportResponse> {
+        use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+        let bytes = file.metadata()?.len();
+        let mut file = tokio::fs::File::from_std(file);
+        file.seek(std::io::SeekFrom::Start(0)).await?;
+        let stream = async_stream::stream! {
+            let mut remaining = bytes;
+            while remaining > 0 {
+                let mut buffer = vec![0;usize::try_from(remaining.min(64*1024)).unwrap_or(64*1024)];
+                if let Err(error) = file.read_exact(&mut buffer).await {yield Err::<Bytes,std::io::Error>(error);break;}
+                remaining -= buffer.len() as u64;
+                yield Ok::<_,std::io::Error>(Bytes::from(buffer));
+            }
+        };
+        let (mut sender, _guard) = self.connect().await?;
+        let request = self
+            .build(Method::POST, "/api/v1/registry/import")
+            .header(header::CONTENT_TYPE, "application/gzip")
+            .header(header::CONTENT_LENGTH, bytes)
+            .header("x-atmux-resume-generation", generation)
+            .body(axum::body::Body::from_stream(stream))?;
+        let response =
+            tokio::time::timeout(Duration::from_secs(630), sender.send_request(request)).await??;
+        check_status(&self.id, "/api/v1/registry/import", response.status())?;
+        let body = tokio::time::timeout(
+            self.request_timeout,
+            collect_bounded(response.into_body(), MAX_RESPONSE_BYTES),
+        )
+        .await??;
+        serde_json::from_slice(&body).context("invalid resume owner response")
+    }
+
+    pub(crate) async fn download_registry_bundle(
+        &self,
+        path: &str,
+        file: std::fs::File,
+        expected_bytes: u64,
+    ) -> Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut sender, _guard) = self.connect().await?;
+        let request = self
+            .build(Method::GET, path)
+            .body(axum::body::Body::empty())?;
+        let response =
+            tokio::time::timeout(self.request_timeout, sender.send_request(request)).await??;
+        if !response.status().is_success() {
+            return Err(RemoteResponseError {
+                machine: self.id.clone(),
+                path: path.to_owned(),
+                status: response.status(),
+                detail: String::new(),
+            }
+            .into());
+        }
+        if let Some(length) = response.headers().get(header::CONTENT_LENGTH) {
+            anyhow::ensure!(
+                length.to_str()?.parse::<u64>()? == expected_bytes,
+                "peer archive size mismatch"
+            );
+        }
+        let mut body = response.into_body();
+        let mut output = tokio::fs::File::from_std(file);
+        let mut bytes = 0_u64;
+        tokio::time::timeout(Duration::from_secs(120), async {
+            while let Some(frame) = tokio::time::timeout(self.request_timeout, body.frame()).await?
+            {
+                if let Ok(data) = frame?.into_data() {
+                    bytes = bytes
+                        .checked_add(data.len() as u64)
+                        .context("archive size overflow")?;
+                    anyhow::ensure!(bytes <= expected_bytes, "peer archive exceeds size cap");
+                    output.write_all(&data).await?;
+                }
+            }
+            anyhow::ensure!(bytes == expected_bytes, "incomplete peer archive");
+            output.sync_all().await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1134,6 +1231,7 @@ mod tests {
             machine: machine.to_owned(),
             name: name.to_owned(),
             description: None,
+            description_source: None,
             pane_id: pane.to_owned(),
             status: "working".to_owned(),
             agent: "codex".to_owned(),

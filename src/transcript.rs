@@ -1977,6 +1977,11 @@ fn sensitive_key(key: &str) -> bool {
         || compact.ends_with("token")
 }
 
+/// Reuse nested-JSON and credential redaction for digest evidence and output.
+pub(crate) fn digest_text(text: &str) -> Option<String> {
+    sanitize_or_redact_string(text, 0)
+}
+
 fn sanitize_tool_text(text: &str) -> Option<String> {
     let mut sanitized = Vec::new();
     let mut inside_private_key = false;
@@ -2006,6 +2011,14 @@ fn sanitize_tool_text(text: &str) -> Option<String> {
 
 fn sensitive_tool_line(lower: &str) -> bool {
     lower.contains("bearer ")
+        || lower
+            .split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_'))
+            .any(|word| {
+                word.len() >= 16
+                    && ["sk-", "ghp_", "github_pat_", "akia"]
+                        .iter()
+                        .any(|prefix| word.starts_with(prefix))
+            })
         || [
             "authorization:",
             "proxy-authorization:",
@@ -2335,6 +2348,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn conversation_pages_filter_both_native_harness_fixtures() {
+        use crate::conversation::{ConversationRequest, Include, page};
+        for (source, log) in [
+            ("claude", include_str!("../tests/fixtures/a2-claude.jsonl")),
+            ("codex", include_str!("../tests/fixtures/a2-codex.jsonl")),
+        ] {
+            let (messages, truncated) = if source == "claude" {
+                parse_claude(&tail(log))
+            } else {
+                parse_codex(&tail(log))
+            };
+            let transcript = Transcript {
+                available: true,
+                source: source.into(),
+                content_hash: "fixture".into(),
+                changed: true,
+                truncated,
+                messages: Some(messages),
+                note: None,
+            };
+            let mut request = ConversationRequest {
+                id: "%1".into(),
+                include: None,
+                after: None,
+                limit: Some(1),
+                max_bytes: None,
+            };
+            let first = page(transcript.clone(), &request).unwrap();
+            assert_eq!(first.entries[0].role, "user");
+            request.after = first.next;
+            request.include = Some(vec![Include::Agent]);
+            request.limit = Some(240);
+            let rest = page(transcript.clone(), &request).unwrap();
+            assert_eq!(rest.entries.len(), 2);
+            assert!(
+                rest.entries
+                    .iter()
+                    .all(|entry| entry.kind == "message" && entry.tool_output.is_none())
+            );
+            request.after = None;
+            request.include = Some(vec![Include::Tools]);
+            assert!(!page(transcript, &request).unwrap().entries.is_empty());
+        }
+    }
+
+    #[test]
     fn claude_native_context_uses_latest_complete_assistant_usage_and_reset_order() {
         let first = serde_json::json!({
             "type": "assistant",
@@ -2484,6 +2543,7 @@ mod tests {
         Session {
             name: "fixture".to_owned(),
             description: None,
+            description_source: None,
             attached: false,
             windows: 1,
             activity: 0,

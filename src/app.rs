@@ -388,17 +388,12 @@ impl App {
                 if self.current_session.as_deref() == Some(&name) {
                     self.message = Some(("atmux cannot kill its own session".to_owned(), true));
                 } else {
-                    if let Some(store) =
-                        crate::resume_anywhere::ResumeStore::open(&self.config.registry)?
-                    {
-                        let fresh = self.tmux.sessions(&HashMap::new(), &self.config.status)?;
-                        crate::resume_anywhere::record_named_close(
-                            &store,
-                            &self.config,
-                            &fresh,
-                            &name,
-                        )?;
-                    }
+                    let fresh = self.tmux.sessions(&HashMap::new(), &self.config.status)?;
+                    let affected = fresh
+                        .into_iter()
+                        .filter(|session| session.name == name)
+                        .collect::<Vec<_>>();
+                    crate::registry::Registry::close_intents(&self.config.registry, &affected)?;
                     self.tmux.kill(&name)?;
                     self.message = Some((format!("killed {name}"), false));
                     self.refresh()?;
