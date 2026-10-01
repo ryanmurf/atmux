@@ -1119,6 +1119,60 @@ async fn fetch_launch_options(control: &ControlPlane, machine: &Arc<RemoteMachin
     }
 }
 
+// A3: stream archive bytes through the existing mTLS + bearer transport. The
+// connection guard stays alive through EOF and no whole bundle is buffered.
+impl RemoteMachine {
+    pub(crate) async fn download_registry_bundle(
+        &self,
+        path: &str,
+        file: std::fs::File,
+        expected_bytes: u64,
+    ) -> Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut sender, _guard) = self.connect().await?;
+        let request = self
+            .build(Method::GET, path)
+            .body(Full::new(Bytes::new()))?;
+        let response =
+            tokio::time::timeout(self.request_timeout, sender.send_request(request)).await??;
+        if !response.status().is_success() {
+            return Err(RemoteResponseError {
+                machine: self.id.clone(),
+                path: path.to_owned(),
+                status: response.status(),
+                detail: String::new(),
+            }
+            .into());
+        }
+        if let Some(length) = response.headers().get(header::CONTENT_LENGTH) {
+            anyhow::ensure!(
+                length.to_str()?.parse::<u64>()? == expected_bytes,
+                "peer archive size mismatch"
+            );
+        }
+        let mut body = response.into_body();
+        let mut output = tokio::fs::File::from_std(file);
+        let mut bytes = 0_u64;
+        tokio::time::timeout(Duration::from_secs(120), async {
+            while let Some(frame) = tokio::time::timeout(self.request_timeout, body.frame()).await?
+            {
+                if let Ok(data) = frame?.into_data() {
+                    bytes = bytes
+                        .checked_add(data.len() as u64)
+                        .context("archive size overflow")?;
+                    anyhow::ensure!(bytes <= expected_bytes, "peer archive exceeds size cap");
+                    output.write_all(&data).await?;
+                }
+            }
+            anyhow::ensure!(bytes == expected_bytes, "incomplete peer archive");
+            output.sync_all().await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

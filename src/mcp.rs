@@ -176,6 +176,37 @@ impl AtmuxMcp {
             .map_err(|error| error.to_string())?;
         serde_json::to_string(&page).map_err(|error| error.to_string())
     }
+
+    #[tool(
+        name = "sessions_search",
+        description = "Search durable session history across machines by state, machine, project and text over name/description/title. Returns at most 100 records with a stable-key cursor. Requires [registry].enabled. Native conversation identities are never returned."
+    )]
+    async fn sessions_search(
+        &self,
+        Parameters(query): Parameters<crate::registry::SessionsSearch>,
+    ) -> Result<String, String> {
+        let page = self
+            .control
+            .sessions_search(&query)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_string(&page).map_err(|_| "session history serialization failed".to_owned())
+    }
+
+    #[tool(
+        name = "session_get",
+        description = "Read a durable session record by its stable session_key, including archived state and bundle availability metadata. Requires [registry].enabled. Native conversation identities are never returned."
+    )]
+    async fn session_get(
+        &self,
+        Parameters(query): Parameters<crate::registry::SessionGet>,
+    ) -> Result<String, String> {
+        let record = self
+            .control
+            .session_get(&query.session_key)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_string(&record).map_err(|_| "session record serialization failed".to_owned())
+    }
+
     #[tool(
         name = "agents_list",
         description = "List compact live agent/session state for every federated machine. Each session carries an opaque machine-qualified id plus its machine, and the machines array reports online/offline health. Save revision and content_hash values for efficient follow-up calls."
@@ -1027,5 +1058,79 @@ mod tests {
             .is_err()
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn history_tools_never_serialize_native_identity() {
+        use crate::registry::{
+            NativeIdentity, RegistryConfig, RegistryPage, SessionGet, SessionRecord,
+            SessionsSearch, StoredRecord,
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "atmux-mcp-registry-{}",
+            crate::tmux::new_session_key().unwrap()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let directory = directory.canonicalize().unwrap();
+        let mut config = crate::config::Config::default();
+        config.node.coordinator_only = true;
+        config.profiles.clear();
+        config.general.project_roots.clear();
+        config.general.favorite_dirs.clear();
+        config.general.switch_on_launch = false;
+        config.registry = RegistryConfig {
+            enabled: true,
+            directory: Some(directory.join("registry")),
+            ..RegistryConfig::default()
+        };
+        let control = ControlPlane::start(config).await.unwrap();
+        let key = crate::tmux::new_session_key().unwrap();
+        let record = SessionRecord {
+            session_key: key.clone(),
+            machine: "peer".to_owned(),
+            name: "MCP history fixture".to_owned(),
+            ..SessionRecord::default()
+        };
+        let stored = StoredRecord {
+            record,
+            native: Some(NativeIdentity {
+                config_root: "/private/native/root".into(),
+                session_id: "private-native-id".to_owned(),
+                log_path: "/private/native/root/log.jsonl".into(),
+            }),
+            ..StoredRecord::default()
+        };
+        control
+            .registry()
+            .unwrap()
+            .import_page(
+                "peer",
+                &RegistryPage {
+                    cursor: String::new(),
+                    reset: false,
+                    more: false,
+                    records: vec![stored],
+                },
+            )
+            .unwrap();
+        let mcp = AtmuxMcp::new(control);
+        let search = mcp
+            .sessions_search(Parameters(SessionsSearch::default()))
+            .await
+            .unwrap();
+        let get = mcp
+            .session_get(Parameters(SessionGet {
+                session_key: key.clone(),
+            }))
+            .await
+            .unwrap();
+        for response in [search, get] {
+            assert!(response.contains(&key));
+            assert!(!response.contains("private-native-id"));
+            assert!(!response.contains("/private/native/root"));
+            assert!(!response.contains("config_root"));
+            assert!(!response.contains("log_path"));
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

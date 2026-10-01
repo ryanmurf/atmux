@@ -19,6 +19,8 @@ pub mod project;
 #[cfg(feature = "pulse")]
 pub mod pulse;
 pub mod recovery;
+pub mod registry;
+mod registry_web;
 pub mod remote;
 pub mod self_update;
 pub mod session_search;

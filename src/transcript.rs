@@ -470,6 +470,8 @@ pub(crate) struct NativeResumeTarget {
     pub(crate) config_dir: PathBuf,
     pub(crate) session_id: String,
     pub(crate) session_fingerprint: String,
+    /// Exact log selected by the existing native identity checks (registry/A4).
+    pub(crate) log_path: PathBuf,
 }
 
 /// Resolves the exact native saved conversation currently held open by a pane.
@@ -508,6 +510,7 @@ pub(crate) fn native_resume_target(session: &Session) -> Option<NativeResumeTarg
         config_dir,
         session_id,
         session_fingerprint: format!("{:x}", digest.finalize()),
+        log_path,
     })
 }
 

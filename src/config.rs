@@ -235,6 +235,8 @@ pub struct Config {
     #[serde(default)]
     pub self_update: SelfUpdateConfig,
     #[serde(default)]
+    pub registry: crate::registry::RegistryConfig,
+    #[serde(default)]
     pub node: NodeConfig,
     #[serde(default)]
     pub discovery: DiscoveryConfig,
@@ -621,6 +623,10 @@ impl Config {
             .pulse
             .validate()
             .with_context(|| format!("invalid Pulse configuration in {}", path.display()))?;
+        config
+            .registry
+            .validate()
+            .context("invalid registry configuration")?;
         config.source_path = Some(path.clone());
         crate::events::configure_profiles(&mut config)?;
         Ok((config, path))

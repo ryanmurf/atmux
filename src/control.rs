@@ -834,6 +834,9 @@ struct Inner {
     events: Option<Arc<crate::events::EventService>>,
     config: Config,
     summarizer: Option<Arc<crate::summarizer::Summarizer>>,
+    registry: Option<Arc<crate::registry::Registry>>,
+    registry_peer_token: Option<crate::machine::Secret>,
+    registry_watchers: Mutex<BTreeMap<String, AbortHandle>>,
     local_id: String,
     local_label: String,
     /// With no `[[machines]]` configured or discovery enabled there is nothing
@@ -1033,14 +1036,7 @@ impl ControlPlane {
         config.validate_federation()?;
         config.validate_auto_compact()?;
         config.maintenance.validate()?;
-        let mut machines = BTreeMap::new();
-        for machine in &config.machines {
-            let machine = Arc::new(match &config.node.tls {
-                Some(tls) => RemoteMachine::from_config_with_tls(machine, tls)?,
-                None => RemoteMachine::from_config(machine)?,
-            });
-            machines.insert(machine.id.clone(), machine);
-        }
+        let machines = remote_machine_handles(&config)?;
         let remotes = machines
             .keys()
             .map(|id| {
@@ -1061,16 +1057,13 @@ impl ControlPlane {
         let recovery = RecoveryRunner::production(&config);
         let updater = SelfUpdater::production(&config.self_update)?;
         let coordinator = config.node.coordinator_only || !config.machines.is_empty();
-        let events = config
-            .events
-            .clone()
-            .map(|events| {
-                crate::events::EventService::open(events, config.node.id.clone(), coordinator)
-            })
-            .transpose()?;
+        let (events, registry, registry_peer_token) = open_node_stores(&config, coordinator)?;
         let control = Self {
             inner: Arc::new(Inner {
                 events,
+                registry,
+                registry_peer_token,
+                registry_watchers: Mutex::new(BTreeMap::new()),
                 local_id: config.node.id.clone(),
                 local_label: config.node_label(),
                 bare_local_ids,
@@ -1459,6 +1452,18 @@ impl ControlPlane {
             events.federate(machine.clone());
         }
         let id = machine.id.clone();
+        if let Some(registry) = &self.inner.registry {
+            let handle = crate::registry::spawn_pull(Arc::clone(registry), Arc::clone(&machine));
+            if let Some(previous) = self
+                .inner
+                .registry_watchers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id.clone(), handle)
+            {
+                previous.abort();
+            }
+        }
         let watcher = remote::spawn_watcher(self.clone(), machine);
         self.inner
             .watchers
@@ -1547,6 +1552,15 @@ impl ControlPlane {
             .remove(id);
         if removed.is_none() {
             return;
+        }
+        if let Some(watcher) = self
+            .inner
+            .registry_watchers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id)
+        {
+            watcher.abort();
         }
         if let Some(watcher) = self
             .inner
@@ -2271,6 +2285,9 @@ impl ControlPlane {
             truncate_front(&mut session.content, MAX_CAPTURE_BYTES);
         }
 
+        if let Some(registry) = &self.inner.registry {
+            registry.observe(&sessions, now_ms())?;
+        }
         self.apply_refresh(sessions);
         let metrics = self
             .inner
@@ -5891,6 +5908,47 @@ fn valid_profile_mode_id(value: &str) -> bool {
 /// Classifies the result of a blocking tmux call made on this coordinator.
 ///
 /// A tmux failure is never the caller's fault, so it stays [`ErrorKind::Internal`].
+/// One authenticated client per configured remote machine.
+fn remote_machine_handles(config: &Config) -> Result<BTreeMap<String, Arc<RemoteMachine>>> {
+    let mut machines = BTreeMap::new();
+    for machine in &config.machines {
+        let machine = Arc::new(match &config.node.tls {
+            Some(tls) => RemoteMachine::from_config_with_tls(machine, tls)?,
+            None => RemoteMachine::from_config(machine)?,
+        });
+        machines.insert(machine.id.clone(), machine);
+    }
+    Ok(machines)
+}
+
+type NodeStores = (
+    Option<Arc<crate::events::EventService>>,
+    Option<Arc<crate::registry::Registry>>,
+    Option<crate::machine::Secret>,
+);
+
+/// Opens this node's durable event spool and session registry, when configured.
+fn open_node_stores(config: &Config, coordinator: bool) -> Result<NodeStores> {
+    let events = config
+        .events
+        .clone()
+        .map(|events| {
+            crate::events::EventService::open(events, config.node.id.clone(), coordinator)
+        })
+        .transpose()?;
+    let registry = crate::registry::Registry::open(&config.registry, &config.node.id)?;
+    let registry_peer_token = if registry.is_some() {
+        crate::machine::resolve_token(
+            &config.node.id,
+            config.node.token_env.as_deref(),
+            config.node.token_file.as_deref(),
+        )?
+    } else {
+        None
+    };
+    Ok((events, registry, registry_peer_token))
+}
+
 fn local_tmux(joined: std::result::Result<Result<()>, tokio::task::JoinError>) -> Result<()> {
     match joined {
         Ok(Ok(())) => Ok(()),
@@ -6637,6 +6695,9 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
                 .unwrap(),
             config,
             summarizer,
+            registry: None,
+            registry_peer_token: None,
+            registry_watchers: Mutex::new(BTreeMap::new()),
             local_id: local_id.clone(),
             local_label,
             bare_local_ids: handles.is_empty(),
@@ -6713,6 +6774,53 @@ pub(crate) fn test_session(name: &str, pane_id: &str, content: &str) -> Session 
         systemd_scope: None,
         memory_max_bytes: None,
         status: crate::status::AgentStatus::Working,
+    }
+}
+
+// A3 history/federation integration. Keep these independent of live pane routing.
+impl ControlPlane {
+    /// # Errors
+    /// Returns `NotFound` while the explicitly configured registry is disabled.
+    pub fn registry(&self) -> Result<Arc<crate::registry::Registry>> {
+        self.inner
+            .registry
+            .clone()
+            .ok_or_else(|| not_found("session registry is disabled"))
+    }
+
+    pub(crate) fn registry_peer_authorized(&self, credential: &str) -> bool {
+        self.inner
+            .registry_peer_token
+            .as_ref()
+            .is_some_and(|token| {
+                let expected = token.expose().as_bytes();
+                let supplied = credential.as_bytes();
+                expected.len() == supplied.len()
+                    && expected
+                        .iter()
+                        .zip(supplied)
+                        .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
+                        == 0
+            })
+    }
+
+    /// # Errors
+    /// Returns disabled/invalid-filter errors; native identity is never returned.
+    pub fn sessions_search(
+        &self,
+        query: &crate::registry::SessionsSearch,
+    ) -> Result<crate::registry::SessionsPage> {
+        self.registry()?
+            .search(query)
+            .map_err(|_| bad_request("invalid session history filters"))
+    }
+
+    /// # Errors
+    /// Returns disabled/invalid-key errors; native identity is never returned.
+    pub fn session_get(&self, key: &str) -> Result<Option<crate::registry::SessionRecord>> {
+        self.registry()?
+            .get(key)
+            .map_err(|_| bad_request("invalid session key"))
     }
 }
 
