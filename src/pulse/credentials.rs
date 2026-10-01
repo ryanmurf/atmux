@@ -2137,7 +2137,9 @@ mod tests {
         );
 
         let validated = ValidatedDirectory::open(&config_dir).expect("validate after mismatch");
-        CredentialLock::acquire(&validated, Duration::ZERO)
+        // Concurrent subprocess fixtures can briefly inherit a locked descriptor
+        // between fork and exec/CLOEXEC. A leaked owner still fails this deadline.
+        CredentialLock::acquire(&validated, Duration::from_millis(200))
             .expect("mismatched owner released both locks");
     }
 

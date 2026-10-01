@@ -2,6 +2,7 @@
 //! and an isolated HOME. The fixture CLI is a copy of sh named `claude`.
 use atmux::{
     config::MachineConfig,
+    events::EventPage,
     machine::now_ms,
     registry::{RegistryPage, SessionState, SessionsPage},
     remote::RemoteMachine,
@@ -131,6 +132,9 @@ async fn disposable_owner_archives_external_and_dashboard_kills() {
     };
     fs::create_dir_all(owner.directory.join("home/bin")).unwrap();
     fs::create_dir(owner.directory.join("project")).unwrap();
+    let runtime = owner.directory.join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
     fs::copy("/bin/sh", owner.directory.join("home/bin/claude")).unwrap();
     owner.create_agent("external");
     owner.create_agent("dashboard");
@@ -154,11 +158,15 @@ token_file = "{}"
 [registry]
 enabled = true
 directory = "{}"
+[events]
+inject_hooks = false
+directory = "{}"
 [web]
 allow_unauthenticated_loopback = true
 "#,
         token.display(),
-        owner.directory.join("registry").display()
+        owner.directory.join("registry").display(),
+        owner.directory.join("events").display()
     );
     fs::write(&config_path, config).unwrap();
     let log = fs::File::create(owner.directory.join("web.log")).unwrap();
@@ -174,6 +182,8 @@ allow_unauthenticated_loopback = true
             .env("ATMUX_TMUX_SOCKET_NAME", &owner.socket)
             .env("HOME", owner.directory.join("home"))
             .env("XDG_STATE_HOME", owner.directory.join("state"))
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("TMPDIR", &runtime)
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
             .stdin(Stdio::null())
@@ -251,7 +261,8 @@ allow_unauthenticated_loopback = true
     };
     for record in archived.sessions {
         assert_eq!(record.state, SessionState::Archived);
-        assert!(record.bundle.unwrap().native_log);
+        let bundle = record.bundle.unwrap();
+        assert!(bundle.native_log);
         assert!(
             page.records
                 .iter()
@@ -265,5 +276,21 @@ allow_unauthenticated_loopback = true
             .await
             .unwrap();
         assert!(public.get("native").is_none());
+        let events = remote.get_json::<EventPage>(&format!(
+            "/api/v1/agent-events?session_key={}&types=agent.exited,session.closed,session.archived",
+            record.session_key
+        )).await.unwrap();
+        assert_eq!(
+            events
+                .events
+                .iter()
+                .map(|stored| stored.event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["agent.exited", "session.closed", "session.archived"]
+        );
+        let archived_event = &events.events[2].event;
+        assert_eq!(archived_event.session_key, record.session_key);
+        assert_eq!(archived_event.detail["state"], "archived");
+        assert_eq!(archived_event.detail["archive_bundle_id"], bundle.id);
     }
 }

@@ -154,33 +154,33 @@ fn answer(
     config: &Config,
     session: &Session,
     events: Option<&crate::events::EventService>,
-) -> Result<()> {
+) -> Result<bool> {
     if !matches!(session.agent, AgentKind::Claude | AgentKind::Codex) {
-        return Ok(());
+        return Ok(false);
     }
     let Some(pid) = session.agent_pid else {
-        return Ok(());
+        return Ok(false);
     };
     let Some((generation, args, agent_cwd)) = process(pid) else {
-        return Ok(());
+        return Ok(false);
     };
     // A resume transaction can hold the registry lock while a concurrent close
     // holds the pane lock. Skip this scan rather than invert that lock order.
     let Some(_lock) = crate::auto_update::PaneProcessLock::try_acquire(&session.pane_id)? else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(live) = Tmux::live_pane_identity(&session.pane_id)? else {
-        return Ok(());
+        return Ok(false);
     };
     if live.pane_identity != session.pane_identity || live.pane_pid != session.pane_pid {
-        return Ok(());
+        return Ok(false);
     }
     let text = Tmux.capture(&session.pane_id, 80)?;
     let Some(dialog) = recognize(&text) else {
         if looks_like_startup(&text) {
             report(session, "unrecognized dialog", events);
         }
-        return Ok(());
+        return Ok(false);
     };
     if (dialog == Dialog::CodexTrust && session.agent != AgentKind::Codex)
         || (dialog != Dialog::CodexTrust && session.agent != AgentKind::Claude)
@@ -191,7 +191,7 @@ fn answer(
                 || live.path.canonicalize().ok().as_ref() != Some(&agent_cwd)))
     {
         report(session, "startup dialog requires input", events);
-        return Ok(());
+        return Ok(false);
     }
     let marker = Tmux::output([
         "show-options",
@@ -203,7 +203,7 @@ fn answer(
         dialog.option(),
     ])?;
     if marker.trim() == generation {
-        return Ok(());
+        return Ok(false);
     }
     // Claim before keys: crashes and overlapping monitors fail closed. Each
     // recognized dialog is answered at most once per native process generation.
@@ -239,24 +239,33 @@ fn answer(
     for _ in 0..10 {
         thread::sleep(Duration::from_millis(25));
         if recognize(&Tmux.capture(&session.pane_id, 80)?) != Some(dialog) {
-            if let Some(events) = events {
-                events.startup_event(session, Some((dialog.option(), true)));
-            }
-            Tmux::output([
-                "set-option",
-                "-p",
-                "-t",
-                &session.pane_id,
-                "@atmux_startup_answered",
-                &format!("{generation}|{}", dialog.option()),
-            ])?;
-            return Ok(());
+            record_answer(session, events, dialog, &generation, true)?;
+            return Ok(true);
         }
     }
-    if let Some(events) = events {
-        events.startup_event(session, Some((dialog.option(), false)));
-    }
+    record_answer(session, events, dialog, &generation, false)?;
     report(session, "dialog remained after one answer", events);
+    Ok(false)
+}
+
+fn record_answer(
+    session: &Session,
+    events: Option<&crate::events::EventService>,
+    dialog: Dialog,
+    generation: &str,
+    verified: bool,
+) -> Result<()> {
+    if let Some(events) = events {
+        events.startup_event(session, Some((dialog.option(), verified)));
+    }
+    Tmux::output([
+        "set-option",
+        "-p",
+        "-t",
+        &session.pane_id,
+        "@atmux_startup_answered",
+        &format!("{generation}|{}|{verified}", dialog.option()),
+    ])?;
     Ok(())
 }
 
@@ -282,14 +291,14 @@ fn report(session: &Session, reason: &str, events: Option<&crate::events::EventS
 }
 
 pub(crate) fn handle(config: &Config, session: &Session) {
-    handle_with_events(config, session, None);
+    let _ = handle_with_events(config, session, None);
 }
 
 pub(crate) fn handle_with_events(
     config: &Config,
     session: &Session,
     events: Option<&crate::events::EventService>,
-) {
+) -> bool {
     if let Some(events) = events
         && let Some(pid) = session.agent_pid
         && let Some((generation, _, _)) = process(pid)
@@ -302,16 +311,28 @@ pub(crate) fn handle_with_events(
             &session.pane_id,
             "@atmux_startup_answered",
         ])
-        && let Some((answered, dialog)) = marker.trim().split_once('|')
-        && answered == generation
+        && let mut parts = marker.trim().split('|')
+        && parts.next() == Some(generation.as_str())
+        && let Some(dialog) = parts.next()
+        && let verified = parts.next().unwrap_or("true")
+        && matches!(verified, "true" | "false")
+        && parts.next().is_none()
+        && matches!(
+            dialog,
+            "@atmux_startup_development" | "@atmux_startup_trust" | "@atmux_startup_codex_trust"
+        )
     {
-        events.startup_event(session, Some((dialog, true)));
+        events.startup_event(session, Some((dialog, verified == "true")));
     }
     if !config.startup_prompts.auto_answer && events.is_none() {
-        return;
+        return false;
     }
-    if let Err(error) = answer(config, session, events) {
-        report(session, &error.to_string(), events);
+    match answer(config, session, events) {
+        Ok(answered) => answered,
+        Err(error) => {
+            report(session, &error.to_string(), events);
+            false
+        }
     }
 }
 

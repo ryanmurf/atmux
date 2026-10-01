@@ -209,6 +209,25 @@ title/description with very easy renaming.
 - Authorized work stayed local. No deployment, push, service restart, Kubernetes action, or running
   tmux session/agent was touched. Existing untracked `.atmux.toml` was left untouched.
 
+### A1 integration follow-up (2026-09-30, after c9effc0)
+
+The A1 placeholders above are now wired: summary updates append validated
+`agent.summary_updated` events directly to the coordinator fleet log, including
+remote sessions; search hooks durably enqueue the exact `SearchPublication`
+topic/key/value before advancing the digest timestamp high-water mark.
+The sink drains a bounded FIFO outbox and keeps unacknowledged bytes through
+restart and broker failure. `agent_summary` uses generation-bound lifecycle
+attention for permission/question/startup/plan reasons and working clears;
+status remains the fallback when no applicable event is retained.
+
+Search still requires explicit `summaries.search_tenant_id` and coordinator
+`[events]` storage, with `[events.redpanda]` for publication. No broker access
+is needed to enqueue. Enqueue failure keeps the cached snapshot retryable.
+The fake-model scenario now checks the actual summary event and cached reason;
+the durable search-order test uses real event/outbox storage, and an additional
+test checks failed enqueue cannot advance the stored high-water mark.
+See `features/agent-events.md` for final integration commands and results.
+
 ### Commits
 
 - `12fd4af`: bounded federated conversation MCP tool, filters/cursors, and native harness fixtures.

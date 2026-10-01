@@ -311,7 +311,11 @@ impl ResumeSpec {
             .context("archive has no native log")?;
         let harness = harness(&record.harness)?;
         ResumeCandidate::imported(harness, &native.session_id)?;
-        let project_root = PathBuf::from(&record.project.root);
+        let project_root = PathBuf::from(if record.project.root.is_empty() {
+            &record.cwd
+        } else {
+            &record.project.root
+        });
         let cwd = PathBuf::from(&record.cwd);
         for path in [&project_root, &cwd] {
             ensure!(
@@ -1010,6 +1014,7 @@ pub(crate) mod tests {
             },
             0,
             1000,
+            false,
         )?;
         Ok(registry.capture_bundle(key)?.0)
     }
@@ -1183,6 +1188,26 @@ pub(crate) mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn a3_local_non_git_resume_uses_the_configured_cwd_as_project_anchor() {
+        let fixture = Fixture::new(ResumeHarness::Claude);
+        let mut config = fixture.config.clone();
+        config.node.id = "source".into();
+        let cwd = config.general.project_roots[0].join("atmux");
+        let file = seed(
+            &fixture.registry,
+            &fixture.root,
+            &cwd,
+            &crate::tmux::new_session_key().unwrap(),
+            ResumeHarness::Claude,
+        )
+        .unwrap();
+        let mut archive = decode(&fixture.registry, file).unwrap();
+        archive.manifest.session.record.project = ProjectPosition::default();
+        let prepared = import(&config, &fixture.registry, archive).unwrap();
+        assert_eq!(prepared.directory, cwd);
+    }
+
     #[test]
     fn a3_decode_rejects_oversize_traversal_and_checksum_damage() {
         let fixture = Fixture::new(ResumeHarness::Claude);

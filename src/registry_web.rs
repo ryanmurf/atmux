@@ -76,6 +76,7 @@ fn peer(control: &ControlPlane, headers: &HeaderMap) -> bool {
 struct ChangesQuery {
     after: Option<String>,
     wait_ms: Option<u64>,
+    restore_boot: Option<String>,
 }
 async fn changes(
     State(control): State<ControlPlane>,
@@ -89,6 +90,12 @@ async fn changes(
         Ok(value) => value,
         Err(error) => return history_error(&error),
     };
+    if let Some(boot) = query.restore_boot {
+        return match registry.pending_restore_page(&boot, query.after.as_deref()) {
+            Ok(page) => Json(page).into_response(),
+            Err(_) => error_response(StatusCode::BAD_REQUEST),
+        };
+    }
     match registry
         .changes(query.after.as_deref(), query.wait_ms.unwrap_or(10_000))
         .await
@@ -235,5 +242,73 @@ async fn stop_source(
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => history_error(&error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, os::unix::fs::PermissionsExt as _};
+    use tower::ServiceExt as _;
+    #[tokio::test]
+    async fn peer_import_requires_owner_credential_rejects_browsers_and_bounds_streams() {
+        let root = std::env::temp_dir().join(format!(
+            "atmux-a4-peer-{}",
+            crate::tmux::new_session_key().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let token = root.join("token");
+        fs::write(&token, "fixture-owner-token").unwrap();
+        fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut config = crate::config::Config::default();
+        config.registry.enabled = true;
+        config.registry.directory = Some(root.join("registry"));
+        config.registry.bundle_max_bytes = 64 * 1024;
+        config.node.token_file = Some(token);
+        let control = crate::control::test_control_with_config(&[], config);
+        let app = routes(control);
+        for browser in [true, false] {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/registry/import")
+                .header(header::AUTHORIZATION, "Bearer fixture-owner-token")
+                .header("x-atmux-resume-generation", "1");
+            if browser {
+                request = request.header(header::ORIGIN, "http://fixture");
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(vec![0; 64 * 1024 + 1])).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if browser {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                }
+            );
+        }
+        let request = axum::http::Request::builder()
+            .uri("/api/v1/registry")
+            .header(header::AUTHORIZATION, "Bearer fixture-owner-token")
+            .header("sec-fetch-mode", "navigate")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let request = axum::http::Request::builder()
+            .uri("/api/v1/registry")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
     }
 }

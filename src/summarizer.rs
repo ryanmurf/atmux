@@ -460,6 +460,83 @@ impl DigestRecord {
             .as_deref()
             .unwrap_or(&self.description)
     }
+    /// Overlays authoritative lifecycle metadata without replacing cached model
+    /// output or its transcript cursor. No-digest sessions still have a complete
+    /// search document, with the session name as their title.
+    pub(crate) fn registry_snapshot(
+        record: &crate::registry::SessionRecord,
+        pane: &str,
+        cached: Option<Self>,
+    ) -> Self {
+        let mut snapshot = cached.unwrap_or_else(|| Self {
+            session_key: record.session_key.clone(),
+            machine: String::new(),
+            pane: String::new(),
+            name: String::new(),
+            description: String::new(),
+            title: String::new(),
+            digest: String::new(),
+            digest_updated_at: 0,
+            digest_updated_at_ms: 0,
+            digest_version: 0,
+            transcript_hash: String::new(),
+            pane_hash: String::new(),
+            last_entry: None,
+            last_attempt: 0,
+            last_seen: 0,
+            created_at: 0,
+            checked_at: 0,
+            dirty: false,
+            snapshot_description: None,
+            search_updated_at_ms: 0,
+            project_remote: None,
+            project_branch: None,
+            cwd: String::new(),
+            harness: String::new(),
+            profile: String::new(),
+            state: String::new(),
+        });
+        snapshot.machine.clone_from(&record.machine);
+        pane.clone_into(&mut snapshot.pane);
+        snapshot.name.clone_from(&record.name);
+        if snapshot.digest.is_empty() || snapshot.title.is_empty() {
+            snapshot.title = bounded_text(&record.name, 400);
+        }
+        // A cleared registry description is authoritative too; do not revive a
+        // generated description from the cached digest after a user clears it.
+        snapshot.snapshot_description = Some(record.description.clone().unwrap_or_default());
+        if snapshot.digest.is_empty() {
+            snapshot.description = record
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .take(120)
+                .collect();
+        }
+        snapshot.project_remote.clone_from(&record.project.remote);
+        snapshot.project_branch.clone_from(&record.project.branch);
+        snapshot.cwd.clone_from(&record.cwd);
+        snapshot.harness.clone_from(&record.harness);
+        snapshot.profile.clone_from(&record.profile);
+        snapshot.state = match record.state {
+            crate::registry::SessionState::Running => "running",
+            crate::registry::SessionState::Exited => "exited",
+            crate::registry::SessionState::Closed => "closed",
+            crate::registry::SessionState::Archived => "archived",
+        }
+        .into();
+        snapshot.created_at = record.created_ms / 1000;
+        snapshot.last_seen = record
+            .last_seen_ms
+            .max(record.closed_ms.unwrap_or(0))
+            .max(record.archived_ms.unwrap_or(0))
+            / 1000;
+        snapshot
+    }
+    pub(crate) fn next_registry_search_timestamp(&self, timestamp_ms: u64) -> u64 {
+        timestamp_ms.max(self.search_updated_at_ms.saturating_add(1))
+    }
     fn new(session: &SessionSummary, key: &str, now: u64) -> Self {
         Self {
             session_key: key.into(),
@@ -781,7 +858,8 @@ impl Summarizer {
             digest_updated_at: record
                 .and_then(|r| (r.digest_updated_at != 0).then_some(r.digest_updated_at)),
             status: session.status.clone(),
-            needs_input_reason: (session.status == "waiting").then(|| "idle_prompt".into()),
+            // ControlPlane joins generation-bound lifecycle attention here.
+            needs_input_reason: None,
             stale,
             enabled: true,
         }
@@ -993,9 +1071,9 @@ impl Summarizer {
             record.project_remote = summary.remote;
         }
         self.persist(record.clone())?;
-        self.publish_digest_search(control, &record)?;
-        // Single integration seam for A1. Only bounded digest text, no raw messages.
+        // Summary events do not depend on search outbox availability.
         summary_updated(control, session, &record);
+        self.publish_digest_search(control, &record)?;
         self.apply_description(control, session).await
     }
     fn persist(&self, mut record: DigestRecord) -> Result<()> {
@@ -1055,6 +1133,9 @@ impl Summarizer {
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !store.records.contains_key(&record.session_key) {
+            store.prune(epoch())?;
+        }
         let previous = store
             .records
             .get(&record.session_key)
@@ -1064,13 +1145,33 @@ impl Summarizer {
         }
         let publication =
             crate::session_search::search_publication(record, tenant, change, timestamp_ms)?;
-        // Single search publish seam: lead replaces this with A1's durable enqueue.
+        // A1 durably enqueues before the per-session high-water mark advances.
         control.summary_search_document_hook(&publication)?;
         let mut updated = store
             .records
             .get(&record.session_key)
             .cloned()
             .unwrap_or_else(|| record.clone());
+        // Retain the freshest model output/cursor while caching the authoritative
+        // metadata of the accepted full snapshot (including registry archives).
+        updated.machine.clone_from(&record.machine);
+        updated.pane.clone_from(&record.pane);
+        updated.name.clone_from(&record.name);
+        updated
+            .snapshot_description
+            .clone_from(&record.snapshot_description);
+        updated.project_remote.clone_from(&record.project_remote);
+        updated.project_branch.clone_from(&record.project_branch);
+        updated.cwd.clone_from(&record.cwd);
+        updated.harness.clone_from(&record.harness);
+        updated.profile.clone_from(&record.profile);
+        updated.state.clone_from(&record.state);
+        updated.created_at = record.created_at;
+        updated.last_seen = record.last_seen;
+        if updated.digest.is_empty() {
+            updated.title.clone_from(&record.title);
+            updated.description.clone_from(&record.description);
+        }
         updated.search_updated_at_ms = timestamp_ms;
         store.save(&updated)?;
         store.records.insert(updated.session_key.clone(), updated);
@@ -1099,7 +1200,7 @@ impl Summarizer {
     }
 }
 
-/// A1 replaces this hook's body with its event-log append. Called once, after
+/// Called once for the event-log append, after
 /// successful durable persistence; never on a cache read or failed completion.
 fn summary_updated(control: &ControlPlane, session: &SessionSummary, record: &DigestRecord) {
     control.summary_updated_hook(session, serde_json::json!({"title": record.title,
@@ -1505,6 +1606,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One fake model/owner scenario exercises both wired summary seams.
     async fn fake_openai_server_refreshes_persists_and_does_not_repeat_unchanged_work() {
         let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
         let capture = requests.clone();
@@ -1536,6 +1638,12 @@ mod tests {
             token_env: None,
             token_file: None,
         });
+        config.events = Some(crate::events::EventsConfig {
+            directory: Some(temp.0.join("events")),
+            inject_hooks: false,
+            ..crate::events::EventsConfig::default()
+        });
+        config.summaries.search_tenant_id = Some(crate::session_search::HQ_TENANT.into());
         let control = crate::control::test_control_with_config(&["fixture"], config);
         let service = control.test_summarizer().unwrap();
         let session = session();
@@ -1546,8 +1654,59 @@ mod tests {
         assert!(!cached.stale);
         assert!(cached.digest_updated_at.is_some());
         assert_eq!(metadata.lock().unwrap().len(), 1);
+        let events = control
+            .agent_events(crate::events::EventQuery::default(), false)
+            .await
+            .unwrap();
+        assert_eq!(events.events.len(), 1);
+        assert_eq!(events.events[0].event.event_type, "agent.summary_updated");
+        assert_eq!(events.events[0].event.detail["digest"], cached.digest);
+        assert_eq!(events.events[0].event.detail["digest_version"], 1);
+        assert_eq!(events.events[0].event.machine, "fixture");
+        assert!(
+            control
+                .agent_events(crate::events::EventQuery::default(), true)
+                .await
+                .unwrap()
+                .events
+                .is_empty()
+        );
         service.refresh(&control, &session).await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            control
+                .agent_events(crate::events::EventQuery::default(), false)
+                .await
+                .unwrap()
+                .events
+                .len(),
+            1
+        );
+        let mut attention = crate::events::AgentEvent::from_summary(
+            &session,
+            "agent.needs_input",
+            Some("permission"),
+        )
+        .unwrap();
+        control.append_fleet_agent_event(attention.clone()).unwrap();
+        assert_eq!(
+            control
+                .agent_summary(&session.id)
+                .unwrap()
+                .needs_input_reason
+                .as_deref(),
+            Some("permission")
+        );
+        attention =
+            crate::events::AgentEvent::from_summary(&session, "agent.working", None).unwrap();
+        control.append_fleet_agent_event(attention).unwrap();
+        assert!(
+            control
+                .agent_summary(&session.id)
+                .unwrap()
+                .needs_input_reason
+                .is_none()
+        );
         {
             let bodies = requests.lock().unwrap();
             let prompt = bodies[0]["messages"][1]["content"].as_str().unwrap();
@@ -1608,6 +1767,10 @@ mod tests {
         let temp = Temp::new();
         let mut config = settings("http://127.0.0.1:1", &temp.0);
         config.summaries.search_tenant_id = Some(crate::session_search::HQ_TENANT.into());
+        config.events = Some(crate::events::EventsConfig {
+            directory: Some(temp.0.join("events")),
+            ..crate::events::EventsConfig::default()
+        });
         let control = crate::control::test_control_with_config(&[], config);
         let service = control.test_summarizer().unwrap();
         let session = session();
@@ -1657,6 +1820,53 @@ mod tests {
         assert_eq!(
             restored.records[&record.session_key].search_updated_at_ms,
             base + 600
+        );
+    }
+
+    #[test]
+    fn failed_search_enqueue_does_not_advance_the_durable_high_water_mark() {
+        use crate::session_search::SearchChange;
+        let temp = Temp::new();
+        let mut config = settings("http://127.0.0.1:1", &temp.0);
+        config.summaries.search_tenant_id = Some(crate::session_search::HQ_TENANT.into());
+        let control = crate::control::test_control_with_config(&[], config.clone());
+        let service = control.test_summarizer().unwrap();
+        let session = session();
+        let mut record =
+            DigestRecord::new(&session, session.session_key.as_deref().unwrap(), epoch());
+        record.digest = "Preserve this pending snapshot".into();
+        service.persist(record.clone()).unwrap();
+        let timestamp = epoch_millis();
+        assert!(
+            control
+                .publish_digest_search(&record, SearchChange::Created, timestamp)
+                .is_err()
+        );
+        assert_eq!(
+            control
+                .session_digest_record(&record.session_key)
+                .unwrap()
+                .search_updated_at_ms,
+            0
+        );
+        drop(service);
+        drop(control);
+        config.events = Some(crate::events::EventsConfig {
+            directory: Some(temp.0.join("events")),
+            ..crate::events::EventsConfig::default()
+        });
+        let control = crate::control::test_control_with_config(&[], config);
+        // No producer or broker connection is required for a durable enqueue.
+        assert!(
+            control
+                .publish_digest_search(&record, SearchChange::Created, timestamp)
+                .unwrap()
+        );
+        drop(control);
+        let restored = Store::open(temp.0.clone()).unwrap();
+        assert_eq!(
+            restored.records[&record.session_key].search_updated_at_ms,
+            timestamp
         );
     }
 

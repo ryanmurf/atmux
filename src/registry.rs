@@ -1,7 +1,7 @@
 //! Opt-in durable session history. Native identities and bundles are peer-only;
 //! browser/MCP responses use `SessionRecord`, which cannot contain an identity.
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
@@ -249,6 +249,7 @@ pub struct StoredRecord {
     pub desired_running: Option<bool>,
     pub close_reason: Option<String>,
     pub resume_generation: u64,
+    pub bundle_captured_ms: Option<u64>,
 }
 impl StoredRecord {
     pub(crate) fn validate(&mut self) -> Result<()> {
@@ -362,12 +363,40 @@ pub struct LifecycleEvent {
 }
 pub type EventSink = Arc<dyn Fn(LifecycleEvent) + Send + Sync>;
 
+/// Internal lifecycle projection. It deliberately carries no native identity.
+#[derive(Clone, Debug)]
+pub(crate) struct RegistrySnapshot {
+    pub record: SessionRecord,
+    pub pane_id: String,
+    pub instance_id: String,
+    pub agent_pid: Option<u32>,
+}
+impl From<&StoredRecord> for RegistrySnapshot {
+    fn from(stored: &StoredRecord) -> Self {
+        Self {
+            record: stored.record.clone(),
+            pane_id: stored.pane_id.clone(),
+            instance_id: stored.instance_id.clone(),
+            agent_pid: stored.agent_pid,
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub(crate) struct RegistryChange {
+    pub previous: Option<RegistrySnapshot>,
+    pub current: RegistrySnapshot,
+    pub timestamp_ms: u64,
+}
+pub(crate) type ChangeSink = Arc<dyn Fn(&RegistryChange) -> Result<()> + Send + Sync>;
+
 #[derive(Default)]
 struct RegistryState {
     records: BTreeMap<String, StoredRecord>,
     observed: BTreeMap<String, (u64, u64)>, // output hash, last enrichment time
     revision: u64,
     sink: Option<EventSink>,
+    change_sink: Option<ChangeSink>,
+    pending_changes: VecDeque<RegistryChange>,
     owner_server: Option<String>,
     server_observed: bool,
     owner_boot_id: String,
@@ -642,6 +671,46 @@ impl Registry {
             .sink = Some(sink);
     }
 
+    /// Installs the ordered durable-publication seam before the first scan.
+    /// Callbacks run under the registry transaction lock and must not call back
+    /// into the registry. Only one failed publication is retained: mutations
+    /// stop until it succeeds, so retry memory cannot grow without bound.
+    pub(crate) fn set_change_sink(&self, sink: ChangeSink) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.change_sink = Some(sink);
+        // Replay existing snapshots for search after restart/config enablement.
+        // No historical lifecycle transitions are invented by this replay.
+        let keys = state.records.keys().cloned().collect::<Vec<_>>();
+        for key in keys {
+            let current = RegistrySnapshot::from(&state.records[&key]);
+            let timestamp_ms = current
+                .record
+                .last_seen_ms
+                .max(current.record.closed_ms.unwrap_or(0))
+                .max(current.record.archived_ms.unwrap_or(0));
+            state.pending_changes.push_back(RegistryChange {
+                previous: None,
+                current,
+                timestamp_ms,
+            });
+            Self::flush_changes(&mut state)?;
+        }
+        Ok(())
+    }
+
+    fn flush_changes(state: &mut RegistryState) -> Result<()> {
+        if let Some(sink) = &state.change_sink {
+            while let Some(change) = state.pending_changes.front() {
+                sink(change)?;
+                state.pending_changes.pop_front();
+            }
+        }
+        Ok(())
+    }
+
     /// Successful scans only: an unavailable tmux server must never close a
     /// registry record. Native identity is refreshed while the CLI still lives.
     /// # Errors
@@ -673,6 +742,7 @@ impl Registry {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::flush_changes(&mut state)?;
         self.consume_close_intents(&mut state, at_ms)?;
         let mut seen = BTreeSet::new();
         let server_changed =
@@ -741,9 +811,14 @@ impl Registry {
             record.session_key.clone_from(key);
             record.machine.clone_from(&self.owner);
             record.name.clone_from(&session.name);
-            if record.description != session.description {
+            if record.description != session.description
+                || record.description_source != session.description_source
+            {
                 record.description.clone_from(&session.description);
-                record.description_source = record.description.as_ref().map(|_| "user".to_owned());
+                record.description_source = session
+                    .description_source
+                    .clone()
+                    .or_else(|| record.description.as_ref().map(|_| "user".to_owned()));
             }
             record.title.clone_from(&session.title);
             record.cwd = session.path.to_string_lossy().into_owned();
@@ -939,6 +1014,7 @@ impl Registry {
     }
 
     fn commit(&self, state: &mut RegistryState, mut stored: StoredRecord) -> Result<()> {
+        Self::flush_changes(state)?;
         stored.validate()?;
         let revision = state
             .revision
@@ -955,12 +1031,22 @@ impl Registry {
             &format!("{}.json", stored.record.session_key),
             &bytes,
         )?;
+        if state.change_sink.is_some() {
+            state.pending_changes.push_back(RegistryChange {
+                previous: state
+                    .records
+                    .get(&stored.record.session_key)
+                    .map(RegistrySnapshot::from),
+                current: RegistrySnapshot::from(&stored),
+                timestamp_ms: crate::machine::now_ms(),
+            });
+        }
         state
             .records
             .insert(stored.record.session_key.clone(), stored);
         state.revision = revision;
         self.changed.send_replace(revision);
-        Ok(())
+        Self::flush_changes(state)
     }
 
     fn retain(&self, state: &mut RegistryState, at_ms: u64, make_room: bool) -> Result<()> {
@@ -1013,6 +1099,24 @@ impl Registry {
         self.page(after)
     }
     fn page(&self, after: Option<&str>) -> Result<RegistryPage> {
+        self.page_for(after, None)
+    }
+
+    /// A filtered A3 owner feed for phone-home, including non-primary live copies.
+    /// It shares the record schema/cursor and never trusts coordinator close intent.
+    pub(crate) fn pending_restore_page(
+        &self,
+        boot: &str,
+        after: Option<&str>,
+    ) -> Result<RegistryPage> {
+        ensure!(
+            tmux::valid_session_key(boot) && boot == self.owner_boot_id(),
+            "stale owner boot signal"
+        );
+        self.page_for(after, Some(boot))
+    }
+
+    fn page_for(&self, after: Option<&str>, restore_boot: Option<&str>) -> Result<RegistryPage> {
         let (epoch, revision) = match after {
             Some(value) => {
                 ensure!(value.len() <= 100, "invalid registry cursor");
@@ -1039,7 +1143,15 @@ impl Registry {
         let mut matches = state
             .records
             .values()
-            .filter(|s| s.record.machine == self.owner && s.revision > revision)
+            .filter(|s| {
+                s.record.machine == self.owner
+                    && s.revision > revision
+                    && restore_boot.is_none_or(|boot| {
+                        s.desired_running == Some(true)
+                            && s.close_reason.as_deref() == Some("node_loss")
+                            && s.owner_boot_id.as_deref() != Some(boot)
+                    })
+            })
             .collect::<Vec<_>>();
         matches.sort_by_key(|s| s.revision);
         let more = matches.len() > PAGE_SIZE;
@@ -1085,6 +1197,7 @@ impl Registry {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::flush_changes(&mut state)?;
         for stored in checked {
             let existing = state.records.get(&stored.record.session_key);
             if existing.is_some_and(|e| {
@@ -1426,7 +1539,11 @@ impl Registry {
         private_directory(&root)?;
         private_directory(&root.join("close-intents"))?;
         let dir = workspace::open_absolute_directory(&root.join("close-intents"))?;
-        for session in sessions.iter().take(config.max_owner_records) {
+        for session in sessions
+            .iter()
+            .filter(|session| matches!(session.agent, AgentKind::Claude | AgentKind::Codex))
+            .take(config.max_owner_records)
+        {
             if let Some(key) = &session.session_key
                 && tmux::valid_session_key(key)
             {
@@ -1476,6 +1593,13 @@ impl Registry {
                 record.record.state = SessionState::Closed;
                 record.record.closed_ms = Some(at_ms);
                 self.commit(state, record)?;
+            } else {
+                let file = open_at(&self.intents_dir, name, OFlags::RDONLY, 0)?;
+                if file.metadata()?.modified()?.elapsed().unwrap_or_default()
+                    < Duration::from_secs(60)
+                {
+                    continue;
+                }
             }
             rustix::fs::unlinkat(&self.intents_dir, name, AtFlags::empty())?;
         }
@@ -1511,6 +1635,7 @@ impl Registry {
             .cloned())
     }
 
+    #[cfg(test)]
     pub(crate) fn restore_keys(&self, machine: &str, boot: &str) -> Vec<String> {
         self.state
             .lock()
@@ -1552,6 +1677,9 @@ impl Registry {
             stored.record.machine == self.owner,
             "cannot bind another owner's native identity"
         );
+        if stored.native.as_ref() == Some(&native) && stored.process_start == process_start {
+            return Ok(());
+        }
         stored.native = Some(native);
         stored.process_start = process_start;
         self.commit(&mut state, stored)
@@ -1574,9 +1702,50 @@ impl Registry {
         self.mark_owner_evictions(&mut state, &evicted)?;
         let info = self.create_bundle(&stored)?;
         stored.record.bundle = Some(info);
+        stored.bundle_captured_ms = Some(crate::machine::now_ms());
+        stored.record.archive_error = None;
         self.commit(&mut state, stored)?;
         drop(state);
         self.bundle_file(key)
+    }
+
+    // One eligible live checkpoint per scan bounds monitor work and feeds A3's
+    // existing streaming pull into the coordinator's durable archive store.
+    pub(crate) fn checkpoint_live(&self, sessions: &[Session], at_ms: u64) -> Result<()> {
+        let key = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            sessions
+                .iter()
+                .filter_map(|session| session.session_key.as_ref())
+                .find(|key| {
+                    state.records.get(*key).is_some_and(|stored| {
+                        stored.record.machine == self.owner
+                            && stored.record.state == SessionState::Running
+                            && stored.native.is_some()
+                            && stored.bundle_captured_ms.is_none_or(|previous| {
+                                at_ms.saturating_sub(previous) >= OBSERVATION_INTERVAL_MS
+                            })
+                    })
+                })
+                .cloned()
+        };
+        if let Some(key) = key
+            && self.capture_bundle(&key).is_err()
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(mut stored) = state.records.get(&key).cloned() {
+                stored.bundle_captured_ms = Some(at_ms);
+                stored.record.archive_error = Some("native checkpoint unavailable".into());
+                self.commit(&mut state, stored)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn record_close(&self, keys: &[String], at_ms: u64) -> Result<()> {
@@ -1620,11 +1789,55 @@ impl Registry {
         native: NativeIdentity,
         generation: u64,
         at_ms: u64,
+        restoring: bool,
     ) -> Result<StoredRecord> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = state.records.get(&stored.record.session_key);
+        ensure!(
+            !previous.is_some_and(|previous| previous.close_reason.as_deref() == Some("user")
+                && previous.instance_id == session.pane_identity
+                && previous.agent_pid == session.agent_pid),
+            "session was closed during resume verification"
+        );
+        ensure!(
+            !restoring
+                || previous.is_some_and(|previous| previous.record.machine == self.owner
+                    && previous.desired_running == Some(true)),
+            "session was intentionally closed before restore committed"
+        );
+        let intent_name = format!("{}.json", stored.record.session_key);
+        match rustix::fs::statat(&self.intents_dir, &intent_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => {
+                let (instance, pid): (String, Option<u32>) =
+                    serde_json::from_slice(&read_at(&self.intents_dir, &intent_name, 8192)?)?;
+                if instance == session.pane_identity && pid == session.agent_pid {
+                    stored.record.machine.clone_from(&self.owner);
+                    stored.record.name.clone_from(&session.name);
+                    stored.record.cwd = session.path.to_string_lossy().into_owned();
+                    stored.pane_id.clone_from(&session.pane_id);
+                    stored.instance_id = instance;
+                    stored.agent_pid = pid;
+                    stored.native = Some(native);
+                    stored.record.state = SessionState::Closed;
+                    stored.record.closed_ms = Some(at_ms);
+                    stored.record.bundle = None;
+                    stored.desired_running = Some(false);
+                    stored.close_reason = Some("user".into());
+                    self.commit(&mut state, stored)?;
+                    rustix::fs::unlinkat(&self.intents_dir, &intent_name, AtFlags::empty())?;
+                    anyhow::bail!("session was closed during resume verification");
+                }
+            }
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(error) => return Err(error.into()),
+        }
+        ensure!(
+            session.session_key.as_deref() == Some(&stored.record.session_key),
+            "resumed pane key differs from archive"
+        );
         stored.record.machine.clone_from(&self.owner);
         stored.record.name.clone_from(&session.name);
         stored.record.cwd = session.path.to_string_lossy().into_owned();
@@ -2135,6 +2348,107 @@ mod tests {
                 (name, bytes)
             })
             .collect()
+    }
+
+    #[test]
+    fn user_close_intent_wins_inside_the_resume_commit_transaction() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        let session = session();
+        let key = session.session_key.clone().unwrap();
+        registry
+            .observe_owner(
+                std::slice::from_ref(&session),
+                1000,
+                Some("server-1".into()),
+            )
+            .unwrap();
+        let stored = registry.stored(&key).unwrap().unwrap();
+        Registry::close_intents(&fixture.config, std::slice::from_ref(&session)).unwrap();
+        assert!(
+            registry
+                .commit_resume(stored, &session, fixture.native("claude"), 1, 2000, true)
+                .is_err()
+        );
+        assert!(!registry.restore_desired(&key).unwrap());
+        assert_eq!(
+            registry
+                .stored(&key)
+                .unwrap()
+                .unwrap()
+                .close_reason
+                .as_deref(),
+            Some("user")
+        );
+    }
+
+    #[test]
+    fn resume_selection_excludes_user_close_intents_after_owner_restart() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        let session = session();
+        let key = session.session_key.clone().unwrap();
+        registry
+            .observe_owner(
+                std::slice::from_ref(&session),
+                1000,
+                Some("server-1".into()),
+            )
+            .unwrap();
+        Registry::close_intents(&fixture.config, std::slice::from_ref(&session)).unwrap();
+        drop(registry);
+        let registry = fixture.registry();
+        let boot = registry.owner_boot_id();
+        registry
+            .observe_owner(&[], 2000, Some("server-2".into()))
+            .unwrap();
+        let saved = registry.stored(&key).unwrap().unwrap();
+        assert_eq!(saved.close_reason.as_deref(), Some("user"));
+        assert_eq!(saved.desired_running, Some(false));
+        assert!(registry.restore_keys("owner", &boot).is_empty());
+        assert!(!registry.restore_desired(&key).unwrap());
+    }
+
+    #[test]
+    fn resume_selection_requires_node_loss_and_new_node_started_boot() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        let session = session();
+        let key = session.session_key.clone().unwrap();
+        registry
+            .observe_owner(
+                std::slice::from_ref(&session),
+                1000,
+                Some("server-1".into()),
+            )
+            .unwrap();
+        let old_boot = registry.owner_boot_id();
+        drop(registry);
+        let registry = fixture.registry();
+        let new_boot = registry.owner_boot_id();
+        registry
+            .observe_owner(&[], 2000, Some("server-2".into()))
+            .unwrap();
+        assert!(registry.restore_keys("owner", &old_boot).is_empty());
+        assert_eq!(registry.restore_keys("owner", &new_boot), vec![key.clone()]);
+        assert!(registry.restore_desired(&key).unwrap());
+        registry
+            .record_close(std::slice::from_ref(&key), 3000)
+            .unwrap();
+        assert!(registry.restore_keys("owner", &new_boot).is_empty());
+        let mut fresh = session;
+        fresh.session_key = Some(tmux::new_session_key().unwrap());
+        registry
+            .observe_owner(std::slice::from_ref(&fresh), 4000, Some("server-2".into()))
+            .unwrap();
+        registry
+            .observe_owner(&[], 5000, Some("server-2".into()))
+            .unwrap();
+        assert!(
+            !registry
+                .restore_desired(fresh.session_key.as_deref().unwrap())
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2790,5 +3104,51 @@ mod tests {
         let manifest: BundleManifest =
             serde_json::from_slice(&entries(&registry, &key)["manifest.json"]).unwrap();
         assert_eq!(manifest.session.record.project, archived.project);
+    }
+
+    #[test]
+    fn failed_change_publication_retries_before_another_mutation_without_losing_the_durable_record()
+    {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        let fail = Arc::new(AtomicBool::new(true));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (failure, count) = (Arc::clone(&fail), Arc::clone(&attempts));
+        registry
+            .set_change_sink(Arc::new(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+                ensure!(
+                    !failure.load(Ordering::SeqCst),
+                    "fixture publisher unavailable"
+                );
+                Ok(())
+            }))
+            .unwrap();
+        let mut session = session();
+        let key = session.session_key.clone().unwrap();
+        assert!(
+            registry
+                .observe(std::slice::from_ref(&session), 1000)
+                .is_err()
+        );
+        assert_eq!(
+            registry.get(&key).unwrap().unwrap().state,
+            SessionState::Running
+        );
+        assert_eq!(registry.state.lock().unwrap().pending_changes.len(), 1);
+        session.name = "not committed while publisher is unavailable".into();
+        assert!(
+            registry
+                .observe(std::slice::from_ref(&session), 2000)
+                .is_err()
+        );
+        assert_ne!(registry.get(&key).unwrap().unwrap().name, session.name);
+        assert_eq!(registry.state.lock().unwrap().pending_changes.len(), 1);
+        fail.store(false, Ordering::SeqCst);
+        registry.observe(&[session.clone()], 3000).unwrap();
+        assert_eq!(registry.get(&key).unwrap().unwrap().name, session.name);
+        assert!(registry.state.lock().unwrap().pending_changes.is_empty());
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
     }
 }

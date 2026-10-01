@@ -1,6 +1,6 @@
 # A4: Resume anywhere, phone-home restore, no startup prompts
 
-Status: A4 integration in progress on `feat/resume-anywhere` (2026-09-30)
+Status: A4 integration acceptance in progress on `feat/resume-anywhere` (2026-10-01)
 
 Read `features/agent-control-plane.md` first. This record is your brief; keep it updated with
 progress, evidence, and gate checkboxes.
@@ -106,7 +106,9 @@ Agents never sit at a startup prompt.
   identity requires origin and recorded branch. Ambiguous repositories or an existing checkout
   on a different branch are refused to preserve workspaces; only new clones are checked out.
   The existing credential-free git URL policy is reused. Projects without a remote can be
-  restored on their owner, but cannot be guessed on another machine.
+  restored on their owner (A3 records without a git root use the configured cwd as the local
+  project anchor), but cannot be guessed on another machine. New clones use the existing
+  launch_directory::clone_repository implementation and its ten-minute clone deadline.
 - Import uses the existing native resume lease and launcher, setting the original session key
   before discovery. Launch verification checks harness/profile/cwd/native identity within five
   seconds. The transaction lock lives inside the blocking worker so request cancellation cannot
@@ -116,15 +118,22 @@ Agents never sit at a startup prompt.
 - Explicit web closes write authoritative user tombstones before tmux mutation. TUI closes
   atomically queue generation-bound intents in the same registry's private close-intents mailbox;
   the single registry writer consumes these before observing panes, including on restart. This
-  avoids opening a second writer and closes the restart-before-scan gap. No mailbox contains
+  avoids opening a second writer and closes the restart-before-scan gap. Restore commit
+  rechecks desired intent atomically; an exact-generation TUI intent also wins before commit.
+  Unmatched intents are retained briefly while a new launch is awaiting its first registry scan.
+  No mailbox contains
   conversation content. Native files are refreshed before restore to retain post-archive turns.
 - A1 EventService records unknown startup dialogs as agent.needs_input/startup_prompt and
-  auto-answers as agent.startup_prompt_answered with dialog/verification only. The TUI's existing
+  auto-answers as agent.startup_prompt_answered with dialog/verification/process-generation metadata only. The TUI's existing
   per-process tmux claim and bounded outcome marker let the owner emit a TUI answer as well.
   session.resumed goes through ControlPlane::emit_agent_event. A1 node.started carries A3's
   owner boot id; tmux server changes emit another node.started. The existing durable event
   checkpoint retains latest imported node boots. An allowlisted coordinator retries missing
-  desired node-loss entries every 15 seconds using that signal and A3 federation records.
+  desired node-loss entries every 15 seconds using that signal and a filtered A3 owner feed.
+  Reading authoritative owner records also recovers non-primary source copies without creating
+  a per-owner manifest/store on the coordinator. Each poll requests at most 32 pages/512 keys.
+  Live checkpoints use A3 archives (one eligible checkpoint per scan, 30-second interval per key)
+  so its existing streaming pull retains running conversation snapshots centrally.
 - Resume on… is integrated into A3's Sessions rows for both live and archived sessions, and
   remains in agent Actions. The picker captures the stable key independently of live selection.
   A lightweight history query detects registry availability; no fallback listing/API remains.
@@ -163,7 +172,7 @@ exclusion pass. JavaScript unit tests pass (195); browser navigation/history pas
 
 - [x] Consolidate onto A3 registry/config/archive/peer API/Sessions view
 - [x] A1 startup input/auto-answer/resumed/node-started wiring
-- [ ] Merge lead's latest lifecycle/search/fleet wiring
+- [x] Merge lead's latest lifecycle/search/fleet wiring (`a585502`)
 - [ ] Final cargo fmt, strict clippy, full all-features Rust suite
 - [ ] Final JS and full browser suites
 

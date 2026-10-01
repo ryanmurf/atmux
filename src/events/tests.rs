@@ -624,6 +624,9 @@ async fn federation_checkpoints_survive_restart_and_replay_is_deduplicated() {
 struct FakeProducer {
     values: Mutex<Vec<Publication>>,
     fail: std::sync::atomic::AtomicBool,
+    // Records the broker's receipt but returns an ambiguous failure once.
+    fail_after: std::sync::atomic::AtomicUsize,
+    fail_topic: Mutex<Option<String>>,
 }
 type Publication = (String, Vec<u8>, Vec<u8>);
 impl sink::Producer for FakeProducer {
@@ -634,13 +637,16 @@ impl sink::Producer for FakeProducer {
         value: &'a [u8],
     ) -> sink::PublishFuture<'a> {
         Box::pin(async move {
-            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed)
+                || self.fail_topic.lock().unwrap().as_deref() == Some(topic)
+            {
                 anyhow::bail!("fake offline");
             }
-            self.values
-                .lock()
-                .unwrap()
-                .push((topic.into(), key.to_vec(), value.to_vec()));
+            let mut values = self.values.lock().unwrap();
+            values.push((topic.into(), key.to_vec(), value.to_vec()));
+            if self.fail_after.load(std::sync::atomic::Ordering::Relaxed) == values.len() {
+                anyhow::bail!("fake ambiguous acknowledgement");
+            }
             Ok(())
         })
     }
@@ -682,4 +688,481 @@ async fn sink_retries_without_advancing_and_wraps_the_verified_platform_contract
     assert_eq!(value["eventPayload"]["tenantId"], config.tenant_id);
     assert_eq!(value["eventPayload"]["schema"], SCHEMA);
     assert!(value["securityContext"]["token"].is_null());
+}
+
+fn remote_summary() -> crate::control::SessionSummary {
+    serde_json::from_value(json!({
+        "id":"remote~%7", "machine":"remote", "pane_id":"%7", "instance_id":"pane-v1-fixture",
+        "session_key":tmux::new_session_key().unwrap(), "name":"fixture", "status":"working",
+        "agent":"codex", "profile":"fixture", "attached":false, "activity":0,
+        "path":"/fixture/project", "title":"", "command":"codex", "windows":1,
+        "window_index":0, "pane_index":0, "content_hash":"fixture"
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn coordinator_summary_events_are_durable_deduplicated_and_never_owner_events() {
+    let temp = Temp::new();
+    let settings = EventsConfig {
+        directory: Some(temp.0.join("events")),
+        inject_hooks: false,
+        redpanda: Some(RedpandaConfig::default()),
+        ..EventsConfig::default()
+    };
+    let mut config = crate::config::Config {
+        events: Some(settings.clone()),
+        ..crate::config::Config::default()
+    };
+    config.node.coordinator_only = true;
+    let control = crate::control::test_control_with_config(&["remote"], config);
+    let session = remote_summary();
+    let detail = json!({"title":"Durable summaries", "description":"Keep context",
+        "digest":"Completed event integration. Validate publication next.", "digest_version":3});
+    control.summary_updated_hook(&session, detail.clone());
+    let page = control
+        .agent_events(EventQuery::default(), false)
+        .await
+        .unwrap();
+    assert_eq!(page.events.len(), 1);
+    let event = page.events[0].event.clone();
+    assert_eq!(event.event_type, "agent.summary_updated");
+    assert_eq!(event.detail, detail);
+    assert_eq!(event.machine, session.machine);
+    assert_eq!(
+        event.session_key,
+        session.session_key.as_ref().unwrap().as_str()
+    );
+    assert_eq!(event.pane, session.id);
+    assert_eq!(event.instance_id, session.instance_id);
+    assert!(control.emit_agent_event(event.clone()).is_err());
+    control.append_fleet_agent_event(event.clone()).unwrap();
+    let mut invalid = event;
+    invalid.pane = "imposter~%7".into();
+    assert!(control.append_fleet_agent_event(invalid).is_err());
+    assert!(
+        control
+            .agent_events(EventQuery::default(), true)
+            .await
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    drop(control);
+    let service = EventService::open(settings.clone(), "local".into(), true).unwrap();
+    assert_eq!(
+        service
+            .fleet
+            .read(&EventQuery::default())
+            .await
+            .unwrap()
+            .events
+            .len(),
+        1
+    );
+    let producer = FakeProducer::default();
+    service.publish_pending(&producer).await.unwrap();
+    drop(service);
+    let service = EventService::open(settings, "local".into(), true).unwrap();
+    service.publish_pending(&producer).await.unwrap();
+    let values = producer.values.lock().unwrap();
+    assert_eq!(values.len(), 1);
+    let published: Value = serde_json::from_slice(&values[0].2).unwrap();
+    assert_eq!(published["eventPayload"]["detail"], detail);
+    assert_eq!(values[0].1, session.session_key.unwrap().as_bytes());
+
+    let owner = EventService::open(
+        EventsConfig {
+            directory: Some(temp.0.join("owner-only")),
+            ..EventsConfig::default()
+        },
+        "local".into(),
+        false,
+    )
+    .unwrap();
+    let foreign = AgentEvent::from_summary(&remote_summary(), "session.closed", None).unwrap();
+    assert!(owner.append_fleet(foreign.clone()).is_err());
+    assert!(owner.emit(foreign).is_err());
+    assert!(
+        owner
+            .enqueue_publication("entity-change", b"key", b"value")
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn summary_search_enqueue_survives_restart_and_ambiguous_ack_in_snapshot_order() {
+    let temp = Temp::new();
+    let settings = EventsConfig {
+        directory: Some(temp.0.join("events")),
+        redpanda: Some(RedpandaConfig::default()),
+        ..EventsConfig::default()
+    };
+    let mut config = crate::config::Config {
+        events: Some(settings.clone()),
+        ..crate::config::Config::default()
+    };
+    config.node.coordinator_only = true;
+    let control = crate::control::test_control_with_config(&[], config);
+    let publications: Vec<_> = [
+        include_str!("../../tests/fixtures/atmux-search/session-created.json"),
+        include_str!("../../tests/fixtures/atmux-search/session-updated.json"),
+        include_str!("../../tests/fixtures/atmux-search/session-archived.json"),
+    ]
+    .into_iter()
+    .map(|fixture| {
+        let envelope: crate::session_search::SearchEnvelope =
+            serde_json::from_str(fixture).unwrap();
+        crate::session_search::SearchPublication {
+            topic: crate::session_search::SEARCH_TOPIC,
+            key: envelope.event_payload.entity_id.clone(),
+            envelope,
+        }
+    })
+    .collect();
+    for publication in &publications {
+        control.summary_search_document_hook(publication).unwrap();
+    }
+    drop(control);
+    let producer = FakeProducer::default();
+    producer
+        .fail_after
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    let service = EventService::open(settings.clone(), "local".into(), true).unwrap();
+    assert!(service.publish_pending(&producer).await.is_err());
+    assert_eq!(producer.values.lock().unwrap().len(), 2);
+    drop(service);
+    let service = EventService::open(settings.clone(), "local".into(), true).unwrap();
+    service.publish_pending(&producer).await.unwrap();
+    drop(service);
+    let service = EventService::open(settings, "local".into(), true).unwrap();
+    service.publish_pending(&producer).await.unwrap();
+    let values = producer.values.lock().unwrap();
+    let expected = [0, 1, 1, 2].map(|i| {
+        (
+            "entity-change".to_owned(),
+            publications[i].key.as_bytes().to_vec(),
+            publications[i].value().unwrap(),
+        )
+    });
+    assert_eq!(*values, expected);
+}
+
+#[tokio::test]
+async fn summary_attention_follows_lifecycle_events_and_ignores_other_generations() {
+    let temp = Temp::new();
+    let mut config = crate::config::Config {
+        events: Some(EventsConfig {
+            directory: Some(temp.0.join("events")),
+            ..EventsConfig::default()
+        }),
+        ..crate::config::Config::default()
+    };
+    config.node.coordinator_only = true;
+    let control = crate::control::test_control_with_config(&["remote"], config);
+    let mut session = remote_summary();
+    control.apply_machine_sessions("remote", vec![session.clone()], None);
+    for reason in ["permission", "question", "startup_prompt", "plan_approval"] {
+        control
+            .append_fleet_agent_event(
+                AgentEvent::from_summary(&session, "agent.needs_input", Some(reason)).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            control
+                .agent_summary(&session.id)
+                .unwrap()
+                .needs_input_reason
+                .as_deref(),
+            Some(reason)
+        );
+    }
+    control.summary_updated_hook(
+        &session,
+        json!({"title":"Context", "description":"", "digest":"Safe digest", "digest_version":1}),
+    );
+    assert_eq!(
+        control
+            .agent_summary(&session.id)
+            .unwrap()
+            .needs_input_reason
+            .as_deref(),
+        Some("plan_approval")
+    );
+    session.status = "waiting".into();
+    control.apply_machine_sessions("remote", vec![session.clone()], None);
+    control
+        .append_fleet_agent_event(
+            AgentEvent::from_summary(&session, "agent.working", None).unwrap(),
+        )
+        .unwrap();
+    assert!(
+        control
+            .agent_summary(&session.id)
+            .unwrap()
+            .needs_input_reason
+            .is_none()
+    );
+    let mut stale = session.clone();
+    stale.instance_id = "pane-v1-old".into();
+    control
+        .append_fleet_agent_event(
+            AgentEvent::from_summary(&stale, "agent.needs_input", Some("permission")).unwrap(),
+        )
+        .unwrap();
+    stale = session.clone();
+    stale.machine = "another".into();
+    control
+        .append_fleet_agent_event(
+            AgentEvent::from_summary(&stale, "agent.needs_input", Some("question")).unwrap(),
+        )
+        .unwrap();
+    assert!(
+        control
+            .agent_summary(&session.id)
+            .unwrap()
+            .needs_input_reason
+            .is_none()
+    );
+    session.instance_id = "pane-v1-replacement".into();
+    control.apply_machine_sessions("remote", vec![session.clone()], None);
+    assert_eq!(
+        control
+            .agent_summary(&session.id)
+            .unwrap()
+            .needs_input_reason
+            .as_deref(),
+        Some("idle_prompt")
+    );
+}
+
+#[tokio::test]
+async fn outbox_bounds_reject_enqueue_without_evicting_pending_bytes() {
+    let temp = Temp::new();
+    let path = temp.0.join("outbox");
+    let outbox = outbox::PublicationOutbox::open(path.clone(), 2000).unwrap();
+    let value = vec![0_u8; 1000];
+    outbox.enqueue("entity-change", b"key", &value).unwrap();
+    assert!(outbox.enqueue("entity-change", b"key", &value).is_err());
+    assert!(outbox.enqueue("bad/topic", b"key", b"value").is_err());
+    assert!(
+        outbox
+            .enqueue("entity-change", &[0; 4097], b"value")
+            .is_err()
+    );
+    assert!(
+        outbox
+            .enqueue("entity-change", b"key", &vec![0; 128 * 1024 + 1])
+            .is_err()
+    );
+    assert!(outbox::PublicationOutbox::open(path.clone(), 2000).is_err());
+    for entry in fs::read_dir(&path).unwrap() {
+        assert_eq!(
+            entry.unwrap().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    drop(outbox);
+    let outbox = outbox::PublicationOutbox::open(path, 2000).unwrap();
+    let producer = FakeProducer::default();
+    assert_eq!(outbox.publish_pending(&producer).await.unwrap(), 1);
+    assert_eq!(producer.values.lock().unwrap()[0].2, value);
+    outbox.enqueue("entity-change", b"key", b"newer").unwrap();
+    assert_eq!(outbox.publish_pending(&producer).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn outbox_ack_checkpoint_prevents_old_replay_after_interrupted_cleanup() {
+    let temp = Temp::new();
+    let path = temp.0.join("outbox");
+    let outbox = outbox::PublicationOutbox::open(path.clone(), 2000).unwrap();
+    outbox.enqueue("entity-change", b"a", b"first").unwrap();
+    let first = path.join("00000000000000000001.json");
+    let backup = temp.0.join("backup.json");
+    fs::copy(&first, &backup).unwrap();
+    let producer = FakeProducer::default();
+    assert_eq!(outbox.publish_pending(&producer).await.unwrap(), 1);
+    outbox.enqueue("entity-change", b"a", b"second").unwrap();
+    // Simulate an acknowledged file surviving an interrupted deletion.
+    fs::copy(backup, first).unwrap();
+    let partial = path.join("00000000000000000003.tmp");
+    fs::write(&partial, "{partial").unwrap();
+    fs::set_permissions(&partial, fs::Permissions::from_mode(0o600)).unwrap();
+    drop(outbox);
+    let outbox = outbox::PublicationOutbox::open(path, 2000).unwrap();
+    assert_eq!(outbox.publish_pending(&producer).await.unwrap(), 1);
+    assert_eq!(
+        *producer.values.lock().unwrap(),
+        vec![
+            ("entity-change".into(), b"a".to_vec(), b"first".to_vec()),
+            ("entity-change".into(), b"a".to_vec(), b"second".to_vec())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn sink_drains_each_stream_even_when_the_other_topic_fails() {
+    let temp = Temp::new();
+    let settings = EventsConfig {
+        directory: Some(temp.0.join("events")),
+        redpanda: Some(RedpandaConfig::default()),
+        ..EventsConfig::default()
+    };
+    let service = EventService::open(settings, "local".into(), true).unwrap();
+    service
+        .append_fleet(
+            AgentEvent::from_summary(&remote_summary(), "session.archived", None).unwrap(),
+        )
+        .unwrap();
+    service
+        .enqueue_publication("entity-change", b"key", b"created")
+        .unwrap();
+    let producer = FakeProducer::default();
+    *producer.fail_topic.lock().unwrap() = Some("atmux.agent.events.v1".into());
+    assert!(service.publish_pending(&producer).await.is_err());
+    assert_eq!(producer.values.lock().unwrap()[0].2, b"created");
+    *producer.fail_topic.lock().unwrap() = Some("entity-change".into());
+    service
+        .enqueue_publication("entity-change", b"key", b"archived")
+        .unwrap();
+    assert!(service.publish_pending(&producer).await.is_err());
+    assert!(service.publish_pending(&producer).await.is_err());
+    assert_eq!(producer.values.lock().unwrap().len(), 2);
+    *producer.fail_topic.lock().unwrap() = None;
+    service.publish_pending(&producer).await.unwrap();
+    let values = producer.values.lock().unwrap();
+    assert_eq!(values.len(), 3);
+    assert_eq!(values[0].0, "entity-change");
+    assert_eq!(values[1].0, "atmux.agent.events.v1");
+    assert_eq!(values[2].0, "entity-change");
+    assert_eq!(values[2].2, b"archived");
+}
+
+#[test]
+fn local_summary_attention_sees_owner_events_before_federation_and_survives_restart() {
+    let temp = Temp::new();
+    let settings = EventsConfig {
+        directory: Some(temp.0.join("events")),
+        ..EventsConfig::default()
+    };
+    let service = EventService::open(settings.clone(), "local".into(), true).unwrap();
+    let mut session = remote_summary();
+    session.machine = "local".into();
+    session.id = "local~%7".into();
+    session.status = "waiting".into();
+    service
+        .emit(AgentEvent::from_summary(&session, "agent.needs_input", Some("permission")).unwrap())
+        .unwrap();
+    assert_eq!(
+        service.needs_input_reason(&session).as_deref(),
+        Some("permission")
+    );
+    service
+        .emit(AgentEvent::from_summary(&session, "agent.working", None).unwrap())
+        .unwrap();
+    assert!(service.needs_input_reason(&session).is_none());
+    drop(service);
+    let service = EventService::open(settings, "local".into(), true).unwrap();
+    assert!(service.needs_input_reason(&session).is_none());
+}
+
+#[tokio::test]
+async fn discovery_federators_keep_coordinator_events_out_of_the_owner_feed() {
+    let temp = Temp::new();
+    let mut config = crate::config::Config {
+        events: Some(EventsConfig {
+            directory: Some(temp.0.join("events")),
+            inject_hooks: false,
+            redpanda: Some(RedpandaConfig::default()),
+            ..EventsConfig::default()
+        }),
+        ..crate::config::Config::default()
+    };
+    config.discovery.enabled = true;
+    configure_profiles(&mut config).unwrap();
+    let control = crate::control::test_control_with_config(&[], config);
+    control
+        .append_fleet_agent_event(
+            AgentEvent::from_summary(&remote_summary(), "session.resumed", None).unwrap(),
+        )
+        .unwrap();
+    control
+        .enqueue_publication("entity-change", b"key", b"snapshot")
+        .unwrap();
+    assert_eq!(
+        control
+            .agent_events(EventQuery::default(), false)
+            .await
+            .unwrap()
+            .events
+            .len(),
+        1
+    );
+    assert!(
+        control
+            .agent_events(EventQuery::default(), true)
+            .await
+            .unwrap()
+            .events
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn startup_events_are_body_free_and_deduplicated_per_process_generation() {
+    let temp = Temp::new();
+    let service = EventService::open(
+        EventsConfig {
+            directory: Some(temp.0.join("spool")),
+            ..EventsConfig::default()
+        },
+        "tron".into(),
+        false,
+    )
+    .unwrap();
+    let mut session = pane_session();
+    session.agent_pid = Some(std::process::id());
+    session.content = "unrecognized startup secret".into();
+    service.startup_event(&session, None);
+    service.startup_event(&session, None);
+    service.startup_event(&session, Some(("@atmux_startup_codex_trust", true)));
+    service.startup_event(&session, Some(("@atmux_startup_codex_trust", true)));
+    let page = service.owner.read(&EventQuery::default()).await.unwrap();
+    assert_eq!(page.events.len(), 2);
+    assert_eq!(
+        page.events[0].event.reason.as_deref(),
+        Some("startup_prompt")
+    );
+    assert_eq!(
+        page.events[1].event.event_type,
+        "agent.startup_prompt_answered"
+    );
+    assert_eq!(page.events[1].event.detail["verified"], true);
+    assert!(!serde_json::to_string(&page).unwrap().contains("secret"));
+    let replay = page.events[1].event.clone();
+    let mut replayed = replay;
+    replayed.id = crate::tmux::new_session_key().unwrap();
+    service.emit(replayed).unwrap();
+    assert_eq!(
+        service
+            .owner
+            .read(&EventQuery::default())
+            .await
+            .unwrap()
+            .events
+            .len(),
+        2
+    );
+    session.agent_pid = Some(124);
+    service.startup_event(&session, None);
+    assert_eq!(
+        service
+            .owner
+            .read(&EventQuery::default())
+            .await
+            .unwrap()
+            .events
+            .len(),
+        3
+    );
 }

@@ -239,7 +239,8 @@ fn search_snapshot(
         updated_by: SYSTEM_USER.into(),
         created_at: rfc3339(created_at_ms)?,
         updated_at: timestamp.to_owned(),
-        archived_at: (change == SearchChange::Archived).then(|| timestamp.to_owned()),
+        archived_at: (change == SearchChange::Archived || record.state == "archived")
+            .then(|| timestamp.to_owned()),
         title: bounded_text(&record.title, 400),
         description: bounded_text(record.search_description(), 480),
         digest: bounded_text(&record.digest, MAX_DOCUMENT_BYTES),
