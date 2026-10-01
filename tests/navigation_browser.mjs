@@ -69,12 +69,14 @@ test("mobile navigation persists preferences and session actions retain the sele
   const modelRequests = [];
   const paneContent = "first line\nsecond line ✓";
   const instance = (digit) => `pane-v1-${digit.repeat(64)}`;
+  let eventPhase = "agent.needs_input";
+  const agentSessionKey = "00000000-0000-7000-8000-000000000001";
   const machines = [
     { id: "local", label: "Workstation", kind: "local", online: true, sessions: 2 },
     { id: "max", label: "Max", kind: "remote", online: true, sessions: 1 },
   ];
   let sessions = [
-    { id: "local~%1", machine: "local", pane_id: "%1", name: "alpha", path: "/work/api", agent: "codex", status: "working", instance_id: instance("a") },
+    { id: "local~%1", machine: "local", pane_id: "%1", name: "alpha", path: "/work/api", agent: "codex", status: "working", instance_id: instance("a"), session_key: agentSessionKey },
     { id: "local~%2", machine: "local", pane_id: "%2", name: "zebra", path: "/work/web", agent: "claude", status: "waiting", instance_id: instance("b") },
     { id: "max~%1", machine: "max", pane_id: "%1", name: "beta", path: "/work/api", agent: "claude", status: "waiting", instance_id: instance("c") },
   ];
@@ -84,6 +86,14 @@ test("mobile navigation persists preferences and session actions retain the sele
     [name, await readFile(new URL(`../web/${name}`, import.meta.url))])));
   const server = createServer((request, response) => {
     const path = new URL(request.url, "http://fixture").pathname;
+    if (path === "/api/v1/fleet/agent-events") {
+      const seq = eventPhase === "agent.needs_input" ? 1 : 2;
+      const next = `${agentSessionKey}:${seq}`;
+      const after = new URL(request.url, "http://fixture").searchParams.get("after");
+      const events = after === next ? [] : [{ seq, event: { type: eventPhase, reason: "permission", machine: "local", instance_id: instance("a"), session_key: agentSessionKey } }];
+      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ epoch: agentSessionKey, events, next, reset: false }));
+      return;
+    }
     if (request.method !== "GET") mutations.push({ path, method: request.method });
     if (path === "/api/v1/events") {
       response.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
@@ -164,6 +174,12 @@ test("mobile navigation persists preferences and session actions retain the sele
       await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [point] });
       await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
     };
+    await waitFor(() => cdp.evaluate("document.querySelector('.session-button[data-session-id=\"local~%1\"] .needs-input-badge')?.textContent === 'Needs input · permission'"), "event badge on working agent in rail");
+    await tap("document.querySelector('.session-button[data-session-id=\"local~%1\"]')");
+    await waitFor(() => cdp.evaluate("document.getElementById('agent-needs-input')?.textContent === 'Needs input · permission' && !document.getElementById('agent-needs-input').hidden"), "event reason in selected agent header");
+    eventPhase = "agent.working";
+    await waitFor(() => cdp.evaluate("document.getElementById('agent-needs-input')?.hidden && document.querySelector('.session-button[data-session-id=\"local~%1\"] .needs-input-badge')?.hidden"), "working event clears header and rail attention");
+    await cdp.evaluate("document.getElementById('mobile-back').click()");
     assert.deepEqual(await cdp.evaluate(`(() => {
       const toggle = ${disclosure};
       const controls = [toggle, ${pin}, document.getElementById('filter-status'), document.getElementById('filter-harness')];

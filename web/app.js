@@ -4319,6 +4319,11 @@ function initialize() {
   const requestedPulseAccount = pulseAccountId(pageUrl.searchParams.get("pulseAccount"));
   const state = {
     revision: 0,
+    agentEventStates: new Map(),
+    agentEventCursor: null,
+    agentEventController: null,
+    agentEventTimer: null,
+    agentEventAvailable: true,
     sessions: new Map(),
     machines: [],
     selected: initialRoute.view === "session" ? initialRoute.id : null,
@@ -6877,6 +6882,16 @@ function initialize() {
         : `Memory ${formatMemoryLimit(selected.memory_max_bytes)}`,
     ].filter(Boolean).join(" · ");
     $("agent-meta").title = selected.path || "";
+    let inputBadge = $("agent-needs-input");
+    if (!inputBadge) {
+      inputBadge = document.createElement("span");
+      inputBadge.id = "agent-needs-input";
+      inputBadge.className = "needs-input-badge";
+      $("agent-meta").before(inputBadge);
+    }
+    const inputReason = needsInputReason(selected, state.agentEventStates);
+    inputBadge.hidden = !inputReason;
+    inputBadge.textContent = needsInputLabel(inputReason);
     const launch = $("agent-launch");
     launch.hidden = !launchCommand;
     launch.textContent = launchCommand ? `tmux: ${launchCommand}` : "";
@@ -7382,6 +7397,15 @@ function initialize() {
     node.description.hidden = !session.description;
     node.sub.textContent = [folder, profile, session.status, session.agent].filter(Boolean).join(" · ");
     node.sub.title = session.path || "";
+    if (!node.inputBadge) {
+      node.inputBadge = document.createElement("span");
+      node.inputBadge.className = "needs-input-badge";
+      node.sub.after(node.inputBadge);
+    }
+    const reason = needsInputReason(session, state.agentEventStates);
+    node.inputBadge.hidden = !reason;
+    node.inputBadge.textContent = needsInputLabel(reason);
+    if (reason) node.button.setAttribute("aria-label", `${node.button.getAttribute("aria-label")}, ${needsInputLabel(reason)}`);
   }
 
   async function request(url, options = {}) {
@@ -10918,12 +10942,80 @@ function initialize() {
   });
   window.addEventListener("pagehide", () => { persistBoundComposerDraft(true); });
   window.addEventListener("pagehide", stopTranscriptPolling);
+  window.addEventListener("pagehide", stopAgentEvents);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopAgentEvents();
+    else void pollAgentEvents();
+  });
   window.addEventListener("pageshow", startTranscriptPolling);
+  window.addEventListener("pageshow", () => { void pollAgentEvents(); });
+
+  function stopAgentEvents() {
+    clearTimeout(state.agentEventTimer);
+    state.agentEventTimer = null;
+    state.agentEventController?.abort();
+  }
+
+  async function pollAgentEvents() {
+    if (document.hidden || !state.agentEventAvailable || state.agentEventController) return;
+    clearTimeout(state.agentEventTimer);
+    const controller = new AbortController();
+    state.agentEventController = controller;
+    let delay = 100;
+    try {
+      const query = new URLSearchParams({ wait: "25", limit: "100" });
+      if (state.agentEventCursor) query.set("after", state.agentEventCursor);
+      const response = await fetch(`/api/v1/fleet/agent-events?${query}`, { signal: controller.signal });
+      if (response.status === 404) { state.agentEventAvailable = false; return; }
+      if (!response.ok) throw new Error("Agent events unavailable");
+      const page = await response.json();
+      state.agentEventStates = reconcileAgentEvents(state.agentEventStates, page);
+      state.agentEventCursor = typeof page.next === "string" ? page.next : null;
+      render();
+    } catch { delay = 5000; }
+    finally {
+      state.agentEventController = null;
+      if (!document.hidden && state.agentEventAvailable) state.agentEventTimer = setTimeout(() => { void pollAgentEvents(); }, delay);
+    }
+  }
 
   render();
+  void pollAgentEvents();
   connectOverview();
   void refreshFleetUpdates();
   void refreshFleetRecovery(false);
   if (state.selected) connectPane();
   if (state.pulseOpen) void loadPulseAccounts();
 }
+
+// Durable lifecycle signals supplement the status classifier. Keep only
+// generation-bound state; event bodies are never rendered as HTML.
+function reconcileAgentEvents(previous, page) {
+  const next = page?.reset ? new Map() : new Map(previous instanceof Map ? previous : []);
+  for (const record of Array.isArray(page?.events) ? page.events.slice(0, 100) : []) {
+    const event = record?.event;
+    if (!event || typeof event.session_key !== "string" || typeof event.machine !== "string") continue;
+    const type = event.type;
+    if (!["agent.needs_input", "agent.working", "agent.turn_completed", "agent.started", "agent.exited", "session.closed", "session.archived", "session.resumed"].includes(type)) continue;
+    next.delete(event.session_key);
+    next.set(event.session_key, { instance: event.instance_id, machine: event.machine, type, reason: type === "agent.needs_input" ? event.reason : type === "agent.turn_completed" ? "idle_prompt" : null });
+    if (next.size > 4096) next.delete(next.keys().next().value);
+  }
+  return next;
+}
+
+function needsInputReason(session, events) {
+  const event = events?.get(session?.session_key);
+  if (event && event.machine === session.machine && event.instance === session.instance_id) {
+    if (["agent.working", "agent.exited", "session.closed", "session.archived"].includes(event.type)) return null;
+    if (["idle_prompt", "question", "permission", "startup_prompt", "plan_approval"].includes(event.reason)) return event.reason;
+  }
+  return session?.status === "waiting" ? "idle_prompt" : null;
+}
+
+function needsInputLabel(reason) {
+  const labels = { idle_prompt: "idle", question: "question", permission: "permission", startup_prompt: "startup prompt", plan_approval: "plan approval" };
+  return labels[reason] ? `Needs input · ${labels[reason]}` : "";
+}
+
+if (typeof module !== "undefined" && module.exports) Object.assign(module.exports, { reconcileAgentEvents, needsInputReason, needsInputLabel });

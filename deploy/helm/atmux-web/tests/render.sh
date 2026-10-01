@@ -35,6 +35,10 @@ assert_unique_top_level_keys() {
 grep -Eq '^version: 0\.4\.9$' "$chart/Chart.yaml"
 "$helm_bin" template atmux-web "$chart" --namespace murphytek >"$work/default.yaml"
 assert_unique_top_level_keys "$work/default.yaml"
+if grep -Fq 'hostAliases:' "$work/default.yaml"; then
+  echo "empty hostAliases unexpectedly rendered a Pod field" >&2
+  exit 1
+fi
 
 if grep -Eq '^kind: Ingress$' "$work/default.yaml"; then
   echo "safe default unexpectedly rendered an Ingress" >&2
@@ -57,6 +61,21 @@ test "$(grep -Ec '^kind: NetworkPolicy$' "$work/default.yaml")" -eq 1
 "$helm_bin" template atmux-web "$chart" --namespace murphytek \
   "${enabled_values[@]}" >"$work/enabled.yaml"
 assert_unique_top_level_keys "$work/enabled.yaml"
+"$helm_bin" template atmux-web "$chart" --namespace murphytek \
+  "${enabled_values[@]}" \
+  --set server.events.enabled=true --set server.events.redpanda.enabled=true \
+  --set-json 'hostAliases=[{"ip":"10.152.183.23","hostnames":["redpanda"]}]' \
+  >"$work/events.yaml"
+grep -Fq 'hostAliases:' "$work/events.yaml"
+grep -Fq 'ip: 10.152.183.23' "$work/events.yaml"
+grep -Fq 'directory = "/var/lib/atmux/data/events"' "$work/events.yaml"
+grep -Fq 'brokers = ["redpanda.herodevs.svc.cluster.local:9092"]' "$work/events.yaml"
+grep -Fq 'tenant_id = "95efe33d-fa71-53ce-8e0a-3fe45ac0e58a"' "$work/events.yaml"
+grep -Fq 'matchLabels: {app: redpanda}' "$work/events.yaml"
+if grep -Fq '[events]' "$work/enabled.yaml"; then
+  echo "disabled event telemetry unexpectedly rendered configuration" >&2
+  exit 1
+fi
 
 # The rollout checksum must follow the rendered TOML itself, including a
 # template-only change made with identical release values.

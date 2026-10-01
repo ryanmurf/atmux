@@ -1,5 +1,9 @@
 host: atmux.murphytek.com
 
+# Optional Pod hostname mappings, e.g. for a broker advertising redpanda:9092
+# to a coordinator running outside the herodevs namespace.
+hostAliases: []
+
 # atmux continues to run on tron so it can manage the host tmux server. The
 # gateway is deliberately limited to this single private-node endpoint.
 atmux:
@@ -37,6 +41,17 @@ server:
   # Production overrides use the reviewed private IPs whose IP SANs are in the
   # host certificates. DNS aliases and mDNS are intentionally not used in K8s.
   machines: []
+  events:
+    enabled: false
+    # The coordinator stores its bounded owner/fleet logs on the existing PVC.
+    maxBytes: 16777216
+    segmentBytes: 1048576
+    retentionSeconds: 604800
+    redpanda:
+      enabled: false
+      brokers: [redpanda.herodevs.svc.cluster.local:9092]
+      topic: atmux.agent.events.v1
+      tenantId: 95efe33d-fa71-53ce-8e0a-3fe45ac0e58a
   # Example shape (keep disabled defaults environment-neutral):
   # - id: tron
   #   label: Tron

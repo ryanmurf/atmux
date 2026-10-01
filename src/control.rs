@@ -831,6 +831,7 @@ enum ResumeLeaseAcquireError {
 
 #[derive(Debug)]
 struct Inner {
+    events: Option<Arc<crate::events::EventService>>,
     config: Config,
     summarizer: Option<Arc<crate::summarizer::Summarizer>>,
     local_id: String,
@@ -885,6 +886,14 @@ struct Inner {
 #[derive(Clone, Debug)]
 pub struct ControlPlane {
     inner: Arc<Inner>,
+}
+
+#[derive(Clone)]
+pub(crate) struct WeakControlPlane(Weak<Inner>);
+impl WeakControlPlane {
+    pub(crate) fn upgrade(&self) -> Option<ControlPlane> {
+        self.0.upgrade().map(|inner| ControlPlane { inner })
+    }
 }
 
 struct CliMaintenanceRuntime<'a> {
@@ -945,12 +954,78 @@ impl auto_update::MaintenanceRuntime for CliMaintenanceRuntime<'_> {
 }
 
 impl ControlPlane {
+    pub(crate) fn downgrade(&self) -> WeakControlPlane {
+        WeakControlPlane(Arc::downgrade(&self.inner))
+    }
+
+    pub(crate) fn event_session(&self, pane: &str) -> Result<Session> {
+        if !pane.starts_with('%')
+            || pane.len() > 12
+            || !pane[1..].bytes().all(|v| v.is_ascii_digit())
+        {
+            return Err(bad_request("invalid hook pane"));
+        }
+        let cached = self
+            .read_state()
+            .sessions
+            .iter()
+            .find(|v| v.pane_id == pane)
+            .cloned();
+        if let Some(mut session) = cached
+            && let Some(live) = Tmux::live_pane_identity(pane)?
+            && live.pane_pid == session.pane_pid
+            && live.pane_identity == session.pane_identity
+        {
+            session.path = live.path;
+            return Ok(session);
+        }
+        Tmux.sessions(&HashMap::new(), &self.inner.config.status)?
+            .into_iter()
+            .find(|v| v.pane_id == pane)
+            .ok_or_else(|| not_found("hook pane no longer exists"))
+    }
+
+    /// Shared owner emission seam for summaries, registry and resume events.
+    /// # Errors
+    /// Rejects disabled telemetry, foreign owners or failed durable writes.
+    pub fn emit_agent_event(&self, event: crate::events::AgentEvent) -> Result<()> {
+        self.inner
+            .events
+            .as_ref()
+            .ok_or_else(|| not_found("agent events are disabled"))?
+            .emit(event)
+    }
+
+    /// Reads the owner feed for federation, or the fleet feed for MCP/UI.
+    /// # Errors
+    /// Rejects disabled telemetry, invalid cursors or failed spool reads.
+    pub async fn agent_events(
+        &self,
+        query: crate::events::EventQuery,
+        owner: bool,
+    ) -> Result<crate::events::EventPage> {
+        query
+            .validate()
+            .map_err(|error| bad_request(error.to_string()))?;
+        let service = self
+            .inner
+            .events
+            .as_ref()
+            .ok_or_else(|| not_found("agent events are disabled"))?;
+        let log = if owner {
+            &service.owner
+        } else {
+            &service.fleet
+        };
+        log.read(&query).await
+    }
     /// Starts the shared tmux monitor used by the web and MCP interfaces.
     ///
     /// # Errors
     ///
     /// Returns an error when tmux is unavailable or the initial scan fails.
-    pub async fn start(config: Config) -> Result<Self> {
+    pub async fn start(mut config: Config) -> Result<Self> {
+        crate::events::configure_profiles(&mut config)?;
         config.validate_coordinator_only()?;
         if !config.node.coordinator_only {
             Tmux::check()?;
@@ -985,8 +1060,17 @@ impl ControlPlane {
         let summarizer = crate::summarizer::Summarizer::configured(&config)?;
         let recovery = RecoveryRunner::production(&config);
         let updater = SelfUpdater::production(&config.self_update)?;
+        let coordinator = config.node.coordinator_only || !config.machines.is_empty();
+        let events = config
+            .events
+            .clone()
+            .map(|events| {
+                crate::events::EventService::open(events, config.node.id.clone(), coordinator)
+            })
+            .transpose()?;
         let control = Self {
             inner: Arc::new(Inner {
+                events,
                 local_id: config.node.id.clone(),
                 local_label: config.node_label(),
                 bare_local_ids,
@@ -1027,14 +1111,24 @@ impl ControlPlane {
             control.spawn_auto_compact();
             control.spawn_maintenance();
         }
-        control.inner.updater.spawn_background();
-        for machine in control.remote_machines() {
-            control.start_watcher(machine);
-        }
-        if let Some(service) = &control.inner.summarizer {
-            tokio::spawn(service.clone().run(control.clone()));
-        }
+        control.start_background_services(coordinator)?;
         Ok(control)
+    }
+
+    /// Starts the node-wide background services that run on every node:
+    /// self-update, agent events, federation watchers, and the summarizer.
+    fn start_background_services(&self, coordinator: bool) -> Result<()> {
+        self.inner.updater.spawn_background();
+        if let Some(events) = &self.inner.events {
+            events.start(self, coordinator, !self.inner.config.node.coordinator_only)?;
+        }
+        for machine in self.remote_machines() {
+            self.start_watcher(machine);
+        }
+        if let Some(service) = &self.inner.summarizer {
+            tokio::spawn(service.clone().run(self.clone()));
+        }
+        Ok(())
     }
 
     /// Reads safe Quick Resume state from the owning machine.
@@ -1361,6 +1455,9 @@ impl ControlPlane {
     }
 
     fn start_watcher(&self, machine: Arc<RemoteMachine>) {
+        if let Some(events) = &self.inner.events {
+            events.federate(machine.clone());
+        }
         let id = machine.id.clone();
         let watcher = remote::spawn_watcher(self.clone(), machine);
         self.inner
@@ -2188,6 +2285,9 @@ impl ControlPlane {
     pub(crate) fn apply_refresh(&self, sessions: Vec<Session>) -> bool {
         if self.inner.config.node.coordinator_only {
             return false;
+        }
+        if let Some(events) = &self.inner.events {
+            events.observe(&sessions);
         }
         self.inner
             .resume_leases
@@ -3636,6 +3736,12 @@ impl ControlPlane {
                 let status = self.inner.config.status.clone();
                 let capture_lines = self.inner.config.general.preview_lines;
                 let resources = self.inner.config.agent_resources;
+                let inject_hooks = self
+                    .inner
+                    .config
+                    .events
+                    .as_ref()
+                    .is_some_and(|events| events.inject_hooks);
                 local_agent_restart(
                     tokio::task::spawn_blocking(move || {
                         let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
@@ -3672,6 +3778,7 @@ impl ControlPlane {
                             &resume.config_dir,
                             &resume.session_id,
                             scope,
+                            inject_hooks,
                         )?;
                         Ok(())
                     })
@@ -6516,6 +6623,18 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
     let (revisions, _) = watch::channel(0);
     ControlPlane {
         inner: Arc::new(Inner {
+            events: config
+                .events
+                .clone()
+                .map(|events| {
+                    crate::events::EventService::open(
+                        events,
+                        local_id.clone(),
+                        !machines.is_empty() || config.node.coordinator_only,
+                    )
+                })
+                .transpose()
+                .unwrap(),
             config,
             summarizer,
             local_id: local_id.clone(),

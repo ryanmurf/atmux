@@ -698,3 +698,29 @@ dialog::backdrop { background: #000a; }
 .inline-rename button { padding: 5px; font-size: .8rem; }
 .inline-rename-note { flex-basis: 100%; font-size: .8rem; color: var(--red); }
 .session-name { touch-action: manipulation; }
+/* Agent event attention is visible beside both rail and header context. */
+.needs-input-badge {
+  display: inline-block;
+  width: fit-content;
+  color: #ffc977;
+  background: #4b381f;
+  border: 1px solid #806137;
+  border-radius: 5px;
+  padding: 1px 5px;
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
+.needs-input-badge[hidden] { display: none; }
+.session-copy > .needs-input-badge {
+  height: 20px;
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  vertical-align: top;
+}
+/* Keep a stable click target when status/event attention oscillates. */
+.session-copy > .needs-input-badge[hidden] {
+  display: inline-block !important;
+  visibility: hidden;
+}

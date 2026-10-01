@@ -848,6 +848,7 @@ server-side MCP sessions or standalone GET/DELETE streams.
 | `agents_list` | Read compact state for every machine, plus revision and output hashes |
 | `machines_list` | Read every federated machine's online state, health, and last contact |
 | `agents_observe` | Long-poll a previous revision for up to 30 seconds, for the federation or one machine |
+| `agent_events` | Read durable lifecycle events with an epoch:sequence cursor, up to 30-second wait, and types/machine/session_key/reasons filters |
 | `agent_output` | Read a bounded tail, omitting content when its supplied hash still matches |
 | `agent_send` | Paste and optionally submit a literal message to another agent |
 | `agent_interrupt` | Interrupt an agent's current operation |
@@ -856,6 +857,69 @@ server-side MCP sessions or standalone GET/DELETE streams.
 | `agent_stop` | Terminate a tmux session |
 | `pulse_read` | Read bounded, explicit-account Pulse usage, health, reports, profiles, alerts, limits, machines, and receiver metadata |
 | `pulse_mutate` | Change bounded profile settings, queue account/profile collection, manage alerts/subscriptions/pricing, or administer receiver tokens without accepting raw secrets or paths |
+
+Agent event telemetry is off until `[events]` exists. Owners persist mode-0600
+JSONL segments beneath the atmux state directory; `directory` may select an
+absolute private directory. Native hooks use a user-owned Unix socket, return
+silently within a 160 ms deadline, and never retain native message/tool bodies.
+Profiles receive process-scoped Claude `--settings` or Codex `-c hooks.*`
+overrides, including native resume, maintenance and Quick Resume bridges.
+`inject_hooks = false` keeps status-derived telemetry without hook injection.
+
+```toml
+[events]
+inject_hooks = true
+max_bytes = 16777216
+segment_bytes = 1048576
+retention_seconds = 604800
+
+# Coordinator only; omit this block on owners.
+[events.redpanda]
+brokers = ["redpanda.herodevs.svc.cluster.local:9092"]
+topic = "atmux.agent.events.v1"
+tenant_id = "95efe33d-fa71-53ce-8e0a-3fe45ac0e58a"
+# Platform defaults: PLAINTEXT, no auth. Other installations may use:
+# tls = true
+# ca_file = "/etc/atmux/kafka-ca.pem"
+# sasl = "scram-sha-256" # or plain / scram-sha-512
+# username_env = "ATMUX_KAFKA_USERNAME" # alternatively username_file
+# password_file = "/etc/atmux/kafka-password" # alternatively password_env
+```
+
+Codex 0.159.x requires hook trust for inline overrides. Atmux adds the native
+`--dangerously-bypass-hook-trust` flag for configured injection so its vetted
+bridge runs without a startup approval. This invocation-wide flag also applies
+to other loaded native hooks; disable injection if that policy is unsuitable.
+Codex preserves hooks from lower native configuration layers. Targeted tool
+hooks report questions and plan approval without retaining their message bodies.
+Codex `notify` is left intact: its legacy turn-completion callback is redundant
+with `Stop`, and replacing it would discard the user's notification program.
+
+`GET /api/v1/agent-events` is the **owner-only** feed used by federation;
+`GET /api/v1/fleet/agent-events` and MCP `agent_events` read the aggregated feed.
+Both HTTP routes share the existing auth policy. Query parameters are `after`
+(opaque cursor), `wait` (0..30), `limit` (1..100, default 50), and exact filters
+`types`, `machine`, `session_key`, `reasons` (type/reason lists are comma separated).
+Responses are `{epoch, events: [{seq, event}], next, reset}` and at most 512 KiB.
+Use `next` even on filtered empty pages. `reset` means an epoch changed, a cursor
+was ahead, or retention removed its preceding records; resume at the returned
+cursor after reconciling a fresh state snapshot. Owner spool loss mints a new
+epoch; sequence numbers remain monotonic through ordinary rotation and restart.
+
+The coordinator checkpoints each durable imported batch, de-duplicates event
+ids, tolerates offline/older owners, and publishes outside the request path.
+Broker acknowledgements precede its durable publication checkpoint. Delivery
+is at least once; consumers should de-duplicate `eventPayload.id`. The same
+bounded fleet spool is the sink backlog. Size/age eviction reports cursor gaps;
+retention is a storage bound, so outages longer than retention can lose events.
+Values use HdEventEnvelope v2 with tenantId in both securityContext and
+eventPayload, keyed by session_key. No topics are created by atmux.
+
+Rust integrations can emit owner events through `ControlPlane::emit_agent_event`
+and reuse `events::sink::{KafkaProducer, Producer}`: connect with a
+`RedpandaConfig`, then `publish(topic, key_bytes, value_bytes).await`. Each
+publication is bounded to 128 KiB with a ten-second timeout; callers retain
+their own retry/checkpoint policy for other topics such as `entity-change`.
 
 An efficient coordinating agent should call `agents_list` once, retain its `revision` and each
 `content_hash`, wait with `agents_observe`, and call `agent_output` only for sessions whose hash

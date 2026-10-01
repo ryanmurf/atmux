@@ -9,6 +9,7 @@ pub mod config;
 pub mod control;
 pub mod conversation;
 pub mod discovery;
+pub mod events;
 mod launch_directory;
 pub mod machine;
 pub mod mcp;
