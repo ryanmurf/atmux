@@ -41,6 +41,9 @@ impl fmt::Debug for Secret {
 pub fn read_secret(path: &Path) -> Result<Secret> {
     let file =
         std::fs::File::open(path).map_err(|_| anyhow::anyhow!("credential file unavailable"))?;
+    read_secret_handle(file)
+}
+fn read_secret_handle(file: std::fs::File) -> Result<Secret> {
     ensure!(
         file.metadata()?.is_file(),
         "credential must be a regular file"
@@ -309,7 +312,7 @@ impl DeviceAuth {
             user_code: text("user_code")?,
             code: Secret::new(text("device_code")?)?,
             nonce,
-            interval: value["interval"].as_u64().unwrap_or(5).clamp(5, 60),
+            interval: value["interval"].as_u64().unwrap_or(5).clamp(5, 300),
             expires,
         })
     }
@@ -324,7 +327,9 @@ impl DeviceAuth {
                 tokio::time::Instant::now() < deadline,
                 "device code expired"
             );
-            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            let next = tokio::time::Instant::now() + std::time::Duration::from_secs(interval);
+            ensure!(next < deadline, "device code expired before next poll");
+            tokio::time::sleep_until(next).await;
             let value = self
                 .form(
                     &d.token_endpoint,
@@ -338,13 +343,13 @@ impl DeviceAuth {
                 )
                 .await;
             let Ok(value) = value else {
-                interval = (interval * 2).min(60);
+                interval = interval.saturating_mul(2);
                 continue;
             };
             match value["error"].as_str() {
                 Some("authorization_pending") => continue,
                 Some("slow_down") => {
-                    interval = (interval + 5).min(60);
+                    interval = interval.saturating_add(5);
                     continue;
                 }
                 Some(_) => bail!("device login rejected; start explicit login again"),
@@ -443,7 +448,7 @@ fn credential_lock(path: &Path) -> Result<std::fs::File> {
 #[allow(clippy::verbose_bit_mask)]
 fn private_file(path: &Path) -> Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true);
+    options.read(true).write(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -466,8 +471,7 @@ fn private_file(path: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 fn read_refresh(path: &Path) -> Result<Secret> {
-    let _checked = private_file(path)?;
-    read_secret(path)
+    read_secret_handle(private_file(path)?)
 }
 fn write_credential(path: &Path, value: &str) -> Result<()> {
     let temporary = path.with_extension("pending");
@@ -518,6 +522,8 @@ pub struct ChannelMessage {
     #[serde(default)]
     pub job_id: Option<String>,
     #[serde(default)]
+    pub job_type: Option<String>,
+    #[serde(default)]
     pub job_state: Option<String>,
     #[serde(default)]
     pub fence_token: Option<i64>,
@@ -540,7 +546,7 @@ pub struct PostJob {
     pub metadata: Value,
     pub priority: u8,
 }
-const FIELDS: &str = "id channelId content jobId jobState fenceToken ordinal metadata claimedByAgentId leaseExpiresAt";
+const FIELDS: &str = "id channelId content jobId jobType jobState fenceToken ordinal metadata claimedByAgentId leaseExpiresAt";
 impl HerodevsClient {
     pub fn new(config: HerodevsConfig, auth: Arc<dyn AuthProvider>) -> Result<Self> {
         crate::platform_http::endpoint(&config.graphql_url, &config.allow_http_hosts)?;
@@ -576,6 +582,10 @@ impl HerodevsClient {
     pub async fn post_job(&self, input: &PostJob) -> Result<ChannelMessage> {
         validate_metadata(&input.metadata, false)?;
         ensure!(
+            crate::session_search::valid_tenant(&input.client_request_id),
+            "clientRequestId must be a UUID"
+        );
+        ensure!(
             !input.content.trim().is_empty()
                 && input.content.len() <= 65536
                 && input.priority <= 10
@@ -597,7 +607,7 @@ impl HerodevsClient {
     ) -> Result<Vec<ChannelMessage>> {
         validate_metadata(&metadata, true)?;
         ensure!((1..=100).contains(&limit), "invalid job limit");
-        let data = self.graphql(&format!("query($tenant:ID!,$channel:ID!,$states:[JobState!],$metadata:Object,$first:Int){{tenant(id:$tenant){{listJobs(channelId:$channel,jobStates:$states,metadata:$metadata,first:$first){{{FIELDS}}}}}}}"), json!({"tenant":self.config.tenant_id,"channel":channel,"states":if states.is_empty(){None}else{Some(states)},"metadata":metadata,"first":limit})).await?;
+        let data = self.graphql(&format!("query($channel:ID!,$states:[JobState!],$metadata:Object,$first:Int){{tenant{{listJobs(channelId:$channel,jobStates:$states,metadata:$metadata,first:$first){{{FIELDS}}}}}}}"), json!({"channel":channel,"states":if states.is_empty(){None}else{Some(states)},"metadata":metadata,"first":limit})).await?;
         serde_json::from_value(
             data.pointer("/tenant/listJobs")
                 .cloned()
@@ -659,7 +669,7 @@ impl HerodevsClient {
     }
     pub async fn history(&self, channel: &str, after: Option<&str>, limit: usize) -> Result<Value> {
         ensure!((1..=100).contains(&limit), "invalid history limit");
-        self.graphql(&format!("query($tenant:ID!,$channel:ID!,$after:String,$first:Int){{tenant(id:$tenant){{channel(id:$channel){{messages(first:$first,after:$after){{edges{{cursor node{{{FIELDS}}}}}pageInfo{{endCursor hasNextPage}}}}}}}}}}"), json!({"tenant":self.config.tenant_id,"channel":channel,"after":after,"first":limit})).await
+        self.graphql(&format!("query($channel:ID!,$after:String,$first:Int){{tenant{{channel(id:$channel){{messages(first:$first,after:$after){{edges{{cursor node{{{FIELDS}}}}}pageInfo{{endCursor hasNextPage}}}}}}}}}}"), json!({"channel":channel,"after":after,"first":limit})).await
     }
     /// Stateless MCP tools/call; supports JSON and bounded SSE responses.
     pub async fn search(&self, arguments: Value) -> Result<Value> {
@@ -742,4 +752,180 @@ pub fn validate_metadata(value: &Value, filter: bool) -> Result<()> {
         "metadata filters must be scalar"
     );
     Ok(())
+}
+
+/// Stable opaque retry key scoped by the platform to channel and sender.
+#[must_use]
+pub fn client_request_id(key: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(key.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let mut h = String::with_capacity(32);
+    for byte in bytes {
+        let _ = write!(h, "{byte:02x}");
+    }
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    )
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use axum::{
+        Json, Router,
+        extract::State,
+        routing::{get, post},
+    };
+    use std::sync::Mutex;
+    #[derive(Clone)]
+    struct Fixture {
+        issuer: Arc<Mutex<String>>,
+        nonce: Arc<Mutex<String>>,
+        polls: Arc<Mutex<usize>>,
+    }
+    fn signed(value: &Value) -> String {
+        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        header.kid = Some("fixture".into());
+        jsonwebtoken::encode(
+            &header,
+            value,
+            &jsonwebtoken::EncodingKey::from_rsa_der(include_bytes!(
+                "../tests/fixtures/intake/test-only-key.der"
+            )),
+        )
+        .unwrap()
+    }
+    async fn keys() -> Json<Value> {
+        Json(serde_json::from_str(include_str!("../tests/fixtures/intake/jwks.json")).unwrap())
+    }
+    async fn discovery(State(f): State<Fixture>) -> Json<Value> {
+        let issuer = f.issuer.lock().unwrap().clone();
+        Json(
+            json!({"issuer":issuer,"device_authorization_endpoint":format!("{issuer}/device"),"token_endpoint":format!("{issuer}/token"),"jwks_uri":format!("{issuer}/keys")}),
+        )
+    }
+    async fn device(State(f): State<Fixture>, body: String) -> Json<Value> {
+        let fields: std::collections::HashMap<_, _> = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(fields["tenant_slug"], "hq");
+        assert_eq!(fields["scope"], "openid profile offline_access");
+        *f.nonce.lock().unwrap() = fields["nonce"].clone();
+        Json(
+            json!({"verification_uri":format!("{}/verify",f.issuer.lock().unwrap()),"user_code":"PUBLIC-CODE","device_code":"PRIVATE-CODE","expires_in":60,"interval":5}),
+        )
+    }
+    fn access(f: &Fixture) -> Value {
+        json!({"iss":f.issuer.lock().unwrap().clone(),"sub":"ryan","azp":"hd-atmux","tenant_id":"hq","identity_type":"USER","aud":["hd-subgraphs","https://hq.herodevs.dev/hd-mcp"],"exp":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()+300})
+    }
+    async fn token(State(f): State<Fixture>, body: String) -> Json<Value> {
+        let fields: std::collections::HashMap<_, _> = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(fields["tenant_slug"], "hq");
+        assert_eq!(fields["client_secret"], "fixture-secret");
+        let mut count = f.polls.lock().unwrap();
+        *count += 1;
+        if *count == 1 {
+            return Json(json!({"error":"authorization_pending"}));
+        }
+        let mut id = access(&f);
+        id["aud"] = json!("hd-atmux");
+        id["nonce"] = json!(f.nonce.lock().unwrap().clone());
+        Json(
+            json!({"access_token":signed(&access(&f)),"id_token":signed(&id),"refresh_token":"offline-refresh","scope":"openid profile offline_access","token_type":"Bearer"}),
+        )
+    }
+    #[tokio::test]
+    async fn device_login_and_all_jwt_identity_pins() {
+        let f = Fixture {
+            issuer: Arc::new(Mutex::new(String::new())),
+            nonce: Arc::new(Mutex::new(String::new())),
+            polls: Arc::new(Mutex::new(0)),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        *f.issuer.lock().unwrap() = issuer.clone();
+        let router = Router::new()
+            .route("/.well-known/openid-configuration", get(discovery))
+            .route("/keys", get(keys))
+            .route("/device", post(device))
+            .route("/token", post(token))
+            .with_state(f.clone());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let directory = std::env::temp_dir().join(format!(
+            "atmux-device-test-{}",
+            crate::tmux::new_session_key().unwrap()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let secret = directory.join("secret");
+        std::fs::write(&secret, "fixture-secret").unwrap();
+        let auth = DeviceAuth::new(AuthConfig {
+            issuer: issuer.clone(),
+            client_secret_file: secret,
+            refresh_token_file: directory.join("refresh"),
+            expected_subject: "ryan".into(),
+            allow_http_hosts: vec!["127.0.0.1".into()],
+            ..AuthConfig::default()
+        })
+        .unwrap();
+        let login = auth.begin_login().await.unwrap();
+        assert_eq!(login.user_code, "PUBLIC-CODE");
+        auth.finish_login(login).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(directory.join("refresh")).unwrap(),
+            "offline-refresh"
+        );
+        auth.access_token().await.unwrap();
+        assert_eq!(*f.polls.lock().unwrap(), 2);
+        let jwks = format!("{issuer}/keys");
+        for (field, value) in [
+            ("sub", json!("someone-else")),
+            ("iss", json!("https://other.test")),
+            ("tenant_id", json!("other")),
+            ("azp", json!("other-client")),
+            ("identity_type", json!("AGENT")),
+            ("aud", json!(["hd-subgraphs"])),
+            ("exp", json!(1)),
+            (
+                "nbf",
+                json!(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        + 3600
+                ),
+            ),
+        ] {
+            let mut claims = access(&f);
+            claims[field] = value;
+            assert!(
+                auth.verify(&signed(&claims), &jwks, None).await.is_err(),
+                "pin {field}"
+            );
+        }
+        let mut claims = access(&f);
+        claims["aud"] = json!("hd-atmux");
+        claims["nonce"] = json!("wrong-nonce");
+        assert!(
+            auth.verify(&signed(&claims), &jwks, Some("original-nonce"))
+                .await
+                .is_err()
+        );
+        task.abort();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
