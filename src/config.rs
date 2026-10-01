@@ -254,6 +254,8 @@ pub struct Config {
     pub herodevs: crate::herodevs::HerodevsConfig,
     #[serde(default)]
     pub supervisor: crate::supervisor::SupervisorConfig,
+    #[serde(default)]
+    pub intake: crate::intake::IntakeConfig,
     /// Agent lifecycle telemetry is disabled unless this section exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<crate::events::EventsConfig>,

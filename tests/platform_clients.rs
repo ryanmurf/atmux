@@ -92,7 +92,7 @@ async fn job_retry_filters_fence_and_error_redaction() {
         channel_id: "channel".into(),
         content: "Implement fixture".into(),
         job_type: "IMPL".into(),
-        client_request_id: "stable-key".into(),
+        client_request_id: "00000000-0000-8000-8000-000000000001".into(),
         metadata: json!({"source_url":"fixture"}),
         priority: 5,
     };
@@ -110,7 +110,7 @@ async fn job_retry_filters_fence_and_error_redaction() {
         .unwrap();
     assert_eq!(
         calls.lock().unwrap()[0]["variables"]["input"]["clientRequestId"],
-        "stable-key"
+        "00000000-0000-8000-8000-000000000001"
     );
     assert_eq!(
         calls.lock().unwrap()[2]["variables"]["metadata"],

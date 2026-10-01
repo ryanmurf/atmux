@@ -1451,3 +1451,18 @@ command allowlist and untrusted model output cannot supply commands or free-form
 The complete configuration contract, completion protocol, operating bounds and acceptance evidence
 are in [the A6 feature record](features/supervisor.md). Orphan archiving is separately opt-in and
 requires a cached digest. Begin with dry run and review the fleet decisions before allowing effects.
+
+
+## Intake and Work ledger
+
+The coordinator can opt into `[intake]` to ingest GitHub ProjectsV2 boards, indexed Gather Markdown,
+forwarded Slack requests and unfinished idle sessions into herodevs channel jobs. It routes one item
+at a time through configured Qwen endpoints and owner launch policies. The Work button shows the
+local ledger mirror and links to assigned sessions. Intake is disabled by default; dry-run is the
+initial enabled mode. Create its configured kill-switch file to stop further mutations.
+
+See [the A5 feature record](features/intake-router.md) for the source-verified API contract,
+configuration, budgets, device-login setup, secrets/channel ids, and A6 assignment/lease protocol.
+`atmux herodevs login` performs confidential device approval and saves an owner-only offline
+refresh token; background intake only refreshes an already-approved credential. No login prompt
+appears at startup.

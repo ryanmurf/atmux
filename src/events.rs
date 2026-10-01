@@ -136,6 +136,17 @@ const TYPES: &[&str] = &[
     "supervisor.nudged",
     "supervisor.digest",
     "supervisor.error",
+    "intake.triaged",
+    "intake.job_created",
+    "intake.source_error",
+    "intake.route_error",
+    "intake.decision",
+    "intake.clone",
+    "intake.launched",
+    "intake.assigned",
+    "intake.kickoff",
+    "intake.escalated",
+    "intake.source_closed",
 ];
 const REASONS: &[&str] = &[
     "idle_prompt",

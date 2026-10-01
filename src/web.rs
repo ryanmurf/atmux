@@ -808,8 +808,11 @@ fn routes(state: WebState) -> Router {
         .route("/", get(index))
         .route("/app.css", get(css))
         .route("/app.js", get(js))
+        .route("/work.js", get(work_js))
         .route("/atmux-logo.jpg", get(logo))
         .route("/api/v1/health", get(health))
+        .route("/api/v1/work", get(intake_work))
+        .route("/api/v1/launch-repository", get(launch_repository))
         .route("/api/v1/machines", get(machines))
         .route(
             "/api/v1/machines/{id}/quick-resume",
@@ -4461,4 +4464,38 @@ mod tests {
         .unwrap();
         assert!(encoded.len() <= MAX_REQUEST_BODY_BYTES);
     }
+}
+
+async fn intake_work(
+    State(state): State<WebState>,
+) -> Result<Json<crate::intake::WorkView>, ApiError> {
+    Ok(Json(
+        state
+            .control
+            .intake_work()
+            .map_err(|e| ApiError::from_control(&e))?,
+    ))
+}
+#[derive(Deserialize)]
+struct RepositoryLookup {
+    remote: String,
+}
+async fn launch_repository(
+    State(state): State<WebState>,
+    Query(query): Query<RepositoryLookup>,
+) -> Result<Json<Option<String>>, ApiError> {
+    Ok(Json(
+        state
+            .control
+            .find_launch_repository(state.control.local_id(), &query.remote)
+            .await
+            .map_err(|e| ApiError::from_control(&e))?,
+    ))
+}
+
+async fn work_js() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/work.js"),
+    )
 }

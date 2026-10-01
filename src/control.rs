@@ -1052,6 +1052,7 @@ impl ControlPlane {
     ///
     /// Returns an error when tmux is unavailable or the initial scan fails.
     pub async fn start(mut config: Config) -> Result<Self> {
+        config.intake.validate(&config)?;
         crate::events::configure_profiles(&mut config)?;
         config.validate_coordinator_only()?;
         if !config.node.coordinator_only {
@@ -1137,6 +1138,7 @@ impl ControlPlane {
     /// Starts the node-wide background services that run on every node:
     /// self-update, agent events, federation watchers, and the summarizer.
     fn start_background_services(&self, coordinator: bool) -> Result<()> {
+        crate::intake::spawn(self.clone(), self.inner.config.clone())?;
         self.inner.updater.spawn_background();
         if let Some(events) = &self.inner.events {
             events.start(self, coordinator, !self.inner.config.node.coordinator_only)?;
@@ -6960,6 +6962,39 @@ impl ControlPlane {
         self.registry()?
             .get(key)
             .map_err(|_| bad_request("invalid session key"))
+    }
+}
+
+impl ControlPlane {
+    /// Read-only owner-scoped lookup, bounded by project roots and scan limits.
+    /// # Errors
+    /// Rejects invalid remotes, unavailable owners, or incomplete scans.
+    pub async fn find_launch_repository(
+        &self,
+        machine: &str,
+        repo: &str,
+    ) -> Result<Option<String>> {
+        if machine != self.local_id() {
+            let remote = self.remote_machine(machine)?;
+            self.ensure_online(machine)?;
+            return remote
+                .get_json(&format!(
+                    "/api/v1/launch-repository?remote={}",
+                    encode_segment(repo)
+                ))
+                .await
+                .map_err(|e| upstream(&e));
+        }
+        self.ensure_local_owner_enabled()?;
+        let config = self.inner.config.clone();
+        let repo = repo.to_owned();
+        tokio::task::spawn_blocking(move || crate::intake::pool_lookup(&config, &repo)).await?
+    }
+    /// Local mirror of the channel ledger for the Work dashboard; no platform request.
+    /// # Errors
+    /// Rejects corrupted or oversized persisted state.
+    pub fn intake_work(&self) -> Result<crate::intake::WorkView> {
+        crate::intake::work(&self.inner.config.intake)
     }
 }
 
