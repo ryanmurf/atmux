@@ -216,6 +216,26 @@ pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+/// Scan/native hooks and registry recovery can see the same end independently.
+/// Use the already-bounded durable spool as the deduplication ledger, including
+/// after restart, rather than an unbounded second cache.
+fn same_lifecycle_transition(previous: &AgentEvent, current: &AgentEvent) -> bool {
+    let attribute = match current.event_type.as_str() {
+        "agent.exited" => "agent_pid",
+        "session.closed" => "closed_ms",
+        "session.archived" => "archived_ms",
+        _ => return false,
+    };
+    previous.event_type == current.event_type
+        && previous.machine == current.machine
+        && previous.session_key == current.session_key
+        && previous.instance_id == current.instance_id
+        && current
+            .detail
+            .get(attribute)
+            .is_some_and(|value| value.is_u64() && previous.detail.get(attribute) == Some(value))
+}
+
 impl EventLog {
     /// # Errors
     /// Rejects insecure directories, concurrent owners and damaged records.
@@ -352,7 +372,16 @@ impl EventLog {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.ids.contains(&event.id) {
+        if state.ids.contains(&event.id)
+            || matches!(
+                event.event_type.as_str(),
+                "agent.exited" | "session.closed" | "session.archived"
+            ) && state
+                .records
+                .iter()
+                .rev()
+                .any(|stored| same_lifecycle_transition(&stored.event, &event))
+        {
             return Ok(());
         }
         let seq = state

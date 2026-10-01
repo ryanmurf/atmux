@@ -229,6 +229,9 @@ impl EventService {
         if !map_hook(&mut event, delivery) {
             return Ok(());
         }
+        if event.event_type == "agent.exited" {
+            event.detail["agent_pid"] = serde_json::json!(session.agent_pid);
+        }
         event.project = self.projects.get(&session.path);
         let mut panes = self
             .panes

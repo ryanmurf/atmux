@@ -1098,6 +1098,7 @@ impl ControlPlane {
                 test_message_live_instances: Mutex::new(HashMap::new()),
             }),
         };
+        crate::registry_integration::install(&control, control.inner.events.is_some())?;
         if !control.inner.config.node.coordinator_only {
             control.refresh().await?;
             control.spawn_monitor();
@@ -6678,8 +6679,9 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
         })
         .collect();
     let summarizer = crate::summarizer::Summarizer::configured(&config).unwrap();
+    let registry = crate::registry::Registry::open(&config.registry, &local_id).unwrap();
     let (revisions, _) = watch::channel(0);
-    ControlPlane {
+    let control = ControlPlane {
         inner: Arc::new(Inner {
             events: config
                 .events
@@ -6695,7 +6697,7 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
                 .unwrap(),
             config,
             summarizer,
-            registry: None,
+            registry,
             registry_peer_token: None,
             registry_watchers: Mutex::new(BTreeMap::new()),
             local_id: local_id.clone(),
@@ -6736,7 +6738,9 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
             local_agent_restart_attempts: AtomicU64::new(0),
             test_message_live_instances: Mutex::new(HashMap::new()),
         }),
-    }
+    };
+    crate::registry_integration::install(&control, control.inner.events.is_some()).unwrap();
+    control
 }
 
 /// Builds a `Session` fixture for tests in this crate.

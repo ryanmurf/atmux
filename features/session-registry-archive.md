@@ -210,3 +210,55 @@ Bundle import/resume and phone-home restore (A4); summaries (A2); events (A1).
   those separate gates pass. No deploy, push, service restart, cluster change, or operation on a
   running fleet tmux session/agent was performed; the original untracked `.atmux.toml` remains
   untouched.
+
+
+## Lead integration follow-up (base `13fe19a`)
+
+Status: event/search wiring implemented; frozen acceptance run pending.
+
+- `registry_integration.rs` installs a weak control-plane callback before the first owner scan.
+  Every durable registry commit, including authenticated remote imports, carries a public
+  previous/current projection plus pane generation and process id. Native identity is absent.
+  This extends the original terminal-only callback so search also sees discovery, rename,
+  description/provenance, Git/project changes, process exit and resume. Heartbeat-only writes
+  and bundle-availability changes do not produce redundant search documents.
+- Local transitions emit `agent.exited`, `session.closed` and `session.archived` through
+  `ControlPlane::emit_agent_event` -> `EventService::emit`. The complete envelope carries the
+  stable key, machine-qualified pane, generation, harness/profile/model, cwd and credential-free
+  final project position. Detail carries `state`, process id, close/archive timestamps and
+  `archive_bundle_id` on archive. PID replacement also closes the previous process generation.
+- Native SessionEnd and status-derived exits carry the same process id. The existing bounded
+  durable event spool deduplicates exits by key/generation/PID and terminal session events by
+  key/generation/transition timestamp, so registry-first, native-first, scan-first and retry
+  delivery cannot append duplicate lifecycle events; distinct relaunches still emit exits.
+- Search uses `ControlPlane::session_digest_record` and `publish_digest_search`. Registry
+  metadata overlays cached model title/digest and cursors; without a digest the title is the
+  session name, description comes from the registry, and digest is empty. Explicitly cleared
+  descriptions remain empty, and scan-derived automatic provenance remains `auto`. Archival
+  uses `SearchChange::Updated`, state `archived`, and a non-null archive timestamp in the full
+  H2 snapshot. Publication times advance beyond the durable search high-water mark so close
+  and archive within one wall-clock millisecond both publish and late model jobs stay stale.
+- Accepted lifecycle metadata is cached alongside the freshest model output; no-digest cache
+  entries obey A2's existing count/retention limits. A search tenant and enabled summaries
+  service remain required; absence preserves existing opt-in behavior. Remote snapshots only
+  publish search, never another owner's lifecycle events; ownership transfer likewise cannot
+  emit the previous owner's process exit. A1 owns transport/fleet append.
+- The callback completes durable publication before the next mutation. A failure retains one
+  pending projection for retry before the next scan/import/commit, preserving bounded memory
+  and ordering; the registry write itself remains durable. Restart replays existing snapshots
+  to search without inventing historical events. This callback must not call back into the
+  registry while its transaction lock is held.
+- The A1-owned `summary_search_document_hook` and coordinator fleet-append hook bodies were
+  left unchanged. No UI edits, deployment, push, service restart, cluster change or running
+  tmux/agent operation is included in this follow-up.
+
+Follow-up focused evidence so far: `cargo test --all-features --lib registry` (23 passed,
+including 7 integration tests plus bounded retry coverage); `events::` (12 passed),
+`summarizer::` (9 passed), `session_search::` (4 passed); JavaScript syntax check passed and
+`node --test web/*.test.mjs tests/navigation.test.mjs` passed all 193 tests. Final fmt/clippy
+and full-suite evidence will be recorded after freezing the implementation.
+
+The disposable owner integration also enables its own events store and private runtime directory
+(`XDG_RUNTIME_DIR`/`TMPDIR`), then checks the real HTTP owner feed for exactly one exit, close and
+archive per fixture session, including the archived bundle id, for both external and dashboard
+closes. Hook sockets and all native/tmux fixtures remain isolated from running agents.

@@ -460,6 +460,83 @@ impl DigestRecord {
             .as_deref()
             .unwrap_or(&self.description)
     }
+    /// Overlays authoritative lifecycle metadata without replacing cached model
+    /// output or its transcript cursor. No-digest sessions still have a complete
+    /// search document, with the session name as their title.
+    pub(crate) fn registry_snapshot(
+        record: &crate::registry::SessionRecord,
+        pane: &str,
+        cached: Option<Self>,
+    ) -> Self {
+        let mut snapshot = cached.unwrap_or_else(|| Self {
+            session_key: record.session_key.clone(),
+            machine: String::new(),
+            pane: String::new(),
+            name: String::new(),
+            description: String::new(),
+            title: String::new(),
+            digest: String::new(),
+            digest_updated_at: 0,
+            digest_updated_at_ms: 0,
+            digest_version: 0,
+            transcript_hash: String::new(),
+            pane_hash: String::new(),
+            last_entry: None,
+            last_attempt: 0,
+            last_seen: 0,
+            created_at: 0,
+            checked_at: 0,
+            dirty: false,
+            snapshot_description: None,
+            search_updated_at_ms: 0,
+            project_remote: None,
+            project_branch: None,
+            cwd: String::new(),
+            harness: String::new(),
+            profile: String::new(),
+            state: String::new(),
+        });
+        snapshot.machine.clone_from(&record.machine);
+        pane.clone_into(&mut snapshot.pane);
+        snapshot.name.clone_from(&record.name);
+        if snapshot.digest.is_empty() || snapshot.title.is_empty() {
+            snapshot.title = bounded_text(&record.name, 400);
+        }
+        // A cleared registry description is authoritative too; do not revive a
+        // generated description from the cached digest after a user clears it.
+        snapshot.snapshot_description = Some(record.description.clone().unwrap_or_default());
+        if snapshot.digest.is_empty() {
+            snapshot.description = record
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .take(120)
+                .collect();
+        }
+        snapshot.project_remote.clone_from(&record.project.remote);
+        snapshot.project_branch.clone_from(&record.project.branch);
+        snapshot.cwd.clone_from(&record.cwd);
+        snapshot.harness.clone_from(&record.harness);
+        snapshot.profile.clone_from(&record.profile);
+        snapshot.state = match record.state {
+            crate::registry::SessionState::Running => "running",
+            crate::registry::SessionState::Exited => "exited",
+            crate::registry::SessionState::Closed => "closed",
+            crate::registry::SessionState::Archived => "archived",
+        }
+        .into();
+        snapshot.created_at = record.created_ms / 1000;
+        snapshot.last_seen = record
+            .last_seen_ms
+            .max(record.closed_ms.unwrap_or(0))
+            .max(record.archived_ms.unwrap_or(0))
+            / 1000;
+        snapshot
+    }
+    pub(crate) fn next_registry_search_timestamp(&self, timestamp_ms: u64) -> u64 {
+        timestamp_ms.max(self.search_updated_at_ms.saturating_add(1))
+    }
     fn new(session: &SessionSummary, key: &str, now: u64) -> Self {
         Self {
             session_key: key.into(),
@@ -1055,6 +1132,9 @@ impl Summarizer {
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !store.records.contains_key(&record.session_key) {
+            store.prune(epoch())?;
+        }
         let previous = store
             .records
             .get(&record.session_key)
@@ -1071,6 +1151,26 @@ impl Summarizer {
             .get(&record.session_key)
             .cloned()
             .unwrap_or_else(|| record.clone());
+        // Retain the freshest model output/cursor while caching the authoritative
+        // metadata of the accepted full snapshot (including registry archives).
+        updated.machine.clone_from(&record.machine);
+        updated.pane.clone_from(&record.pane);
+        updated.name.clone_from(&record.name);
+        updated
+            .snapshot_description
+            .clone_from(&record.snapshot_description);
+        updated.project_remote.clone_from(&record.project_remote);
+        updated.project_branch.clone_from(&record.project_branch);
+        updated.cwd.clone_from(&record.cwd);
+        updated.harness.clone_from(&record.harness);
+        updated.profile.clone_from(&record.profile);
+        updated.state.clone_from(&record.state);
+        updated.created_at = record.created_at;
+        updated.last_seen = record.last_seen;
+        if updated.digest.is_empty() {
+            updated.title.clone_from(&record.title);
+            updated.description.clone_from(&record.description);
+        }
         updated.search_updated_at_ms = timestamp_ms;
         store.save(&updated)?;
         store.records.insert(updated.session_key.clone(), updated);
