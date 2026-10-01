@@ -11,6 +11,8 @@
 {{- $serverEnabled := get $server "enabled" | default false -}}
 {{- $events := get $server "events" | default dict -}}
 {{- $redpanda := get $events "redpanda" | default dict -}}
+{{- $summaries := get $server "summaries" | default dict -}}
+{{- $extraEgress := get $server "extraEgress" | default list -}}
 {{- if and (get $redpanda "enabled") (not (get $events "enabled")) -}}
 {{- fail "server.events.redpanda.enabled requires server.events.enabled" -}}
 {{- end -}}
@@ -670,6 +672,21 @@ spec:
     - to:
         - ipBlock: {cidr: {{ . | quote }}}
       ports: [{protocol: TCP, port: 443}]
+    {{- end }}
+    {{- if and $serverEnabled (get $summaries "enabled") }}
+    - to:
+        - ipBlock: {cidr: {{ get $summaries "egressCidr" | quote }}}
+      ports: [{protocol: TCP, port: {{ get $summaries "egressPort" }}}]
+    {{- end }}
+    {{- if $serverEnabled }}
+    {{- range $rule := $extraEgress }}
+    - to:
+        - ipBlock: {cidr: {{ get $rule "cidr" | quote }}}
+      ports:
+        {{- range $port := get $rule "ports" }}
+        - {protocol: TCP, port: {{ $port }}}
+        {{- end }}
+    {{- end }}
     {{- end }}
     - to:
         - namespaceSelector:
