@@ -45,8 +45,11 @@ Status: design accepted 2026-09-30; implementation in progress by Sol 6.1 agents
 ### Session key
 
 Every agent session gets a stable `session_key`: a lowercase UUIDv7 minted by atmux at launch (or
-on first discovery of an unmanaged pane) and stored in the tmux session option
-`@atmux_session_key`. It survives pane respawns, CLI relaunches, renames, archive, and resume on
+on first discovery of an unmanaged pane) and stored in the tmux pane option `@atmux_session_key`.
+This is already implemented in the base commit: `Session::session_key`,
+`tmux::new_session_key`, `tmux::valid_session_key`, `tmux::SESSION_KEY_OPTION`, and
+`SessionSummary::session_key` in the API. To carry a key to a restored or resumed pane, set the
+option on the new pane before the first scan. It survives pane respawns, CLI relaunches, renames, archive, and resume on
 another machine. The pane id and the native conversation id are attributes of it, not identity.
 
 ### Event envelope `atmux.agent.event/v1`

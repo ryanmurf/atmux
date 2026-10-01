@@ -253,6 +253,11 @@ pub struct SessionSummary {
     /// Unlike a tmux pane id, this changes when a deleted pane id is reused.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub instance_id: String,
+    /// Stable agent session identity (`UUIDv7`) that survives respawns,
+    /// renames, archive and resume on another machine. Absent from older
+    /// owners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<String>,
     /// Machine that owns this session.
     #[serde(default)]
     pub machine: String,
@@ -291,6 +296,7 @@ impl SessionSummary {
         Self {
             id,
             instance_id: session.pane_identity.clone(),
+            session_key: session.session_key.clone(),
             machine: machine.to_owned(),
             name: session.name.clone(),
             description: session.description.clone(),
@@ -6384,6 +6390,7 @@ pub(crate) fn test_session(name: &str, pane_id: &str, content: &str) -> Session 
         agent: crate::status::AgentKind::Codex,
         profile: "Default".to_owned(),
         resume_lease: None,
+        session_key: None,
         systemd_scope: None,
         memory_max_bytes: None,
         status: crate::status::AgentStatus::Working,
@@ -6402,6 +6409,7 @@ mod tests {
         SessionSummary {
             id: composite_id(LOCAL_MACHINE_ID, id),
             instance_id: String::new(),
+            session_key: None,
             machine: LOCAL_MACHINE_ID.to_owned(),
             name: format!("session-{id}"),
             description: None,
@@ -6480,6 +6488,7 @@ mod tests {
             agent: AgentKind::Codex,
             profile: "Default".to_owned(),
             resume_lease: None,
+            session_key: None,
             systemd_scope: None,
             memory_max_bytes: None,
             status: AgentStatus::Working,
@@ -6588,6 +6597,7 @@ mod tests {
     fn remote_summary(machine: &str, pane: &str, name: &str, hash: &str) -> SessionSummary {
         SessionSummary {
             id: composite_id(machine, pane),
+            session_key: None,
             instance_id: format!("pane-v1-{}", "a".repeat(64)),
             machine: machine.to_owned(),
             name: name.to_owned(),

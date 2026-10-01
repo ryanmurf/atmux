@@ -1123,6 +1123,7 @@ mod tests {
         SessionSummary {
             id: format!("{machine}~{pane}"),
             instance_id: String::new(),
+            session_key: None,
             machine: machine.to_owned(),
             name: name.to_owned(),
             description: None,

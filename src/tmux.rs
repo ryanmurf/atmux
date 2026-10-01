@@ -308,6 +308,12 @@ pub struct Session {
     pub profile: String,
     /// Stable opaque saved-conversation lease persisted only in tmux metadata.
     pub(crate) resume_lease: Option<String>,
+    /// Stable agent session identity (a lowercase `UUIDv7`) kept in the pane
+    /// option `@atmux_session_key`. It survives respawns, relaunches, renames
+    /// and resume elsewhere; pane ids and native conversation ids are only
+    /// attributes of it. `None` only when tmux refused to store one.
+    #[allow(clippy::struct_field_names)]
+    pub(crate) session_key: Option<String>,
     /// Unique transient systemd scope containing this agent process generation.
     pub systemd_scope: Option<String>,
     /// Scope-level cgroup `MemoryMax`, in bytes.
@@ -346,7 +352,7 @@ pub(crate) struct LivePaneIdentity {
 }
 
 /// Tab-separated fields emitted per pane by `sessions_with_capture`.
-const PANE_FIELDS: usize = 24;
+const PANE_FIELDS: usize = 25;
 
 /// Longest dashboard session description, in characters.
 pub(crate) const MAX_SESSION_DESCRIPTION_CHARS: usize = 120;
@@ -364,6 +370,7 @@ pub enum DescriptionUpdate {
 struct RawPane {
     name: String,
     description: String,
+    session_key: String,
     attached: bool,
     windows: u32,
     activity: u64,
@@ -589,6 +596,7 @@ impl Tmux {
             "#{@atmux_systemd_scope}",
             "#{@atmux_memory_max_bytes}",
             "#{@atmux_description}",
+            "#{@atmux_session_key}",
             "#{session_name}",
             "#{pane_current_command}",
             "#{pane_start_command}",
@@ -642,6 +650,7 @@ impl Tmux {
             );
             let pane_identity =
                 ensure_pane_identity(&pane.pane_id, &pane.pane_identity).unwrap_or_default();
+            let session_key = ensure_session_key(&pane.pane_id, &pane.session_key).ok();
             let (systemd_scope, memory_max_bytes) =
                 scope_metadata(&pane.systemd_scope, &pane.memory_max_bytes);
             sessions.push(Session {
@@ -666,6 +675,7 @@ impl Tmux {
                 content_hash,
                 agent,
                 profile: agent_profile_label(&pane.start_command, &pane.profile, agent),
+                session_key,
                 resume_lease: valid_resume_lease(&pane.resume_lease)
                     .then(|| pane.resume_lease.clone()),
                 systemd_scope,
@@ -3173,11 +3183,12 @@ fn parse_pane(line: &str) -> Option<RawPane> {
         systemd_scope: fields[16].to_owned(),
         memory_max_bytes: fields[17].to_owned(),
         description: fields[18].to_owned(),
-        name: fields[19].to_owned(),
-        command: fields[20].to_owned(),
-        start_command: fields[21].to_owned(),
-        path: PathBuf::from(fields[22]),
-        title: fields[23].to_owned(),
+        session_key: fields[19].to_owned(),
+        name: fields[20].to_owned(),
+        command: fields[21].to_owned(),
+        start_command: fields[22].to_owned(),
+        path: PathBuf::from(fields[23]),
+        title: fields[24].to_owned(),
     })
 }
 
@@ -3296,6 +3307,88 @@ fn ensure_pane_identity(pane_id: &str, observed: &str) -> Result<String> {
         bail!("tmux pane identity could not be established");
     }
     Ok(identity)
+}
+
+/// Returns the pane's stable session key, minting a `UUIDv7` once if absent.
+fn ensure_session_key(pane_id: &str, observed: &str) -> Result<String> {
+    if valid_session_key(observed) {
+        return Ok(observed.to_owned());
+    }
+    if !observed.is_empty() {
+        bail!("tmux pane has an invalid atmux session key");
+    }
+    let generated = new_session_key()?;
+    // `-o` is set-if-absent: a concurrent refresh that already minted a key
+    // wins, and the authoritative pane option is read back.
+    let _ = Tmux::output([
+        "set-option",
+        "-p",
+        "-o",
+        "-t",
+        pane_id,
+        SESSION_KEY_OPTION,
+        &generated,
+    ]);
+    let key = Tmux::output([
+        "display-message",
+        "-p",
+        "-t",
+        pane_id,
+        &format!("#{{{SESSION_KEY_OPTION}}}"),
+    ])?;
+    if !valid_session_key(&key) {
+        bail!("tmux pane session key could not be established");
+    }
+    Ok(key)
+}
+
+/// Pane option holding the stable agent session key.
+pub(crate) const SESSION_KEY_OPTION: &str = "@atmux_session_key";
+
+/// A new lowercase `UUIDv7`: 48-bit Unix milliseconds, version 7, RFC 9562
+/// variant, and 74 random bits.
+pub(crate) fn new_session_key() -> Result<String> {
+    let millis = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+        & 0xffff_ffff_ffff;
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes[6..]).map_err(|error| anyhow::anyhow!("no randomness: {error}"))?;
+    bytes[..6].copy_from_slice(&millis.to_be_bytes()[2..]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = bytes
+        .iter()
+        .fold(String::with_capacity(32), |mut hex, byte| {
+            let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+            hex
+        });
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
+}
+
+/// Exactly a lowercase hyphenated `UUIDv7` with the RFC 9562 variant.
+pub(crate) fn valid_session_key(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && [8, 13, 18, 23].iter().all(|&index| bytes[index] == b'-')
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            [8, 13, 18, 23].contains(&index)
+                || byte.is_ascii_digit()
+                || (b'a'..=b'f').contains(byte)
+        })
+        && bytes[14] == b'7'
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
 }
 
 fn valid_resume_lease(value: &str) -> bool {
@@ -3996,7 +4089,7 @@ mod tests {
 
     #[test]
     fn parses_tmux_pane() {
-        let line = "%7\t1\t2\t123\t456\t0\t1\t1\t1\t42\twaiting\t\t\t\t\t\t\t\t\twork\tnode\tenv codex\t/tmp/work\t⠹ work";
+        let line = "%7\t1\t2\t123\t456\t0\t1\t1\t1\t42\twaiting\t\t\t\t\t\t\t\t\t\twork\tnode\tenv codex\t/tmp/work\t⠹ work";
         let pane = parse_pane(line).unwrap();
         assert_eq!(pane.name, "work");
         assert_eq!(pane.pane_id, "%7");
@@ -4008,7 +4101,8 @@ mod tests {
 
     #[test]
     fn parses_pane_with_empty_status_override() {
-        let line = "%0\t0\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\t\tsolo\tbash\t\t/tmp\tsolo";
+        let line =
+            "%0\t0\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\t\t\tsolo\tbash\t\t/tmp\tsolo";
         let pane = parse_pane(line).unwrap();
         assert_eq!(pane.name, "solo");
         assert!(pane.status_override.is_empty());
@@ -4016,7 +4110,7 @@ mod tests {
 
     #[test]
     fn a_tab_in_free_text_pane_fields_cannot_move_the_pane_id() {
-        let line = "%3\t1\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\t\twork\tnode\tenv codex\t/tmp/work\thijack\t%9\tstopped";
+        let line = "%3\t1\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\t\t\twork\tnode\tenv codex\t/tmp/work\thijack\t%9\tstopped";
         let pane = parse_pane(line).unwrap();
         assert_eq!(pane.pane_id, "%3");
         assert_eq!(pane.name, "work");
@@ -4036,7 +4130,7 @@ mod tests {
     fn parses_only_well_formed_persistent_resume_leases() {
         let lease = format!("lease-v1-{}", "a".repeat(64));
         let line = format!(
-            "%0\t0\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\tDefault\t{lease}\t\t\t\t\tsolo\tcodex\tcodex\t/tmp\tsolo"
+            "%0\t0\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\tDefault\t{lease}\t\t\t\t\t\tsolo\tcodex\tcodex\t/tmp\tsolo"
         );
         let pane = parse_pane(&line).unwrap();
         assert!(valid_resume_lease(&pane.resume_lease));
@@ -4048,7 +4142,7 @@ mod tests {
     fn parses_scope_metadata_only_as_a_valid_complete_pair() {
         let unit = "atmux-tmux-spawn-12-34-0123456789abcdef.scope";
         let line = format!(
-            "%0\t0\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\tDefault\t\t\t{unit}\t34359738368\t\tsolo\tcodex\tcodex\t/tmp\tsolo"
+            "%0\t0\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\tDefault\t\t\t{unit}\t34359738368\t\t\tsolo\tcodex\tcodex\t/tmp\tsolo"
         );
         let pane = parse_pane(&line).unwrap();
         assert_eq!(
@@ -4070,7 +4164,7 @@ mod tests {
         assert!(!encoded.contains([';', '\t', '\n']));
         assert_eq!(decode_session_description(&encoded).as_deref(), Some(text));
         let line = format!(
-            "%0\t0\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\t{encoded}\tsolo\tcodex\tcodex\t/tmp\tsolo"
+            "%0\t0\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\t{encoded}\t\tsolo\tcodex\tcodex\t/tmp\tsolo"
         );
         let pane = parse_pane(&line).unwrap();
         assert_eq!(pane.name, "solo");
@@ -4092,6 +4186,63 @@ mod tests {
             decode_session_description(&URL_SAFE_NO_PAD.encode([0xff, 0xfe])),
             None
         );
+    }
+
+    #[test]
+    fn session_keys_are_lowercase_uuid_v7_and_distinct() {
+        let first = new_session_key().unwrap();
+        let second = new_session_key().unwrap();
+        assert!(valid_session_key(&first), "{first}");
+        assert!(valid_session_key(&second), "{second}");
+        assert_ne!(first, second);
+        assert!(!valid_session_key(&first.to_uppercase()));
+        assert!(!valid_session_key("11111111-1111-1111-1111-111111111111"));
+        assert!(!valid_session_key("01a0eee8-199d-79c2-c39f-091c4eff95ba"));
+        assert!(!valid_session_key(""));
+        assert!(valid_session_key("01a0eee8-199d-79c2-a39f-091c4eff95ba"));
+    }
+
+    #[test]
+    fn a_pane_keeps_one_session_key_across_scans_and_respawns() {
+        let probe = disposable_tmux("session-key");
+        Tmux::with_socket_for_test(&probe.socket, || {
+            Tmux::output(["new-session", "-d", "-s", "keyed", "sleep 30"])?;
+            let pane = Tmux::output(["list-panes", "-t", "=keyed", "-F", "#{pane_id}"])?;
+            let key = || -> Result<Option<String>> {
+                Ok(Tmux
+                    .sessions(&HashMap::new(), &StatusConfig::default())?
+                    .into_iter()
+                    .find(|session| session.pane_id == pane)
+                    .and_then(|session| session.session_key))
+            };
+            let minted = key()?.expect("a discovered pane gets a session key");
+            assert!(valid_session_key(&minted));
+            assert_eq!(key()?.as_deref(), Some(minted.as_str()));
+            Tmux::output(["respawn-pane", "-k", "-t", &pane, "sleep 30"])?;
+            assert_eq!(key()?.as_deref(), Some(minted.as_str()));
+
+            // A key carried over from another machine is kept as-is.
+            Tmux::output(["new-session", "-d", "-s", "carried", "sleep 30"])?;
+            let carried = Tmux::output(["list-panes", "-t", "=carried", "-F", "#{pane_id}"])?;
+            let original = "01a0eee8-199d-79c2-a39f-091c4eff95ba";
+            Tmux::output([
+                "set-option",
+                "-p",
+                "-t",
+                &carried,
+                SESSION_KEY_OPTION,
+                original,
+            ])?;
+            let found = Tmux
+                .sessions(&HashMap::new(), &StatusConfig::default())?
+                .into_iter()
+                .find(|session| session.pane_id == carried)
+                .and_then(|session| session.session_key);
+            assert_eq!(found.as_deref(), Some(original));
+            Tmux.kill("keyed")?;
+            Tmux.kill("carried")
+        })
+        .unwrap();
     }
 
     #[test]
@@ -4635,8 +4786,8 @@ mod tests {
     #[test]
     fn recognized_agent_pane_wins_over_active_shell_pane() {
         let source = concat!(
-            "%1\t0\t1\t123\t456\t0\t1\t0\t1\t41\t\t\t\t\t\t\t\t\t\twork\tbash\tsh\t/tmp\tshell\n",
-            "%2\t0\t1\t123\t456\t0\t0\t1\t0\t42\t\t\t\t\t\t\t\t\t\twork\tcodex\tenv codex\t/tmp\tagent\n",
+            "%1\t0\t1\t123\t456\t0\t1\t0\t1\t41\t\t\t\t\t\t\t\t\t\t\twork\tbash\tsh\t/tmp\tshell\n",
+            "%2\t0\t1\t123\t456\t0\t0\t1\t0\t42\t\t\t\t\t\t\t\t\t\t\twork\tcodex\tenv codex\t/tmp\tagent\n",
         );
         let selected = select_session_panes(source, &ProcessTable::default());
         let (pane, agent) = selected.get("work").unwrap();
@@ -4648,8 +4799,8 @@ mod tests {
     #[test]
     fn reserved_service_session_is_not_selected() {
         let source = concat!(
-            "%1\t0\t1\t123\t456\t0\t1\t0\t1\t41\t\t\t\t\t\t\t\t\t\tatmux-web\tbash\tsh\t/tmp\tservice\n",
-            "%2\t0\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\t\twork\tcodex\tcodex\t/tmp\twork\n",
+            "%1\t0\t1\t123\t456\t0\t1\t0\t1\t41\t\t\t\t\t\t\t\t\t\t\tatmux-web\tbash\tsh\t/tmp\tservice\n",
+            "%2\t0\t1\t123\t456\t0\t1\t0\t1\t42\t\t\t\t\t\t\t\t\t\t\twork\tcodex\tcodex\t/tmp\twork\n",
         );
 
         let selected = select_session_panes(source, &ProcessTable::default());
@@ -6194,6 +6345,7 @@ mod tests {
             agent: kind,
             profile: "Default".to_owned(),
             resume_lease: None,
+            session_key: None,
             systemd_scope: None,
             memory_max_bytes: None,
             status: AgentStatus::Waiting,

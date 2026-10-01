@@ -2461,6 +2461,7 @@ mod tests {
             agent,
             profile: "Default".to_owned(),
             resume_lease: None,
+            session_key: None,
             systemd_scope: None,
             memory_max_bytes: None,
             status: crate::status::AgentStatus::Waiting,
