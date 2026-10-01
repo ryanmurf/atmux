@@ -684,3 +684,8 @@ dialog::backdrop { background: #000a; }
 }
 
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } }
+
+.registry-sessions-list { display: grid; gap: .75rem; max-height: 60vh; overflow: auto; }
+.registry-session-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.registry-session-row span { overflow-wrap: anywhere; }
+.registry-session-row button { flex-shrink: 0; }

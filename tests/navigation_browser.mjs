@@ -67,6 +67,8 @@ test("mobile navigation persists preferences and session actions retain the sele
   const mutations = [];
   const restartRequests = [];
   const modelRequests = [];
+  const resumeOnRequests = [];
+  const sessionKey = "019a06d9-8341-7654-8abc-0123456789ab";
   const paneContent = "first line\nsecond line ✓";
   const instance = (digit) => `pane-v1-${digit.repeat(64)}`;
   const machines = [
@@ -75,7 +77,7 @@ test("mobile navigation persists preferences and session actions retain the sele
   ];
   let sessions = [
     { id: "local~%1", machine: "local", pane_id: "%1", name: "alpha", path: "/work/api", agent: "codex", status: "working", instance_id: instance("a") },
-    { id: "local~%2", machine: "local", pane_id: "%2", name: "zebra", path: "/work/web", agent: "claude", status: "waiting", instance_id: instance("b") },
+    { id: "local~%2", machine: "local", pane_id: "%2", session_key: sessionKey, name: "zebra", path: "/work/web", agent: "claude", status: "waiting", instance_id: instance("b") },
     { id: "max~%1", machine: "max", pane_id: "%1", name: "beta", path: "/work/api", agent: "claude", status: "waiting", instance_id: instance("c") },
   ];
   let revision = 1;
@@ -90,6 +92,19 @@ test("mobile navigation persists preferences and session actions retain the sele
       streams.add(response);
       response.write(snapshot());
       request.on("close", () => streams.delete(response));
+      return;
+    }
+    if (path === "/api/v1/registry/sessions") {
+      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify([{ session_key: sessionKey, name: "archived-agent", machine: "local", state: "closed" }]));
+      return;
+    }
+    if (path === "/api/v1/registry/resume" && request.method === "POST") {
+      let body = "";
+      request.on("data", (chunk) => { body += chunk; });
+      request.on("end", () => {
+        const parsed = JSON.parse(body); resumeOnRequests.push(parsed);
+        response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ session_key: parsed.session_key, machine: parsed.machine, name: "resumed-agent", pane_id: "%9", verified: true }));
+      });
       return;
     }
     if (path === "/api/v1/fleet/updates") {
@@ -272,6 +287,21 @@ test("mobile navigation persists preferences and session actions retain the sele
     await cdp.evaluate("document.getElementById('quick-resume').click()");
     assert.equal(await cdp.evaluate("document.getElementById('resume-dialog').open"), true, "replacement requires a new confirmation");
     await cdp.evaluate("document.getElementById('resume-dialog').close()");
+    await cdp.evaluate("document.getElementById('quick-actions-open').click()");
+    await waitFor(() => cdp.evaluate("!document.getElementById('quick-resume-on').hidden"), "cross-machine resume action enabled");
+    await cdp.evaluate("document.getElementById('quick-resume-on').click()");
+    assert.equal(await cdp.evaluate("document.getElementById('resume-on-dialog').open"), true);
+    assert.deepEqual(await cdp.evaluate("[...document.getElementById('resume-on-machine').options].map(option => option.value)"), ["local", "max"]);
+    assert.equal(await cdp.evaluate("document.getElementById('resume-on-move').checked"), false);
+    await cdp.evaluate("document.getElementById('resume-on-machine').value = 'max'; document.getElementById('resume-on-confirm').click()");
+    await waitFor(() => resumeOnRequests.length === 1, "live-session resume sent to selected machine");
+    assert.deepEqual(resumeOnRequests[0], { session_key: sessionKey, machine: "max", move: false });
+    await waitFor(() => cdp.evaluate("!document.getElementById('resume-on-dialog').open"), "verified resume closes picker");
+    await cdp.evaluate("document.getElementById('registry-sessions-open').click()");
+    await waitFor(() => cdp.evaluate("document.getElementById('registry-sessions-dialog').open"), "saved session list opens");
+    await cdp.evaluate("document.querySelector('#registry-sessions-list button').click()");
+    assert.equal(await cdp.evaluate("document.getElementById('resume-on-session').textContent"), "archived-agent");
+    await cdp.evaluate("document.getElementById('resume-on-dialog').close()");
   } finally {
     cdp?.socket.close();
     if (chrome?.pid && chrome.exitCode === null && chrome.signalCode === null) {

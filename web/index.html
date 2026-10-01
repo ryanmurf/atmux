@@ -49,6 +49,7 @@
         <button id="filter-clear" class="subtle" type="button" hidden>Clear filters</button>
       </div>
       <button id="update-all-open" class="rail-update-all subtle" type="button" hidden></button>
+      <button id="registry-sessions-open" class="rail-update-all subtle" type="button" hidden>Saved sessions</button>
       <ul id="sessions" class="session-list"></ul>
       <p id="empty" class="empty" hidden>No matching sessions.</p>
     </nav>
@@ -301,6 +302,7 @@
         <button id="quick-duplicate" class="subtle" type="button">Duplicate agent</button>
         <button id="quick-copy-link" class="subtle" type="button">Copy agent link</button>
         <button id="quick-resume" class="subtle" type="button" hidden>Restart session</button>
+        <button id="quick-resume-on" class="subtle" type="button" hidden>Resume on…</button>
         <button id="quick-compact" class="subtle" type="button">Compact</button>
         <button id="quick-download-output" class="subtle" type="button">Download raw output</button>
         <button id="quick-tmux-prefix-twice" class="subtle" type="button">Ctrl+B ×2</button>
@@ -309,6 +311,26 @@
       </div>
       <p id="quick-resume-note" class="dialog-note" role="status" hidden></p>
       <p id="quick-copy-link-status" class="dialog-note" role="status" aria-live="polite" hidden></p>
+    </form>
+  </dialog>
+
+  <dialog id="resume-on-dialog" aria-labelledby="resume-on-title">
+    <form id="resume-on-form" class="dialog-form">
+      <div class="dialog-head"><h2 id="resume-on-title">Resume on another machine</h2><button class="icon-button dialog-cancel" type="button" aria-label="Close">×</button></div>
+      <p id="resume-on-session" class="dialog-note"></p>
+      <label>Machine<select id="resume-on-machine" required></select></label>
+      <label><input id="resume-on-move" type="checkbox"> Close the source after the resumed agent starts</label>
+      <p id="resume-on-error" class="dialog-note" role="alert" hidden></p>
+      <div class="dialog-actions"><button class="subtle dialog-cancel" type="button">Cancel</button><button id="resume-on-confirm" class="primary" type="submit">Resume</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="registry-sessions-dialog" aria-labelledby="registry-sessions-title">
+    <form method="dialog" class="dialog-form">
+      <div class="dialog-head"><h2 id="registry-sessions-title">Saved sessions</h2><button class="icon-button" type="submit" aria-label="Close">×</button></div>
+      <p class="dialog-note">Resume a saved conversation on any available machine.</p>
+      <div id="registry-sessions-list" class="registry-sessions-list"></div>
+      <p id="registry-sessions-status" class="dialog-note" role="status"></p>
     </form>
   </dialog>
 

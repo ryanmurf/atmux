@@ -1271,3 +1271,52 @@ or require the Claude Pulse TypeScript service at runtime.
 ## License
 
 MIT
+
+## Resume anywhere and startup dialogs
+
+Both capabilities are optional and off by default. Enable native bundle storage on each owner
+and on the coordinator; give the coordinator a persistent, owner-only directory:
+
+```toml
+[startup_prompts]
+auto_answer = true
+
+[registry]
+enabled = true
+store_dir = "~/.local/state/atmux/registry"
+max_bundle_bytes = 8388608
+# Coordinator only: opt into recovery for these owners.
+restore_on_start = true
+restore_machines = ["tron", "midnight"]
+```
+
+Owners can omit `restore_on_start` and `restore_machines`. Configure project roots and a matching
+named Claude or Codex profile on each target, including its `CLAUDE_CONFIG_DIR` or `CODEX_HOME`.
+Resume finds a repository by its credential-free origin remote and recorded branch. When absent,
+it uses the existing clone path and checks out the branch in the new clone. Existing repositories
+on another branch require a matching worktree. Ambiguous repositories, missing profiles, symlinks,
+oversized bundles, and native files with different content are refused.
+
+Use **Resume on…** in agent Actions or **Saved sessions**, select an online owner, and leave
+**Close the source after the resumed agent starts** unchecked to keep the source running. The MCP tool is
+`session_resume {session_key, machine, move?: false}`; the HTTP equivalent is
+`POST /api/v1/registry/resume`. A move verifies the target's native conversation before closing
+the exported source process generation. The original UUIDv7 session key survives the transfer.
+
+Owner transport uses `GET /api/v1/registry/export/{session_key}` and
+`POST /api/v1/registry/import`, with the existing federation mTLS and bearer-token policy.
+`GET /api/v1/registry/snapshot` and `POST /api/v1/registry/restore {session_keys}` support
+coordinator recovery. Recovery requires an allowlisted owner restart, tmux-server change, or
+reconnection; explicit close/archive tombstones take precedence. A missing pane on an otherwise
+unchanged owner is treated as a close. Native logs stay in their CLI stores, while bounded
+`atmux.native-bundle/v1` snapshots retain native logs, Claude siblings, profile/mode, and git
+remote/branch. Claude `cwd` metadata and Codex `session_meta.payload.cwd` are translated; message
+and tool output text are preserved.
+
+Startup handling answers exact recognized Claude development-channel and folder-trust dialogs,
+and Codex's option **1. Trust and continue**. Development-channel confirmation requires the
+flag in the live CLI argv. Folder trust requires the pane and process cwd under a configured
+project root, including worktrees. Each dialog is claimed once per process generation before
+keys are sent, and its disappearance is checked. Other dialogs remain for human input.
+Implementation decisions, verification, and integration seams are recorded in
+[features/resume-anywhere.md](features/resume-anywhere.md).

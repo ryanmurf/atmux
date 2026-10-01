@@ -1,6 +1,6 @@
 # A4: Resume anywhere, phone-home restore, no startup prompts
 
-Status: implementation in progress on branch `feat/resume-anywhere`
+Status: A4 complete on branch `feat/resume-anywhere`; acceptance gates passed 2026-09-30
 
 Read `features/agent-control-plane.md` first. This record is your brief; keep it updated with
 progress, evidence, and gate checkboxes.
@@ -21,6 +21,8 @@ Agents never sit at a startup prompt.
      select option 1 only when the pane's agent process argv actually contains that flag.
    - Claude Code workspace trust dialog: accept only when the pane cwd is under a configured
      project root.
+   - Lead update: Codex folder trust, option `1. Trust and continue`, under the same canonical
+     project-root, exact-dialog, once-per-process, and verify-cleared policy (including worktrees).
    - Leave anything else alone and report it as `agent.needs_input/startup_prompt` (A1 defines
      the event; until it lands, log through one call site).
    Match on bounded, exact pane text plus the process check; send the minimal keys; verify the
@@ -181,7 +183,7 @@ managed settings are changed by A4.
 - [x] Coordinator API, MCP, and UI resume on another machine
 - [x] Durable phone-home selection and restore
 - [x] Federation export/import/translated recorder launch
-- [ ] Required Rust, JavaScript, and browser gates
+- [x] Required Rust, JavaScript, and browser gates
 
 Startup evidence: `cargo test --lib startup_` passed 6 tests (including the disposable fake
 CLI); `cargo clippy --all-targets --all-features` reported zero warnings. Lead scope update:
@@ -195,3 +197,40 @@ divergent-target refusal, advanced-source refusal, neighboring-pane preservation
 coordinator restore, and explicit-close exclusion). `cargo test --lib registry_mutations`
 passed cross-origin and body-limit checks. `cargo clippy --all-targets --all-features -- -D warnings`
 reported zero warnings, and `cargo fmt --check` / `git diff --check` passed.
+
+Final acceptance evidence (all shell commands executed through RTK):
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed |
+| `cargo clippy --all-targets --all-features -- -D warnings` | Passed, zero warnings |
+| `cargo test --all-features -- --test-threads=4` | 823 passed, zero failed, seven declared ignored; includes disposable tmux/federation fixtures |
+| `node --check web/app.js` | Passed |
+| `node --test web/*.test.mjs tests/navigation.test.mjs` | 186 passed, zero failed |
+| `node --test tests/mobile_viewport_browser.mjs tests/navigation_browser.mjs tests/quick_talk_browser.mjs tests/web_mobile_pulse_browser.mjs` | 11 passed, zero failed |
+| `git diff --check` | Passed |
+
+The full Rust gate ran from an identical private source snapshot at
+`/home/ryan/.cache/atmux-a4-gates-n0kf5ct5`, reusing this worktree's Cargo target directory and
+excluding the user's untracked `.atmux.toml`. Environment:
+`ATMUX_REQUIRE_TMUX=1 ATMUX_TMUX_SOCKET_NAME=atmux-ci-a4-final-1790835100`.
+The original worktree is mode 775, which existing recovery tests reject for their executable
+roster fixtures. Its permissions were preserved. One later default-parallelism run hit an
+unrelated self-update fixture `ETXTBSY`; the complete final suite passed with four threads.
+The declared ignored cases require ambient native/systemd conditions or are private child helpers
+invoked by parent tests. No opt-in live-pane or service-manager probes were run. A transient browser
+navigation-context failure passed both its focused rerun and the complete final browser suite.
+
+Implementation commits: `b5ee2ba` (startup policy), `5c27e31` (native transport/recovery),
+`88140ba` (nonblocking startup lock/fixture). The UI and this final acceptance record accompany
+the completion commit. No deployment, push, service restart, cluster change, or mutation of an
+existing user tmux session/agent occurred; tmux mutation tests used disposable sockets.
+
+Brief deviations and merge reconciliation: A3's absent registry/view are supplied by the permitted
+versioned manifest, fallback durable store, and Saved sessions picker. Consolidate those with A3,
+including its `[registry]` config, archive/event hooks, primary location and per-owner bundle
+versions; wire `atmux:session-resume` into its Sessions view. Connect A1's startup-input emitter and
+`node.started` signal to the documented seams. The existing-repository branch refusal and strict
+divergent-log refusal are deliberate preservation rules; no existing workspace is checked out and
+no native logs are merged. The private Rust gate snapshot and four-thread run are the test-environment
+deviations described above. Remaining work is lead integration with those workstreams.
