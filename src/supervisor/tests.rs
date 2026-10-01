@@ -10,6 +10,7 @@ fn job() -> Job {
         id: "job-1".into(),
         message_id: "message-1".into(),
         fence: 1,
+        lease_expires_at: None,
         channel: "board".into(),
         session_key: "key".into(),
         goal: "Fix the failing test".into(),
@@ -154,6 +155,12 @@ impl Agents for Fake {
     }
 }
 impl Platform for Fake {
+    fn renew<'a>(&'a self, _job: &'a Job, _ttl: u32) -> BoxFuture<'a, ()> {
+        Box::pin(async {
+            self.effects.lock().unwrap().push("renew".into());
+            Ok(())
+        })
+    }
     fn blocked<'a>(&'a self, _job: &'a Job, _reason: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async {
             self.effects.lock().unwrap().push("blocked".into());
@@ -433,6 +440,60 @@ async fn owner_supervisor_routes_reject_foreign_origin_before_mutation() {
     assert_eq!(
         app.oneshot(request).await.unwrap().status(),
         axum::http::StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn lease_renewal_is_budgeted_once_and_expired_claims_are_not_answered() {
+    let fixture = Fixture::new();
+    fixture.fake.jobs.lock().unwrap()[0].lease_expires_at = Some(1000);
+    let mut sup = fixture.supervisor();
+    sup.tick(100).await.unwrap();
+    sup.tick(101).await.unwrap();
+    assert_eq!(*fixture.fake.effects.lock().unwrap(), vec!["renew"]);
+    sup.event(&fixture.event("agent.needs_input", Some("question")), 1000)
+        .await
+        .unwrap();
+    assert_eq!(*fixture.fake.model_calls.lock().unwrap(), 0);
+    assert!(fixture.fake.effects.lock().unwrap()[1].contains("lease expired"));
+}
+
+#[test]
+fn immutable_ledger_rows_get_only_delivered_fenced_intake_assignments() {
+    let fixture = Fixture::new();
+    let key = fixture.session.session_key.as_ref().unwrap();
+    let message = crate::herodevs::ChannelMessage {
+        id: "message-1".into(),
+        channel_id: "board".into(),
+        job_id: Some("job-1".into()),
+        fence_token: Some(7),
+        job_state: Some("IN_PROGRESS".into()),
+        metadata: serde_json::json!({"repo_remote":"https://github.com/org/repo"}),
+        ..Default::default()
+    };
+    let mut work:crate::intake::WorkJob=serde_json::from_value(serde_json::json!({"message":message,"item":{"key":"key","channel":"board","source":"github","goal":"Assigned goal","criteria":"Assigned criteria","source_done":false,
+        "metadata":{"session_key":key,"folder":"/work/repo","repo_remote":"https://github.com/org/repo"}},
+        "assignment":{"session_key":key,"pane":"fixture~%1","instance_id":"instance","machine":"fixture","name":"fixture","folder":"/work/repo","repo_remote":"https://github.com/org/repo","status":"waiting","digest":""},
+        "decision":null,"reserved_name":null,"dispatch_started":true,"dispatched":true,"blocked":null})).unwrap();
+    let current = SharedPlatform::assigned_message(&message, &work)
+        .unwrap()
+        .unwrap();
+    assert!(message.metadata.get("session_key").is_none());
+    let job = SharedPlatform::decode(&current).unwrap().unwrap();
+    assert_eq!(&job.session_key, key);
+    assert_eq!(job.completion_criteria, "Assigned criteria");
+    work.message.fence_token = Some(6);
+    assert!(
+        SharedPlatform::assigned_message(&message, &work)
+            .unwrap()
+            .is_none()
+    );
+    work.message.fence_token = Some(7);
+    work.dispatched = false;
+    assert!(
+        SharedPlatform::assigned_message(&message, &work)
+            .unwrap()
+            .is_none()
     );
 }
 

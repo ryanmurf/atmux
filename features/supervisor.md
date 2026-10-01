@@ -98,6 +98,18 @@ archived. Autonomy is approved; everything is audited.
   registry's `session.archived` confirmation, rather than a close request.
 - The first output change after a nudge is treated as possible input echo; it cannot reset the
   stall clock indefinitely. Further output or a status change establishes fresh activity.
+- Merged A5's complete intake implementation through `0cf0041`. H4 ledger metadata is immutable,
+  so dispatched assignments are joined from the coordinator's durable intake mirror only when
+  message/channel identity, live fence, session key and folder agree. Blocked, undelivered or
+  source-completed assignments cannot authorize answers; any outstanding assignment also prevents
+  orphan cleanup. Mirror saturation fails closed rather than overlooking an assignment.
+- A6 renews dispatched jobs before their leases expire, with a configurable bounded TTL and
+  renewal margin. Each live fence/expiry is claimed once; an ambiguous renewal escalates instead
+  of being blindly retried. Expired assignments cannot authorize a prompt answer. This fills the
+  handoff after intake's initial claim/renewal; intake does not renew already dispatched work.
+- Channel notification request IDs use A5's deterministic UUIDv8 helper, matching H4's UUID schema.
+  The new assignment and lease paths passed all 20 focused supervisor tests and all-target,
+  all-feature clippy with `-D warnings`.
 - Intermediate full gate: `cargo fmt`, all-target/all-feature clippy with `-D warnings`, 901 Rust
   tests passed / 7 ignored, 193 JavaScript tests passed, and all 12 browser cases passed across
   the initial run and the isolated 9-case mobile-suite rerun. E2E used loopback OAuth/JWKS,
@@ -118,7 +130,8 @@ archived. Autonomy is approved; everything is audited.
   automation with 404. Configure the existing coordinator Redpanda/search publication separately.
 - Configure the shared `[herodevs]` device-auth provider from A5's record, mount private credentials,
   and perform Ryan's one-time device approval. Ledger job claiming and supervising must use the
-  same acting identity and current fence. Intake owns ongoing lease renewal.
+  same acting identity and current fence. Supervisor renews dispatched leases; configure
+  `lease_ttl_seconds` (default 3600) and `lease_renew_before_seconds` (default 900) together.
 - Set `[supervisor]` `enabled`, `dry_run` (start true), an absolute `kill_switch` path on a writable
   mount, `store_dir` on the persistent volume, and the authenticated HTTPS `dashboard_url`.
   A kill-switch file stops model calls and external effects; removing it resumes the loop.

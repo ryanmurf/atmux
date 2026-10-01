@@ -151,8 +151,44 @@ pub struct SharedPlatform {
     pub herodevs: HerodevsClient,
     pub github: GithubClient,
     pub config: SupervisorConfig,
+    pub control: Option<ControlPlane>,
 }
 impl SharedPlatform {
+    /// Combines A5's durable assignment with a fresh fenced ledger row.
+    /// # Errors
+    /// Rejects a different job/channel or an invalid assignment payload.
+    pub fn assigned_message(
+        message: &ChannelMessage,
+        work: &crate::intake::WorkJob,
+    ) -> Result<Option<ChannelMessage>> {
+        ensure!(
+            message.id == work.message.id
+                && message.job_id == work.message.job_id
+                && message.channel_id == work.item.channel,
+            "intake assignment identity mismatch"
+        );
+        if !work.dispatched
+            || work.blocked.is_some()
+            || work.item.source_done
+            || message.fence_token != work.message.fence_token
+        {
+            return Ok(None);
+        }
+        let Some(candidate) = &work.assignment else {
+            return Ok(None);
+        };
+        ensure!(
+            crate::tmux::valid_session_key(&candidate.session_key)
+                && work.item.metadata["session_key"].as_str() == Some(&candidate.session_key)
+                && work.item.metadata["folder"].as_str() == Some(&candidate.folder),
+            "intake assignment scope mismatch"
+        );
+        let mut current = message.clone();
+        current.metadata = work.item.metadata.clone();
+        current.metadata["goal"] = json!(work.item.goal);
+        current.metadata["completion_criteria"] = json!(work.item.criteria);
+        Ok(Some(current))
+    }
     /// # Errors
     /// Rejects incomplete/oversized ledger metadata rather than inventing scope.
     pub fn decode(message: &ChannelMessage) -> Result<Option<Job>> {
@@ -174,6 +210,15 @@ impl SharedPlatform {
             id: message.job_id.clone().context("job id missing")?,
             message_id: message.id.clone(),
             fence: message.fence_token.unwrap_or(0),
+            lease_expires_at: message
+                .lease_expires_at
+                .as_ref()
+                .map(|s| -> Result<u64> {
+                    Ok(chrono::DateTime::parse_from_rfc3339(s)?
+                        .timestamp()
+                        .try_into()?)
+                })
+                .transpose()?,
             channel: message.channel_id.clone(),
             session_key: key.into(),
             goal: m
@@ -216,8 +261,57 @@ impl SharedPlatform {
     }
 }
 impl Platform for SharedPlatform {
+    fn has_assignment(&self, key: &str) -> Result<bool> {
+        let Some(control) = &self.control else {
+            return Ok(false);
+        };
+        let work = control.intake_work()?;
+        ensure!(work.jobs.len() < 500, "intake assignment mirror saturated");
+        Ok(!work.dry_run
+            && work.jobs.iter().any(|j| {
+                !j.item.source_done
+                    && !matches!(j.message.job_state.as_deref(), Some("COMPLETED"))
+                    && j.assignment.as_ref().is_some_and(|c| c.session_key == key)
+            }))
+    }
+    fn renew<'a>(&'a self, job: &'a Job, ttl: u32) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let result = self
+                .herodevs
+                .transition("renewClaim", &job.message_id, job.fence, json!(ttl))
+                .await?;
+            ensure!(
+                result.job_id.as_deref() == Some(&job.id)
+                    && result.fence_token == Some(job.fence)
+                    && matches!(result.job_state.as_deref(), Some("CLAIMED" | "IN_PROGRESS")),
+                "lease renewal not confirmed"
+            );
+            let expiry = chrono::DateTime::parse_from_rfc3339(
+                result
+                    .lease_expires_at
+                    .as_deref()
+                    .context("renewed lease expiry missing")?,
+            )?
+            .timestamp();
+            ensure!(
+                u64::try_from(expiry)? > job.lease_expires_at.unwrap_or(0),
+                "renewed lease did not advance"
+            );
+            Ok(())
+        })
+    }
     fn jobs(&self) -> BoxFuture<'_, Vec<Job>> {
         Box::pin(async {
+            let assignments = self
+                .control
+                .as_ref()
+                .map(ControlPlane::intake_work)
+                .transpose()?
+                .map_or_else(Vec::new, |v| if v.dry_run { Vec::new() } else { v.jobs });
+            ensure!(
+                assignments.len() < 500,
+                "intake assignment mirror saturated; reconcile before supervision"
+            );
             let mut jobs = Vec::new();
             for channel in &self.config.job_channels {
                 let messages = self
@@ -242,6 +336,16 @@ impl Platform for SharedPlatform {
                 for message in messages {
                     // Completed history never crowds out open work. Completion
                     // sagas retain the necessary project metadata durably.
+                    let message = if let Some(work) =
+                        assignments.iter().find(|w| w.message.id == message.id)
+                    {
+                        let Some(message) = Self::assigned_message(&message, work)? else {
+                            continue;
+                        };
+                        message
+                    } else {
+                        message
+                    };
                     if let Some(job) = Self::decode(&message)? {
                         jobs.push(job);
                     }
@@ -361,7 +465,7 @@ impl Platform for SharedPlatform {
                     &self.config.ryan_channel,
                     message,
                     json!({"source":"atmux.supervisor"}),
-                    key,
+                    &crate::herodevs::client_request_id(key),
                 )
                 .await?;
             let value=self.herodevs.graphql("mutation($installationId:ID!,$input:SendMessageInput!){slackMutations{sendMessage(installationId:$installationId,input:$input){ok error}}}",
@@ -397,6 +501,7 @@ pub fn start(control: ControlPlane, config: &Config, coordinator: bool) -> Resul
         herodevs: hd,
         github: GithubClient::new(policy.github.clone())?,
         config: policy.clone(),
+        control: Some(control.clone()),
     };
     let directory = policy
         .store_dir

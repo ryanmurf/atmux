@@ -8,6 +8,7 @@ pub struct Job {
     pub id: String,
     pub message_id: String,
     pub fence: i64,
+    pub lease_expires_at: Option<u64>,
     pub channel: String,
     pub session_key: String,
     pub goal: String,
@@ -32,6 +33,9 @@ pub enum JobFact {
     SourceUrl,
 }
 impl Job {
+    pub(crate) fn leased(&self, now: u64) -> bool {
+        self.lease_expires_at.is_none_or(|t| t > now)
+    }
     pub(crate) fn fact(&self, fact: JobFact) -> &str {
         match fact {
             JobFact::Goal => &self.goal,

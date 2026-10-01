@@ -37,6 +37,12 @@ pub trait Platform: Send + Sync {
     fn jobs(&self) -> BoxFuture<'_, Vec<Job>>;
     fn complete<'a>(&'a self, job: &'a Job, outcome: &'a str, key: &'a str) -> BoxFuture<'a, ()>;
     fn blocked<'a>(&'a self, job: &'a Job, reason: &'a str) -> BoxFuture<'a, ()>;
+    fn renew<'a>(&'a self, job: &'a Job, ttl: u32) -> BoxFuture<'a, ()>;
+    /// # Errors
+    /// Rejects unavailable assignment evidence; orphan closing must fail closed.
+    fn has_assignment(&self, _session_key: &str) -> Result<bool> {
+        Ok(false)
+    }
     fn project_status<'a>(&'a self, job: &'a Job, status: &'a str) -> BoxFuture<'a, ()>;
     fn pull_request<'a>(&'a self, url: &'a str) -> BoxFuture<'a, PullRequest>;
     /// Notify both configured destinations; use key for idempotent channel posts.
@@ -360,6 +366,16 @@ impl Supervisor {
             return Ok(());
         }
         let job = matches[0];
+        if !job.leased(now) {
+            return self
+                .escalate(
+                    session,
+                    "Job claim lease expired; reconcile before answering",
+                    &format!("expired:{}:{}", job.id, job.fence),
+                    now,
+                )
+                .await;
+        }
         self.handle_job(
             session,
             job,
@@ -724,6 +740,46 @@ impl Supervisor {
                 .iter()
                 .filter(|j| &j.session_key == key && j.active())
                 .collect();
+            if assigned.len() == 1 {
+                let job = assigned[0];
+                if !job.leased(now) {
+                    self.escalate(
+                        session,
+                        "Job claim lease expired; reconcile before answering",
+                        &format!("expired:{}:{}", job.id, job.fence),
+                        now,
+                    )
+                    .await?;
+                    continue;
+                }
+                if let Some(expiry) = job.lease_expires_at
+                    && expiry.saturating_sub(now) <= self.config.lease_renew_before_seconds
+                {
+                    let renew_key = format!("renew:{}:{}:{expiry}", job.id, job.fence);
+                    if self.reserve(Some(session), Action::Renew, &renew_key, now)? {
+                        if self
+                            .platform
+                            .renew(job, self.config.lease_ttl_seconds)
+                            .await
+                            .is_err()
+                        {
+                            self.escalate(
+                                session,
+                                "Job lease renewal failed; inspect ledger before continuing",
+                                &renew_key,
+                                now,
+                            )
+                            .await?;
+                            continue;
+                        }
+                        self.decision(
+                            Some(session),
+                            "renewed",
+                            "assigned job lease renewed with current fence",
+                        )?;
+                    }
+                }
+            }
             if session.status == "waiting"
                 && assigned.len() == 1
                 && let Some(reason) = self.agents.attention(session)
@@ -854,6 +910,9 @@ impl Supervisor {
             .filter(|j| &j.session_key == key && j.active())
             .count();
         if active == 0 {
+            if jobs.iter().any(|j| &j.session_key == key) || self.platform.has_assignment(key)? {
+                return Ok(());
+            }
             if self
                 .config
                 .orphan_archive_seconds

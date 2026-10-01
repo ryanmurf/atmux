@@ -13,6 +13,7 @@ pub enum Action {
     Close,
     Nudge,
     Digest,
+    Renew,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -45,6 +46,8 @@ pub struct SupervisorConfig {
     pub allow_actions: BTreeSet<Action>,
     pub poll_seconds: u64,
     pub quiet_seconds: u64,
+    pub lease_ttl_seconds: u32,
+    pub lease_renew_before_seconds: u64,
     pub prompt_interval_seconds: u64,
     pub stall_seconds: u64,
     pub nudge_grace_seconds: u64,
@@ -85,10 +88,13 @@ impl Default for SupervisorConfig {
                 Action::Close,
                 Action::Nudge,
                 Action::Digest,
+                Action::Renew,
             ]
             .into(),
             poll_seconds: 15,
             quiet_seconds: 120,
+            lease_ttl_seconds: 3600,
+            lease_renew_before_seconds: 900,
             prompt_interval_seconds: 60,
             stall_seconds: 1800,
             nudge_grace_seconds: 600,
@@ -150,6 +156,9 @@ impl SupervisorConfig {
                 .any(|v| v.is_empty() || v.len() > 200 || v.chars().any(char::is_control))
             || !(1..=60).contains(&self.poll_seconds)
             || !(1..=86400).contains(&self.quiet_seconds)
+            || !(180..=3600).contains(&self.lease_ttl_seconds)
+            || !(30..=u64::from(self.lease_ttl_seconds) / 2)
+                .contains(&self.lease_renew_before_seconds)
             || !(1..=3600).contains(&self.prompt_interval_seconds)
             || !(60..=604_800).contains(&self.stall_seconds)
             || !(1..=86400).contains(&self.nudge_grace_seconds)

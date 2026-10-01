@@ -136,6 +136,7 @@ const TYPES: &[&str] = &[
     "supervisor.nudged",
     "supervisor.digest",
     "supervisor.error",
+    "supervisor.renewed",
     "intake.triaged",
     "intake.job_created",
     "intake.source_error",
