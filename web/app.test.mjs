@@ -36,6 +36,7 @@ const {
   composerSubmissionCanRestore,
   composerSubmissionMatches,
   contentToLines,
+  copyTextToClipboard,
   dictationDelivery,
   dictationEndAction,
   dictationErrorPolicy,
@@ -3062,4 +3063,82 @@ test("the dashboard sends only fixed update verbs and never a version or URL", (
   const verbs = [...source.matchAll(/softwareButton\(machine, "([a-z]+)"/g)].map((match) => match[1]);
   assert.deepEqual(verbs.sort(), ["apply", "check", "rollback"]);
   assert.doesNotMatch(source, /update\/\$\{[^}]*version/);
+});
+
+function fakeCopyDocument(copyResult) {
+  const appended = [];
+  const focus = { calls: 0, focus() { this.calls += 1; } };
+  const doc = {
+    activeElement: focus,
+    commands: [],
+    body: { append: (node) => { appended.push(node); node.attached = true; } },
+    createElement: (tag) => ({
+      tag,
+      value: "",
+      style: {},
+      attributes: {},
+      attached: false,
+      selected: false,
+      setAttribute(name, value) { this.attributes[name] = value; },
+      select() { this.selected = true; },
+      setSelectionRange(start, end) { this.range = [start, end]; },
+      remove() { this.attached = false; },
+    }),
+    execCommand(command) {
+      this.commands.push([command, appended.at(-1)?.value]);
+      return copyResult;
+    },
+  };
+  return { doc, appended, focus };
+}
+
+test("message copy prefers the async clipboard and copies the raw text", async () => {
+  const written = [];
+  const { doc, appended } = fakeCopyDocument(true);
+  const env = { navigator: { clipboard: { writeText: async (text) => { written.push(text); } } }, document: doc };
+  assert.equal(await copyTextToClipboard("**bold** `code`\n- item", env), true);
+  assert.deepEqual(written, ["**bold** `code`\n- item"]);
+  assert.equal(appended.length, 0);
+  assert.deepEqual(doc.commands, []);
+});
+
+test("message copy falls back to a hidden textarea on plain-HTTP origins", async () => {
+  const { doc, appended, focus } = fakeCopyDocument(true);
+  assert.equal(await copyTextToClipboard("hello\nworld", { navigator: {}, document: doc }), true);
+  assert.deepEqual(doc.commands, [["copy", "hello\nworld"]]);
+  const [area] = appended;
+  assert.equal(area.tag, "textarea");
+  assert.equal(area.readOnly, true);
+  assert.equal(area.selected, true);
+  assert.deepEqual(area.range, [0, "hello\nworld".length]);
+  assert.equal(area.attached, false, "the helper textarea must not linger in the page");
+  assert.equal(focus.calls, 1, "focus returns to where the reader was");
+});
+
+test("message copy falls back when the clipboard rejects and reports failure", async () => {
+  const rejected = { writeText: async () => { throw new Error("denied"); } };
+  const fallback = fakeCopyDocument(true);
+  assert.equal(await copyTextToClipboard("x", { navigator: { clipboard: rejected }, document: fallback.doc }), true);
+  assert.deepEqual(fallback.doc.commands, [["copy", "x"]]);
+  const refused = fakeCopyDocument(false);
+  assert.equal(await copyTextToClipboard("x", { navigator: {}, document: refused.doc }), false);
+  assert.equal(refused.appended[0].attached, false);
+  assert.equal(await copyTextToClipboard("x", { navigator: {} }), false);
+});
+
+test("conversation message cards carry a delegated, always-visible copy button", () => {
+  const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  const css = readFileSync(new URL("./app.css", import.meta.url), "utf8");
+  const draw = source.slice(source.indexOf("function drawConversation"), source.indexOf("function flushPendingTranscriptRender"));
+  assert.match(draw, /visibility !== "internal" && typeof message\.markdown === "string"/);
+  assert.match(draw, /copy\.className = "message-copy"/);
+  assert.match(draw, /copy\.setAttribute\("aria-label", "Copy message"\)/);
+  assert.match(draw, /transcriptCopyText\.set\(copy, message\.markdown\)/);
+  // Cards are replaced on each redraw, so the click is handled on the container.
+  assert.match(source, /conversation\.addEventListener\("click", \(event\) => \{\s*const button = event\.target\?\.closest\?\.\("button\.message-copy"\)/);
+  assert.match(source, /copyTextToClipboard\(text\)\.then/);
+  assert.match(source, /button\.textContent = "Copied"/);
+  assert.doesNotMatch(source, /message-copy[^\n]*addEventListener/);
+  assert.match(css, /\.message-card \.message-copy \{[^}]*user-select: none;/);
+  assert.doesNotMatch(css, /\.message-copy \{[^}]*(opacity: 0|display: none|visibility: hidden)/);
 });

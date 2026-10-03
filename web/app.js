@@ -923,6 +923,41 @@ function paneTypingText(event) {
   return typeof key === "string" && Array.from(key).length === 1 ? key : "";
 }
 
+/// The dashboard is often served over plain HTTP on the LAN, where
+/// `navigator.clipboard` does not exist, so a hidden read-only textarea and the
+/// legacy copy command stand in for it. Resolves whether the copy happened.
+async function copyTextToClipboard(text, env = globalThis) {
+  const value = String(text ?? "");
+  const clipboard = env.navigator?.clipboard;
+  if (typeof clipboard?.writeText === "function") {
+    try {
+      await clipboard.writeText(value);
+      return true;
+    } catch {
+      // A denied permission can still leave the legacy path working.
+    }
+  }
+  const doc = env.document;
+  if (!doc?.body || typeof doc.execCommand !== "function") return false;
+  const area = doc.createElement("textarea");
+  area.value = value;
+  area.readOnly = true;
+  area.setAttribute("aria-hidden", "true");
+  area.style.cssText = "position:fixed;top:0;left:-9999px;opacity:0;";
+  const focused = doc.activeElement;
+  doc.body.append(area);
+  try {
+    area.select();
+    area.setSelectionRange?.(0, value.length);
+    return doc.execCommand("copy") === true;
+  } catch {
+    return false;
+  } finally {
+    area.remove();
+    focused?.focus?.({ preventScroll: true });
+  }
+}
+
 /// Moves through a chronological message history. `history.length` is the
 /// draft position after the newest message, and `null` means do not consume
 /// the key because there is no history move to make.
@@ -4073,6 +4108,7 @@ if (typeof module !== "undefined" && module.exports) {
     composerSubmissionCanRestore,
     composerSubmissionMatches,
     contentToLines,
+    copyTextToClipboard,
     dictationDelivery,
     dictationEndAction,
     dictationErrorPolicy,
@@ -4527,6 +4563,8 @@ function initialize() {
   const sessionList = $("sessions");
   const pane = $("pane");
   const conversation = $("conversation");
+  // Raw message markdown per copy button; redrawn cards drop their entries.
+  const transcriptCopyText = new WeakMap();
   const filesPanel = $("files-panel");
   const gitPanel = $("git-panel");
 
@@ -5169,6 +5207,15 @@ function initialize() {
       const label = document.createElement("header");
       label.textContent = transcriptRoleLabel(message);
       label.append(document.createTextNode(" "), renderEntryMetrics(message));
+      if (visibility !== "internal" && typeof message.markdown === "string" && message.markdown) {
+        const copy = document.createElement("button");
+        copy.type = "button";
+        copy.className = "message-copy";
+        copy.textContent = "Copy";
+        copy.setAttribute("aria-label", "Copy message");
+        transcriptCopyText.set(copy, message.markdown);
+        label.append(copy);
+      }
       const body = document.createElement("div");
       body.className = "markdown-body";
       body.append(markdownFragment(message.markdown));
@@ -9745,6 +9792,25 @@ function initialize() {
   conversation.addEventListener("pointerdown", () => {
     state.transcriptPointerDown = true;
   });
+  // Every transcript redraw replaces the cards, so one delegated listener
+  // serves all copy buttons and copies the raw message, not the rendered card.
+  conversation.addEventListener("click", (event) => {
+    const button = event.target?.closest?.("button.message-copy");
+    const text = button ? transcriptCopyText.get(button) : undefined;
+    if (typeof text !== "string") return;
+    void copyTextToClipboard(text).then((copied) => {
+      if (!copied) {
+        toast("Copy failed; select the message text instead");
+        return;
+      }
+      button.textContent = "Copied";
+      button.setAttribute("aria-label", "Message copied");
+      setTimeout(() => {
+        button.textContent = "Copy";
+        button.setAttribute("aria-label", "Copy message");
+      }, 1500);
+    });
+  });
   pane.addEventListener("wheel", () => { state.paneFollowing = false; }, { passive: true });
   pane.addEventListener("touchstart", () => { state.paneFollowing = false; }, { passive: true });
   conversation.addEventListener("wheel", (event) => {
@@ -9780,11 +9846,14 @@ function initialize() {
     if (state.transcriptFollowing) state.transcriptUnseen = false;
     renderTranscriptJump();
   }, { passive: true });
-  const finishPanePointerSelection = () => {
+  const finishPanePointerSelection = (event) => {
     state.panePointerDown = false;
     state.transcriptPointerDown = false;
     flushPendingPaneRender();
-    flushPendingTranscriptRender();
+    // A redraw between pointerup and click would detach the pressed copy
+    // button before its click lands, so let the click run first.
+    if (event?.target?.closest?.(".message-copy")) setTimeout(flushPendingTranscriptRender, 0);
+    else flushPendingTranscriptRender();
   };
   document.addEventListener("pointerup", finishPanePointerSelection);
   document.addEventListener("pointercancel", finishPanePointerSelection);
@@ -9797,6 +9866,8 @@ function initialize() {
       event.preventDefault();
       return;
     }
+    // Space on a focused transcript button activates it, not the composer.
+    if (event.target?.closest?.("button")) return;
     const text = paneTypingText(event);
     const message = $("message");
     if (!text || !state.selected || message.disabled) return;

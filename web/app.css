@@ -225,9 +225,13 @@ button.code-line-number:focus-visible, button.code-line-number[aria-pressed="tru
 .message-card { width: 100%; max-width: none; margin: 0 0 8px; overflow: hidden; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); }
 .message-card.user { width: 100%; max-width: none; margin-inline: 0; border-color: #32565e; background: #12242a; }
 .message-card.internal { border-color: #293940; background: #0c151a; }
-.message-card > header { padding: 5px 11px; border-bottom: 1px solid var(--line); color: var(--cyan); font-size: 10px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+.message-card > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 11px; border-bottom: 1px solid var(--line); color: var(--cyan); font-size: 10px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
 .message-card.user > header { color: #9ae8df; }
 .message-card.internal > header { color: var(--muted); }
+/* Always visible (touch has no hover); negative margins keep the header height. */
+.message-card .message-copy { flex: none; min-height: 22px; margin: -3px -6px -3px auto; padding: 0 8px; border-color: transparent; border-radius: 6px; color: var(--muted); background: transparent; font-size: 10px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; user-select: none; touch-action: manipulation; }
+.message-card .message-copy:hover, .message-card .message-copy:focus-visible { border-color: var(--line); color: var(--cyan); }
+@media (pointer: coarse) { .message-card .message-copy { min-height: 30px; margin-block: -7px; padding-inline: 10px; } }
 .message-card.subagent { border-color: #2c3a42; background: #0d161b; }
 .message-card.subagent > header { color: var(--muted); }
 .message-card.subagent > .markdown-body { color: #b9c8cd; }
