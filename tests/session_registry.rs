@@ -286,7 +286,10 @@ allow_unauthenticated_loopback = true
                 .iter()
                 .map(|stored| stored.event.event_type.as_str())
                 .collect::<Vec<_>>(),
-            ["agent.exited", "session.closed", "session.archived"]
+            ["agent.exited", "session.closed", "session.archived"],
+            "{} lifecycle events: {:#?}",
+            record.name,
+            events.events
         );
         let archived_event = &events.events[2].event;
         assert_eq!(archived_event.session_key, record.session_key);

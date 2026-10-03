@@ -194,7 +194,7 @@ archived. Autonomy is approved; everything is audited.
 | --- | --- |
 | `cargo fmt --check` and `git diff --check` | Passed |
 | `cargo clippy --all-targets --all-features -- -D warnings` | Passed, zero warnings |
-| `cargo test --all-features -- --test-threads=1` | 936 passed, zero failed; 7 declared ignored |
+| `cargo test --all-features -- --test-threads=1` | 940 passed after lifecycle follow-up, zero failed; 7 declared ignored |
 | Focused supervisor tests (included in full gate) | 22 unit tests and configured disposable E2E passed |
 | `node --check web/app.js` | Passed |
 | `node --test web/*.test.mjs tests/navigation.test.mjs` | 196 passed, zero failed/skipped |
@@ -208,7 +208,43 @@ sockets were used. No live probes, deploy, push, service restart, cluster/Keyclo
 mutation of existing tmux sessions/agents occurred. The user's untracked `.atmux.toml` is preserved.
 
 Implementation commits: `0bc5caf` (core), `07156d1` (configured adapters/E2E), `d1bf29d`
-(intake overlay and lease handoff), and the final assignment-revalidation/acceptance commit.
+(intake overlay and lease handoff), `6cedd35` (assignment revalidation/acceptance), and the
+lifecycle-regression fix recorded below.
 Integration merges: `1179541` and `0cf0041` (A5), `72aee1a` (lead through `ce77c67`, A4 reconciliation).
 The feature remains off by default. No implementation work is pending; deployment configuration
 and the one-time shared device login above remain the lead's handoff.
+
+## Lifecycle regression follow-up
+
+- The lead reported duplicate lifecycle events after integration. The requested disposable
+  `session_registry` command and 60 repeat runs initially passed, but a deterministic fixture
+  reproduced the exact sequence: `agent.exited`, `session.closed`, `session.closed`,
+  `session.archived`, `agent.exited`.
+- The two emitters were the registry lifecycle callback and the status observer. A scan can
+  retain the CLI banner after losing its PID. The registry's intentional-close filter compared
+  that missing PID with the stored PID, reopened the tombstone and issued a second close with a
+  later timestamp. The status observer invented a fallback process generation and later emitted
+  an exit with a null PID, bypassing A3's process de-duplication. A late native SessionEnd could
+  likewise publish a null-PID exit before the registry's known-PID exit; a separate red fixture
+  reproduced that duplication.
+- Missing PIDs now preserve the intentional-close tombstone and the last known process identity.
+  Native SessionEnd uses that same known identity; an unidentified end does not invent a new
+  process generation. Close retries preserve the first timestamp and Archived state. Registry
+  publication retries flush before an idempotent close returns, retaining ordered publication.
+- The existing bounded durable spool remains the de-duplication ledger. Close/archive observations
+  compare owner, stable key and pane/process generation rather than wall-clock timestamps. Known
+  new PIDs and new pane instances retain their own transitions; replay after reopening suppresses
+  the old generation's duplicates. No second publisher, store or unbounded de-duplication cache
+  was introduced.
+- Regressions cover the PID-less scan for external and intentional closes, repeated close requests,
+  late native exits, timestamp changes, resume/relaunch generations and durable replay. The full
+  configured supervisor E2E now asserts exactly `agent.exited`, `session.closed`, `session.archived`
+  for its quiet close, matching the dashboard/external integration test.
+- Final follow-up gates: `cargo fmt --check`, `git diff --check`, all-target/all-feature clippy
+  with `-D warnings`, `node --check web/app.js`, and all 196 Node tests passed. The complete
+  `cargo test --all-features -- --test-threads=1` passed 940 tests with 7 declared ignored, using
+  `ATMUX_REQUIRE_TMUX=1` and a unique `atmux-ci-a6-lifecycle-<uuid>` socket. The exact requested
+  `ATMUX_REQUIRE_TMUX=1 cargo test --all-features --test session_registry` also passed after
+  the final full gate. The supervisor lifecycle assertion passed in that full gate. No UI changed;
+  the 13 browser results above remain from the original A6 gate. Worktree mode was restored to
+  0775; `.atmux.toml`, shared clients and all existing tmux/agent processes remain untouched.

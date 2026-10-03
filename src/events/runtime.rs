@@ -236,6 +236,7 @@ impl EventService {
             if !present
                 && let Some(previous) = state.previous.clone()
                 && previous.agent != AgentKind::Other
+                && previous.agent_pid.is_some()
             {
                 self.derive(&previous, state, "agent.exited", None);
             }
@@ -246,6 +247,21 @@ impl EventService {
                 continue;
             }
             let state = panes.entry(session.pane_id.clone()).or_default();
+            if session.agent_pid.is_none() {
+                // A retained banner can identify a harness after it exits.
+                // Keep the last known process generation for disappearance,
+                // rather than inventing a generation with a fallback pane PID.
+                if let Some(previous) = state.previous.clone() {
+                    if previous.agent != AgentKind::Other && previous.agent_pid.is_some() {
+                        self.derive(&previous, state, "agent.exited", None);
+                    }
+                    if previous.pane_identity != session.pane_identity {
+                        *state = PaneState::default();
+                    }
+                }
+                state.status = Some(session.status);
+                continue;
+            }
             let generation = format!(
                 "{}:{}:{:?}",
                 session.pane_identity,
@@ -255,6 +271,7 @@ impl EventService {
             if state.generation != generation {
                 if let Some(previous) = state.previous.clone()
                     && previous.agent != AgentKind::Other
+                    && previous.agent_pid.is_some()
                 {
                     self.derive(&previous, state, "agent.exited", None);
                 }
@@ -329,15 +346,30 @@ impl EventService {
         if !map_hook(&mut event, delivery) {
             return Ok(());
         }
-        if event.event_type == "agent.exited" {
-            event.detail["agent_pid"] = serde_json::json!(session.agent_pid);
-        }
         event.project = self.projects.get(&session.path);
         let mut panes = self
             .panes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = panes.entry(session.pane_id.clone()).or_default();
+        if event.event_type == "agent.exited" {
+            let pid = session.agent_pid.or_else(|| {
+                state
+                    .previous
+                    .as_ref()
+                    .filter(|previous| {
+                        previous.pane_identity == session.pane_identity
+                            && previous.session_key == session.session_key
+                    })
+                    .and_then(|previous| previous.agent_pid)
+            });
+            let Some(pid) = pid else {
+                // An unidentified hook cannot establish a new process end;
+                // the registry's last known generation remains authoritative.
+                return Ok(());
+            };
+            event.detail["agent_pid"] = serde_json::json!(pid);
+        }
         if state.generation.is_empty() {
             state.generation = format!(
                 "{}:{}:{:?}",

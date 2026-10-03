@@ -592,11 +592,22 @@ async fn configured_supervisor_answers_verifies_closes_and_archives_disposable_a
         .get_json::<EventPage>("/api/v1/agent-events?limit=100")
         .await
         .unwrap();
-    assert!(
-        owner_events
-            .events
-            .iter()
-            .any(|e| e.event.event_type == "session.archived" && e.event.session_key == done_key)
+    let lifecycle: Vec<_> = owner_events
+        .events
+        .iter()
+        .filter(|e| {
+            e.event.session_key == done_key
+                && matches!(
+                    e.event.event_type.as_str(),
+                    "agent.exited" | "session.closed" | "session.archived"
+                )
+        })
+        .map(|e| e.event.event_type.as_str())
+        .collect();
+    assert_eq!(
+        lifecycle,
+        ["agent.exited", "session.closed", "session.archived"],
+        "supervisor quiet close must emit each lifecycle transition exactly once: {owner_events:#?}"
     );
     server.abort();
 }

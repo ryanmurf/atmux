@@ -64,6 +64,95 @@ fn pane_session() -> Session {
 }
 
 #[tokio::test]
+async fn close_and_archive_deduplicate_by_generation_across_timestamps_and_restart() {
+    let temp = Temp::new();
+    let directory = temp.0.join("events");
+    let log = EventLog::open(directory.clone(), EventsConfig::default()).unwrap();
+    let base = event();
+    for (instance, pid) in [
+        ("pane-v1-original", 123),
+        ("pane-v1-restored", 123),
+        ("pane-v1-restored", 124),
+    ] {
+        for (kind, field) in [
+            ("session.closed", "closed_ms"),
+            ("session.archived", "archived_ms"),
+        ] {
+            for at in [100, 200] {
+                let mut transition = base.clone();
+                transition.id = tmux::new_session_key().unwrap();
+                transition.event_type = kind.into();
+                transition.reason = None;
+                transition.instance_id = instance.into();
+                transition.detail = json!({field:at,"agent_pid":pid});
+                log.append(transition).unwrap();
+            }
+        }
+    }
+    assert_eq!(
+        log.read(&EventQuery::default()).await.unwrap().events.len(),
+        6
+    );
+    drop(log);
+    let log = EventLog::open(directory, EventsConfig::default()).unwrap();
+    for (kind, field) in [
+        ("session.closed", "closed_ms"),
+        ("session.archived", "archived_ms"),
+    ] {
+        let mut replay = base.clone();
+        replay.id = tmux::new_session_key().unwrap();
+        replay.event_type = kind.into();
+        replay.reason = None;
+        replay.instance_id = "pane-v1-restored".into();
+        replay.detail = json!({field:300,"agent_pid":124});
+        log.append(replay).unwrap();
+    }
+    assert_eq!(
+        log.read(&EventQuery::default()).await.unwrap().events.len(),
+        6
+    );
+}
+
+#[tokio::test]
+async fn late_native_exit_uses_last_known_pid_for_registry_deduplication() {
+    let temp = Temp::new();
+    let service = EventService::open(
+        EventsConfig {
+            directory: Some(temp.0.join("events")),
+            ..Default::default()
+        },
+        "tron".into(),
+        false,
+    )
+    .unwrap();
+    let mut session = pane_session();
+    service.observe(std::slice::from_ref(&session));
+    let registry_exit = AgentEvent::from_session("tron", &session, "agent.exited", None).unwrap();
+    session.agent_pid = None;
+    let hook = hooks::HookDelivery {
+        harness: "claude".into(),
+        pane: session.pane_id.clone(),
+        parent_pid: 1,
+        event: None,
+        payload: json!({"hook_event_name":"SessionEnd"}),
+    };
+    service.ingest_hook(&session, &hook).unwrap();
+    service.emit(registry_exit).unwrap();
+    service.observe(&[]);
+    let events = service
+        .owner
+        .read(&EventQuery {
+            types: Some("agent.exited".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .events;
+    assert_eq!(events.len(), 1, "{events:#?}");
+    assert_eq!(events[0].event.detail["agent_pid"], 123);
+}
+
+#[tokio::test]
 async fn native_and_status_signals_deduplicate_across_multiple_claude_turns() {
     let temp = Temp::new();
     let service = EventService::open(

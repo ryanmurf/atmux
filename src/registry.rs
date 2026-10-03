@@ -769,7 +769,9 @@ impl Registry {
             if previous.as_ref().is_some_and(|record| {
                 record.close_reason.as_deref() == Some("user")
                     && record.instance_id == session.pane_identity
-                    && record.agent_pid == session.agent_pid
+                    // A missing PID is an exit observation, not a new process
+                    // that can override an intentional-close tombstone.
+                    && (session.agent_pid.is_none() || record.agent_pid == session.agent_pid)
             }) {
                 continue;
             }
@@ -1753,6 +1755,7 @@ impl Registry {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::flush_changes(&mut state)?;
         let mut events = Vec::new();
         for key in keys {
             let Some(mut stored) = state.records.get(key).cloned() else {
@@ -1762,15 +1765,25 @@ impl Registry {
                 stored.record.machine == self.owner,
                 "cannot close a foreign registry record"
             );
+            if stored.desired_running == Some(false)
+                && stored.close_reason.as_deref() == Some("user")
+            {
+                continue;
+            }
+            let newly_closed = stored.record.closed_ms.is_none();
             stored.desired_running = Some(false);
             stored.close_reason = Some("user".to_owned());
-            stored.record.state = SessionState::Closed;
-            stored.record.closed_ms = Some(at_ms);
+            if stored.record.state != SessionState::Archived {
+                stored.record.state = SessionState::Closed;
+            }
+            stored.record.closed_ms.get_or_insert(at_ms);
             self.commit(&mut state, stored.clone())?;
-            events.push(LifecycleEvent {
-                event_type: "session.closed",
-                record: stored.record,
-            });
+            if newly_closed {
+                events.push(LifecycleEvent {
+                    event_type: "session.closed",
+                    record: stored.record,
+                });
+            }
         }
         let sink = state.sink.clone();
         drop(state);

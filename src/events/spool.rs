@@ -233,20 +233,26 @@ fn same_lifecycle_transition(previous: &AgentEvent, current: &AgentEvent) -> boo
                 .iter()
                 .all(|field| previous.detail.get(field) == current.detail.get(field));
     }
-    let attribute = match current.event_type.as_str() {
-        "agent.exited" => "agent_pid",
-        "session.closed" => "closed_ms",
-        "session.archived" => "archived_ms",
-        _ => return false,
-    };
-    previous.event_type == current.event_type
+    let same_generation = previous.event_type == current.event_type
         && previous.machine == current.machine
         && previous.session_key == current.session_key
-        && previous.instance_id == current.instance_id
-        && current
-            .detail
-            .get(attribute)
-            .is_some_and(|value| value.is_u64() && previous.detail.get(attribute) == Some(value))
+        && previous.instance_id == current.instance_id;
+    same_generation
+        && match current.event_type.as_str() {
+            // Process relaunches can share the pane instance, but not the agent PID.
+            "agent.exited" => current.detail.get("agent_pid").is_some_and(|value| {
+                value.is_u64() && previous.detail.get("agent_pid") == Some(value)
+            }),
+            // Observation time is evidence, not identity. A pane can close/archive
+            // only once per generation; a resume has another instance. A known
+            // new process in a retained pane also has its own transitions.
+            "session.closed" | "session.archived" => !matches!(
+                (previous.detail.get("agent_pid").and_then(serde_json::Value::as_u64),
+                 current.detail.get("agent_pid").and_then(serde_json::Value::as_u64)),
+                (Some(previous), Some(current)) if previous != current
+            ),
+            _ => false,
+        }
 }
 
 impl EventLog {
