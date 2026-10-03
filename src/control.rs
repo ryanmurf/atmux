@@ -5736,6 +5736,22 @@ fn restart_token_from_stamp(session: &Session, stamp: &str) -> Option<String> {
     Some(format!("restart-v1-{:x}", hash.finalize()))
 }
 
+/// Logs an unresolvable profile session store once per profile, since the
+/// registry snapshot that encounters it repeats on every refresh.
+fn warn_unbound_registry_profile(profile: &str, error: &anyhow::Error) {
+    static WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    if WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(profile.to_owned())
+    {
+        eprintln!(
+            "atmux registry: sessions of profile {profile:?} stay unbound from native logs: {error:#}"
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn native_process_start_stamp(pid: u32) -> Option<String> {
     if pid == 0 {
@@ -6890,7 +6906,17 @@ impl ControlPlane {
             AgentKind::Codex => crate::old_sessions::ResumeHarness::Codex,
             AgentKind::Other => return Ok(()),
         };
-        let root = crate::old_sessions::profile_config_directory(profile, provider)?;
+        // Native binding enriches the registry record but is optional: a profile
+        // whose session store cannot be resolved (for example a wrapper command
+        // without CLAUDE_CONFIG_DIR/CODEX_HOME) stays unbound instead of failing
+        // the snapshot, close and resume paths for every other session.
+        let root = match crate::old_sessions::profile_config_directory(profile, provider) {
+            Ok(root) => root,
+            Err(error) => {
+                warn_unbound_registry_profile(&session.profile, &error);
+                return Ok(());
+            }
+        };
         if let Some(native) = crate::transcript::native_resume_target_in_store(session, &root) {
             self.registry()?.bind_native(
                 key,
@@ -7805,6 +7831,47 @@ mod resume_federation_tests {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
+    #[test]
+    fn an_unresolvable_profile_store_leaves_the_session_unbound_instead_of_failing() {
+        let key = crate::tmux::new_session_key().unwrap();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("atmux-unbound-profile-{key}"));
+        fs::create_dir_all(&root).unwrap();
+        let mut config = Config::default();
+        config.node.id = "fixture".to_owned();
+        config.general.favorite_dirs.clear();
+        // A wrapper launcher without CLAUDE_CONFIG_DIR has no resolvable store.
+        config.profiles = vec![AgentProfile {
+            name: "wrapped".to_owned(),
+            harness: "claude".to_owned(),
+            command: root.join("claude-wrapper").to_string_lossy().into_owned(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            inherit_discovered: false,
+            claude_relaunch_permissions: None,
+            modes: Vec::new(),
+        }];
+        config.registry = crate::registry::RegistryConfig {
+            enabled: true,
+            directory: Some(root.join("registry")),
+            ..crate::registry::RegistryConfig::default()
+        };
+        let token = root.join("token");
+        fs::write(&token, "unbound-fixture-token").unwrap();
+        fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+        config.node.token_file = Some(token);
+        let control = test_control_with_config(&[], config);
+        let mut session = super::tests::session("ready");
+        session.agent = AgentKind::Claude;
+        session.profile = "wrapped".to_owned();
+        session.session_key = Some(key);
+
+        control.bind_registry_session(&session).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
     async fn authenticated_fixture(control: ControlPlane) -> (String, tokio::task::JoinHandle<()>) {
         async fn auth(request: Request, next: Next) -> Response {
             if request
@@ -8142,7 +8209,7 @@ mod tests {
         lines.join("\n")
     }
 
-    fn session(content: &str) -> Session {
+    pub(super) fn session(content: &str) -> Session {
         Session {
             name: "agent".to_owned(),
             description: None,
