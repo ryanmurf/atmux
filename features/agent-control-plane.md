@@ -1,6 +1,6 @@
 # Agent control plane: events, conversation, lifecycle, resume anywhere, intake
 
-Status: design accepted 2026-09-30; implementation in progress by Sol 6.1 agents
+Status: A1–A6 merged; A1–A4 deployed fleet-wide 2026-10-03 (runtime `acbee1b`); A5/A6 intake and supervisor not yet enabled (need credentials and chart wiring)
 
 ## Requests (2026-09-30)
 
@@ -220,3 +220,34 @@ decisions escalate to Ryan.
   tmux session (which archives it through A3) once the job is done and the session is idle.
 - Nudge stalled sessions; enforce budgets (sessions per machine, Qwen calls per hour); publish
   every decision as an event so the audit trail lives in Redpanda and search.
+
+## Deployment — 2026-10-03
+
+Runtime commit `acbee1b`: the A1–A6 integration (`354dfce`), plus `888d705`, which keeps an owner
+running when a profile's session store can't be resolved, plus the Conversation Copy button.
+Gate: fmt and clippy clean; 939 Rust tests passed. Run them with `ATMUX_REQUIRE_TMUX=1` and a
+disposable `ATMUX_TMUX_SOCKET_NAME=atmux-ci-…`, or the federation suite fails. 200 JS tests
+passed. `disposable_owner_archives_external_and_dashboard_kills` once hit its 20 s native-log
+mapping deadline under `--test-threads=4` and passes on its own.
+
+Owners got `[events] inject_hooks = true`, `[registry] enabled = true` and
+`[startup_prompts] auto_answer = true`. Each node keeps its previous config as
+`config.toml.pre-control-plane` and its previous binary as `atmux.rollback-pre-*`.
+
+| Machine | Artifact SHA-256 prefix | Notes |
+| --- | --- | --- |
+| Tron | `50a55e23ae250f05` | `atmux-web:0.0` respawned with its original `scoped-exec` command; 24 tmux sessions kept |
+| Max | `50a55e23ae250f05` (Tron's build) | the first enable on `354dfce` crash-looped (fixed by `888d705`); profile `max` stays unbound (no `CLAUDE_CONFIG_DIR`) |
+| Midnight | `e3aa2db26394d2eb` (built on Midnight) | loopback is plain HTTP; mutual TLS only on LAN addresses |
+| Clue | `639c42d745d82863` (aarch64, built on Clue) | |
+| Coordinator | `localhost:32000/atmux:acbee1b5f142@sha256:69925122…` | Helm rev 34: events + Redpanda sink, registry, summaries (Qwen Flash Next), `hostAliases` redpanda |
+
+Coordinator notes: don't use `helm upgrade --reuse-values` when the chart adds new keys. It drops
+the new defaults, which rendered `brokers = ""` and an empty egress CIDR (rev 32 crash-looped and
+was rolled back to rev 31). Instead, pass the release's saved values plus the overlay with `-f`.
+Redpanda topic `atmux.agent.events.v1` (1 partition, RF 1) was created by hand: the sink requires
+a provisioned topic. Events are verified on the topic with envelope v2 and the HQ tenant.
+`restore_on_start` stays off until the registry has run for a while.
+
+Still open: shared herodevs device login, intake/supervisor channel ids, GitHub token and the
+chart's intake/supervisor values; `[summaries] search_tenant_id` once H2 indexing is live.
