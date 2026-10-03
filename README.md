@@ -644,6 +644,9 @@ dry-run the chart before installing; none of those credentials belong in Git.
 
 ## Multiple machines
 
+To add a new computer to the fleet (prerequisites, certificate, service, and coordinator
+registration), follow [docs/new-machine.md](docs/new-machine.md).
+
 One `atmux web` process can act as a **coordinator** that aggregates the live state of other
 machines running `atmux web` as **nodes**. Nothing is copied or synchronized: the coordinator
 subscribes to each node's existing change-only event stream and forwards commands back to the
