@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-const { reconcileAgentEvents, needsInputReason, needsInputLabel } = createRequire(import.meta.url)("./app.js");
+const { reconcileAgentEvents, needsInputReason, needsInputLabel, needsInputShortLabel } = createRequire(import.meta.url)("./app.js");
 
 const session = { session_key: "key", machine: "tron", instance_id: "generation", status: "working" };
 const record = (type, reason = null, instance_id = "generation") => ({ event: { type, reason, instance_id, session_key: "key", machine: "tron" } });
@@ -21,6 +21,8 @@ test("badge falls back to status and rejects stale generations and unknown reaso
   assert.equal(needsInputReason(session, stale), null);
   assert.equal(needsInputReason({ ...session, status: "waiting" }, stale), "idle_prompt");
   assert.equal(needsInputLabel("<script>"), "");
+  assert.equal(needsInputShortLabel("idle_prompt"), "idle");
+  assert.equal(needsInputShortLabel("<script>"), "");
   assert.equal(needsInputReason(session, new Map()), null);
   assert.equal(needsInputReason({ ...session, status: "waiting" }, new Map()), "idle_prompt");
 });

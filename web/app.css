@@ -715,19 +715,17 @@ dialog::backdrop { background: #000a; }
   line-height: 1.5;
 }
 .needs-input-badge[hidden] { display: none; }
-.session-copy > .needs-input-badge {
-  height: 20px;
-  max-width: 100%;
-  overflow: hidden;
+.session-name-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.session-name-row > .session-name { flex: 0 1 auto; min-width: 0; }
+.session-name-row > .needs-input-badge {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  font-size: 0.68rem;
+  font-weight: 400;
+  line-height: 1.45;
   white-space: nowrap;
-  text-overflow: ellipsis;
-  vertical-align: top;
 }
-/* Keep a stable click target when status/event attention oscillates. */
-.session-copy > .needs-input-badge[hidden] {
-  display: inline-block !important;
-  visibility: hidden;
-}
+.agent-title-row > .needs-input-badge { flex: 0 0 auto; white-space: nowrap; }
 /* A3 session history shares the existing detail/navigation layout. */
 .session-history-view { padding: 1.25rem; min-width: 0; }
 .session-history-filters { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1rem 0; }

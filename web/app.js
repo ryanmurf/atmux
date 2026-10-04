@@ -7068,7 +7068,7 @@ function initialize() {
       inputBadge = document.createElement("span");
       inputBadge.id = "agent-needs-input";
       inputBadge.className = "needs-input-badge";
-      $("agent-meta").before(inputBadge);
+      document.querySelector(".agent-title-row").append(inputBadge);
     }
     const inputReason = needsInputReason(selected, state.agentEventStates);
     inputBadge.hidden = !inputReason;
@@ -7512,10 +7512,14 @@ function initialize() {
     const name = textSpan("", "session-name");
     bindInlineRenameGesture(name, () => openInlineRename(id, name));
     name.title = "Double-click or hold to rename (F2 for selected session)";
+    const inputBadge = textSpan("", "needs-input-badge");
+    inputBadge.hidden = true;
+    const nameRow = document.createElement("span"); nameRow.className = "session-name-row";
+    nameRow.append(name, inputBadge);
     const description = textSpan("", "session-description");
     description.hidden = true;
     const sub = textSpan("", "session-sub");
-    copy.append(name, description, sub);
+    copy.append(nameRow, description, sub);
     button.append(dot, copy);
     const pinButton = document.createElement("button");
     pinButton.type = "button";
@@ -7549,7 +7553,7 @@ function initialize() {
     editButton.title = "Rename or describe this session";
     editButton.addEventListener("click", () => openSessionEditDialog(id));
     li.append(button, pinButton, editButton, deleteButton);
-    return { li, button, pinButton, editButton, deleteButton, dot, name, description, sub };
+    return { li, button, pinButton, editButton, deleteButton, dot, name, inputBadge, description, sub };
   }
 
   function updateSessionNode(node, session) {
@@ -7580,14 +7584,10 @@ function initialize() {
     node.description.hidden = !session.description;
     node.sub.textContent = [folder, profile, session.status, session.agent].filter(Boolean).join(" · ");
     node.sub.title = session.path || "";
-    if (!node.inputBadge) {
-      node.inputBadge = document.createElement("span");
-      node.inputBadge.className = "needs-input-badge";
-      node.sub.after(node.inputBadge);
-    }
     const reason = needsInputReason(session, state.agentEventStates);
     node.inputBadge.hidden = !reason;
-    node.inputBadge.textContent = needsInputLabel(reason);
+    node.inputBadge.textContent = needsInputShortLabel(reason);
+    node.inputBadge.title = needsInputLabel(reason);
     if (reason) node.button.setAttribute("aria-label", `${node.button.getAttribute("aria-label")}, ${needsInputLabel(reason)}`);
   }
 
@@ -11282,9 +11282,15 @@ function needsInputReason(session, events) {
   return session?.status === "waiting" ? "idle_prompt" : null;
 }
 
+const NEEDS_INPUT_LABELS = { idle_prompt: "idle", question: "question", permission: "permission", startup_prompt: "startup prompt", plan_approval: "plan approval" };
+
 function needsInputLabel(reason) {
-  const labels = { idle_prompt: "idle", question: "question", permission: "permission", startup_prompt: "startup prompt", plan_approval: "plan approval" };
-  return labels[reason] ? `Needs input · ${labels[reason]}` : "";
+  return NEEDS_INPUT_LABELS[reason] ? `Needs input · ${NEEDS_INPUT_LABELS[reason]}` : "";
 }
 
-if (typeof module !== "undefined" && module.exports) Object.assign(module.exports, { reconcileAgentEvents, needsInputReason, needsInputLabel });
+/** The rail shares its line with the session name, so it shows only the reason. */
+function needsInputShortLabel(reason) {
+  return NEEDS_INPUT_LABELS[reason] || "";
+}
+
+if (typeof module !== "undefined" && module.exports) Object.assign(module.exports, { reconcileAgentEvents, needsInputReason, needsInputLabel, needsInputShortLabel });

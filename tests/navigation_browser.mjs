@@ -189,7 +189,7 @@ test("mobile navigation persists preferences and session actions retain the sele
       await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [point] });
       await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
     };
-    await waitFor(() => cdp.evaluate("document.querySelector('.session-button[data-session-id=\"local~%1\"] .needs-input-badge')?.textContent === 'Needs input · permission'"), "event badge on working agent in rail");
+    await waitFor(() => cdp.evaluate("document.querySelector('.session-button[data-session-id=\"local~%1\"] .needs-input-badge')?.textContent === 'permission'"), "event badge on working agent in rail");
     await tap("document.querySelector('.session-button[data-session-id=\"local~%1\"]')");
     await waitFor(() => cdp.evaluate("document.getElementById('agent-needs-input')?.textContent === 'Needs input · permission' && !document.getElementById('agent-needs-input').hidden"), "event reason in selected agent header");
     eventPhase = "agent.working";
