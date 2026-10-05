@@ -92,7 +92,7 @@ grep -Fq 'ryanm@herodevs.com' "$work/enabled.yaml"
 grep -Fq 'checksum/allowed-emails:' "$work/enabled.yaml"
 grep -Fq 'checksum/server-config:' "$work/enabled.yaml"
 grep -Fq 'atmux.dev/secret-revision: "v1"' "$work/enabled.yaml"
-grep -Fq 'oauth2-proxy:v7.15.3@sha256:' "$work/enabled.yaml"
+grep -Fq 'oauth2-proxy:v7.15.5@sha256:' "$work/enabled.yaml"
 grep -Fq 'listen 127.0.0.1:8080;' "$work/enabled.yaml"
 grep -Fq 'proxy_pass http://127.0.0.1:7345;' "$work/enabled.yaml"
 if grep -Fq 'proxy_pass https://192.168.0.109:7345;' "$work/enabled.yaml"; then
