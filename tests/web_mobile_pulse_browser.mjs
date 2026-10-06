@@ -1877,7 +1877,8 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       const cards = [...document.querySelectorAll('#machine-metrics .metric-card')];
       const card = cards.find((node) => node.querySelector('h2')?.textContent === 'System');
       return {
-        lines: [...card.querySelectorAll('li')].map((node) => node.textContent),
+        lines: [...card.querySelectorAll('dl > div')]
+          .map((node) => node.querySelector('dt').textContent + ' · ' + node.querySelector('dd').textContent),
         injectedMarkup: Boolean(card.querySelector('script, img')),
         documentOverflow: document.documentElement.scrollWidth - innerWidth,
         viewOverflow: document.getElementById('machine-view').scrollWidth
@@ -1887,8 +1888,8 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     })()`);
     assert.deepEqual(systemCard.lines, [
       "Uptime · 2d 3h 4m",
-      `Kernel · ${LONG_KERNEL_VERSION}`,
       `OS · ${LONG_OS_VERSION}`,
+      `Kernel · ${LONG_KERNEL_VERSION}`,
     ]);
     assert.equal(systemCard.injectedMarkup, false);
     assert.ok(systemCard.documentOverflow <= 1, JSON.stringify(systemCard));

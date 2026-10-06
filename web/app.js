@@ -3700,13 +3700,129 @@ function formatUptime(seconds) {
   return parts.join(" ");
 }
 
-function systemMetricLines(metrics = {}) {
+/// Label/value rows for the machine view's System panel. Uptime, OS and
+/// kernel are always listed so an older owner reads "Unavailable", not blank.
+function systemMetricRows(metrics = {}) {
   const displayText = (value) => typeof value === "string" && value.trim() ? value.trim() : "Unavailable";
-  return [
-    `Uptime · ${formatUptime(metrics.uptime_seconds)}`,
-    `Kernel · ${displayText(metrics.kernel_version)}`,
-    `OS · ${displayText(metrics.os_version)}`,
+  const rows = [
+    ["Uptime", formatUptime(metrics.uptime_seconds)],
+    ["OS", displayText(metrics.os_version)],
+    ["Kernel", displayText(metrics.kernel_version)],
   ];
+  const brand = metrics.cpu?.brand;
+  if (typeof brand === "string" && brand.trim()) rows.push(["Processor", brand.trim()]);
+  const topology = cpuTopologyText(metrics.cpu);
+  if (topology) rows.push(["Cores", topology]);
+  if (Number.isFinite(metrics.process_count)) rows.push(["Processes", formatCount(metrics.process_count)]);
+  return rows;
+}
+
+function systemMetricLines(metrics = {}) {
+  return systemMetricRows(metrics).map(([label, value]) => `${label} · ${value}`);
+}
+
+function formatCount(value) {
+  return Number.isFinite(value) ? Math.round(value).toLocaleString("en-US") : "—";
+}
+
+/// Whole-number share of `total`, or null when either side is unusable.
+function percentOf(part, total) {
+  if (!Number.isFinite(part) || !Number.isFinite(total) || total <= 0 || part < 0) return null;
+  return Math.min(100, (part / total) * 100);
+}
+
+function formatPercent(value, decimals = 0) {
+  if (!Number.isFinite(value)) return "—";
+  if (value > 0 && value < 10 ** -decimals) return `<${10 ** -decimals}%`;
+  return `${value.toFixed(decimals)}%`;
+}
+
+function formatFrequency(mhz) {
+  if (!Number.isFinite(mhz) || mhz <= 0) return "";
+  return mhz >= 1000 ? `${(mhz / 1000).toFixed(2)} GHz` : `${Math.round(mhz)} MHz`;
+}
+
+/// "16 cores · 32 threads · 5.26 GHz", omitting whatever the owner lacks.
+function cpuTopologyText(cpu) {
+  if (!cpu || typeof cpu !== "object") return "";
+  const parts = [];
+  const physical = Number(cpu.physical_cores);
+  const logical = Number(cpu.logical_cores);
+  if (physical > 0) {
+    parts.push(`${physical} core${physical === 1 ? "" : "s"}`);
+    if (logical > physical) parts.push(`${logical} threads`);
+  } else if (logical > 0) {
+    parts.push(`${logical} core${logical === 1 ? "" : "s"}`);
+  }
+  const frequency = formatFrequency(Number(cpu.frequency_mhz));
+  if (frequency) parts.push(frequency);
+  return parts.join(" · ");
+}
+
+function loadAverageText(load) {
+  if (!load || ![load.one, load.five, load.fifteen].every(Number.isFinite)) return "";
+  return [load.one, load.five, load.fifteen].map((value) => value.toFixed(2)).join(" · ");
+}
+
+/// Meter severity: the fill alone never carries meaning, the value is printed.
+function meterLevel(percent) {
+  if (!Number.isFinite(percent)) return "normal";
+  if (percent >= 95) return "critical";
+  if (percent >= 85) return "high";
+  return "normal";
+}
+
+const MEMORY_SEGMENTS = {
+  apps: { label: "Apps", description: "Memory processes are actively using" },
+  wired: { label: "Wired", description: "Locked by the kernel and drivers, including GPU allocations on Apple silicon; never compressed or swapped" },
+  kernel: { label: "Kernel", description: "Kernel slab, stacks, and page tables that cannot be reclaimed" },
+  compressed: { label: "Compressed", description: "Inactive memory compressed in RAM to avoid swapping" },
+  shared: { label: "Shared", description: "tmpfs and shared memory segments" },
+  cache: { label: "Cache", description: "File cache the OS reclaims on demand" },
+  free: { label: "Free", description: "Unused memory" },
+};
+
+/// Legend rows for the memory composition bar. Percentages are of the
+/// segments' own sum, which owners keep equal to physical memory.
+function memoryBreakdownRows(memory) {
+  const segments = Array.isArray(memory?.segments) ? memory.segments : [];
+  const valid = segments.filter((segment) => typeof segment?.kind === "string"
+    && /^[a-z_]{1,24}$/.test(segment.kind) && Number.isFinite(segment.bytes) && segment.bytes >= 0);
+  const total = valid.reduce((sum, segment) => sum + segment.bytes, 0);
+  if (!total) return [];
+  return valid.map((segment) => {
+    const known = MEMORY_SEGMENTS[segment.kind];
+    return {
+      kind: known ? segment.kind : "other",
+      label: known?.label || segment.kind.replaceAll("_", " "),
+      description: known?.description || "",
+      bytes: segment.bytes,
+      percent: (segment.bytes / total) * 100,
+    };
+  });
+}
+
+/// Process groups as display rows, keeping the owner's memory-first order.
+function processRows(processes, memoryTotal) {
+  if (!Array.isArray(processes)) return [];
+  return processes
+    .filter((group) => typeof group?.name === "string" && group.name.trim() && Number.isFinite(group.memory_bytes))
+    .map((group) => ({
+      name: group.name.trim(),
+      count: Number.isFinite(group.count) && group.count > 1 ? group.count : 1,
+      memory: formatBytes(group.memory_bytes),
+      memoryPercent: percentOf(group.memory_bytes, memoryTotal),
+      cpu: formatPercent(Number(group.cpu_percent), 1),
+    }));
+}
+
+/// Hottest first, so a long sensor list still leads with what matters.
+function temperatureRows(temperatures) {
+  if (!Array.isArray(temperatures)) return [];
+  return temperatures
+    .filter((reading) => Number.isFinite(reading?.celsius))
+    .map((reading) => ({ label: String(reading.label || "Sensor"), celsius: reading.celsius }))
+    .sort((left, right) => right.celsius - left.celsius || left.label.localeCompare(right.label));
 }
 
 function formatBytes(bytes) {
@@ -4175,6 +4291,16 @@ if (typeof module !== "undefined" && module.exports) {
     gpuDiagnosticLines,
     formatUptime,
     systemMetricLines,
+    systemMetricRows,
+    percentOf,
+    formatPercent,
+    formatFrequency,
+    cpuTopologyText,
+    loadAverageText,
+    meterLevel,
+    memoryBreakdownRows,
+    processRows,
+    temperatureRows,
     markdownBlocks,
     messageFitsByteLimit,
     messageHistoryDirection,
@@ -4410,6 +4536,8 @@ function initialize() {
     machines: [],
     selected: initialRoute.view === "session" ? initialRoute.id : null,
     selectedMachine: initialRoute.view === "machine" ? initialRoute.id : null,
+    machineOpenDetails: new Set(),
+    machineTip: null,
     paneLines: [],
     paneOutputBinding: null,
     paneRevision: 0,
@@ -7022,6 +7150,7 @@ function initialize() {
     const selectedMachine = state.machines.find((machine) => machine.id === state.selectedMachine) || null;
     $("welcome").hidden = Boolean(selected || selectedMachine || state.pulseOpen || state.historyOpen);
     $("machine-view").hidden = !selectedMachine || Boolean(selected);
+    if ($("machine-view").hidden && state.machineTip) hideMachineTip();
     $("agent-view").hidden = !selected;
     $("history-view").hidden = !state.historyOpen;
     $("history-open").setAttribute("aria-pressed", String(state.historyOpen));
@@ -7367,14 +7496,22 @@ function initialize() {
     offline.hidden = machine.online !== false;
     offline.textContent = machine.health || "This machine is offline.";
     const metrics = machine.metrics || {};
-    const cards = [
-      metricCard("CPU", metrics.cpu_percent == null ? "—" : `${metrics.cpu_percent}%`, "Current total utilization"),
-      metricCard("Memory", memoryValue(metrics.memory_used_bytes, metrics.memory_total_bytes), "Used / total"),
-      metricListCard("System", systemMetricLines(metrics)),
-      gpuMetricCard(metrics.gpus, metrics.gpu_diagnostics),
-      metricListCard("Temperatures", temperatureLines(metrics.temperatures)),
-    ];
-    $("machine-metrics").replaceChildren(...cards);
+    const panels = document.createElement("div");
+    panels.className = "machine-panels";
+    // System and Graphics share one column so the long process table has a
+    // neighbor of similar height instead of one short card and empty space.
+    const side = document.createElement("div");
+    side.className = "machine-side";
+    side.append(systemPanel(metrics), gpuPanel(machine.id, metrics.gpus, metrics.gpu_diagnostics));
+    panels.append(
+      cpuPanel(metrics),
+      memoryPanel(metrics),
+      processPanel(metrics),
+      side,
+      temperaturePanel(metrics.temperatures),
+    );
+    $("machine-metrics").replaceChildren(machineStatRow(metrics), panels);
+    refreshMachineTip();
     renderMachineSoftware(machine);
   }
 
@@ -7438,61 +7575,401 @@ function initialize() {
     button.dataset.updateCount = String(targets.length);
   }
 
-  function metricCard(title, value, sub) {
-    const card = document.createElement("section"); card.className = "metric-card";
-    const heading = document.createElement("h2"); heading.textContent = title;
-    const main = textSpan(value, "metric-value");
-    const detail = textSpan(sub, "metric-sub");
-    card.append(heading, main, detail);
+  function metricPanel(title, className, subtitle = "") {
+    const card = document.createElement("section");
+    card.className = `metric-card metric-panel ${className}`.trim();
+    const header = document.createElement("header");
+    header.className = "metric-panel-header";
+    const heading = document.createElement("h2");
+    heading.textContent = title;
+    header.append(heading);
+    if (subtitle) header.append(textSpan(subtitle, "metric-panel-subtitle"));
+    card.append(header);
     return card;
   }
 
-  function metricListCard(title, lines) {
-    const card = document.createElement("section"); card.className = "metric-card";
-    const heading = document.createElement("h2"); heading.textContent = title;
-    const list = document.createElement("ul"); list.className = "metric-list";
-    for (const line of lines.length ? lines : ["Unavailable on this machine"]) {
-      const item = document.createElement("li"); item.textContent = line; list.append(item);
+  /// A horizontal meter whose track is a quiet step of the fill's own hue.
+  function meter(percent, label) {
+    const track = document.createElement("span");
+    track.className = "meter";
+    track.dataset.level = meterLevel(percent);
+    track.setAttribute("role", "meter");
+    track.setAttribute("aria-label", label);
+    track.setAttribute("aria-valuemin", "0");
+    track.setAttribute("aria-valuemax", "100");
+    const fill = document.createElement("span");
+    fill.className = "meter-fill";
+    if (Number.isFinite(percent)) {
+      track.setAttribute("aria-valuenow", String(Math.round(percent)));
+      fill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+    } else {
+      fill.style.width = "0";
     }
-    card.append(heading, list);
+    track.append(fill);
+    return track;
+  }
+
+  function statTile(label, value, sub, percent = null) {
+    const tile = document.createElement("section");
+    tile.className = "stat-tile";
+    tile.append(textSpan(label, "stat-label"), textSpan(value, "stat-value"));
+    if (percent !== null) tile.append(meter(percent, `${label} ${formatPercent(percent)}`));
+    if (sub) tile.append(textSpan(sub, "stat-sub"));
+    return tile;
+  }
+
+  function machineStatRow(metrics) {
+    const row = document.createElement("div");
+    row.className = "stat-row";
+    const cpu = metrics.cpu || {};
+    const cpuPercent = Number.isFinite(metrics.cpu_percent) ? metrics.cpu_percent : null;
+    row.append(statTile("CPU", cpuPercent === null ? "—" : formatPercent(cpuPercent),
+      cpuTopologyText(cpu) || "Total utilization", cpuPercent));
+    const memoryPercent = percentOf(metrics.memory_used_bytes, metrics.memory_total_bytes);
+    const available = metrics.memory?.available_bytes;
+    row.append(statTile("Memory",
+      Number.isFinite(metrics.memory_total_bytes) && metrics.memory_total_bytes > 0 ? formatBytes(metrics.memory_used_bytes) : "—",
+      [Number.isFinite(metrics.memory_total_bytes) && metrics.memory_total_bytes > 0 ? `of ${formatBytes(metrics.memory_total_bytes)}` : "",
+        Number.isFinite(available) ? `${formatBytes(available)} available` : ""].filter(Boolean).join(" · "),
+      memoryPercent));
+    const swapTotal = metrics.memory?.swap_total_bytes;
+    if (Number.isFinite(swapTotal) && swapTotal > 0) {
+      const swapUsed = metrics.memory.swap_used_bytes;
+      row.append(statTile("Swap", formatBytes(swapUsed), `of ${formatBytes(swapTotal)}`, percentOf(swapUsed, swapTotal)));
+    }
+    const load = cpu.load_average;
+    if (load && Number.isFinite(load.one)) {
+      const perCore = Number(cpu.logical_cores) > 0 ? percentOf(load.one, cpu.logical_cores) : null;
+      row.append(statTile("Load", load.one.toFixed(2),
+        Number.isFinite(load.five) && Number.isFinite(load.fifteen)
+          ? `5 min ${load.five.toFixed(2)} · 15 min ${load.fifteen.toFixed(2)}` : "1 minute average",
+        perCore));
+    }
+    row.append(statTile("Uptime", formatUptime(metrics.uptime_seconds), metrics.os_version || ""));
+    return row;
+  }
+
+  function cpuPanel(metrics) {
+    const cpu = metrics.cpu || {};
+    const card = metricPanel("CPU", "cpu-panel", typeof cpu.brand === "string" ? cpu.brand : "");
+    const facts = [cpuTopologyText(cpu)];
+    const load = loadAverageText(cpu.load_average);
+    if (load) facts.push(`load ${load}`);
+    if (facts.some(Boolean)) card.append(textSpan(facts.filter(Boolean).join(" · "), "metric-facts"));
+    const cores = Array.isArray(cpu.core_percent) ? cpu.core_percent.filter(Number.isFinite) : [];
+    if (!cores.length) {
+      card.append(textSpan(Number.isFinite(metrics.cpu_percent)
+        ? `${formatPercent(metrics.cpu_percent)} total. Per-core detail needs a newer atmux on this machine.`
+        : "Unavailable on this machine", "metric-sub"));
+      return card;
+    }
+    const busiest = Math.max(...cores);
+    const average = cores.reduce((sum, value) => sum + value, 0) / cores.length;
+    const caption = document.createElement("div");
+    caption.className = "metric-caption";
+    const threads = Number(cpu.physical_cores) > 0 && cores.length > Number(cpu.physical_cores);
+    caption.append(textSpan(threads ? "Per thread" : "Per core", "metric-caption-label"),
+      textSpan(`average ${formatPercent(average)} · busiest ${formatPercent(busiest)}`, "metric-caption-value"));
+    const grid = document.createElement("div");
+    grid.className = "core-grid";
+    grid.setAttribute("role", "img");
+    grid.setAttribute("aria-label", `Per-core utilization: ${cores.map((value, index) => `${index} ${value}%`).join(", ")}`);
+    cores.forEach((value, index) => {
+      const bar = document.createElement("span");
+      bar.className = "core-bar";
+      bar.dataset.level = meterLevel(value);
+      bar.dataset.tip = `Core ${index} · ${value}%`;
+      bar.dataset.tipKey = `core-${index}`;
+      const fill = document.createElement("span");
+      fill.className = "core-fill";
+      fill.style.height = `${Math.max(value > 0 ? 2 : 0, Math.min(100, value))}%`;
+      bar.append(fill);
+      grid.append(bar);
+    });
+    card.append(caption, grid);
     return card;
   }
 
-  function gpuMetricCard(gpus, diagnostics) {
-    const card = document.createElement("section"); card.className = "metric-card gpu-metric-card";
-    const heading = document.createElement("h2"); heading.textContent = "Graphics";
-    card.append(heading);
+  function memoryPanel(metrics) {
+    const card = metricPanel("Memory", "memory-panel");
+    const total = metrics.memory_total_bytes;
+    const memory = metrics.memory || {};
+    if (!Number.isFinite(total) || total <= 0) {
+      card.append(textSpan("Unavailable on this machine", "metric-sub"));
+      return card;
+    }
+    const headline = document.createElement("div");
+    headline.className = "memory-headline";
+    headline.append(
+      textSpan(formatBytes(metrics.memory_used_bytes), "memory-used"),
+      textSpan(`used of ${formatBytes(total)}`, "memory-total"),
+    );
+    if (Number.isFinite(memory.available_bytes)) {
+      headline.append(textSpan(`${formatBytes(memory.available_bytes)} available`, "memory-available"));
+    }
+    card.append(headline);
+    const rows = memoryBreakdownRows(memory);
+    if (!rows.length) {
+      card.append(meter(percentOf(metrics.memory_used_bytes, total), "Memory used"),
+        textSpan("A breakdown needs a newer atmux on this machine.", "metric-sub"));
+      return card;
+    }
+    const bar = document.createElement("div");
+    bar.className = "memory-bar";
+    bar.setAttribute("role", "img");
+    bar.setAttribute("aria-label", `Memory composition: ${rows.map((row) => `${row.label} ${formatBytes(row.bytes)}`).join(", ")}`);
+    const legend = document.createElement("ul");
+    legend.className = "memory-legend";
+    for (const row of rows) {
+      const tip = `${row.label} · ${formatBytes(row.bytes)} · ${formatPercent(row.percent, 1)}${row.description ? ` — ${row.description}` : ""}`;
+      if (row.bytes > 0) {
+        const segment = document.createElement("span");
+        segment.className = "memory-segment";
+        segment.dataset.kind = row.kind;
+        segment.dataset.tip = tip;
+        segment.dataset.tipKey = `memory-${row.kind}`;
+        segment.style.flexGrow = String(row.bytes);
+        bar.append(segment);
+      }
+      const item = document.createElement("li");
+      item.dataset.tip = tip;
+      item.dataset.tipKey = `legend-${row.kind}`;
+      const swatch = textSpan("", "memory-swatch");
+      swatch.dataset.kind = row.kind;
+      item.append(swatch, textSpan(row.label, "memory-legend-label"),
+        textSpan(formatBytes(row.bytes), "memory-legend-value"),
+        textSpan(formatPercent(row.percent), "memory-legend-percent"));
+      legend.append(item);
+    }
+    card.append(bar, legend);
+    const swapTotal = memory.swap_total_bytes;
+    if (Number.isFinite(swapTotal) && swapTotal > 0) {
+      const swap = document.createElement("div");
+      swap.className = "memory-swap";
+      const percent = percentOf(memory.swap_used_bytes, swapTotal);
+      swap.append(textSpan("Swap", "memory-swap-label"), meter(percent, "Swap used"),
+        textSpan(`${formatBytes(memory.swap_used_bytes)} of ${formatBytes(swapTotal)}`, "memory-swap-value"));
+      card.append(swap);
+    }
+    return card;
+  }
+
+  function processPanel(metrics) {
+    const subtitle = Number.isFinite(metrics.process_count)
+      ? `${formatCount(metrics.process_count)} running · grouped by name` : "Grouped by name";
+    const card = metricPanel("Top processes", "process-panel", subtitle);
+    const rows = processRows(metrics.processes, metrics.memory_total_bytes);
+    if (!rows.length) {
+      card.append(textSpan("Process detail needs a newer atmux on this machine.", "metric-sub"));
+      return card;
+    }
+    const table = document.createElement("table");
+    table.className = "process-table";
+    const head = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    for (const [label, className, tip] of [
+      ["Process", "", ""],
+      ["Memory", "numeric", "Resident memory summed across processes with this name"],
+      ["CPU", "numeric", "Share of the whole machine's CPU over the last 15 seconds"],
+    ]) {
+      const cell = document.createElement("th");
+      cell.scope = "col";
+      cell.textContent = label;
+      if (className) cell.className = className;
+      if (tip) cell.title = tip;
+      headRow.append(cell);
+    }
+    head.append(headRow);
+    const body = document.createElement("tbody");
+    for (const row of rows) {
+      const tr = document.createElement("tr");
+      const name = document.createElement("td");
+      name.className = "process-name";
+      name.append(textSpan(row.name, "process-label"));
+      if (row.count > 1) name.append(textSpan(`×${row.count}`, "process-count"));
+      const memory = document.createElement("td");
+      memory.className = "numeric";
+      const cell = document.createElement("div");
+      cell.className = "process-memory-cell";
+      const track = textSpan("", "process-share-track");
+      const share = textSpan("", "process-share");
+      share.style.width = `${row.memoryPercent ?? 0}%`;
+      track.append(share);
+      cell.dataset.tip = `${row.name} · ${row.memory}${row.memoryPercent === null ? "" : ` · ${formatPercent(row.memoryPercent, 1)} of RAM`}`;
+      cell.dataset.tipKey = `process-${row.name}`;
+      cell.append(track, textSpan(row.memory, "process-memory-value"));
+      memory.append(cell);
+      const cpu = document.createElement("td");
+      cpu.className = "numeric";
+      cpu.textContent = row.cpu;
+      tr.append(name, memory, cpu);
+      body.append(tr);
+    }
+    table.append(head, body);
+    card.append(table);
+    return card;
+  }
+
+  function systemPanel(metrics) {
+    const card = metricPanel("System", "system-panel");
+    const list = document.createElement("dl");
+    list.className = "metric-facts-list";
+    for (const [label, value] of systemMetricRows(metrics)) {
+      const row = document.createElement("div");
+      const term = document.createElement("dt"); term.textContent = label;
+      const detail = document.createElement("dd"); detail.textContent = value;
+      row.append(term, detail);
+      list.append(row);
+    }
+    card.append(list);
+    return card;
+  }
+
+  /// One block per GPU: utilization and VRAM meters up front, every other
+  /// counter one click away. Open details survive the live re-render.
+  function gpuPanel(machineId, gpus, diagnostics) {
+    const card = metricPanel("Graphics", "gpu-panel");
     if (!Array.isArray(gpus) || !gpus.length) {
       card.append(textSpan("Unavailable on this machine", "metric-sub"));
-    } else {
-      for (const gpu of gpus) {
-        const details = document.createElement("details"); details.className = "gpu-device";
-        const summary = document.createElement("summary"); summary.textContent = gpuSummary(gpu);
-        const list = document.createElement("ul"); list.className = "metric-list gpu-detail-list";
-        for (const line of gpuDetailLines(gpu)) {
-          const item = document.createElement("li"); item.textContent = line; list.append(item);
-        }
-        details.append(summary, list);
-        card.append(details);
-      }
     }
+    const list = document.createElement("div");
+    list.className = "gpu-list";
+    for (const [index, gpu] of (Array.isArray(gpus) ? gpus : []).entries()) {
+      const block = document.createElement("article");
+      block.className = "gpu-block";
+      const title = document.createElement("div");
+      title.className = "gpu-title";
+      title.append(textSpan(gpu.name || "GPU", "gpu-name"));
+      const chips = [];
+      if (Number.isFinite(gpu.temperature_celsius)) chips.push(`${formatDecimal(gpu.temperature_celsius)}°C`);
+      if (Number.isFinite(gpu.power_draw_watts)) chips.push(`${formatDecimal(gpu.power_draw_watts)} W`);
+      if (Number.isFinite(gpu.fan_percent)) chips.push(`fan ${gpu.fan_percent}%`);
+      if (chips.length) title.append(textSpan(chips.join(" · "), "gpu-chips"));
+      block.append(title);
+      const meters = document.createElement("div");
+      meters.className = "gpu-meters";
+      const utilization = Number.isFinite(gpu.utilization_percent) ? gpu.utilization_percent : null;
+      meters.append(gpuMeterRow("Load", utilization === null ? "—" : formatPercent(utilization), utilization));
+      if (Number.isFinite(gpu.memory_total_bytes)) {
+        meters.append(gpuMeterRow(gpu.memory_shared ? "Memory" : "VRAM",
+          memoryValue(gpu.memory_used_bytes, gpu.memory_total_bytes),
+          percentOf(gpu.memory_used_bytes, gpu.memory_total_bytes)));
+      } else if (gpu.memory_shared) {
+        meters.append(gpuMeterRow("Memory", "shared with system", null, false));
+      }
+      block.append(meters);
+      const key = `${machineId}:${gpu.id || index}`;
+      const details = document.createElement("details");
+      details.className = "gpu-device";
+      details.open = state.machineOpenDetails.has(key);
+      details.addEventListener("toggle", () => {
+        if (details.open) state.machineOpenDetails.add(key);
+        else state.machineOpenDetails.delete(key);
+      });
+      const summary = document.createElement("summary");
+      summary.textContent = "All counters";
+      const detailList = document.createElement("ul");
+      detailList.className = "metric-list gpu-detail-list";
+      for (const line of gpuDetailLines(gpu)) {
+        const item = document.createElement("li"); item.textContent = line; detailList.append(item);
+      }
+      details.append(summary, detailList);
+      block.append(details);
+      list.append(block);
+    }
+    if (list.childElementCount) card.append(list);
     const diagnosticLines = gpuDiagnosticLines(diagnostics);
     if (diagnosticLines.length) {
+      const key = `${machineId}:diagnostics`;
       const details = document.createElement("details"); details.className = "gpu-diagnostics";
+      details.open = state.machineOpenDetails.has(key);
+      details.addEventListener("toggle", () => {
+        if (details.open) state.machineOpenDetails.add(key);
+        else state.machineOpenDetails.delete(key);
+      });
       const summary = document.createElement("summary"); summary.textContent = "Collector diagnostics";
-      const list = document.createElement("ul"); list.className = "metric-list";
+      const diagnosticList = document.createElement("ul"); diagnosticList.className = "metric-list";
       for (const line of diagnosticLines) {
-        const item = document.createElement("li"); item.textContent = line; list.append(item);
+        const item = document.createElement("li"); item.textContent = line; diagnosticList.append(item);
       }
-      details.append(summary, list);
+      details.append(summary, diagnosticList);
       card.append(details);
     }
     return card;
   }
 
-  function temperatureLines(temperatures) {
-    if (!Array.isArray(temperatures)) return [];
-    return temperatures.map((reading) => `${reading.label || "Sensor"} · ${reading.celsius}°C`);
+  function gpuMeterRow(label, value, percent, showMeter = true) {
+    const row = document.createElement("div");
+    row.className = "gpu-meter-row";
+    row.append(textSpan(label, "gpu-meter-label"));
+    row.append(showMeter ? meter(percent, `GPU ${label}`) : textSpan("", "gpu-meter-spacer"));
+    row.append(textSpan(value, "gpu-meter-value"));
+    return row;
+  }
+
+  function temperaturePanel(temperatures) {
+    const rows = temperatureRows(temperatures);
+    const card = metricPanel("Temperatures", "temperature-panel", rows.length ? `${rows.length} sensor${rows.length === 1 ? "" : "s"} · hottest first` : "");
+    if (!rows.length) {
+      card.append(textSpan("Unavailable on this machine", "metric-sub"));
+      return card;
+    }
+    const list = document.createElement("ul");
+    list.className = "temperature-grid";
+    for (const row of rows) {
+      const item = document.createElement("li");
+      item.dataset.level = row.celsius >= 95 ? "critical" : row.celsius >= 85 ? "high" : "normal";
+      item.dataset.tip = `${row.label} · ${formatDecimal(row.celsius)}°C`;
+      item.dataset.tipKey = `temperature-${row.label}`;
+      item.append(textSpan(row.label, "temperature-label"), textSpan(`${formatDecimal(row.celsius)}°C`, "temperature-value"));
+      list.append(item);
+    }
+    card.append(list);
+    return card;
+  }
+
+  /// One floating tooltip for every hoverable mark in the machine view. The
+  /// view re-renders on each live update, so the tip follows a stable key
+  /// rather than a DOM node and refreshes its text after each render.
+  function machineTipElement() {
+    let tip = document.getElementById("machine-tip");
+    if (!tip) {
+      tip = document.createElement("div");
+      tip.id = "machine-tip";
+      tip.className = "machine-tip";
+      tip.setAttribute("role", "tooltip");
+      tip.hidden = true;
+      document.body.append(tip);
+    }
+    return tip;
+  }
+
+  function showMachineTip(target, x, y) {
+    const tip = machineTipElement();
+    state.machineTip = { key: target.dataset.tipKey || "", x, y };
+    tip.textContent = target.dataset.tip;
+    tip.hidden = false;
+    const width = tip.offsetWidth;
+    const height = tip.offsetHeight;
+    const left = Math.max(8, Math.min(window.innerWidth - width - 8, x + 12));
+    const top = y - height - 12 >= 8 ? y - height - 12 : y + 18;
+    tip.style.left = `${left}px`;
+    tip.style.top = `${top}px`;
+  }
+
+  function hideMachineTip() {
+    state.machineTip = null;
+    const tip = document.getElementById("machine-tip");
+    if (tip) tip.hidden = true;
+  }
+
+  function refreshMachineTip() {
+    const current = state.machineTip;
+    if (!current?.key) return;
+    const target = [...$("machine-metrics").querySelectorAll("[data-tip-key]")]
+      .find((node) => node.dataset.tipKey === current.key);
+    if (target) showMachineTip(target, current.x, current.y);
+    else hideMachineTip();
   }
 
   function textSpan(text, className) {
@@ -9040,6 +9517,17 @@ function initialize() {
   });
   $("mobile-back").addEventListener("click", backToAgentMenu);
   $("machine-mobile-back").addEventListener("click", backToAgentMenu);
+  {
+    const metricsRoot = $("machine-metrics");
+    const tipTarget = (event) => event.target instanceof Element ? event.target.closest("[data-tip]") : null;
+    metricsRoot.addEventListener("pointermove", (event) => {
+      const target = tipTarget(event);
+      if (target && metricsRoot.contains(target)) showMachineTip(target, event.clientX, event.clientY);
+      else hideMachineTip();
+    });
+    metricsRoot.addEventListener("pointerleave", hideMachineTip);
+    $("machine-view").addEventListener("scroll", hideMachineTip, { passive: true });
+  }
 
   function composerDraftIdentityForPane(paneId) {
     const session = state.sessions.get(paneId);

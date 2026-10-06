@@ -4,7 +4,8 @@
 //! best effort and never requires elevated privileges: Linux uses NVIDIA's
 //! documented CSV query plus bounded DRM/sysfs reads for AMD and Intel, while
 //! macOS uses bounded `system_profiler`, `ioreg`, `pmset`, and
-//! `memory_pressure` output. Missing counters stay `None` and are named in the
+//! `memory_pressure` output. Host CPU, memory composition, and process groups
+//! live in [`host`]. Missing counters stay `None` and are named in the
 //! device's `unavailable` list instead of being reported as zero.
 
 use std::{
@@ -22,6 +23,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(any(target_os = "macos", test))]
 use serde_json::Value;
 use sysinfo::{Components, System};
+
+mod host;
+
+pub use host::{CpuDetail, LoadAverage, MemoryDetail, MemorySegment, ProcessGroup};
 
 const GPU_SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
@@ -237,6 +242,14 @@ pub struct MachineMetrics {
     pub gpus: Vec<GpuMetrics>,
     pub temperatures: Vec<TemperatureReading>,
     pub gpu_diagnostics: Vec<GpuDiagnostic>,
+    /// Processor identity, load averages, and per-core utilization.
+    pub cpu: Option<CpuDetail>,
+    /// Physical memory composition and swap.
+    pub memory: Option<MemoryDetail>,
+    /// Heaviest process groups by memory, plus the busiest by CPU.
+    pub processes: Vec<ProcessGroup>,
+    /// Processes running when `processes` was sampled.
+    pub process_count: Option<u32>,
 }
 
 #[derive(Default, Deserialize)]
@@ -251,6 +264,10 @@ struct MachineMetricsWire {
     gpus: Vec<GpuMetrics>,
     temperatures: Vec<TemperatureReading>,
     gpu_diagnostics: Vec<GpuDiagnostic>,
+    cpu: Option<CpuDetail>,
+    memory: Option<MemoryDetail>,
+    processes: Vec<ProcessGroup>,
+    process_count: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -264,6 +281,14 @@ struct MachineMetricsOutput {
     gpus: Vec<GpuMetrics>,
     temperatures: Vec<TemperatureReading>,
     gpu_diagnostics: Vec<GpuDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu: Option<CpuDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory: Option<MemoryDetail>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    processes: Vec<ProcessGroup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_count: Option<u32>,
 }
 
 impl Serialize for MachineMetrics {
@@ -318,6 +343,10 @@ impl Serialize for MachineMetrics {
             gpus,
             temperatures,
             gpu_diagnostics,
+            cpu: self.cpu.clone().and_then(CpuDetail::sanitized),
+            memory: self.memory.clone().and_then(MemoryDetail::sanitized),
+            processes: host::sanitize_processes(self.processes.clone()),
+            process_count: self.process_count,
         }
         .serialize(serializer)
     }
@@ -360,6 +389,10 @@ impl<'de> Deserialize<'de> for MachineMetrics {
                     !diagnostic.source.is_empty() && !diagnostic.message.is_empty()
                 })
                 .collect(),
+            cpu: wire.cpu.and_then(CpuDetail::sanitized),
+            memory: wire.memory.and_then(MemoryDetail::sanitized),
+            processes: host::sanitize_processes(wire.processes),
+            process_count: wire.process_count,
         })
     }
 }
@@ -373,6 +406,7 @@ pub struct HardwareSampler {
     os_version: Option<String>,
     gpu_sample: GpuSample,
     gpu_sampled_at: Option<Instant>,
+    host: host::HostSampler,
 }
 
 impl Default for HardwareSampler {
@@ -387,6 +421,7 @@ impl Default for HardwareSampler {
             os_version: bounded_optional(System::long_os_version().or_else(System::os_version)),
             gpu_sample: GpuSample::default(),
             gpu_sampled_at: None,
+            host: host::HostSampler::default(),
         }
     }
 }
@@ -418,6 +453,7 @@ impl HardwareSampler {
                 })
             })
             .collect();
+        let host = self.host.sample(&mut self.system);
         MachineMetrics {
             cpu_percent: finite_percent(self.system.global_cpu_usage()),
             memory_used_bytes: self.system.used_memory(),
@@ -428,6 +464,10 @@ impl HardwareSampler {
             gpus: self.gpu_sample.gpus.clone(),
             temperatures,
             gpu_diagnostics: self.gpu_sample.diagnostics.clone(),
+            cpu: host.cpu,
+            memory: host.memory,
+            processes: host.processes,
+            process_count: host.process_count,
         }
     }
 }

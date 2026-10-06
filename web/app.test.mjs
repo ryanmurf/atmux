@@ -56,6 +56,16 @@ const {
   stickyBottomState,
   STICKY_BOTTOM_TOLERANCE,
   formatUptime,
+  systemMetricRows,
+  percentOf,
+  formatPercent,
+  formatFrequency,
+  cpuTopologyText,
+  loadAverageText,
+  meterLevel,
+  memoryBreakdownRows,
+  processRows,
+  temperatureRows,
   formatRelativeTime,
   fleetUpdatePollDelay,
   recoveryMachines,
@@ -2491,14 +2501,81 @@ test("system telemetry formats compact uptime and explicit unavailable values", 
     os_version: "Linux (Ubuntu 24.04)",
   }), [
     "Uptime · 2d 3h 4m",
-    "Kernel · 6.8.0-48-generic",
     "OS · Linux (Ubuntu 24.04)",
+    "Kernel · 6.8.0-48-generic",
   ]);
   assert.deepEqual(systemMetricLines({}), [
     "Uptime · Unavailable",
-    "Kernel · Unavailable",
     "OS · Unavailable",
+    "Kernel · Unavailable",
   ]);
+  assert.deepEqual(systemMetricRows({
+    uptime_seconds: 60,
+    cpu: { brand: " AMD Ryzen 9 7950X ", physical_cores: 16, logical_cores: 32, frequency_mhz: 5256 },
+    process_count: 4886,
+  }).slice(3), [
+    ["Processor", "AMD Ryzen 9 7950X"],
+    ["Cores", "16 cores · 32 threads · 5.26 GHz"],
+    ["Processes", "4,886"],
+  ]);
+});
+
+test("machine view helpers format CPU, load, meters, and sensors without inventing data", () => {
+  assert.equal(cpuTopologyText({ physical_cores: 16, logical_cores: 16 }), "16 cores");
+  assert.equal(cpuTopologyText({ logical_cores: 8, frequency_mhz: 800 }), "8 cores · 800 MHz");
+  assert.equal(cpuTopologyText(null), "");
+  assert.equal(formatFrequency(0), "");
+  assert.equal(loadAverageText({ one: 5.541, five: 6.2, fifteen: 5.86 }), "5.54 · 6.20 · 5.86");
+  assert.equal(loadAverageText({ one: 1 }), "");
+  assert.equal(percentOf(1, 4), 25);
+  assert.equal(percentOf(5, 4), 100);
+  assert.equal(percentOf(1, 0), null);
+  assert.equal(percentOf(undefined, 4), null);
+  assert.equal(formatPercent(0.4), "<1%");
+  assert.equal(formatPercent(0.04, 1), "<0.1%");
+  assert.equal(formatPercent(0), "0%");
+  assert.equal(formatPercent(Number.NaN), "—");
+  assert.deepEqual([meterLevel(84), meterLevel(85), meterLevel(95), meterLevel(null)], ["normal", "high", "critical", "normal"]);
+  assert.deepEqual(temperatureRows([
+    { label: "edge", celsius: 43 }, { label: "Tctl", celsius: 76.8 }, { celsius: 50 }, { label: "bad", celsius: "hot" },
+  ]).map((row) => `${row.label} ${row.celsius}`), ["Tctl 76.8", "Sensor 50", "edge 43"]);
+});
+
+test("memory breakdown rows keep owner order, label known kinds, and drop malformed slices", () => {
+  const GiB = 1024 ** 3;
+  const rows = memoryBreakdownRows({
+    segments: [
+      { kind: "apps", bytes: 12 * GiB },
+      { kind: "wired", bytes: 41 * GiB },
+      { kind: "future_kind", bytes: 1 * GiB },
+      { kind: "<img>", bytes: 99 * GiB },
+      { kind: "cache", bytes: -1 },
+      { kind: "free", bytes: 10 * GiB },
+    ],
+  });
+  assert.deepEqual(rows.map((row) => [row.kind, row.label]), [
+    ["apps", "Apps"], ["wired", "Wired"], ["other", "future kind"], ["free", "Free"],
+  ]);
+  assert.equal(Math.round(rows[1].percent), 64);
+  assert.match(rows[1].description, /GPU/);
+  assert.deepEqual(memoryBreakdownRows({}), []);
+  assert.deepEqual(memoryBreakdownRows({ segments: [{ kind: "free", bytes: 0 }] }), []);
+});
+
+test("process rows keep owner order and report each group's share of RAM", () => {
+  const GiB = 1024 ** 3;
+  const rows = processRows([
+    { name: "llama-server", count: 1, memory_bytes: 7 * GiB, cpu_percent: 31.44 },
+    { name: "claude", count: 10, memory_bytes: 4 * GiB, cpu_percent: 0.04 },
+    { name: " ", count: 2, memory_bytes: GiB, cpu_percent: 1 },
+    { name: "broken", count: 1, cpu_percent: 1 },
+  ], 64 * GiB);
+  assert.deepEqual(rows.map((row) => [row.name, row.count, row.memory, row.cpu]), [
+    ["llama-server", 1, "7.0 GiB", "31.4%"],
+    ["claude", 10, "4.0 GiB", "<0.1%"],
+  ]);
+  assert.equal(rows[0].memoryPercent, 7 / 64 * 100);
+  assert.deepEqual(processRows(null, 1), []);
 });
 
 test("isMachineControllable blocks control only for a known-offline machine", () => {
