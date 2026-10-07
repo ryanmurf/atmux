@@ -462,7 +462,7 @@ pub(super) fn meminfo_segments(input: &str) -> Vec<MemorySegment> {
 
 /// Builds `apps, <ordered>, free` summing to `total`. Apps is the remainder;
 /// when the counters overshoot `total`, later slices are trimmed instead.
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", test))]
 fn fit_segments(total: u64, ordered: &[(&str, u64)], free: u64) -> Vec<MemorySegment> {
     if total == 0 {
         return Vec::new();
