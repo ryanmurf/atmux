@@ -500,11 +500,13 @@ dialog::backdrop { background: #000a; }
 .process-table td { padding: 5px 0; border-bottom: 1px solid var(--line-soft); }
 .process-table tr:last-child td { border-bottom: 0; }
 .process-table .numeric { padding-left: 8px; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
-.process-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.process-count { margin-left: 6px; color: var(--muted); font-size: 12px; }
+.process-name { min-width: 0; display: flex; align-items: baseline; gap: 6px; }
+.process-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.process-count { flex: none; color: var(--muted); font-size: 12px; }
 .process-memory-cell { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
 .process-share-track { min-width: 24px; max-width: 80px; height: 6px; display: block; flex: 1 1 auto; overflow: hidden; border-radius: 3px; background: var(--mem-free); }
 .process-share { max-width: 100%; height: 100%; display: block; border-radius: 3px; background: var(--mem-apps); }
+.process-memory-value { min-width: 60px; text-align: right; }
 .metric-facts-list { min-width: 0; display: grid; gap: 7px; margin: 0; font-size: 13px; }
 .metric-facts-list div { min-width: 0; display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 10px; }
 .metric-facts-list dt { color: var(--muted); }
@@ -630,6 +632,8 @@ dialog::backdrop { background: #000a; }
   .topbar { height: 58px; padding: 0 10px; gap: 8px; }
   body.has-selection .topbar { display: none; }
   .stat-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .process-share-track { display: none; }
+  .process-table th:nth-child(2) { width: 30%; }
   .rail-toggle { display: none; }
   .brand { min-width: 34px; flex: 1; }
   .brand-wordmark, .brand small, .counts { display: none; }

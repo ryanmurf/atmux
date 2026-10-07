@@ -7784,9 +7784,13 @@ function initialize() {
     for (const row of rows) {
       const tr = document.createElement("tr");
       const name = document.createElement("td");
-      name.className = "process-name";
-      name.append(textSpan(row.name, "process-label"));
-      if (row.count > 1) name.append(textSpan(`×${row.count}`, "process-count"));
+      const nameCell = document.createElement("div");
+      nameCell.className = "process-name";
+      nameCell.dataset.tip = row.count > 1 ? `${row.name} · ${row.count} processes` : row.name;
+      nameCell.dataset.tipKey = `process-name-${row.name}`;
+      nameCell.append(textSpan(row.name, "process-label"));
+      if (row.count > 1) nameCell.append(textSpan(`×${row.count}`, "process-count"));
+      name.append(nameCell);
       const memory = document.createElement("td");
       memory.className = "numeric";
       const cell = document.createElement("div");
@@ -7850,10 +7854,14 @@ function initialize() {
       meters.className = "gpu-meters";
       const utilization = Number.isFinite(gpu.utilization_percent) ? gpu.utilization_percent : null;
       meters.append(gpuMeterRow("Load", utilization === null ? "—" : formatPercent(utilization), utilization));
-      if (Number.isFinite(gpu.memory_total_bytes)) {
-        meters.append(gpuMeterRow(gpu.memory_shared ? "Memory" : "VRAM",
-          memoryValue(gpu.memory_used_bytes, gpu.memory_total_bytes),
+      const label = gpu.memory_shared ? "Memory" : "VRAM";
+      if (Number.isFinite(gpu.memory_total_bytes) && Number.isFinite(gpu.memory_used_bytes)) {
+        meters.append(gpuMeterRow(label, memoryValue(gpu.memory_used_bytes, gpu.memory_total_bytes),
           percentOf(gpu.memory_used_bytes, gpu.memory_total_bytes)));
+      } else if (Number.isFinite(gpu.memory_total_bytes)) {
+        // Apple silicon reports the unified pool but not the GPU's share of it;
+        // the Memory panel's wired slice is where that use shows up.
+        meters.append(gpuMeterRow(label, `${formatBytes(gpu.memory_total_bytes)} ${gpu.memory_shared ? "shared" : "total"}`, null, false));
       } else if (gpu.memory_shared) {
         meters.append(gpuMeterRow("Memory", "shared with system", null, false));
       }
