@@ -1,6 +1,6 @@
 # Conversation: when each entry finished
 
-Status: implemented 2026-10-11; deploying.
+Status: deployed fleet-wide 2026-10-11 (runtime `f7bb4e5`).
 
 ## Why
 
@@ -34,3 +34,23 @@ different `self_update` install test. Each passed alone, and none touches transc
 tests passed, and all four browser suites passed. The new browser test runs at 360 px with a long, 400-day-old subagent header. It checks every label, right alignment, the
 first-line placement, no horizontal overflow, and that the label moves to "10m ago" on return
 without a redraw. With the old centered header, the first-line check fails.
+
+## Deployment (2026-10-11)
+
+| Machine | Artifact SHA-256 prefix | Rollback |
+| --- | --- | --- |
+| Tron | `813e99420c9b005e` | `target/release/atmux.rollback-4f18199` |
+| Max | `813e99420c9b005e` (Tron's build) | `target/release/atmux.rollback-4f18199` |
+| Midnight | `aeb1c3daa880aaa0` (built on Midnight, 4 jobs) | `target/release/atmux.rollback-4f18199` |
+| Clue | `dcf933d9576a22d5` (aarch64, built on Clue) | `~/.local/bin/atmux.rollback-4f18199` |
+| Coordinator | `localhost:32000/atmux:f7bb4e5ae73f@sha256:2c7a1014…` | Helm rev 40 (`4f18199`) |
+
+The fleet first ran `a95375c` (Helm rev 41). Checking it through the coordinator showed that Codex
+`send_message` and `followup_task` calls never got a finish time, because Codex writes an empty
+result for them. `f7bb4e5` fixed that and went to every machine (Helm rev 42). Only `server.image`
+changed; the values are in `/mnt/data/herodevs-agents/atmux-rollout-entry-times-lWMH0e` on Tron.
+Session counts held: Tron 15, Max 6, Midnight 14 (LaunchAgent kickstart only), Clue 1.
+
+Through the coordinator, every tool call in four live transcripts had `finished_at` except the
+one still running: Tron Claude 158 of 159, Midnight Claude 12 of 12, Max Codex 79 of 79, Max
+Claude 90 of 90.
