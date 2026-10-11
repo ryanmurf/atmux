@@ -51,6 +51,10 @@ server:
     allowHttpHosts: [192.168.0.124]
     egressCidr: 192.168.0.124/32
     egressPort: 8091
+    timeoutSeconds: 90
+    # true or false sends Qwen's enable_thinking template switch; null sends
+    # nothing. Thinking spends the 4,096-token reply budget before the digest.
+    enableThinking: null
     minIntervalSeconds: 300
     dailyRequestBudget: 500
     searchTenantId: ""

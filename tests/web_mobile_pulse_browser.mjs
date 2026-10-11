@@ -290,7 +290,11 @@ function mockApi(url, response, request) {
     const observed = { pane: decodeURIComponent(pathname.split("/")[4]), hash: url.searchParams.get("known_hash"), closed: false };
     transcriptRequests.push(observed);
     // Capture at request time so retired, slow responses can be tested.
-    const payload = structuredClone(transcriptFixture || { available: false, source: "codex", changed: false, messages: [] });
+    let payload = structuredClone(transcriptFixture || { available: false, source: "codex", changed: false, messages: [] });
+    // Like the owner, answer a poll that already has this content with no messages.
+    if (payload.available && observed.hash && observed.hash === payload.content_hash) {
+      payload = { available: true, source: payload.source, changed: false, content_hash: payload.content_hash };
+    }
     let timer;
     response.once("close", () => { observed.closed = true; clearTimeout(timer); });
     if (transcriptResponseDelayMs) timer = setTimeout(() => json(response, payload), transcriptResponseDelayMs);
@@ -3590,10 +3594,11 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(expandedExec.resultVisible, true, JSON.stringify(expandedExec));
     assert.equal(expandedExec.markupInjected, false, JSON.stringify(expandedExec));
 
-    // A stale expansion callback must not mutate a freshly reconnected
-    // transcript even when it is still the same pane. Hold the queued callback,
-    // force the pane stream's resync path, then invoke the old callback against
-    // the new Conversation generation.
+    // A stale expansion callback must not move a reconnected conversation
+    // even when it is still the same pane. Hold the queued callback, force the
+    // pane stream's resync path, then invoke the old callback against the new
+    // Conversation generation. The resync keeps the cards on screen, so only
+    // the generation check stops the callback.
     const staleExpansionSetup = await cdp.evaluate(`(() => {
       const conversation = document.getElementById('conversation');
       const group = conversation.querySelector('.tool-call-group:not(.tool-run-group)');
@@ -3612,12 +3617,14 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
     assert.equal(staleExpansionSetup.queued, 1, JSON.stringify(staleExpansionSetup));
     const currentPaneStream = [...paneStreams].at(-1);
     assert.ok(currentPaneStream, "same-pane reconnect test requires the current pane stream");
+    const requestsBeforeResync = transcriptRequests.length;
     currentPaneStream.write(`event: pane.patch\ndata: ${JSON.stringify({
       base_revision: 999, revision: 1_000, start_line: 0, delete_lines: 0, lines: [],
     })}\n\n`);
     await waitFor(
-      () => cdp.evaluate("document.getElementById('stream-state').textContent === 'Live' && document.querySelectorAll('#conversation .tool-call-group:not([data-old-generation])').length === 2"),
-      "same-pane reconnect did not replace the old tool group generation",
+      async () => transcriptRequests.slice(requestsBeforeResync).some((request) => request.hash === "coordination-tools")
+        && await cdp.evaluate("document.getElementById('stream-state').textContent === 'Live'"),
+      "same-pane reconnect did not resume polling with the known transcript",
       5_000,
     );
     const staleExpansionResult = await cdp.evaluate(`(() => {
@@ -3635,7 +3642,7 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
         groupCount: document.querySelectorAll('#conversation .tool-call-group').length,
       };
     })()`);
-    assert.equal(staleExpansionResult.oldConnected, false, JSON.stringify(staleExpansionResult));
+    assert.equal(staleExpansionResult.oldConnected, true, JSON.stringify(staleExpansionResult));
     assert.equal(staleExpansionResult.groupCount, 2, JSON.stringify(staleExpansionResult));
     assert.ok(Math.abs(staleExpansionResult.after - staleExpansionResult.before) <= 1, JSON.stringify({ staleExpansionSetup, staleExpansionResult }));
 
@@ -5090,7 +5097,12 @@ test("inline rename, keyboard controls and safe automatic summaries work in the 
   let server; let chrome; let cdp; let testError = null;
   sessionRenameRequests.length = 0;
   agentSummaryFixture = { enabled: true, title: "Durable session summaries", description: "Keep context",
-    digest: "Goal: retain context. <script>window.summaryInjected = true</script> Tests remain.", stale: false };
+    digest: "Goal: retain context. <script>window.summaryInjected = true</script> Tests remain.", stale: false,
+    digest_updated_at: Math.floor(Date.now() / 1000) - 600, status: "waiting" };
+  transcriptFixture = {
+    available: true, source: "codex", changed: true, content_hash: "summary-transcript", truncated: false,
+    messages: ["Plan", "Patch", "Verify"].map((text, index) => ({ id: `summary-message-${index}`, role: "assistant", markdown: text })),
+  };
   try {
     const started = await startServer(); server = started.server;
     const browser = await launchChrome(profileDirectory); chrome = browser.chrome;
@@ -5116,6 +5128,37 @@ test("inline rename, keyboard controls and safe automatic summaries work in the 
     assert.equal(await cdp.evaluate("document.querySelector('.conversation-summary').open"), true);
     assert.equal(await cdp.evaluate("Boolean(window.summaryInjected)"), false);
     assert.equal(await cdp.evaluate("document.querySelector('.conversation-summary script') === null"), true);
+    // A phone switching apps hides and re-shows the page, which reconnects the
+    // pane. The conversation and its open summary stay on screen while a slow
+    // poll confirms nothing changed, and a summary that only turned stale or
+    // changed status does not rebuild the transcript.
+    await waitFor(() => cdp.evaluate("document.querySelectorAll('#conversation .message-card').length === 3"), "summary transcript did not render");
+    const summaryLabel = await cdp.evaluate("document.querySelector('.conversation-summary summary').textContent");
+    assert.match(summaryLabel, /^Summary · updated \S/);
+    await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      window.conversationGaps = [];
+      window.conversationRedraws = 0;
+      new MutationObserver(() => {
+        window.conversationRedraws += 1;
+        if (conversation.querySelectorAll('.message-card').length !== 3 || !conversation.querySelector('.conversation-summary[open]')) {
+          window.conversationGaps.push(conversation.children.length);
+        }
+      }).observe(conversation, { childList: true });
+      return true;
+    })()`);
+    const requestsBeforeReturn = transcriptRequests.length;
+    transcriptResponseDelayMs = 1_500;
+    agentSummaryFixture = { ...agentSummaryFixture, stale: true, status: "working" };
+    await cdp.evaluate("Object.defineProperty(document, 'hidden', { configurable: true, get: () => true }); document.dispatchEvent(new Event('visibilitychange')); true");
+    await cdp.evaluate("Object.defineProperty(document, 'hidden', { configurable: true, get: () => false }); document.dispatchEvent(new Event('visibilitychange')); true");
+    await waitFor(() => transcriptRequests.length - requestsBeforeReturn >= 2, "returning to the page did not resume polling");
+    transcriptResponseDelayMs = 0;
+    assert.equal(transcriptRequests[requestsBeforeReturn].hash, "summary-transcript");
+    assert.deepEqual(await cdp.evaluate("window.conversationGaps"), []);
+    assert.equal(await cdp.evaluate("window.conversationRedraws"), 0);
+    assert.equal(await cdp.evaluate("document.querySelector('.conversation-summary summary').textContent"), summaryLabel);
+    await cdp.evaluate("delete document.hidden; true");
     emitOverviewPatch([{ ...mockSession("tron", "%100", "durable-session-summaries", "waiting", { agent: "codex" }),
       instance_id: "pane-v1-" + "1".repeat(64), description: "Keep context", description_source: "auto" }]);
     await waitFor(() => cdp.evaluate("document.querySelector('.session-description[data-source=auto]')?.textContent === 'Keep context'"), "automatic note marker did not render");
@@ -5125,6 +5168,8 @@ test("inline rename, keyboard controls and safe automatic summaries work in the 
   } catch (error) { testError = error; throw error; }
   finally {
     agentSummaryFixture = null;
+    transcriptFixture = null;
+    transcriptResponseDelayMs = 0;
     try { await cleanupBrowserHarness({ cdp, chrome, server, profileDirectory }); }
     catch (error) { if (!testError) throw error; console.error(error); }
     paneStreams.clear(); overviewStreams.clear();

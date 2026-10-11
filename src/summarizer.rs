@@ -42,6 +42,8 @@ pub struct SummariesConfig {
     pub api_key_env: Option<String>,
     pub api_key_file: Option<PathBuf>,
     pub timeout_seconds: u64,
+    /// Qwen's `enable_thinking` template switch; unset sends nothing.
+    pub enable_thinking: Option<bool>,
     pub concurrency: usize,
     pub min_interval_seconds: u64,
     pub poll_seconds: u64,
@@ -61,6 +63,7 @@ impl Default for SummariesConfig {
             api_key_env: None,
             api_key_file: None,
             timeout_seconds: 90,
+            enable_thinking: None,
             concurrency: 1,
             min_interval_seconds: 300,
             poll_seconds: 30,
@@ -117,6 +120,7 @@ impl CompletionClient {
             allow_http_hosts: config.allow_http_hosts.clone(),
             timeout_seconds: config.timeout_seconds,
             max_tokens: 4096,
+            enable_thinking: config.enable_thinking,
         };
         if let Some(name) = &config.api_key_env {
             let key =
@@ -821,8 +825,10 @@ impl Summarizer {
                 let key = key.clone();
                 tokio::spawn(async move {
                     // HTTP, read and persistence failures retain the last good digest.
-                    if service.refresh(&control, &session).await.is_err() {
-                        eprintln!("atmux summary refresh failed for {key}");
+                    // Only the outermost context is logged: inner parse errors
+                    // can quote model output.
+                    if let Err(error) = service.refresh(&control, &session).await {
+                        eprintln!("atmux summary refresh failed for {key}: {error}");
                     }
                     service
                         .in_flight

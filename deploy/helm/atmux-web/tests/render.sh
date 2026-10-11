@@ -83,6 +83,7 @@ grep -Fq 'matchLabels: {app: redpanda}' "$work/events.yaml"
 "$helm_bin" template atmux-web "$chart" --namespace murphytek "${enabled_values[@]}" \
   --set server.summaries.enabled=true \
   --set server.summaries.searchTenantId=95efe33d-fa71-53ce-8e0a-3fe45ac0e58a \
+  --set server.summaries.timeoutSeconds=300 --set server.summaries.enableThinking=false \
   --set server.registry.enabled=true --set server.registry.restoreOnStart=true \
   --set-json 'server.registry.restoreMachines=["midnight","clue"]' \
   --set-json 'server.extraEgress=[{"cidr":"203.0.113.10/32","ports":[443]}]' \
@@ -91,6 +92,8 @@ assert_unique_top_level_keys "$work/control-plane.yaml"
 grep -Fq '[summaries]' "$work/control-plane.yaml"
 grep -Fq 'endpoint = "http://192.168.0.124:8091/v1"' "$work/control-plane.yaml"
 grep -Fq 'store_dir = "/var/lib/atmux/data/summaries"' "$work/control-plane.yaml"
+grep -Fq 'timeout_seconds = 300' "$work/control-plane.yaml"
+grep -Fq 'enable_thinking = false' "$work/control-plane.yaml"
 grep -Fq 'search_tenant_id = "95efe33d-fa71-53ce-8e0a-3fe45ac0e58a"' "$work/control-plane.yaml"
 grep -Fq '[registry]' "$work/control-plane.yaml"
 grep -Fq 'directory = "/var/lib/atmux/data/registry"' "$work/control-plane.yaml"

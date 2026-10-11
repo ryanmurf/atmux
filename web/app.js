@@ -3059,6 +3059,28 @@ function reduceTranscript(current, data) {
 
 const MAX_TRANSCRIPT_NOTE_CHARS = 400;
 
+/// The Summary block's heading. The owner marks a digest stale as soon as the
+/// agent moves on, which for a working agent is nearly always, so the heading
+/// says when the digest was written rather than claiming a refresh is running.
+function conversationSummaryLabel(summary, now) {
+  const seconds = summary?.digest_updated_at;
+  if (!Number.isSafeInteger(seconds) || seconds <= 0) return "Summary";
+  const updated = new Date(seconds * 1000);
+  const sameDay = updated.toDateString() === new Date(now).toDateString();
+  const when = sameDay
+    ? updated.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+    : updated.toLocaleDateString([], { month: "short", day: "numeric" });
+  return `Summary · updated ${when}`;
+}
+
+/// The parts of a summary the conversation draws. Status and staleness change
+/// often and draw nothing, so they must not rebuild the whole transcript.
+function conversationSummaryKey(summary) {
+  return summary?.digest
+    ? JSON.stringify([summary.title || "", summary.digest, summary.digest_updated_at ?? null])
+    : "";
+}
+
 /// Terminal-cell bounds for fitting a detached tmux window to the raw view.
 /// The owner accepts 40-400 columns and 10-200 rows; below 60 columns a
 /// full-screen agent becomes unreadable, so a phone keeps at least that.
@@ -4376,6 +4398,8 @@ if (typeof module !== "undefined" && module.exports) {
     codeNavResults,
     fileSearchQuery,
     fileSearchHighlights,
+    conversationSummaryLabel,
+    conversationSummaryKey,
     pushCodeHistory,
     stepCodeHistory,
     inlineTokens,
@@ -4675,6 +4699,8 @@ function initialize() {
     paneExpectedScrollTop: null,
     transcript: { available: false, source: "agent", messages: [], truncated: false, error: null },
     transcriptHash: "",
+    // The pane output the conversation on screen belongs to.
+    transcriptBinding: null,
     transcriptPoll: null,
     transcriptRequest: 0,
     transcriptPointerDown: false,
@@ -5009,25 +5035,32 @@ function initialize() {
     state.paneReadingScrollTop = 0;
     state.paneExpectedScrollTop = null;
     state.paneModels = null;
-    state.transcript = { available: false, source: "agent", messages: [], truncated: false, error: null };
-    state.transcriptHash = "";
-    state.agentSummary = null; state.summaryOpen = false;
-    state.transcriptRequest += 1;
-    state.transcriptPointerDown = false;
-    state.pendingTranscriptRender = false;
-    state.pendingTranscriptFilterChange = false;
-    state.transcriptFollowing = true;
-    state.transcriptExpectedScrollTop = null;
-    // Opening or switching agents always starts pinned at the newest message.
-    state.transcriptReadingScrollTop = 0;
-    state.transcriptPendingBottom = true;
-    state.transcriptUnseen = false;
-    state.transcriptDrawnHash = "";
-    renderTranscriptJump();
-    pane.textContent = "";
-    conversation.replaceChildren();
-    renderConversationMetrics();
     const selected = state.sessions.get(state.selected);
+    // Reconnecting the same pane output (the page returning to view, or a
+    // stream resync) keeps the conversation and summary on screen; the next
+    // poll sends the known hash and redraws only when something changed.
+    // Selecting an agent or a new owner of the pane ID starts from nothing.
+    state.transcriptRequest += 1;
+    if (resetProject || !paneOutputMatchesSession(state.transcriptBinding, selected)) {
+      state.transcriptBinding = paneOutputBinding(selected);
+      state.transcript = { available: false, source: "agent", messages: [], truncated: false, error: null };
+      state.transcriptHash = "";
+      state.agentSummary = null; state.summaryOpen = false;
+      state.transcriptPointerDown = false;
+      state.pendingTranscriptRender = false;
+      state.pendingTranscriptFilterChange = false;
+      state.transcriptFollowing = true;
+      state.transcriptExpectedScrollTop = null;
+      // Opening or switching agents always starts pinned at the newest message.
+      state.transcriptReadingScrollTop = 0;
+      state.transcriptPendingBottom = true;
+      state.transcriptUnseen = false;
+      state.transcriptDrawnHash = "";
+      renderTranscriptJump();
+      conversation.replaceChildren();
+      renderConversationMetrics();
+    }
+    pane.textContent = "";
     if (!selected || document.hidden) return;
     const binding = paneOutputBinding(selected);
     void refreshModels(state.selected);
@@ -5177,7 +5210,7 @@ function initialize() {
         state.transcriptRequest += 1;
         const next = reduceTranscript(state.transcript, data);
         const summary = data.summary === undefined ? state.agentSummary : data.summary?.enabled ? data.summary : null;
-        const summaryChanged = JSON.stringify(state.agentSummary) !== JSON.stringify(summary);
+        const summaryChanged = conversationSummaryKey(state.agentSummary) !== conversationSummaryKey(summary);
         state.agentSummary = summary;
         const shouldDraw = summaryChanged || next.transcript.messages !== state.transcript.messages
           || next.transcript.available !== state.transcript.available
@@ -5385,7 +5418,7 @@ function initialize() {
       const summary = document.createElement("details"); summary.className = "conversation-summary";
       summary.open = Boolean(state.summaryOpen);
       summary.addEventListener("toggle", () => { if (summary.isConnected) state.summaryOpen = summary.open; });
-      const label = document.createElement("summary"); label.textContent = `Summary${state.agentSummary.stale ? " · refreshing" : ""}`;
+      const label = document.createElement("summary"); label.textContent = conversationSummaryLabel(state.agentSummary, Date.now());
       const title = document.createElement("p"); title.className = "summary-title"; title.textContent = state.agentSummary.title;
       const body = document.createElement("p"); body.textContent = state.agentSummary.digest;
       summary.append(label, title, body); nodes.push(summary);

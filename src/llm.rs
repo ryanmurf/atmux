@@ -13,6 +13,9 @@ pub struct LlmConfig {
     pub allow_http_hosts: Vec<String>,
     pub timeout_seconds: u64,
     pub max_tokens: u32,
+    /// Sent as `chat_template_kwargs.enable_thinking` when set. Qwen on
+    /// llama.cpp or vLLM otherwise spends its token budget reasoning first.
+    pub enable_thinking: Option<bool>,
 }
 impl Default for LlmConfig {
     fn default() -> Self {
@@ -23,6 +26,7 @@ impl Default for LlmConfig {
             allow_http_hosts: vec![],
             timeout_seconds: 90,
             max_tokens: 4096,
+            enable_thinking: None,
         }
     }
 }
@@ -78,7 +82,13 @@ impl LlmClient {
             .as_ref()
             .map(|k| vec![("Authorization", format!("Bearer {}", k.expose()))])
             .unwrap_or_default();
-        let value = crate::platform_http::json(&self.endpoint, &headers, &serde_json::json!({"model":self.config.model,"temperature":0.1,"max_tokens":self.config.max_tokens,"messages":[{"role":"system","content":system},{"role":"user","content":prompt}]}), self.config.timeout_seconds).await?;
+        let value = crate::platform_http::json(
+            &self.endpoint,
+            &headers,
+            &self.request_body(system, prompt),
+            self.config.timeout_seconds,
+        )
+        .await?;
         let content = value
             .pointer("/choices/0/message/content")
             .and_then(serde_json::Value::as_str)
@@ -86,10 +96,47 @@ impl LlmClient {
         ensure!(content.len() <= 64 * 1024, "LLM output exceeded bound");
         Ok(content.to_owned())
     }
+    fn request_body(&self, system: &str, prompt: &str) -> serde_json::Value {
+        let mut body = serde_json::json!({"model":self.config.model,"temperature":0.1,"max_tokens":self.config.max_tokens,"messages":[{"role":"system","content":system},{"role":"user","content":prompt}]});
+        if let Some(enabled) = self.config.enable_thinking {
+            body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": enabled });
+        }
+        body
+    }
     pub async fn json<T: DeserializeOwned>(&self, system: &str, prompt: &str) -> Result<T> {
         let content = self.complete(system, prompt).await?;
         serde_json::from_str(&content).map_err(|_| {
             anyhow::anyhow!("LLM must return strict JSON matching the requested schema")
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_is_sent_only_when_configured() {
+        let client = |enable_thinking| {
+            LlmClient::new(LlmConfig {
+                endpoint: "http://127.0.0.1:8195/v1".into(),
+                allow_http_hosts: vec!["127.0.0.1".into()],
+                enable_thinking,
+                ..LlmConfig::default()
+            })
+            .unwrap()
+        };
+        assert!(
+            client(None)
+                .request_body("s", "p")
+                .get("chat_template_kwargs")
+                .is_none()
+        );
+        let off = client(Some(false)).request_body("s", "p");
+        assert_eq!(
+            off["chat_template_kwargs"],
+            serde_json::json!({"enable_thinking": false})
+        );
+        assert_eq!(off["messages"][1]["content"], "p");
     }
 }

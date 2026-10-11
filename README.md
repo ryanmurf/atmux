@@ -210,7 +210,8 @@ enabled = true
 endpoint = "http://192.168.0.124:8091/v1"
 model = "qwen3.8-flash-next"
 allow_http_hosts = ["192.168.0.124"]
-timeout_seconds = 90
+timeout_seconds = 90 # up to 300
+# enable_thinking = false # Qwen template switch; unset sends nothing
 concurrency = 1 # 1 or 2 global requests
 min_interval_seconds = 300
 poll_seconds = 30
@@ -221,12 +222,18 @@ daily_request_budget = 500
 # search_tenant_id = "95efe33d-fa71-53ce-8e0a-3fe45ac0e58a"
 ```
 
+Qwen models think before answering unless told not to, and the reasoning
+comes out of the same 4,096-token reply budget as the digest. Set
+`enable_thinking = false` for them; a server that doesn't use chat templates may
+reject the extra field, so leave it unset elsewhere.
+
 Summaries are off by default. HTTPS verifies the server certificate. Plain
 HTTP requires an exact `allow_http_hosts` match and every resolved address
 must be private or loopback; public and link-local addresses are rejected.
-API keys and response bodies are never included in error logs. The worker
-reserves its daily UTC request budget before sending, counts failed requests,
-and preserves the last successful digest on failure.
+A failed refresh logs the session key and a short reason, such as a timeout or
+an HTTP status. API keys and response bodies are never included in error logs.
+The worker reserves its daily UTC request budget before sending, counts failed
+requests, and preserves the last successful digest on failure.
 
 Private JSON files in the platform data directory persist digests by stable
 `session_key`, rolling cursors, attempts, and budgets. The store admits one
@@ -234,7 +241,10 @@ worker, retains up to 2,000 records for 30 days, and works without Pulse or
 SQLite. Owners need the automatic-description route to apply generated notes;
 an older owner can still serve its existing transcript API.
 
-Conversation shows the cached digest in a collapsible **Summary** block.
+Conversation shows the cached digest in a collapsible **Summary** block whose
+heading says when the digest was written. Returning to the page, for example
+after switching apps on a phone, keeps the conversation and summary on screen
+while the next poll checks for changes.
 Generated notes have an **auto** marker; saving or clearing a description
 makes it user-owned. Double-click or touch-and-hold a session name in the rail
 or header to rename inline. **F2** edits the selected session, **Enter** saves,

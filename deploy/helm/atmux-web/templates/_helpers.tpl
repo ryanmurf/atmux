@@ -68,6 +68,11 @@ enabled = true
 endpoint = {{ get $summaries "endpoint" | quote }}
 model = {{ get $summaries "model" | quote }}
 allow_http_hosts = {{ get $summaries "allowHttpHosts" | default list | toJson }}
+timeout_seconds = {{ get $summaries "timeoutSeconds" | default 90 | int64 }}
+{{- $thinking := get $summaries "enableThinking" }}
+{{- if kindIs "bool" $thinking }}
+enable_thinking = {{ $thinking }}
+{{- end }}
 store_dir = "/var/lib/atmux/data/summaries"
 min_interval_seconds = {{ get $summaries "minIntervalSeconds" | default 300 | int64 }}
 daily_request_budget = {{ get $summaries "dailyRequestBudget" | default 500 | int64 }}

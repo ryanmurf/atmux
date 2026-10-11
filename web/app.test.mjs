@@ -67,6 +67,8 @@ const {
   processRows,
   temperatureRows,
   formatRelativeTime,
+  conversationSummaryLabel,
+  conversationSummaryKey,
   fleetUpdatePollDelay,
   recoveryMachines,
   recoveryPollDelay,
@@ -2487,6 +2489,31 @@ test("formatRelativeTime degrades gracefully across scales and bad input", () =>
   assert.equal(formatRelativeTime(now + 10_000, now), "0s ago");
   assert.equal(formatRelativeTime(undefined, now), "");
   assert.equal(formatRelativeTime(now, undefined), "");
+});
+
+test("the conversation summary heading says when the digest was written, never that it is refreshing", () => {
+  const written = new Date(2026, 9, 11, 8, 41).getTime();
+  const sameDay = new Date(2026, 9, 11, 17, 5).getTime();
+  const nextWeek = new Date(2026, 9, 18, 9, 0).getTime();
+  const clock = new Date(written).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const day = new Date(written).toLocaleDateString([], { month: "short", day: "numeric" });
+  const summary = { digest: "Goal", digest_updated_at: written / 1000, stale: true };
+  assert.equal(conversationSummaryLabel(summary, sameDay), `Summary · updated ${clock}`);
+  assert.equal(conversationSummaryLabel(summary, nextWeek), `Summary · updated ${day}`);
+  for (const missing of [{ digest: "Goal", stale: true }, { digest: "Goal", digest_updated_at: 0 }, { digest_updated_at: 1.5 }, null]) {
+    assert.equal(conversationSummaryLabel(missing, sameDay), "Summary");
+  }
+});
+
+test("only drawn summary fields rebuild the conversation", () => {
+  const base = { enabled: true, title: "Fix search", digest: "Goal", digest_updated_at: 100, stale: false, status: "working" };
+  const key = conversationSummaryKey(base);
+  assert.equal(conversationSummaryKey({ ...base, stale: true, status: "waiting", needs_input_reason: "idle_prompt" }), key);
+  assert.notEqual(conversationSummaryKey({ ...base, digest: "Goal and tests" }), key);
+  assert.notEqual(conversationSummaryKey({ ...base, title: "Fix ranking" }), key);
+  assert.notEqual(conversationSummaryKey({ ...base, digest_updated_at: 200 }), key);
+  assert.equal(conversationSummaryKey({ ...base, digest: "" }), "");
+  assert.equal(conversationSummaryKey(null), "");
 });
 
 test("system telemetry formats compact uptime and explicit unavailable values", () => {
