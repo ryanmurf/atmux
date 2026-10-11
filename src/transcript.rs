@@ -58,6 +58,10 @@ pub struct TranscriptMessage {
     pub tool_output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
+    /// When a tool call's result was recorded. `timestamp` is when the call
+    /// was made. Absent until the result arrives, and on every other entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
     /// Names the subagent that produced a `subagent` entry when the native log
     /// carries one. Absent for operator and main-agent turns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2081,6 +2085,7 @@ fn push_message(
         tool_input: None,
         tool_output: None,
         timestamp: timestamp.map(|value| truncate_plain(value, MAX_TIMESTAMP_BYTES)),
+        finished_at: None,
         agent_name: meta.agent_name.map(ToOwned::to_owned),
         input_tokens: meta.input_tokens,
         output_tokens: meta.output_tokens,
@@ -2110,6 +2115,7 @@ fn push_tool(
         tool_input: input.map(|value| truncate_utf8(value, MAX_MESSAGE_BYTES)),
         tool_output: None,
         timestamp: timestamp.map(|value| truncate_plain(value, MAX_TIMESTAMP_BYTES)),
+        finished_at: None,
         agent_name: meta.agent_name.map(ToOwned::to_owned),
         input_tokens: meta.input_tokens,
         output_tokens: meta.output_tokens,
@@ -2139,6 +2145,7 @@ fn attach_tool_output(
         })
     {
         message.tool_output = Some(output);
+        message.finished_at = timestamp.map(|value| truncate_plain(value, MAX_TIMESTAMP_BYTES));
         return;
     }
     messages.push(TranscriptMessage {
@@ -2152,6 +2159,7 @@ fn attach_tool_output(
         tool_input: None,
         tool_output: Some(output),
         timestamp: timestamp.map(|value| truncate_plain(value, MAX_TIMESTAMP_BYTES)),
+        finished_at: timestamp.map(|value| truncate_plain(value, MAX_TIMESTAMP_BYTES)),
         agent_name: None,
         input_tokens: None,
         output_tokens: None,
@@ -2195,6 +2203,7 @@ fn push_compaction(
         tool_input: None,
         tool_output: None,
         timestamp: timestamp.map(|value| truncate_plain(value, MAX_TIMESTAMP_BYTES)),
+        finished_at: None,
         agent_name: None,
         input_tokens: None,
         output_tokens: None,
@@ -2724,7 +2733,7 @@ mod tests {
             "\n",
             r#"{"type":"assistant","uuid":"a1","timestamp":"two","message":{"role":"assistant","content":[{"type":"thinking","thinking":"private"},{"type":"text","text":"Done.\n\n```rust\nfn main() {}\n```"},{"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"echo ok","api_key":"hide me"}}]}}"#,
             "\n",
-            r#"{"type":"user","uuid":"tool","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"ok"}]}}"#,
+            r#"{"type":"user","uuid":"tool","timestamp":"three","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"ok"}]}}"#,
             "\n",
             r#"{"type":"user","uuid":"meta","message":{"role":"user","content":"<system-reminder>hidden</system-reminder>"}}"#,
             "\n",
@@ -2752,6 +2761,9 @@ mod tests {
                 .contains("hide me")
         );
         assert_eq!(messages[2].tool_output.as_deref(), Some("ok"));
+        assert_eq!(messages[2].timestamp.as_deref(), Some("two"));
+        assert_eq!(messages[2].finished_at.as_deref(), Some("three"));
+        assert_eq!(messages[1].finished_at, None);
     }
 
     #[test]
@@ -2857,6 +2869,10 @@ mod tests {
                 .contains("[redacted]")
         );
         assert_eq!(messages[2].tool_output.as_deref(), Some("ok"));
+        // The call keeps the time it was made; the result adds when it finished.
+        assert_eq!(messages[2].timestamp.as_deref(), Some("four"));
+        assert_eq!(messages[2].finished_at.as_deref(), Some("five"));
+        assert_eq!(messages[1].finished_at, None);
         assert!(
             !messages
                 .iter()
@@ -3674,6 +3690,7 @@ mod tests {
                 tool_input: None,
                 tool_output: None,
                 timestamp: None,
+                finished_at: None,
                 agent_name: None,
                 input_tokens: None,
                 output_tokens: None,
@@ -3705,6 +3722,7 @@ mod tests {
                 tool_input: None,
                 tool_output: None,
                 timestamp: Some("t".repeat(1_000)),
+                finished_at: Some("t".repeat(1_000)),
                 agent_name: None,
                 input_tokens: None,
                 output_tokens: None,

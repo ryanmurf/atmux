@@ -5092,6 +5092,105 @@ test("dashboard reconnect preserves the pane and draft, and link/search actions 
 });
 
 
+test("conversation cards show when each entry finished and how long ago", { timeout: 60_000 }, async () => {
+  const profileDirectory = await mkdtemp(join(tmpdir(), "atmux-entry-times-"));
+  let server; let chrome; let cdp; let testError = null;
+  const now = Date.now();
+  const at = (msAgo) => new Date(now - msAgo).toISOString();
+  const minutes = 60_000;
+  transcriptFixture = {
+    available: true, source: "codex", changed: true, content_hash: "entry-times", truncated: false,
+    messages: [
+      { id: "times-user", role: "user", markdown: "Fix the flaky test", timestamp: at(180 * minutes) },
+      { id: "times-agent", role: "assistant", markdown: "Looking.", timestamp: at(179 * minutes), input_tokens: 123_456, output_tokens: 7_890 },
+      { id: "times-tool", role: "tool", kind: "tool", tool_name: "exec_command", tool_input: "{}", tool_output: "ok",
+        timestamp: at(178 * minutes), finished_at: at(177 * minutes) },
+      { id: "times-subagent", role: "subagent", agent_name: "general-purpose", markdown: "Searched the tree.", timestamp: at(400 * 24 * 60 * minutes), input_tokens: 98_765, output_tokens: 4_321 },
+      ...[9, 8, 7].map((ago, index) => ({ id: `times-run-${index}`, role: "tool", kind: "tool", tool_name: "exec_command",
+        tool_input: "{}", tool_output: "ok", timestamp: at(ago * minutes), finished_at: at((ago - 1) * minutes) })),
+      { id: "times-done", role: "assistant", markdown: "Done.", timestamp: at(20_000) },
+      { id: "times-running", role: "tool", kind: "tool", tool_name: "exec_command", tool_input: "{}", timestamp: at(5 * minutes) },
+    ],
+  };
+  try {
+    const started = await startServer(); server = started.server;
+    const browser = await launchChrome(profileDirectory); chrome = browser.chrome;
+    cdp = await openCdp(browser.browserSocket, "about:blank"); await cdp.send("Page.enable");
+    // A narrow phone, where the long subagent header has to wrap.
+    await cdp.send("Emulation.setDeviceMetricsOverride", { width: 360, height: 780, deviceScaleFactor: 1, mobile: true });
+    await cdp.send("Page.navigate", { url: `http://127.0.0.1:${started.port}/?session=tron~%25100` });
+    await waitFor(() => cdp.evaluate("document.getElementById('agent-name').textContent === 'codex-main'"), "selected session did not load");
+    await cdp.evaluate("document.getElementById('conversation-view').click(); true");
+    await waitFor(() => cdp.evaluate("document.querySelectorAll('#conversation time.entry-time').length >= 6"), "entry times did not render");
+    const times = await cdp.evaluate(`(() => {
+      const text = (selector) => document.querySelector(selector)?.querySelector(':scope > header > time, :scope > summary > time')?.textContent;
+      return {
+        user: text('[data-transcript-id="times-user"]'),
+        agent: text('[data-transcript-id="times-agent"]'),
+        tool: text('[data-transcript-id="times-tool"]'),
+        run: text('[data-transcript-id="tool-group:times-run-0"]'),
+        done: text('[data-transcript-id="times-done"]'),
+        running: text('[data-transcript-id="times-running"]'),
+        runningTitle: document.querySelector('[data-transcript-id="times-running"] time')?.title,
+      };
+    })()`);
+    assert.match(times.user, /^\d{1,2}:\d{2}\s?[AP]M · 3h ago$/);
+    assert.match(times.agent, / · 2h ago$/);
+    // A tool call shows when its result arrived, not when it was called.
+    assert.match(times.tool, / · 2h ago$/);
+    assert.match(times.run, / · 6m ago$/, "a collapsed run shows its newest call's finish");
+    assert.match(times.done, / · just now$/);
+    assert.match(times.running, /^started \S.* · 5m ago$/);
+    assert.match(times.runningTitle, /^Started .*; no result yet$/);
+
+    // Times line up on the right edge of every card, beside Copy, and stay on
+    // the first line when a long header wraps.
+    const layout = await cdp.evaluate(`(() => {
+      const conversation = document.getElementById('conversation');
+      const rows = [...conversation.querySelectorAll('.message-card > header, .tool-card > summary')]
+        .filter((row) => row.querySelector(':scope > time'))
+        .map((row) => {
+          const box = row.getBoundingClientRect();
+          const time = row.querySelector(':scope > time').getBoundingClientRect();
+          const copy = row.querySelector(':scope > .message-copy')?.getBoundingClientRect();
+          return { id: row.parentElement.dataset.transcriptId, rowRight: box.right, rowTop: box.top, rowHeight: box.height,
+            timeRight: time.right, timeTop: time.top, copyLeft: copy?.left ?? null };
+        });
+      return { rows, overflow: conversation.scrollWidth - conversation.clientWidth,
+        pageOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth };
+    })()`);
+    assert.equal(layout.overflow, 0);
+    assert.equal(layout.pageOverflow, 0);
+    for (const row of layout.rows) {
+      if (row.copyLeft !== null) assert.ok(row.timeRight <= row.copyLeft && row.copyLeft - row.timeRight <= 12, `${row.id} time sits beside Copy`);
+      else assert.ok(row.rowRight - row.timeRight <= 16, `${row.id} time is right-aligned`);
+      assert.ok(row.timeTop - row.rowTop <= 10, `${row.id} time is on the first line`);
+    }
+
+    // "X ago" moves on while the page sits open, without redrawing the cards.
+    await cdp.evaluate(`(() => {
+      window.entryTimeRedraws = 0;
+      new MutationObserver(() => { window.entryTimeRedraws += 1; })
+        .observe(document.getElementById('conversation'), { childList: true });
+      const realNow = Date.now.bind(Date);
+      Date.now = () => realNow() + 10 * 60_000;
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => true }); document.dispatchEvent(new Event('visibilitychange'));
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => false }); document.dispatchEvent(new Event('visibilitychange'));
+      return true;
+    })()`);
+    assert.match(await cdp.evaluate("document.querySelector('[data-transcript-id=\"times-done\"] time').textContent"), / · 10m ago$/);
+    await waitFor(() => transcriptRequests.some((request) => request.hash === "entry-times"), "returning to the page did not poll");
+    assert.equal(await cdp.evaluate("window.entryTimeRedraws"), 0);
+    await cdp.evaluate("delete document.hidden; true");
+  } catch (error) { testError = error; throw error; }
+  finally {
+    transcriptFixture = null;
+    try { await cleanupBrowserHarness({ cdp, chrome, server, profileDirectory }); }
+    catch (error) { if (!testError) throw error; console.error(error); }
+    paneStreams.clear(); overviewStreams.clear();
+  }
+});
+
 test("inline rename, keyboard controls and safe automatic summaries work in the browser", { timeout: 60_000 }, async () => {
   const profileDirectory = await mkdtemp(join(tmpdir(), "atmux-a2-browser-"));
   let server; let chrome; let cdp; let testError = null;

@@ -26,6 +26,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Show more on the machine page: memory broken down, a friendlier layout instead of large columns | `machine-page-detail.md` | Deployed fleet-wide; reviews pending |
 | Add a search under Files that matches file names | `files-name-search.md` | Deployed fleet-wide; reviews pending |
 | Stop Conversation going blank on mobile; run atmux background summaries on Tron's Qwen | `conversation-steady-summaries.md` | Deployed fleet-wide; reviews pending |
+| Show when each Conversation entry finished and how long ago | `conversation-entry-times.md` | Implemented; deploying |
 
 ## Usage intelligence
 

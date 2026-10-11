@@ -3081,6 +3081,39 @@ function conversationSummaryKey(summary) {
     : "";
 }
 
+/// When a Conversation entry finished, in epoch milliseconds. A tool call
+/// finishes when its result arrives; until then it reports when it started.
+/// Null when the log recorded no usable time.
+function transcriptEntryClock(message) {
+  const parse = (value) => {
+    const at = typeof value === "string" && value ? Date.parse(value) : NaN;
+    return Number.isFinite(at) ? at : null;
+  };
+  const finished = parse(message?.finished_at);
+  if (finished !== null) return { at: finished, started: false };
+  const written = parse(message?.timestamp);
+  if (written === null) return null;
+  return { at: written, started: transcriptItemKind(message) === "tool" };
+}
+
+/// A card header's clock and how long ago. Today shows the time, this week
+/// the weekday and time, and anything older only the date, so the label
+/// fits a phone header. Under a minute reads "just now" because the label
+/// is only refreshed every half minute.
+function conversationEntryTimeLabel(clock, now) {
+  if (!Number.isFinite(clock?.at) || !Number.isFinite(now)) return "";
+  const at = new Date(clock.at);
+  const today = new Date(now);
+  const time = at.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const when = at.toDateString() === today.toDateString() ? time
+    : now - clock.at < 6 * 86_400_000 ? `${at.toLocaleDateString([], { weekday: "short" })} ${time}`
+      : at.toLocaleDateString([], at.getFullYear() === today.getFullYear()
+        ? { month: "short", day: "numeric" }
+        : { year: "numeric", month: "short", day: "numeric" });
+  const ago = now - clock.at < 60_000 ? "just now" : formatRelativeTime(clock.at, now);
+  return `${clock.started ? "started " : ""}${when} · ${ago}`;
+}
+
 /// Terminal-cell bounds for fitting a detached tmux window to the raw view.
 /// The owner accepts 40-400 columns and 10-200 rows; below 60 columns a
 /// full-screen agent becomes unreadable, so a phone keeps at least that.
@@ -4400,6 +4433,8 @@ if (typeof module !== "undefined" && module.exports) {
     fileSearchHighlights,
     conversationSummaryLabel,
     conversationSummaryKey,
+    transcriptEntryClock,
+    conversationEntryTimeLabel,
     pushCodeHistory,
     stepCodeHistory,
     inlineTokens,
@@ -5249,6 +5284,9 @@ function initialize() {
     label.className = "tool-label";
     label.textContent = [name, suffix].filter(Boolean).join(" · ");
     summary.append(label, document.createTextNode(" "), renderEntryMetrics(message));
+    // Floated right, so it goes first to share the summary's first line.
+    const time = renderEntryTime(message);
+    if (time) summary.prepend(time);
     details.classList.toggle("has-errors", resultSignal === "error");
     details.append(summary);
     const body = document.createElement("div");
@@ -5274,6 +5312,8 @@ function initialize() {
     details.open = expandedTools.has(details.dataset.transcriptId);
     const summary = document.createElement("summary");
     summary.textContent = compactionSummaryLabel(message);
+    const time = renderEntryTime(message);
+    if (time) summary.prepend(time);
     details.append(summary);
     if (typeof message.markdown === "string" && message.markdown.trim()) {
       const body = document.createElement("div");
@@ -5304,6 +5344,10 @@ function initialize() {
       "aria-label",
       `${summary.textContent}; ${group.messages.length} calls and results`,
     );
+    // A run is as recent as its newest call that recorded a time.
+    const newest = [...group.messages].reverse().find((message) => transcriptEntryClock(message));
+    const time = newest ? renderEntryTime(newest) : null;
+    if (time) summary.prepend(time);
     // Mobile browsers may scroll an expanding <details> to keep its newly
     // exposed body visible. The reader chose this visible summary, so retain
     // their exact Conversation offset while revealing the original calls.
@@ -5341,6 +5385,33 @@ function initialize() {
     metrics.title = "Recorded model-request tokens, counted once on one entry per request. Input includes cached tokens. — means no separate usage was recorded for this entry.";
     return metrics;
   }
+
+  function renderEntryTime(message) {
+    const clock = transcriptEntryClock(message);
+    if (!clock) return null;
+    const time = document.createElement("time");
+    time.className = "entry-time";
+    time.dateTime = new Date(clock.at).toISOString();
+    time.dataset.at = String(clock.at);
+    if (clock.started) time.dataset.started = "true";
+    time.textContent = conversationEntryTimeLabel(clock, Date.now());
+    const full = new Date(clock.at).toLocaleString([], { dateStyle: "medium", timeStyle: "medium" });
+    time.title = clock.started ? `Started ${full}; no result yet` : full;
+    return time;
+  }
+
+  /// "X ago" moves on while the page sits open on a quiet agent, whose cards
+  /// are otherwise never redrawn. Only labels whose text changed are written.
+  function refreshConversationTimes() {
+    if (document.hidden || state.viewMode !== "conversation") return;
+    const now = Date.now();
+    for (const time of conversation.querySelectorAll("time.entry-time")) {
+      const label = conversationEntryTimeLabel(
+        { at: Number(time.dataset.at), started: time.dataset.started === "true" }, now);
+      if (label && time.textContent !== label) time.textContent = label;
+    }
+  }
+  setInterval(refreshConversationTimes, 30_000);
 
   function renderConversationMetrics() {
     const metrics = $("conversation-metrics");
@@ -5468,6 +5539,8 @@ function initialize() {
       const label = document.createElement("header");
       label.textContent = transcriptRoleLabel(message);
       label.append(document.createTextNode(" "), renderEntryMetrics(message));
+      const time = renderEntryTime(message);
+      if (time) label.append(time);
       if (visibility !== "internal" && typeof message.markdown === "string" && message.markdown) {
         const copy = document.createElement("button");
         copy.type = "button";
@@ -12137,6 +12210,7 @@ function initialize() {
     } else {
       connectOverview();
       connectPane(false);
+      refreshConversationTimes();
       if (state.pulseOpen) {
         void loadPulseAccounts(true);
       }

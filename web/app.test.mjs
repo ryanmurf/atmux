@@ -68,6 +68,8 @@ const {
   temperatureRows,
   formatRelativeTime,
   conversationSummaryLabel,
+  transcriptEntryClock,
+  conversationEntryTimeLabel,
   conversationSummaryKey,
   fleetUpdatePollDelay,
   recoveryMachines,
@@ -2503,6 +2505,38 @@ test("the conversation summary heading says when the digest was written, never t
   for (const missing of [{ digest: "Goal", stale: true }, { digest: "Goal", digest_updated_at: 0 }, { digest_updated_at: 1.5 }, null]) {
     assert.equal(conversationSummaryLabel(missing, sameDay), "Summary");
   }
+});
+
+test("conversation cards say when each entry finished and how long ago", () => {
+  const called = new Date(2026, 9, 11, 8, 40, 50);
+  const finished = new Date(2026, 9, 11, 8, 41, 2);
+  assert.deepEqual(transcriptEntryClock({ role: "assistant", timestamp: finished.toISOString() }),
+    { at: finished.getTime(), started: false });
+  // A tool call finishes when its result arrives; until then it only started.
+  assert.deepEqual(transcriptEntryClock({ kind: "tool", role: "tool", timestamp: called.toISOString() }),
+    { at: called.getTime(), started: true });
+  assert.deepEqual(transcriptEntryClock({ kind: "tool", role: "tool", timestamp: called.toISOString(), finished_at: finished.toISOString(), tool_output: "ok" }),
+    { at: finished.getTime(), started: false });
+  for (const missing of [{ timestamp: "one" }, { timestamp: "" }, { finished_at: 5 }, {}, null]) {
+    assert.equal(transcriptEntryClock(missing), null);
+  }
+
+  const at = finished.getTime();
+  const clock = finished.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const weekday = finished.toLocaleDateString([], { weekday: "short" });
+  const day = finished.toLocaleDateString([], { month: "short", day: "numeric" });
+  const dayWithYear = finished.toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
+  const label = (now, started = false) => conversationEntryTimeLabel({ at, started }, now);
+  assert.equal(label(at + 20_000), `${clock} · just now`);
+  assert.equal(label(at - 5_000), `${clock} · just now`, "clock skew never reads as the future");
+  assert.equal(label(at + 5 * 60_000), `${clock} · 5m ago`);
+  assert.equal(label(new Date(2026, 9, 12, 8, 0).getTime()), `${weekday} ${clock} · 23h ago`);
+  assert.equal(label(new Date(2026, 9, 14, 9, 0).getTime()), `${weekday} ${clock} · 3d ago`);
+  assert.equal(label(new Date(2026, 9, 25, 9, 0).getTime()), `${day} · 14d ago`);
+  assert.equal(label(new Date(2027, 0, 2, 9, 0).getTime()), `${dayWithYear} · 83d ago`);
+  assert.equal(label(at + 2 * 3_600_000, true), `started ${clock} · 2h ago`);
+  assert.equal(conversationEntryTimeLabel(null, at), "");
+  assert.equal(conversationEntryTimeLabel({ at: NaN }, at), "");
 });
 
 test("only drawn summary fields rebuild the conversation", () => {

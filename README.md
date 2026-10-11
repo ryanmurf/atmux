@@ -102,6 +102,13 @@ use them.
 Codex's `compacted` record) appears as one collapsed row naming its trigger and token counts. Its
 summary opens on demand instead of filling the view as an operator message.
 
+**Entry times.** Each Conversation card's header says when that entry finished and how long ago,
+for example "2:46 PM · 5m ago". Entries from earlier in the week show the weekday, and older ones
+only the date; hovering shows the full date and time. A tool call counts from when its result
+arrived and reads "started" until then. A collapsed run of calls shows its newest call. The "ago"
+part keeps up while the page stays open. Owners send a tool result's time as `finished_at`, next
+to the call's own `timestamp`.
+
 **Raw pane sizing.** tmux gives a window with no attached terminal its `default-size` (80×24), so a
 full-screen agent draws only 24 short rows. While Raw pane is open, the browser asks the pane's
 owner to fit that window to the view (60–300 columns, 16–150 rows) through

@@ -245,6 +245,7 @@ mod tests {
             tool_input: None,
             tool_output: None,
             timestamp: None,
+            finished_at: None,
             agent_name: None,
             input_tokens: None,
             output_tokens: None,

@@ -155,6 +155,10 @@ textarea { resize: vertical; min-height: 74px; max-height: 220px; }
 .terminal-header { min-width: 0; }
 .conversation-metrics { padding: 5px 10px; border-bottom: 1px solid var(--line); background: var(--panel); color: var(--muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
 .entry-metrics { display: inline-block; margin-left: 10px; color: var(--muted); font-size: 10px; font-weight: 400; letter-spacing: normal; text-transform: none; }
+/* Right-aligned so times line up down the conversation. Summaries float it; the flex header pushes it. */
+.entry-time { float: right; margin-left: 10px; color: var(--muted); font-size: 10px; font-weight: 400; letter-spacing: normal; text-transform: none; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.message-card > header > .entry-time { float: none; margin-left: auto; }
+.message-card > header > .entry-time + .message-copy { margin-left: 0; }
 .tool-card.has-errors { border-color: #855b40; }
 .tool-card.has-errors > summary { color: #efb481; }
 .terminal-title > span { margin-left: auto; color: var(--muted); font-size: 12px; }
@@ -249,7 +253,7 @@ button.code-line-number:focus-visible, button.code-line-number[aria-pressed="tru
 .message-card { width: 100%; max-width: none; margin: 0 0 8px; overflow: hidden; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); }
 .message-card.user { width: 100%; max-width: none; margin-inline: 0; border-color: #32565e; background: #12242a; }
 .message-card.internal { border-color: #293940; background: #0c151a; }
-.message-card > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 11px; border-bottom: 1px solid var(--line); color: var(--cyan); font-size: 10px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+.message-card > header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 5px 11px; border-bottom: 1px solid var(--line); color: var(--cyan); font-size: 10px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
 .message-card.user > header { color: #9ae8df; }
 .message-card.internal > header { color: var(--muted); }
 /* Always visible (touch has no hover); negative margins keep the header height. */
