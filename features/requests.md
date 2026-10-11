@@ -25,6 +25,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Give the Files view IDE-style highlighting and click-through for Java, Rust, TypeScript, and other popular languages | `ide-code-viewer.md` | Deployed fleet-wide; reviews pending |
 | Show more on the machine page: memory broken down, a friendlier layout instead of large columns | `machine-page-detail.md` | Deployed fleet-wide; reviews pending |
 | Add a search under Files that matches file names | `files-name-search.md` | Deployed fleet-wide; reviews pending |
+| Stop Conversation going blank on mobile; run atmux background summaries on Tron's Qwen | `conversation-steady-summaries.md` | Deployed fleet-wide; reviews pending |
 
 ## Usage intelligence
 
