@@ -46,6 +46,7 @@ let delayGitDiffPane = null;
 let nextFileSaveConflict = false;
 const fileSaveRequests = [];
 const codeNavRequests = [];
+const fileSearchRequests = [];
 const NAV_FIXTURE = [
   'import { formatTotal } from "./util";',
   "export function total(values: number[]): number {",
@@ -294,6 +295,17 @@ function mockApi(url, response, request) {
     response.once("close", () => { observed.closed = true; clearTimeout(timer); });
     if (transcriptResponseDelayMs) timer = setTimeout(() => json(response, payload), transcriptResponseDelayMs);
     else json(response, payload);
+    return true;
+  }
+  if (/^\/api\/v1\/panes\/[^/]+\/code\/files$/.test(pathname)) {
+    const pane = decodeURIComponent(pathname.split("/")[4]);
+    const query = url.searchParams.get("query") || "";
+    fileSearchRequests.push({ pane, query });
+    const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+    const results = ["src/nav.ts", "src/util.ts", "src/app.js", "README <img onerror=boom>.md", "image.bin"]
+      .filter((path) => words.every((word) => path.toLowerCase().includes(word)))
+      .map((path) => ({ path, line: 1, column: 1, kind: "file", preview: "" }));
+    json(response, { pane_id: pane, operation: "files", query, truncated: false, results });
     return true;
   }
   if (/^\/api\/v1\/panes\/[^/]+\/code\/(?:definitions|references|resolve)$/.test(pathname)) {
@@ -2587,6 +2599,60 @@ test("mobile browser Back stays inside atmux and Usage auto-loads its Pulse dash
       "project root did not load lazily",
     );
     assert.equal(await cdp.evaluate("Boolean(document.querySelector('#files-panel img, #files-panel script'))"), false);
+
+    // File search finds a file anywhere in the project, marks the typed
+    // letters, opens a pasted path:line at that line, survives the phone's
+    // trip into the file and back, and Escape returns to the folder listing.
+    const typeFileSearch = (value) => cdp.evaluate(`(() => {
+      const input = document.getElementById('files-search');
+      input.focus();
+      input.value = ${JSON.stringify(value)};
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      return true;
+    })()`);
+    const fileSearchKey = (key) => cdp.evaluate(`document.getElementById('files-search').dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, bubbles: true, cancelable: true }))`);
+    await typeFileSearch("nav");
+    await waitFor(
+      () => cdp.evaluate("document.querySelectorAll('#files-list .file-search-result').length === 1"),
+      "file search did not list the matching file",
+    );
+    assert.deepEqual(await cdp.evaluate(`(() => ({
+      name: document.querySelector('#files-list .file-search-name').textContent,
+      mark: document.querySelector('#files-list .file-search-name mark')?.textContent,
+      directory: document.querySelector('#files-list .file-search-dir').textContent,
+      status: document.querySelector('#files-list .files-search-status').textContent,
+      expanded: document.getElementById('files-search').getAttribute('aria-expanded'),
+      active: document.getElementById('files-search').getAttribute('aria-activedescendant'),
+      folders: document.querySelectorAll('#files-list .project-entry:not(.file-search-result)').length,
+      inputFont: getComputedStyle(document.getElementById('files-search')).fontSize,
+      overflow: document.documentElement.scrollWidth - innerWidth,
+    }))()`), {
+      name: "nav.ts", mark: "nav", directory: "src", status: "1 match", expanded: "true",
+      active: "files-search-result-0", folders: 0, inputFont: "16px", overflow: 0,
+    });
+    assert.deepEqual(fileSearchRequests.at(-1), { pane: "tron~%100", query: "nav" });
+    await typeFileSearch("src/nav.ts:4");
+    await waitFor(
+      () => cdp.evaluate("document.querySelector('#files-list .files-search-status')?.textContent === '1 match. Opens at line 4.'"),
+      "a pasted path:line did not search for the path",
+    );
+    assert.deepEqual(fileSearchRequests.at(-1), { pane: "tron~%100", query: "src/nav.ts" });
+    await fileSearchKey("Enter");
+    await waitFor(
+      () => cdp.evaluate("document.querySelector('#file-viewer .code-viewer-path')?.textContent === 'src/nav.ts' && document.querySelector('#file-viewer .code-line[data-line=\"4\"]')?.classList.contains('code-line-flash')"),
+      "Enter did not open the searched file at its line",
+    );
+    await cdp.evaluate("document.querySelector('#file-viewer .project-viewer-back').click(); true");
+    await waitFor(
+      () => cdp.evaluate("document.querySelector('#files-list .file-search-result.active')?.title === 'src/nav.ts:4' && getComputedStyle(document.querySelector('.files-sidebar')).display !== 'none'"),
+      "search results did not survive returning from the opened file",
+    );
+    await fileSearchKey("Escape");
+    await waitFor(
+      () => cdp.evaluate("document.querySelectorAll('#files-list .project-entry').length === 3 && !document.querySelector('#files-list .file-search-result') && document.getElementById('files-search').value === ''"),
+      "Escape did not return to the folder listing",
+    );
+
     await cdp.evaluate(`(() => {
       [...document.querySelectorAll('#files-list .project-entry')].find((entry) => entry.textContent.includes('image.bin')).click();
       return true;

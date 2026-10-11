@@ -15,6 +15,8 @@ const {
   symbolQualifier,
   paneCodePath,
   codeNavResults,
+  fileSearchQuery,
+  fileSearchHighlights,
   pushCodeHistory,
   stepCodeHistory,
 } = app;
@@ -258,6 +260,38 @@ test("qualifiers, symbols, and owner routes are validated before any request", (
   assert.equal(paneCodePath(pane, "resolve", { path: "a.ts", spec: "bad\nspec" }), null);
   assert.equal(paneCodePath(pane, "execute", { symbol: "Foo" }), null);
   assert.equal(paneCodePath(null, "definitions", { symbol: "Foo" }), null);
+});
+
+test("file searches carry one bounded query and split off a pasted :line", () => {
+  const pane = "tron~%1";
+  assert.equal(
+    paneCodePath(pane, "files", { query: "web/app js" }),
+    `/api/v1/panes/${encodeURIComponent(pane)}/code/files?query=web%2Fapp+js`,
+  );
+  assert.equal(paneCodePath(pane, "files", { query: "  " }), null);
+  assert.equal(paneCodePath(pane, "files", { query: "a\nb" }), null);
+  assert.equal(paneCodePath(pane, "files", { query: "x".repeat(257) }), null);
+  assert.equal(paneCodePath(pane, "files", { query: "a.rs:12" }), null, "the caller strips the line first");
+
+  assert.deepEqual(fileSearchQuery("  app  "), { query: "app", line: null, column: null });
+  assert.deepEqual(fileSearchQuery("src/web.rs:1174"), { query: "src/web.rs", line: 1174, column: null });
+  assert.deepEqual(fileSearchQuery("web.rs:12:4"), { query: "web.rs", line: 12, column: 4 });
+  assert.deepEqual(fileSearchQuery("web.rs:0"), { query: "web.rs", line: null, column: null });
+  assert.deepEqual(fileSearchQuery(":12"), { query: ":12", line: null, column: null });
+  for (const empty of ["", "   ", "./", "/", null, "tab\there"]) assert.equal(fileSearchQuery(empty), null, String(empty));
+  assert.equal(fileSearchQuery("é".repeat(129)), null, "the byte limit counts UTF-8");
+});
+
+test("file search highlights explain the match the way the owner ranks it", () => {
+  const marked = (path, query) => fileSearchHighlights(path, query).map(([start, end]) => path.slice(start, end));
+  assert.deepEqual(marked("web/app.js", "app"), ["app"]);
+  assert.deepEqual(marked("src/application/main.rs", "app"), ["app"], "a folder match when the name lacks it");
+  assert.deepEqual(marked("src/ControlPlane.tsx", "PLANE"), ["Plane"], "case-insensitive, preferring a camelCase hump");
+  assert.deepEqual(marked("src/ControlPlane.tsx", "cp"), ["C", "P"], "scattered letters prefer the name");
+  assert.deepEqual(marked("web/app.js", "wapp"), ["w", "app"]);
+  assert.deepEqual(marked("src/metrics/host.rs", "metrics host"), ["metrics", "host"]);
+  assert.deepEqual(marked("src/metrics/host.rs", "./metrics/host"), ["metrics/host"]);
+  assert.deepEqual(marked("README.md", "zzz"), []);
 });
 
 test("owner results are normalized to project-relative, bounded locations", () => {

@@ -170,7 +170,12 @@
           <section id="files-panel" class="project-panel" role="tabpanel" aria-labelledby="files-view" tabindex="0" hidden>
             <nav id="files-breadcrumbs" class="project-breadcrumbs" aria-label="File path"></nav>
             <div class="files-workspace">
-              <nav id="files-list" class="files-list" aria-label="Project files"></nav>
+              <div class="files-sidebar">
+                <div class="files-search">
+                  <input id="files-search" type="search" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-label="Search file names" placeholder="Search file names" maxlength="256" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="go" aria-keyshortcuts="Control+P Meta+P" title="Find a file anywhere in this project (Ctrl/⌘+P). Add :line to jump to a line.">
+                </div>
+                <nav id="files-list" class="files-list" aria-label="Project files"></nav>
+              </div>
               <section id="file-viewer" class="code-viewer" aria-label="File contents" tabindex="0"></section>
             </div>
           </section>

@@ -174,6 +174,20 @@ textarea { resize: vertical; min-height: 74px; max-height: 220px; }
 .project-breadcrumbs button:not(:last-child)::after { content: " /"; padding-left: 6px; color: #526a73; }
 .files-workspace, .git-workspace { min-width: 0; min-height: 0; display: grid; grid-template-columns: minmax(180px, 26%) minmax(0, 1fr); overflow: hidden; }
 .files-list, .git-changes { min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; border-right: 1px solid var(--line); background: #0b1418; scrollbar-gutter: stable; }
+.files-sidebar { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); border-right: 1px solid var(--line); background: #0b1418; }
+.files-sidebar .files-list { border-right: 0; }
+.files-search { padding: 6px 7px; border-bottom: 1px solid var(--line); }
+.files-search input { min-height: 30px; padding: 5px 9px; border-radius: 6px; background: var(--inset); font: 12px/1.3 "SFMono-Regular", Consolas, monospace; }
+.files-search input::placeholder { color: #6f858d; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+.files-search-status { margin: 0; padding: 6px 9px; border-bottom: 1px solid #17252b; color: var(--muted); font-size: 11px; line-height: 1.35; }
+.files-search-status.error { color: var(--red); }
+.file-search-result { grid-template-columns: 16px minmax(0, 1fr); }
+.file-search-result.active { background: #16252b; box-shadow: inset 2px 0 0 var(--cyan); }
+.file-search-text { min-width: 0; display: grid; gap: 1px; }
+.file-search-name, .file-search-dir { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-search-dir { color: var(--muted); font-size: 10.5px; direction: rtl; text-align: left; }
+.file-search-dir bdi { direction: ltr; }
+.file-search-result mark { padding: 0; border-radius: 2px; background: rgba(67, 217, 211, .2); color: var(--cyan); }
 .project-entry, .git-change { width: 100%; min-width: 0; min-height: 34px; display: grid; align-items: center; gap: 7px; padding: 5px 9px; border: 0; border-bottom: 1px solid #17252b; border-radius: 0; background: transparent; color: #d7e5e7; text-align: left; font: 12px/1.35 "SFMono-Regular", Consolas, monospace; }
 .project-entry { grid-template-columns: 16px minmax(0, 1fr) auto; }
 .project-entry.selected, .git-change.selected { background: #16252b; }
@@ -710,9 +724,10 @@ dialog::backdrop { background: #000a; }
   .conversation { padding: 10px; }
   .conversation-jump { bottom: 10px; min-height: 34px; font-size: 12px; }
   .files-workspace, .git-workspace { display: block; }
-  .files-list, .git-changes { width: 100%; height: 100%; border-right: 0; }
+  .files-list, .git-changes, .files-sidebar { width: 100%; height: 100%; border-right: 0; }
   .files-workspace > .code-viewer, .git-workspace > .code-viewer { display: none; width: 100%; height: 100%; }
-  #files-panel.has-file .files-list, #git-panel.has-diff .git-changes { display: none; }
+  #files-panel.has-file .files-sidebar, #git-panel.has-diff .git-changes { display: none; }
+  .files-search input { min-height: 38px; font-size: 16px; }
   #files-panel.has-file .code-viewer, #git-panel.has-diff .code-viewer { display: block; }
   .project-viewer-back { min-width: max-content; min-height: 32px; padding-inline: 7px; }
   .project-entry, .git-change { min-height: 42px; padding-inline: 7px; font-size: 11px; }

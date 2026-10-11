@@ -1618,7 +1618,10 @@ function linkifyInto(parent, text) {
 const MAX_CODE_SYMBOL_CHARS = 128;
 const CODE_SYMBOL_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/;
 const MAX_CODE_NAV_RESULTS = 200;
-const CODE_NAV_OPERATIONS = new Set(["definitions", "references", "resolve"]);
+const CODE_NAV_OPERATIONS = new Set(["definitions", "references", "resolve", "files"]);
+const MAX_FILE_SEARCH_BYTES = 256;
+const FILE_SEARCH_DEBOUNCE_MS = 120;
+const MAX_FILE_SEARCH_RESULTS = 50;
 const MAX_CODE_NAV_HISTORY = 50;
 
 const codeWords = (value) => new Set(String(value).split(/\s+/).filter(Boolean));
@@ -2554,6 +2557,12 @@ function symbolQualifier(lineText, column) {
 function paneCodePath(paneId, operation, params = {}) {
   if (!paneId || !CODE_NAV_OPERATIONS.has(operation)) return null;
   const query = new URLSearchParams();
+  if (operation === "files") {
+    const search = fileSearchQuery(params.query);
+    if (!search || search.line !== null) return null;
+    query.set("query", search.query);
+    return `/api/v1/panes/${encodeURIComponent(String(paneId))}/code/files?${query}`;
+  }
   for (const key of ["symbol", "path", "spec"]) {
     const value = params[key];
     if (value === undefined || value === null || value === "") continue;
@@ -2586,6 +2595,90 @@ function codeNavResults(data) {
     })
     .filter(Boolean);
   return { results, truncated: Boolean(data?.truncated) };
+}
+
+/// The words the owner matches, lowercased only in ASCII so every character
+/// keeps its position in the original path.
+function fileSearchWords(query) {
+  return String(query ?? "").trim().split(/\s+/)
+    .map((word) => word.replace(/^(?:\.\/)+/, "").replace(/^\/+/, ""))
+    .filter(Boolean)
+    .slice(0, 8)
+    .map((word) => word.replace(/[A-Z]/g, (letter) => letter.toLowerCase()));
+}
+
+/// Splits a typed file search into the name the owner matches and an
+/// optional `:line` or `:line:column` suffix, the way agents print
+/// locations. Returns null when nothing searchable remains.
+function fileSearchQuery(raw) {
+  const text = String(raw ?? "").trim();
+  const location = /^(.*?):(\d{1,7})(?::(\d{1,5}))?$/.exec(text);
+  const query = (location && location[1].trim() ? location[1] : text).trim();
+  if (!query || utf8ByteLength(query) > MAX_FILE_SEARCH_BYTES
+    || /[\u0000-\u001f\u007f]/.test(query) || !fileSearchWords(query).length) return null;
+  const located = Boolean(location && location[1].trim());
+  const line = located ? Number(location[2]) : null;
+  return {
+    query,
+    line: line && line >= 1 ? line : null,
+    column: located && location[3] && Number(location[3]) >= 1 ? Number(location[3]) : null,
+  };
+}
+
+function fileSearchWordStart(text, index) {
+  if (index === 0) return true;
+  const previous = text[index - 1];
+  return "/._- ".includes(previous) || (/[a-z]/.test(previous) && /[A-Z]/.test(text[index]));
+}
+
+/// `[start, end)` ranges of `path` to highlight for `query`. It follows the
+/// owner's order of preference: the file name, then folders, then letters in
+/// order, so the marks explain why the path matched.
+function fileSearchHighlights(path, query) {
+  const text = String(path ?? "");
+  const lower = text.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+  const nameStart = lower.lastIndexOf("/") + 1;
+  const marked = new Array(text.length).fill(false);
+  const substring = (from, word) => {
+    let first = null;
+    for (let index = lower.indexOf(word, from); index !== -1; index = lower.indexOf(word, index + 1)) {
+      if (fileSearchWordStart(text, index)) return index;
+      if (first === null) first = index;
+    }
+    return first;
+  };
+  const subsequence = (from, word) => {
+    const found = [];
+    let position = from;
+    for (const letter of word) {
+      const index = lower.indexOf(letter, position);
+      if (index === -1) return null;
+      found.push(index);
+      position = index + 1;
+    }
+    return found;
+  };
+  for (const word of fileSearchWords(query)) {
+    const starts = word.includes("/") ? [0] : [nameStart, 0];
+    let indexes = null;
+    for (const from of starts) {
+      const at = substring(from, word);
+      if (at !== null) { indexes = Array.from(word, (_, offset) => at + offset); break; }
+    }
+    for (const from of starts) {
+      if (indexes) break;
+      indexes = subsequence(from, word);
+    }
+    for (const index of indexes || []) marked[index] = true;
+  }
+  const ranges = [];
+  marked.forEach((on, index) => {
+    if (!on) return;
+    const last = ranges[ranges.length - 1];
+    if (last && last[1] === index) last[1] = index + 1;
+    else ranges.push([index, index + 1]);
+  });
+  return ranges;
 }
 
 /// Back/forward stacks for the file viewer.
@@ -4281,6 +4374,8 @@ if (typeof module !== "undefined" && module.exports) {
     symbolQualifier,
     paneCodePath,
     codeNavResults,
+    fileSearchQuery,
+    fileSearchHighlights,
     pushCodeHistory,
     stepCodeHistory,
     inlineTokens,
@@ -4598,6 +4693,9 @@ function initialize() {
     fileSaveRequest: 0,
     codeNavRequest: 0,
     codeNavController: null,
+    fileSearchRequest: 0,
+    fileSearchController: null,
+    fileSearchTimer: null,
     gitRequest: 0,
     filesController: null,
     fileSaveController: null,
@@ -4871,6 +4969,8 @@ function initialize() {
     state.codeNavController?.abort();
     state.codeNavController = null;
     state.codeNavRequest += 1;
+    cancelFileSearch();
+    $("files-search").value = "";
     state.filesController?.abort();
     state.fileSaveController?.abort();
     state.gitController?.abort();
@@ -5413,6 +5513,7 @@ function initialize() {
         listScrolls: new Map(), viewerScrolls: new Map(),
         history: { back: [], forward: [] }, symbol: null, symbolPanel: null,
         symbolCount: 0, navModel: null, pendingReveal: null,
+        search: emptyFileSearch(),
       },
       git: {
         summary: null, diff: null, loading: false, diffLoading: false, error: null,
@@ -6060,7 +6161,8 @@ function initialize() {
     const view = state.projectView;
     if (!view || view.paneId !== state.selected) return;
     if (state.viewMode === "files" && !filesPanel.hidden) {
-      view.files.listScrolls.set(view.files.path, $("files-list").scrollTop);
+      if (fileSearchShown(view.files)) view.files.search.scroll = $("files-list").scrollTop;
+      else view.files.listScrolls.set(view.files.path, $("files-list").scrollTop);
       if (view.files.file?.path) {
         view.files.viewerScrolls.set(view.files.file.path, {
           top: $("file-viewer").scrollTop,
@@ -6085,7 +6187,9 @@ function initialize() {
       const view = state.projectView;
       if (!view || view.paneId !== paneId) return;
       if (mode === "files") {
-        $("files-list").scrollTop = view.files.listScrolls.get(view.files.path) || 0;
+        $("files-list").scrollTop = fileSearchShown(view.files)
+          ? view.files.search.scroll || 0
+          : view.files.listScrolls.get(view.files.path) || 0;
         const position = view.files.viewerScrolls.get(path) || {};
         $("file-viewer").scrollTop = position.top || 0;
         $("file-viewer").scrollLeft = position.left || 0;
@@ -6104,10 +6208,19 @@ function initialize() {
       button.type = "button";
       button.textContent = crumb.name;
       button.title = crumb.path || "Project root";
-      button.disabled = files.loading || index === files.breadcrumbs.length - 1;
+      button.disabled = files.loading || (index === files.breadcrumbs.length - 1 && !fileSearchShown(files));
       button.addEventListener("click", () => {
         if (!confirmDiscardFileEdit(files)) return;
         rememberProjectScroll();
+        const searching = fileSearchShown(files);
+        clearFileSearch(files);
+        if (searching && index === files.breadcrumbs.length - 1 && files.listing) {
+          // Leaving a search returns to the folder it covered without
+          // closing the open file.
+          renderFilesList(files);
+          restoreProjectScroll("files", state.selected, files.file?.path || "");
+          return;
+        }
         void loadFilesDirectory(crumb.path, files.breadcrumbs.slice(0, index + 1));
       });
       return button;
@@ -6115,12 +6228,154 @@ function initialize() {
     $("files-breadcrumbs").replaceChildren(...buttons);
   }
 
-  function renderFiles() {
-    const view = selectedProjectView();
-    if (!view) return;
-    const files = view.files;
+  function emptyFileSearch() {
+    return {
+      text: "", query: "", line: null, column: null, results: null, truncated: false,
+      loading: false, error: null, active: 0, scroll: 0, openFirst: false,
+    };
+  }
+
+  /// A search replaces the folder listing while its text is searchable.
+  function fileSearchShown(files) {
+    return Boolean(files?.search && fileSearchQuery(files.search.text));
+  }
+
+  function cancelFileSearch() {
+    clearTimeout(state.fileSearchTimer);
+    state.fileSearchTimer = null;
+    state.fileSearchController?.abort();
+    state.fileSearchController = null;
+    state.fileSearchRequest += 1;
+  }
+
+  function clearFileSearch(files) {
+    cancelFileSearch();
+    if (files) files.search = emptyFileSearch();
+    $("files-search").value = "";
+  }
+
+  function fileSearchErrorMessage(error) {
+    if (error?.status === 404) return "File search is unavailable for this agent. Its machine may need an atmux update.";
+    if (error?.status === 400) return "Search for part of a file name, without control characters.";
+    return projectErrorMessage(error, "File search");
+  }
+
+  function fileSearchStatus(search) {
+    if (search.error) return search.error;
+    const results = search.results;
+    if (!results) return "Searching…";
+    const at = search.line ? ` Opens at line ${search.line}.` : "";
+    if (!results.length) {
+      return `No file names match “${search.query}”. Search skips dependency, build, and cache folders.${search.truncated ? " It also stopped at its safety limit before checking every file." : ""}`;
+    }
+    if (search.truncated && results.length >= MAX_FILE_SEARCH_RESULTS) {
+      return `Top ${results.length} matches. Keep typing to narrow the list.${at}`;
+    }
+    if (search.truncated) {
+      return `${results.length} ${results.length === 1 ? "match" : "matches"}. The search stopped at its safety limit, so some files were not checked.${at}`;
+    }
+    return `${results.length} ${results.length === 1 ? "match" : "matches"}${search.loading ? " · searching…" : ""}${at ? `.${at}` : ""}`;
+  }
+
+  function appendHighlighted(parent, text, offset, ranges) {
+    let position = 0;
+    for (const [start, end] of ranges) {
+      const from = Math.max(0, start - offset);
+      const to = Math.min(text.length, end - offset);
+      if (to <= from || from < position) continue;
+      if (from > position) parent.append(text.slice(position, from));
+      const mark = document.createElement("mark");
+      mark.textContent = text.slice(from, to);
+      parent.append(mark);
+      position = to;
+    }
+    if (position < text.length) parent.append(text.slice(position));
+  }
+
+  function renderFileSearchResults(files) {
+    const search = files.search;
+    const nodes = [];
+    const status = document.createElement("p");
+    status.className = `files-search-status${search.error ? " error" : ""}`;
+    status.setAttribute("role", search.error ? "alert" : "status");
+    status.textContent = fileSearchStatus(search);
+    nodes.push(status);
+    const results = search.error ? [] : search.results || [];
+    if (results.length) {
+      const listbox = document.createElement("div");
+      listbox.id = "files-search-results";
+      listbox.setAttribute("role", "listbox");
+      listbox.setAttribute("aria-label", "Matching files");
+      results.forEach((path, index) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.id = `files-search-result-${index}`;
+        button.tabIndex = -1;
+        button.setAttribute("role", "option");
+        button.setAttribute("aria-selected", String(index === search.active));
+        button.className = `project-entry file-search-result${files.file?.path === path ? " selected" : ""}${index === search.active ? " active" : ""}`;
+        button.title = search.line ? `${path}:${search.line}` : path;
+        const icon = document.createElement("span");
+        icon.className = "project-entry-icon";
+        icon.textContent = "·";
+        const nameStart = path.lastIndexOf("/") + 1;
+        const ranges = fileSearchHighlights(path, search.query);
+        const text = document.createElement("span");
+        text.className = "file-search-text";
+        const name = document.createElement("span");
+        name.className = "file-search-name";
+        appendHighlighted(name, path.slice(nameStart), nameStart, ranges);
+        text.append(name);
+        if (nameStart) {
+          const directory = document.createElement("span");
+          directory.className = "file-search-dir";
+          const isolated = document.createElement("bdi");
+          appendHighlighted(isolated, path.slice(0, nameStart - 1), 0, ranges);
+          directory.append(isolated);
+          text.append(directory);
+        }
+        button.append(icon, text);
+        // Keep focus in the search box so arrow keys keep working.
+        button.addEventListener("mousedown", (event) => event.preventDefault());
+        button.addEventListener("click", () => {
+          // A phone hides the list behind the opened file; drop its keyboard.
+          if (mobileViewportActive()) $("files-search").blur();
+          openFileSearchResult(state.projectView, index);
+        });
+        listbox.append(button);
+      });
+      nodes.push(listbox);
+    }
+    return nodes;
+  }
+
+  function syncFileSearchInput(files) {
+    const input = $("files-search");
+    const search = files.search;
+    if (input.value !== search.text) input.value = search.text;
+    const shown = fileSearchShown(files) && Boolean(search.results?.length) && !search.error;
+    input.setAttribute("aria-expanded", String(shown));
+    if (shown) {
+      input.setAttribute("aria-controls", "files-search-results");
+      input.setAttribute("aria-activedescendant", `files-search-result-${search.active}`);
+    } else {
+      input.removeAttribute("aria-controls");
+      input.removeAttribute("aria-activedescendant");
+    }
+  }
+
+  /// Breadcrumbs and the sidebar list: a folder listing, or search results
+  /// while a search is shown. The open file is left alone, so typing never
+  /// re-renders source.
+  function renderFilesList(files, { resetScroll = false } = {}) {
     renderBreadcrumbs(files);
+    syncFileSearchInput(files);
     const list = $("files-list");
+    if (fileSearchShown(files)) {
+      list.replaceChildren(...renderFileSearchResults(files));
+      if (resetScroll) list.scrollTop = 0;
+      return;
+    }
     if (files.loading && !files.listing) list.replaceChildren(projectStateNode("Loading project files…"));
     else if (files.error && !files.listing) list.replaceChildren(projectStateNode(files.error, true));
     else {
@@ -6155,6 +6410,178 @@ function initialize() {
         return button;
       }) : [projectStateNode(files.error || "This directory is empty.", Boolean(files.error))]));
     }
+  }
+
+  function moveFileSearchActive(files, step) {
+    const search = files.search;
+    const count = search.results?.length || 0;
+    if (!count) return;
+    search.active = (search.active + step + count) % count;
+    const list = $("files-list");
+    for (const option of list.querySelectorAll(".file-search-result")) {
+      const active = option.id === `files-search-result-${search.active}`;
+      option.classList.toggle("active", active);
+      option.setAttribute("aria-selected", String(active));
+      if (active) option.scrollIntoView({ block: "nearest" });
+    }
+    syncFileSearchInput(files);
+  }
+
+  function openFileSearchResult(view, index, { focusViewer = false } = {}) {
+    const files = view?.files;
+    const path = files?.search.results?.[index];
+    if (!path || state.projectView !== view || !confirmDiscardFileEdit(files)) return;
+    files.search.active = index;
+    rememberProjectScroll();
+    const reveal = files.search.line ? { line: files.search.line, column: files.search.column } : null;
+    if (focusViewer) $("file-viewer").focus({ preventScroll: true });
+    if (reveal && files.file?.path === path && !files.loading) {
+      navigateToCodeLocation(view, { path, ...reveal });
+      renderFilesList(files);
+      return;
+    }
+    const current = codeViewerPosition(files);
+    if (current && current.path !== path) files.history = pushCodeHistory(files.history, current);
+    void loadProjectFile(path, reveal ? { reveal } : {});
+  }
+
+  async function runFileSearch(view, query) {
+    const paneId = view.paneId;
+    const files = view.files;
+    const search = files.search;
+    const endpoint = paneCodePath(paneId, "files", { query });
+    if (!endpoint || state.projectView !== view) return;
+    const render = (options) => {
+      if (state.projectView === view && state.selected === paneId
+        && state.viewMode === "files" && !filesPanel.hidden) renderFilesList(files, options);
+    };
+    if (!isMachineControllable(machineOf(state.sessions.get(paneId)))) {
+      search.loading = false; search.openFirst = false;
+      search.query = query; search.results = null;
+      search.error = "The selected machine is offline. File search will be available when it reconnects.";
+      render();
+      return;
+    }
+    state.fileSearchController?.abort();
+    const controller = new AbortController();
+    state.fileSearchController = controller;
+    const generation = ++state.fileSearchRequest;
+    search.loading = true;
+    let changed = false;
+    try {
+      const data = await request(endpoint, { signal: controller.signal });
+      if (generation !== state.fileSearchRequest || state.projectView !== view) return;
+      changed = search.query !== query;
+      search.query = query;
+      search.results = [...new Set(codeNavResults(data).results.map((result) => result.path))];
+      search.truncated = Boolean(data?.truncated);
+      search.error = null;
+      search.active = changed ? 0 : Math.min(search.active, Math.max(0, search.results.length - 1));
+      if (changed) search.scroll = 0;
+    } catch (error) {
+      if (error?.name === "AbortError" || generation !== state.fileSearchRequest || state.projectView !== view) return;
+      changed = true;
+      search.query = query;
+      search.results = null;
+      search.error = fileSearchErrorMessage(error);
+      search.openFirst = false;
+    } finally {
+      if (state.fileSearchController === controller) state.fileSearchController = null;
+    }
+    if (generation !== state.fileSearchRequest) return;
+    search.loading = false;
+    render({ resetScroll: changed });
+    if (search.openFirst) {
+      search.openFirst = false;
+      openFileSearchResult(view, search.active, { focusViewer: true });
+    }
+  }
+
+  function handleFileSearchInput() {
+    const view = selectedProjectView();
+    if (!view) return;
+    const files = view.files;
+    const search = files.search;
+    search.text = $("files-search").value;
+    const parsed = fileSearchQuery(search.text);
+    search.line = parsed?.line ?? null;
+    search.column = parsed?.column ?? null;
+    clearTimeout(state.fileSearchTimer);
+    state.fileSearchTimer = null;
+    if (!parsed) {
+      const text = search.text;
+      cancelFileSearch();
+      files.search = { ...emptyFileSearch(), text };
+      renderFilesList(files);
+      restoreProjectScroll("files", view.paneId, files.file?.path || "");
+      return;
+    }
+    if (parsed.query !== search.query || (!search.results && !search.loading)) {
+      search.loading = true;
+      state.fileSearchTimer = setTimeout(() => {
+        state.fileSearchTimer = null;
+        void runFileSearch(view, parsed.query);
+      }, FILE_SEARCH_DEBOUNCE_MS);
+    }
+    renderFilesList(files);
+  }
+
+  function handleFileSearchKeydown(event) {
+    const view = state.projectView;
+    if (!view || view.paneId !== state.selected || event.isComposing) return;
+    const files = view.files;
+    const search = files.search;
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      if (!fileSearchShown(files) || !search.results?.length) return;
+      event.preventDefault();
+      moveFileSearchActive(files, event.key === "ArrowDown" ? 1 : -1);
+    } else if (event.key === "Enter") {
+      const parsed = fileSearchQuery(search.text);
+      if (!parsed) return;
+      event.preventDefault();
+      if (state.fileSearchTimer !== null) {
+        clearTimeout(state.fileSearchTimer);
+        state.fileSearchTimer = null;
+        search.openFirst = true;
+        void runFileSearch(view, parsed.query);
+      } else if (search.loading) {
+        search.openFirst = true;
+      } else if (search.results?.length) {
+        openFileSearchResult(view, search.active, { focusViewer: true });
+      }
+    } else if (event.key === "Escape") {
+      if (!search.text) return;
+      event.preventDefault();
+      event.stopPropagation();
+      clearFileSearch(files);
+      renderFilesList(files);
+      restoreProjectScroll("files", view.paneId, files.file?.path || "");
+    }
+  }
+
+  /// Ctrl/⌘+P finds a file while Files is open, as in an editor.
+  function focusFileSearch(event) {
+    if (event.key.toLowerCase() !== "p" || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
+    if (state.viewMode !== "files" || filesPanel.hidden || document.querySelector("dialog[open]")) return;
+    event.preventDefault();
+    const input = $("files-search");
+    const files = state.projectView?.files;
+    if (!input.offsetParent && files?.file) {
+      // Phone layout: the list is behind the open file.
+      if (!confirmDiscardFileEdit(files)) return;
+      rememberProjectScroll();
+      files.file = null;
+      renderFiles();
+    }
+    input.focus({ preventScroll: true });
+    input.select();
+  }
+
+  function renderFiles() {
+    const view = selectedProjectView();
+    if (!view) return;
+    const files = view.files;
+    renderFilesList(files);
 
     const viewer = $("file-viewer");
     applyFileReaderPreferences(viewer);
@@ -9482,6 +9909,9 @@ function initialize() {
   $("raw-view").addEventListener("click", () => setViewMode("raw"));
   $("files-view").addEventListener("click", () => setViewMode("files"));
   $("file-viewer").addEventListener("keydown", handleFileViewerKeydown);
+  $("files-search").addEventListener("input", handleFileSearchInput);
+  $("files-search").addEventListener("keydown", handleFileSearchKeydown);
+  document.addEventListener("keydown", focusFileSearch);
   document.addEventListener("keydown", (event) => {
     if (event.key === "Control" || event.key === "Meta") setNavigationModifier(true);
   });

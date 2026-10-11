@@ -95,6 +95,11 @@ struct CodeResolveQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct CodeFilesQuery {
+    query: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct LaunchDirectoryQuery {
     machine: Option<String>,
     path: Option<String>,
@@ -870,6 +875,7 @@ fn routes(state: WebState) -> Router {
             get(pane_code_references),
         )
         .route("/api/v1/panes/{id}/code/resolve", get(pane_code_resolve))
+        .route("/api/v1/panes/{id}/code/files", get(pane_code_files))
         .route("/api/v1/panes/{id}/models", get(pane_models))
         .route("/api/v1/panes/{id}/model", post(switch_model))
         .route("/api/v1/panes/{id}/restart", post(restart_current_agent))
@@ -1249,6 +1255,15 @@ async fn pane_code_resolve(
         spec: query.spec,
         symbol: query.symbol,
     };
+    pane_code(&state, &id, request).await
+}
+
+async fn pane_code_files(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    Query(query): Query<CodeFilesQuery>,
+) -> Result<Json<CodeNavResponse>, ApiError> {
+    let request = CodeNavRequest::Files { query: query.query };
     pane_code(&state, &id, request).await
 }
 
@@ -3325,6 +3340,7 @@ mod tests {
             "/api/v1/panes/nope/code/definitions?symbol=Foo",
             "/api/v1/panes/nope/code/references?symbol=Foo&path=src%2Fa.rs",
             "/api/v1/panes/nope/code/resolve?path=src%2Fa.ts&spec=.%2Fb",
+            "/api/v1/panes/nope/code/files?query=app",
         ] {
             assert_eq!(
                 status_of(&app, "GET", uri, None).await,
@@ -3354,6 +3370,15 @@ mod tests {
             (
                 "/api/v1/panes/%254294967295/code/resolve?path=src%2Fa.ts&spec=%0Abad",
                 "specifiers cannot carry control characters",
+            ),
+            ("/api/v1/panes/nope/code/files", "query is required"),
+            (
+                "/api/v1/panes/%254294967295/code/files?query=%20%20",
+                "a file search needs a word",
+            ),
+            (
+                "/api/v1/panes/%254294967295/code/files?query=a%0Ab",
+                "file searches cannot carry control characters",
             ),
         ] {
             assert_eq!(
@@ -3478,6 +3503,11 @@ mod tests {
             (
                 "GET",
                 "/api/v1/panes/gpu-box~%251/code/resolve?path=a.rs&spec=mod%20b",
+                None,
+            ),
+            (
+                "GET",
+                "/api/v1/panes/gpu-box~%251/code/files?query=app",
                 None,
             ),
             (

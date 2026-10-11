@@ -122,6 +122,22 @@ Groovy, Rust, TypeScript/TSX, JavaScript/JSX, Python, Go, C, C++, C#, Swift,
 Ruby, PHP, shell, SQL, JSON, YAML, TOML, XML/HTML (with embedded script and
 style), CSS/SCSS, Markdown, Dockerfile, Makefile, Protocol Buffers, and GraphQL.
 
+The search box above the file list finds a file anywhere in the project.
+Matches appear as you type, best first: the exact name, then names that start
+with what you typed, then names that contain it, then folders, then letters in
+order, so `wapp` still finds `web/app.js`. Every word has to match, and a word
+with a `/` matches the path, so `metrics host` and `metrics/host.rs` both find
+`src/metrics/host.rs`. Paste a location such as `src/web.rs:1174` and Enter
+opens the file at that line. Arrow keys move through the matches, Enter opens
+one, and Escape goes back to the folder. Ctrl+P or ⌘+P jumps to the box while
+Files is open.
+
+File search lists dotfiles such as `.github/workflows/ci.yml`, which the
+symbol searches below never read. It still skips the generated folders listed
+below, tool caches such as `.venv`, `.gradle`, and `.idea`, and any Git
+checkout inside a hidden folder, so agent worktrees under `.claude/worktrees`
+don't repeat every file.
+
 In a navigable language, names are interactive:
 
 - A tap or click on a name highlights every occurrence in the file and opens
@@ -140,21 +156,25 @@ In a navigable language, names are interactive:
   through jumps with their scroll positions. Unsaved edits are confirmed
   before any jump.
 
-The owner answers three read-only routes. Each is forwarded by a
+The owner answers four read-only routes. Each is forwarded by a
 coordinator exactly like Files:
 
 ```text
 GET /api/v1/panes/{id}/code/definitions?symbol=Name&path=src/Main.java
 GET /api/v1/panes/{id}/code/references?symbol=Name&path=src/Main.java
 GET /api/v1/panes/{id}/code/resolve?path=src/app.ts&spec=./util&symbol=format
+GET /api/v1/panes/{id}/code/files?query=metrics%20host
 ```
 
 Each returns
 `{pane_id, operation, query, results: [{path, line, column, kind, preview}], truncated}`.
 A symbol must be one identifier of at most 128 characters (`[A-Za-z_$][A-Za-z0-9_$]*`).
+A file search query is at most 256 bytes of printable text. It returns up to
+50 paths, each with line 1 and kind `file`, and `truncated` also means more
+paths matched than were returned.
 Paths use the Files validation, so sensitive paths answer like missing ones.
 The owner derives the root from the live pane and walks it descriptor-relatively
-without following symlinks. It skips hidden, sensitive, and generated
+without following symlinks. The symbol searches skip hidden, sensitive, and generated
 directories (`node_modules`, `target`, `build`, `dist`, `out`, `obj`,
 `coverage`, `vendor`, `venv`, `__pycache__`, `Pods`, `DerivedData`). Results
 carry only project-relative paths and a trimmed one-line preview of at most

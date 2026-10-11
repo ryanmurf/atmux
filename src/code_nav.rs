@@ -8,6 +8,11 @@
 //! sensitive, and generated directories are never visited, and every scan
 //! stops at fixed file, byte, time, and result budgets.
 //!
+//! File search ranks walked project paths against a typed name. Unlike the
+//! symbol walks it also lists dotfiles such as `.github/workflows/ci.yml`,
+//! but it still skips version-control metadata, tool caches, and every
+//! sensitive name the Files API refuses to open.
+//!
 //! Definition detection is deliberately heuristic: it recognizes declaration
 //! shapes per language family (keywords such as `class`, `fn`, `def`, `func`,
 //! typed Java/C#/C signatures, Go receivers and grouped declarations). It is a
@@ -45,6 +50,9 @@ const NAV_TIME_BUDGET: Duration = Duration::from_secs(2);
 const MAX_NAV_RESULTS: usize = 200;
 const MAX_PACKAGE_FILES: usize = 50;
 const MAX_PREVIEW_CHARS: usize = 200;
+const MAX_FILE_QUERY_BYTES: usize = 256;
+const MAX_FILE_QUERY_TERMS: usize = 8;
+const MAX_FILE_RESULTS: usize = 50;
 
 /// Generated, vendored, or dependency trees that an editor's "go to
 /// definition" would not search by default and that can dwarf the budget.
@@ -64,6 +72,31 @@ const SKIPPED_DIRECTORIES: &[&str] = &[
     "DerivedData",
 ];
 
+/// Hidden directories that file search skips even though it lists other
+/// dotfiles: version-control metadata, dependency caches, and IDE state.
+const SKIPPED_HIDDEN_DIRECTORIES: &[&str] = &[
+    ".hg",
+    ".svn",
+    ".cache",
+    ".venv",
+    ".tox",
+    ".next",
+    ".nuxt",
+    ".gradle",
+    ".idea",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".terraform",
+    ".turbo",
+    ".yarn",
+    ".pnpm-store",
+    ".parcel-cache",
+    ".svelte-kit",
+    ".angular",
+    ".dart_tool",
+];
+
 /// One source location. Paths are project-relative and use `/`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeLocation {
@@ -81,7 +114,7 @@ pub struct CodeLocation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeNavResponse {
     pub pane_id: String,
-    /// `definitions`, `references`, or `resolve`.
+    /// `definitions`, `references`, `resolve`, or `files`.
     pub operation: String,
     /// The validated symbol or import specifier this answers.
     pub query: String,
@@ -114,6 +147,8 @@ pub enum CodeNavRequest {
         spec: String,
         symbol: Option<String>,
     },
+    /// Project files whose path matches a typed name, best match first.
+    Files { query: String },
 }
 
 impl CodeNavRequest {
@@ -124,6 +159,7 @@ impl CodeNavRequest {
             Self::Definitions { .. } => "definitions",
             Self::References { .. } => "references",
             Self::Resolve { .. } => "resolve",
+            Self::Files { .. } => "files",
         }
     }
 
@@ -145,6 +181,7 @@ impl CodeNavRequest {
                 }
                 pairs
             }
+            Self::Files { query } => vec![("query", query.as_str())],
         }
     }
 }
@@ -186,6 +223,7 @@ fn validate_request(request: &CodeNavRequest) -> WorkspaceResult<()> {
                 validate_symbol(symbol)?;
             }
         }
+        CodeNavRequest::Files { query } => validate_file_query(query)?,
     }
     Ok(())
 }
@@ -215,6 +253,10 @@ fn navigate_in_root(
             })?;
             let (results, truncated) = project.resolve(&from, spec, symbol.as_deref());
             (spec.clone(), results, truncated)
+        }
+        CodeNavRequest::Files { query } => {
+            let (results, truncated) = project.find_files(query);
+            (query.trim().to_owned(), results, truncated)
         }
     };
     Ok(CodeNavResponse {
@@ -248,6 +290,20 @@ fn validate_spec(spec: &str) -> WorkspaceResult<()> {
     if spec.trim().is_empty() || spec.len() > MAX_SPEC_BYTES || spec.chars().any(char::is_control) {
         return Err(WorkspaceError::invalid(
             "import specifier is empty, oversized, or contains control characters",
+        ));
+    }
+    Ok(())
+}
+
+/// A file-name query is one bounded line of printable text. It is compared
+/// with walked paths and never used as a pattern or opened as a path.
+fn validate_file_query(query: &str) -> WorkspaceResult<()> {
+    if file_query_terms(query).is_empty()
+        || query.len() > MAX_FILE_QUERY_BYTES
+        || query.chars().any(char::is_control)
+    {
+        return Err(WorkspaceError::invalid(
+            "file search query is empty, oversized, or contains control characters",
         ));
     }
     Ok(())
@@ -1183,6 +1239,141 @@ fn kind_rank(kind: &str) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// File search
+
+/// Whitespace-separated words, ASCII-lowercased so byte offsets still line
+/// up with the original path. A pasted `./src/a.rs` matches like `src/a.rs`.
+fn file_query_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(|term| term.trim_start_matches("./").trim_start_matches('/'))
+        .filter(|term| !term.is_empty())
+        .take(MAX_FILE_QUERY_TERMS)
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// Ranks `paths` against every word of `query` and keeps the best `limit`.
+/// The flag reports that more paths matched than were kept.
+fn rank_file_paths(
+    paths: impl IntoIterator<Item = String>,
+    query: &str,
+    limit: usize,
+) -> (Vec<String>, bool) {
+    let terms = file_query_terms(query);
+    if terms.is_empty() {
+        return (Vec::new(), false);
+    }
+    let mut scored = paths
+        .into_iter()
+        .filter_map(|path| file_path_score(&path, &terms).map(|score| (score, path)))
+        .collect::<Vec<_>>();
+    // Best score first; among equals, the shorter (usually shallower) path.
+    scored.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.len().cmp(&right.len()))
+            .then_with(|| left.cmp(right))
+    });
+    let more = scored.len() > limit;
+    scored.truncate(limit);
+    (scored.into_iter().map(|(_, path)| path).collect(), more)
+}
+
+/// The sum of each word's score, or `None` when any word fails to match.
+fn file_path_score(path: &str, terms: &[String]) -> Option<u32> {
+    let original = path.as_bytes();
+    let lower = path.to_ascii_lowercase();
+    let name_start = lower.rfind('/').map_or(0, |index| index + 1);
+    terms.iter().try_fold(0_u32, |total, term| {
+        Some(total + file_term_score(original, lower.as_bytes(), name_start, term.as_bytes())?)
+    })
+}
+
+/// Scores one word in tiers that never overlap: the file name beats a
+/// folder, a contiguous run beats scattered letters, and a word that starts
+/// at a separator or camelCase hump beats one in the middle of a word. A word
+/// containing `/` is read as a path fragment instead.
+fn file_term_score(original: &[u8], lower: &[u8], name_start: usize, term: &[u8]) -> Option<u32> {
+    let name = &lower[name_start..];
+    if term.contains(&b'/') {
+        return if lower == term {
+            Some(1_000)
+        } else if lower.ends_with(term) && word_start(original, lower.len() - term.len()) {
+            Some(800)
+        } else if let Some(at_word) = substring(original, lower, 0, term) {
+            Some(if at_word { 500 } else { 400 })
+        } else {
+            subsequence(original, lower, 0, term).map(|bonus| 20 + bonus)
+        };
+    }
+    // A dotfile ranks by the name after its dot, so `gitignore` finds
+    // `.gitignore` as an exact match.
+    let bare = name.strip_prefix(b".").unwrap_or(name);
+    let stem = bare.split(|byte| *byte == b'.').next().unwrap_or(bare);
+    if name == term || bare == term {
+        Some(1_000)
+    } else if stem == term {
+        Some(900)
+    } else if name.starts_with(term) || bare.starts_with(term) {
+        Some(800)
+    } else if let Some(at_word) = substring(original, lower, name_start, term) {
+        Some(if at_word { 650 } else { 550 })
+    } else if let Some(at_word) = substring(original, lower, 0, term) {
+        Some(if at_word { 350 } else { 300 })
+    } else if let Some(bonus) = subsequence(original, lower, name_start, term) {
+        Some(150 + bonus)
+    } else {
+        subsequence(original, lower, 0, term).map(|bonus| 20 + bonus)
+    }
+}
+
+/// Finds `term` in `lower[from..]`. `Some(true)` means one occurrence starts
+/// a word.
+fn substring(original: &[u8], lower: &[u8], from: usize, term: &[u8]) -> Option<bool> {
+    let mut found = false;
+    for start in from..=lower.len().checked_sub(term.len())? {
+        if lower[start..].starts_with(term) {
+            if word_start(original, start) {
+                return Some(true);
+            }
+            found = true;
+        }
+    }
+    found.then_some(false)
+}
+
+/// Matches `term`'s bytes in order inside `lower[from..]`, taking each at the
+/// earliest position. The bonus, below 50, rewards letters that start words
+/// and letters that follow the previous match directly.
+fn subsequence(original: &[u8], lower: &[u8], from: usize, term: &[u8]) -> Option<u32> {
+    let mut position = from;
+    let mut previous: Option<usize> = None;
+    let mut bonus = 0_u32;
+    for needle in term {
+        let found = position + lower[position..].iter().position(|byte| byte == needle)?;
+        if word_start(original, found) {
+            bonus += 6;
+        }
+        if previous.is_some_and(|previous| previous + 1 == found) {
+            bonus += 3;
+        }
+        previous = Some(found);
+        position = found + 1;
+    }
+    Some(bonus.min(49))
+}
+
+/// True at the start of the path, after a separator, and at a camelCase hump.
+fn word_start(original: &[u8], index: usize) -> bool {
+    let Some(previous) = index.checked_sub(1).map(|before| original[before]) else {
+        return true;
+    };
+    matches!(previous, b'/' | b'.' | b'_' | b'-' | b' ')
+        || (previous.is_ascii_lowercase() && original[index].is_ascii_uppercase())
+}
+
+// ---------------------------------------------------------------------------
 // Project traversal
 
 #[derive(Clone, Debug)]
@@ -1215,17 +1406,35 @@ impl Project {
     /// Every visible regular file, walked once per request and bounded.
     fn files(&mut self) -> (&[WalkedFile], bool) {
         if self.walked.is_none() {
-            let mut state = WalkState {
-                files: Vec::new(),
-                directories: 0,
-                truncated: false,
-                deadline: self.deadline,
-            };
+            let mut state = WalkState::new(self.deadline, false);
             walk_directory(&self.root, Path::new(""), 0, &mut state);
             self.walked = Some((state.files, state.truncated));
         }
         let (files, truncated) = self.walked.as_ref().expect("walk was just performed");
         (files, *truncated)
+    }
+
+    /// Project files whose path matches `query`, best first. This walk also
+    /// lists dotfiles, so it never shares the symbol walk's cache.
+    fn find_files(&self, query: &str) -> (Vec<CodeLocation>, bool) {
+        let mut state = WalkState::new(self.deadline, true);
+        walk_directory(&self.root, Path::new(""), 0, &mut state);
+        let paths = state
+            .files
+            .iter()
+            .map(|file| path_for_response(&file.relative));
+        let (matches, more) = rank_file_paths(paths, query, MAX_FILE_RESULTS);
+        let results = matches
+            .into_iter()
+            .map(|path| CodeLocation {
+                path,
+                line: 1,
+                column: 1,
+                kind: "file".to_owned(),
+                preview: String::new(),
+            })
+            .collect();
+        (results, state.truncated || more)
     }
 
     /// Reads one walked file's text under the byte budget.
@@ -2202,6 +2411,36 @@ struct WalkState {
     directories: usize,
     truncated: bool,
     deadline: Instant,
+    /// File search lists dotfiles; symbol walks never read them.
+    include_hidden: bool,
+}
+
+impl WalkState {
+    const fn new(deadline: Instant, include_hidden: bool) -> Self {
+        Self {
+            files: Vec::new(),
+            directories: 0,
+            truncated: false,
+            deadline,
+            include_hidden,
+        }
+    }
+
+    fn admits(&self, name: &str) -> bool {
+        if self.include_hidden {
+            safe_component(name) && !sensitive_component(name)
+        } else {
+            visible_name(name)
+        }
+    }
+}
+
+fn enters_directory(name: &str) -> bool {
+    !SKIPPED_DIRECTORIES.contains(&name) && !SKIPPED_HIDDEN_DIRECTORIES.contains(&name)
+}
+
+fn hidden_path(path: &str) -> bool {
+    path.split('/').any(|component| component.starts_with('.'))
 }
 
 fn visible_name(name: &str) -> bool {
@@ -2209,8 +2448,9 @@ fn visible_name(name: &str) -> bool {
 }
 
 /// Depth-first, descriptor-relative walk. At most one directory descriptor
-/// per level stays open, symlinks are never followed, and hidden, sensitive,
-/// and generated trees are never entered.
+/// per level stays open, symlinks are never followed, and sensitive and
+/// generated trees are never entered. Hidden names are visited only when the
+/// walk asks for them.
 fn walk_directory(directory: &File, relative: &Path, depth: usize, state: &mut WalkState) {
     if state.truncated {
         return;
@@ -2236,7 +2476,7 @@ fn walk_directory(directory: &File, relative: &Path, depth: usize, state: &mut W
         let Ok(name) = entry.file_name().to_str() else {
             continue;
         };
-        if matches!(name, "." | "..") || !visible_name(name) {
+        if matches!(name, "." | "..") || !state.admits(name) {
             continue;
         }
         let Ok(descriptor) = reader.fd() else {
@@ -2248,7 +2488,7 @@ fn walk_directory(directory: &File, relative: &Path, depth: usize, state: &mut W
         };
         let file_type = FileType::from_raw_mode(stat.st_mode);
         if file_type.is_dir() {
-            if !SKIPPED_DIRECTORIES.contains(&name) {
+            if enters_directory(name) {
                 children.push(name.to_owned());
             }
         } else if file_type.is_file() {
@@ -2267,9 +2507,18 @@ fn walk_directory(directory: &File, relative: &Path, depth: usize, state: &mut W
             state.truncated = true;
             return;
         }
-        let Some((child, _)) = open_at(directory, Path::new(&name), true) else {
+        let Some((child, _)) = open_component(directory, &name, true) else {
             continue;
         };
+        // Agent worktrees such as `.claude/worktrees/<id>` are whole copies
+        // of the project. A Git checkout below a hidden directory is skipped
+        // so a file search lists each file once.
+        if state.include_hidden
+            && (name.starts_with('.') || relative.to_str().is_some_and(hidden_path))
+            && rustix::fs::statat(&child, ".git", AtFlags::SYMLINK_NOFOLLOW).is_ok()
+        {
+            continue;
+        }
         state.directories += 1;
         walk_directory(&child, &relative.join(&name), depth + 1, state);
     }
@@ -2288,36 +2537,41 @@ fn open_at(root: &File, relative: &Path, directory: bool) -> Option<(File, u64)>
     if names.is_empty() {
         return None;
     }
-    let mut current: Option<File> = None;
-    let mut size = 0;
+    let mut current: Option<(File, u64)> = None;
     for (index, name) in names.iter().enumerate() {
-        let parent = current.as_ref().unwrap_or(root);
-        let last = index + 1 == names.len();
-        let stat = rustix::fs::statat(parent, *name, AtFlags::SYMLINK_NOFOLLOW).ok()?;
-        let file_type = FileType::from_raw_mode(stat.st_mode);
-        let want_directory = !last || directory;
-        if file_type.is_symlink()
-            || (want_directory && !file_type.is_dir())
-            || (!want_directory && !file_type.is_file())
-        {
-            return None;
-        }
-        let mut flags =
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY;
-        if want_directory {
-            flags |= OFlags::DIRECTORY;
-        }
-        let opened = File::from(rustix::fs::openat(parent, *name, flags, Mode::empty()).ok()?);
-        let metadata = opened.metadata().ok()?;
-        #[allow(clippy::unnecessary_cast)]
-        let same = metadata.dev() == stat.st_dev as u64 && metadata.ino() == stat.st_ino as u64;
-        if !same || metadata.is_dir() != want_directory {
-            return None;
-        }
-        size = metadata.len();
-        current = Some(opened);
+        let parent = current.as_ref().map_or(root, |(file, _)| file);
+        let want_directory = index + 1 < names.len() || directory;
+        current = Some(open_component(parent, name, want_directory)?);
     }
-    current.map(|file| (file, size))
+    current
+}
+
+/// Opens one already-vetted name below `parent`, refusing symlinks, the
+/// wrong file type, and a name whose identity changes between `stat` and
+/// `open`.
+fn open_component(parent: &File, name: &str, want_directory: bool) -> Option<(File, u64)> {
+    let stat = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).ok()?;
+    let file_type = FileType::from_raw_mode(stat.st_mode);
+    if file_type.is_symlink()
+        || (want_directory && !file_type.is_dir())
+        || (!want_directory && !file_type.is_file())
+    {
+        return None;
+    }
+    let mut flags =
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY;
+    if want_directory {
+        flags |= OFlags::DIRECTORY;
+    }
+    let opened = File::from(rustix::fs::openat(parent, name, flags, Mode::empty()).ok()?);
+    let metadata = opened.metadata().ok()?;
+    #[allow(clippy::unnecessary_cast)]
+    let same = metadata.dev() == stat.st_dev as u64 && metadata.ino() == stat.st_ino as u64;
+    if !same || metadata.is_dir() != want_directory {
+        return None;
+    }
+    let size = metadata.len();
+    Some((opened, size))
 }
 
 #[cfg(test)]
@@ -2918,6 +3172,192 @@ func (s *Store) Limit() int { return s.limit }
         assert_eq!(references.results.len(), MAX_NAV_RESULTS);
         assert!(references.truncated);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn ranked(paths: &[&str], query: &str) -> Vec<String> {
+        rank_file_paths(paths.iter().map(|path| (*path).to_owned()), query, 10).0
+    }
+
+    #[test]
+    fn file_search_ranks_names_before_folders_and_scattered_letters() {
+        let paths = [
+            "web/app.test.mjs",
+            "web/app.js",
+            "src/app.rs",
+            "docs/apple/notes.md",
+            "src/application/main.rs",
+            "src/web/happy.rs",
+            "src/metrics/host.rs",
+            "README.md",
+            "docs/README.md",
+            "src/ControlPlane.tsx",
+            "src/airplane.rs",
+        ];
+        // An exact name, then the same stem (shorter path first), then a
+        // name that starts with the word, then folders.
+        assert_eq!(
+            ranked(&paths, "app.js"),
+            vec!["web/app.js", "web/app.test.mjs"]
+        );
+        // A name containing the word, even mid-word, beats a folder.
+        assert_eq!(
+            ranked(&paths, "app"),
+            vec![
+                "src/app.rs",
+                "web/app.js",
+                "web/app.test.mjs",
+                "src/web/happy.rs",
+                "docs/apple/notes.md",
+                "src/application/main.rs",
+            ]
+        );
+        assert_eq!(
+            ranked(&[".gitignore", "docs/gitignore-notes.md"], "gitignore"),
+            vec![".gitignore", "docs/gitignore-notes.md"]
+        );
+        assert_eq!(
+            ranked(&paths, "readme"),
+            vec!["README.md", "docs/README.md"]
+        );
+        // A camelCase hump beats the same letters inside a word.
+        assert_eq!(
+            ranked(&paths, "plane"),
+            vec!["src/ControlPlane.tsx", "src/airplane.rs"]
+        );
+        // Every word must match; a slash makes a word a path fragment.
+        assert_eq!(ranked(&paths, "metrics host"), vec!["src/metrics/host.rs"]);
+        assert_eq!(
+            ranked(&paths, "metrics/host.rs"),
+            vec!["src/metrics/host.rs"]
+        );
+        assert_eq!(
+            ranked(&paths, "./src/metrics/host.rs"),
+            vec!["src/metrics/host.rs"]
+        );
+        // Scattered letters still find a file, after any contiguous match.
+        assert_eq!(ranked(&paths, "wapp")[0], "web/app.js");
+        assert!(ranked(&paths, "zzz").is_empty());
+        assert!(ranked(&paths, "   ").is_empty());
+
+        let many = (0..30).map(|index| format!("src/file{index}.rs"));
+        let (kept, more) = rank_file_paths(many, "file", 10);
+        assert_eq!(kept.len(), 10);
+        assert!(more);
+    }
+
+    #[test]
+    fn file_search_lists_dotfiles_but_never_sensitive_symlinked_or_generated_paths() {
+        let root = fixture("file-search");
+        let outside = fixture("file-search-outside");
+        write(&outside, "config.yml", "secret: true\n");
+        write(&root, "src/config.rs", "");
+        write(&root, ".github/workflows/config.yml", "");
+        write(&root, ".config.toml", "");
+        write(&root, ".env.example", "");
+        write(&root, ".env", "");
+        write(&root, ".env.local", "");
+        write(&root, "keys/config.pem", "");
+        write(&root, ".git/config", "");
+        write(&root, ".cache/config.json", "");
+        write(&root, "node_modules/pkg/config.js", "");
+        write(&root, "target/config.rs", "");
+        write(
+            &root,
+            ".claude/worktrees/agent-1/.git",
+            "gitdir: elsewhere\n",
+        );
+        write(&root, ".claude/worktrees/agent-1/src/config.rs", "");
+        write(&root, ".claude/settings/config.json", "");
+        symlink(
+            outside.join("config.yml"),
+            root.join("src/linked-config.yml"),
+        )
+        .unwrap();
+        symlink(&outside, root.join("config-dir")).unwrap();
+        let search = |query: &str| {
+            ask(
+                &root,
+                &CodeNavRequest::Files {
+                    query: query.to_owned(),
+                },
+            )
+        };
+        let found = search(" config ");
+        assert_eq!(found.operation, "files");
+        assert_eq!(found.query, "config");
+        assert!(!found.truncated);
+        assert_eq!(
+            found
+                .results
+                .iter()
+                .map(|location| location.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                ".config.toml",
+                "src/config.rs",
+                ".claude/settings/config.json",
+                ".github/workflows/config.yml",
+            ]
+        );
+        assert!(found.results.iter().all(|location| location.kind == "file"
+            && location.line == 1
+            && location.column == 1
+            && location.preview.is_empty()));
+        let env = search("env");
+        assert_eq!(
+            env.results
+                .iter()
+                .map(|location| location.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![".env.example"]
+        );
+        let expired = navigate_in_root(
+            &root,
+            &CodeNavRequest::Files {
+                query: "config".to_owned(),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(expired.truncated);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn file_queries_are_bounded_printable_text() {
+        for query in [
+            "app",
+            "web/app.js",
+            "two words",
+            "naïve.md",
+            "./src",
+            "a b c d e f g h i j",
+        ] {
+            assert!(validate_file_query(query).is_ok(), "{query}");
+        }
+        for query in [
+            "",
+            "   ",
+            "./",
+            "/",
+            "a\nb",
+            "tab\there",
+            &"x".repeat(MAX_FILE_QUERY_BYTES + 1),
+        ] {
+            assert!(validate_file_query(query).is_err(), "{query:?}");
+        }
+        assert_eq!(
+            file_query_terms("a b c d e f g h i j").len(),
+            MAX_FILE_QUERY_TERMS
+        );
+        assert_eq!(
+            CodeNavRequest::Files {
+                query: "web/app".to_owned()
+            }
+            .query_pairs(),
+            vec![("query", "web/app")]
+        );
     }
 
     #[test]
