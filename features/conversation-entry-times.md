@@ -14,7 +14,8 @@ whether its last reply came a minute ago or yesterday without opening the raw pa
   and time. Times sit on the right edge, beside Copy, so they line up down the conversation.
 - A tool call counts from when its result arrived. Owners now send that as `finished_at` beside
   the call's `timestamp`, for both Claude and Codex. A call with no result yet reads
-  "started 2:41 PM · 5m ago". A collapsed run of calls shows its newest call.
+  "started 2:41 PM · 5m ago". An empty result still finishes the call; Codex writes one for
+  every `send_message` and `followup_task`. A collapsed run of calls shows its newest call.
 - The "ago" part is refreshed every 30 seconds and when the page comes back into view. The
   refresh only rewrites labels whose text changed and never redraws the cards.
 - Message headers align on the first text line, so a long subagent name that wraps on a narrow

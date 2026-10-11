@@ -2131,10 +2131,7 @@ fn attach_tool_output(
     fallback_id: Option<&str>,
     timestamp: Option<&str>,
 ) {
-    let Some(output) = output else {
-        return;
-    };
-    let output = truncate_utf8(output, MAX_MESSAGE_BYTES);
+    let output = output.map(|output| truncate_utf8(output, MAX_MESSAGE_BYTES));
     if let Some(message) = call_id
         .filter(|value| value.len() <= MAX_ITEM_ID_BYTES)
         .and_then(|call_id| {
@@ -2144,10 +2141,16 @@ fn attach_tool_output(
                 .find(|message| message.kind == "tool" && message.id == call_id)
         })
     {
-        message.tool_output = Some(output);
+        // An empty result, such as Codex's `send_message`, still ends the call.
         message.finished_at = timestamp.map(|value| truncate_plain(value, MAX_TIMESTAMP_BYTES));
+        if output.is_some() {
+            message.tool_output = output;
+        }
         return;
     }
+    let Some(output) = output else {
+        return;
+    };
     messages.push(TranscriptMessage {
         id: bounded_id(fallback_id.or(call_id), || {
             format!("tool-result-{}", messages.len())
@@ -2885,6 +2888,23 @@ mod tests {
                 .unwrap()
                 .contains("hide me")
         );
+    }
+
+    #[test]
+    fn an_empty_tool_result_still_finishes_the_call() {
+        let source = concat!(
+            r#"{"timestamp":"one","type":"response_item","payload":{"type":"function_call","name":"send_message","arguments":"{}","call_id":"call-1"}}"#,
+            "\n",
+            r#"{"timestamp":"two","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":""}}"#,
+            "\n",
+            r#"{"timestamp":"three","type":"response_item","payload":{"type":"function_call_output","call_id":"unknown","output":""}}"#,
+            "\n",
+        );
+        let (messages, _) = parse_codex(&tail(source));
+        assert_eq!(messages.len(), 1, "an empty orphan result adds no entry");
+        assert_eq!(messages[0].timestamp.as_deref(), Some("one"));
+        assert_eq!(messages[0].finished_at.as_deref(), Some("two"));
+        assert_eq!(messages[0].tool_output, None);
     }
 
     #[test]
