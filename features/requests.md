@@ -23,6 +23,8 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Show compaction as a collapsed box | `conversation-mapping-compaction-raw-fit.md` | Deployed fleet-wide; reviews pending |
 | Make Raw pane use the browser's height instead of tmux's 80×24 default | `conversation-mapping-compaction-raw-fit.md` | Deployed fleet-wide; reviews pending |
 | Give the Files view IDE-style highlighting and click-through for Java, Rust, TypeScript, and other popular languages | `ide-code-viewer.md` | Deployed fleet-wide; reviews pending |
+| Show more on the machine page: memory broken down, a friendlier layout instead of large columns | `machine-page-detail.md` | Deployed fleet-wide; reviews pending |
+| Add a search under Files that matches file names | `files-name-search.md` | Deployed fleet-wide; reviews pending |
 
 ## Usage intelligence
 
