@@ -58,10 +58,11 @@ grows the table and moves the boundary. A Python test that held ptys up to each 
 the close-then-open sequence never hit it across seven boundaries, so the evidence for the
 mechanism is Midnight's usage count, the identical retries, and the recovery when the table grew.
 
-The full suite passed (954 tests) at 8 threads. Two earlier library runs each failed one test that
-writes and then runs a fake executable (`Text file busy`), a load flake seen in earlier rollouts. It
-also failed once with the new tests skipped, passed alone three times, and three later full runs
-were clean.
+The full suite passed (954 tests) at 8 threads. Two earlier library runs each failed
+`unlinked_claude_requires_kernel_identity_not_just_matching_argv`, which writes and then runs a
+fake executable (`Text file busy`), the load flake seen in earlier rollouts. That test passed alone
+three times. With the new tests skipped, a `self_update` test failed the same way once, and three
+later full library runs with the new tests were clean.
 
 ## Deployment (2026-10-12)
 
