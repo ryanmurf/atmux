@@ -27,7 +27,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Add a search under Files that matches file names | `files-name-search.md` | Deployed fleet-wide; reviews pending |
 | Stop Conversation going blank on mobile; run atmux background summaries on Tron's Qwen | `conversation-steady-summaries.md` | Deployed fleet-wide; reviews pending |
 | Show when each Conversation entry finished and how long ago | `conversation-entry-times.md` | Deployed fleet-wide; reviews pending |
-| Fix launches failing on Midnight with "fork failed: Device not configured" | `launch-pty-slot-race.md` | Fixed; deploying to Midnight |
+| Fix launches failing on Midnight with "fork failed: Device not configured" | `launch-pty-slot-race.md` | Deployed to Midnight; reviews pending |
 
 ## Usage intelligence
 

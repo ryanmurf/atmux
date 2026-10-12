@@ -1,6 +1,6 @@
 # Launches on macOS: no more "fork failed: Device not configured"
 
-Status: fixed in this branch; deployment below.
+Status: deployed to Midnight 2026-10-12 (runtime `8c8ba19`).
 
 ## Why
 
@@ -57,3 +57,20 @@ The kernel race itself isn't reproducible on demand: an attempt that misses the 
 grows the table and moves the boundary. A Python test that held ptys up to each boundary and ran
 the close-then-open sequence never hit it across seven boundaries, so the evidence for the
 mechanism is Midnight's usage count, the identical retries, and the recovery when the table grew.
+
+The full suite passed (954 tests) at 8 threads. Two earlier library runs each failed one test that
+writes and then runs a fake executable (`Text file busy`), a load flake seen in earlier rollouts. It
+also failed once with the new tests skipped, passed alone three times, and three later full runs
+were clean.
+
+## Deployment (2026-10-12)
+
+| Machine | Artifact SHA-256 prefix | Rollback |
+| --- | --- | --- |
+| Midnight | `12d51f65b3f40de4` (built on Midnight, 4 jobs) | `target/release/atmux.rollback-f7bb4e5` |
+
+Only Midnight needs the pty change; on Linux it does nothing. Tron, Max, Clue, and the coordinator
+stay on `f7bb4e5` until the next rollout, which brings them the relaunch guard. The restart used
+the LaunchAgent kickstart, after opening and closing 16 ptys so its own `respawn-pane -k` couldn't
+hit a full table. All 15 tmux sessions survived. A launch through the coordinator then started
+Claude on Midnight and was removed.
