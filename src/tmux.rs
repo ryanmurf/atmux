@@ -958,6 +958,7 @@ impl Tmux {
             let _ = Self::output(["kill-session", "-t", &session_id]);
             return Err(error);
         }
+        reserve_spare_pty_slots();
         if let Err(error) = Self::output([
             "respawn-pane",
             "-k",
@@ -1141,7 +1142,9 @@ impl Tmux {
         let invocation = scope.wrap(invocation)?;
         let command = escape_tmux_argument(&shell_words::join(invocation)).into_owned();
         let directory = escape_tmux_argument(directory);
+        ensure_pane_can_respawn(pane_id)?;
         publish_scope_metadata(pane_id, &scope)?;
+        reserve_spare_pty_slots();
         Self::output(respawn_pane_args(pane_id, &directory, &command))?;
         Ok(())
     }
@@ -1205,7 +1208,9 @@ impl Tmux {
             .to_str()
             .with_context(|| format!("directory is not valid UTF-8: {}", directory.display()))?;
         let directory = escape_tmux_argument(directory);
+        ensure_pane_can_respawn(pane_id)?;
         publish_scope_metadata(pane_id, &scope)?;
+        reserve_spare_pty_slots();
         Self::output(respawn_pane_args(pane_id, &directory, &command))?;
         Ok(())
     }
@@ -3196,6 +3201,54 @@ fn respawn_pane_args<'a>(pane_id: &'a str, directory: &'a str, command: &'a str)
     ]
 }
 
+/// How many ptys [`reserve_spare_pty_slots`] opens and closes before a respawn.
+const SPARE_PTY_SLOTS: usize = 16;
+
+/// Leaves free slots in the macOS pty table for the pty tmux opens next.
+///
+/// `respawn-pane -k` closes the pane's old pty and opens the new one in one
+/// step. macOS grows its pty table 16 slots at a time and never shrinks it.
+/// When the table is full, the new open is handed the slot past its end, and if
+/// the old pty's slot frees during that open the table doesn't grow, so tmux
+/// fails with "fork failed: Device not configured". Usage then sits one short
+/// of the boundary, so every retry fails the same way. Opening and closing a
+/// few ptys first grows the table when it is full, and tmux takes a free slot.
+fn reserve_spare_pty_slots() {
+    if cfg!(target_os = "macos") {
+        open_and_close_spare_ptys();
+    }
+}
+
+/// Opens up to [`SPARE_PTY_SLOTS`] pty masters together, then closes them.
+/// It's best effort: a pty that fails to open is skipped. Returns how many
+/// opened.
+fn open_and_close_spare_ptys() -> usize {
+    let spare: Vec<fs::File> = (0..SPARE_PTY_SLOTS)
+        .filter_map(|_| {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/ptmx")
+                .ok()
+        })
+        .collect();
+    spare.len()
+}
+
+/// Refuses to respawn a pane whose last respawn failed.
+///
+/// tmux frees a pane's input state before it respawns the pane and recreates
+/// it only once the new process starts. When the fork fails, the pane is left
+/// dead with pid -1, and respawning it again uses the freed state and ends the
+/// whole tmux server (seen with tmux 3.6 and 3.7). Closing such a pane is safe.
+fn ensure_pane_can_respawn(pane_id: &str) -> Result<()> {
+    let pid = Tmux::output(["display-message", "-p", "-t", pane_id, "#{pane_pid}"])?;
+    if pid.trim() == "-1" {
+        bail!("tmux could not start pane {pane_id} earlier; close it and launch a new session");
+    }
+    Ok(())
+}
+
 fn submission_keys(submit: bool) -> &'static [&'static str] {
     if submit { &["Enter"] } else { &[] }
 }
@@ -4477,6 +4530,61 @@ mod tests {
             Tmux.kill("carried")
         })
         .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pane_whose_respawn_failed_is_never_respawned_again() {
+        use rustix::process::{Pid, Resource, Rlimit, getrlimit, prlimit};
+
+        let probe = disposable_tmux("failed-respawn");
+        Tmux::with_socket_for_test(&probe.socket, || {
+            Tmux::output(["new-session", "-d", "-s", "failed", "sleep 30"])?;
+            let pane = Tmux::output(["list-panes", "-t", "=failed", "-F", "#{pane_id}"])?;
+            ensure_pane_can_respawn(&pane)?;
+
+            // Leave the server one spare descriptor. The respawn's client
+            // connection takes it, so tmux can't open a pty for the new process.
+            let server: i32 = Tmux::output(["display-message", "-p", "#{pid}"])?.parse()?;
+            thread::sleep(Duration::from_millis(200));
+            let open = u64::try_from(fs::read_dir(format!("/proc/{server}/fd"))?.count())?;
+            let server = Pid::from_raw(server).context("tmux reported pid 0")?;
+            let original = prlimit(
+                Some(server),
+                Resource::Nofile,
+                Rlimit {
+                    current: Some(open + 1),
+                    maximum: getrlimit(Resource::Nofile).maximum,
+                },
+            )?;
+            let failed = Tmux::output(["respawn-pane", "-k", "-t", &pane, "sleep 30"]);
+            prlimit(Some(server), Resource::Nofile, original)?;
+            let failed = failed.expect_err("the respawn had no descriptor left for a pty");
+            assert!(failed.to_string().contains("fork failed"), "{failed:#}");
+            assert_eq!(
+                Tmux::output(["display-message", "-p", "-t", &pane, "#{pane_pid}"])?,
+                "-1"
+            );
+
+            // Respawning this pane again would end the server; atmux refuses.
+            let refused = ensure_pane_can_respawn(&pane).expect_err("a failed pane is refused");
+            assert!(
+                refused.to_string().contains("could not start pane"),
+                "{refused:#}"
+            );
+            Tmux::output(["has-session", "-t", "=failed"])?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn spare_ptys_open_together_and_close() {
+        if !Path::new("/dev/ptmx").exists() {
+            return;
+        }
+        assert_eq!(open_and_close_spare_ptys(), SPARE_PTY_SLOTS);
+        assert_eq!(open_and_close_spare_ptys(), SPARE_PTY_SLOTS);
     }
 
     #[test]
