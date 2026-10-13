@@ -4030,6 +4030,37 @@ function temperatureRows(temperatures) {
     .sort((left, right) => right.celsius - left.celsius || left.label.localeCompare(right.label));
 }
 
+/// Disk rows in the owner's order: root first, then largest. Percent used is
+/// `df`'s, used over used plus available, so blocks Linux reserves for root
+/// don't count as free space.
+function diskRows(disks) {
+  if (!Array.isArray(disks)) return [];
+  const text = (value) => typeof value === "string" ? value.trim() : "";
+  const bytes = (value) => Number.isFinite(value) && value >= 0;
+  const rate = (value) => bytes(value) ? value : null;
+  return disks
+    .filter((disk) => text(disk?.mount_point) && bytes(disk.total_bytes) && disk.total_bytes > 0
+      && bytes(disk.used_bytes) && bytes(disk.available_bytes))
+    .map((disk) => {
+      const capacity = disk.used_bytes + disk.available_bytes;
+      return {
+        mount: text(disk.mount_point),
+        detail: [text(disk.label), text(disk.model), text(disk.file_system)].filter(Boolean).join(" · "),
+        device: text(disk.device),
+        total: disk.total_bytes,
+        used: disk.used_bytes,
+        available: disk.available_bytes,
+        percent: capacity > 0 ? Math.min(100, (disk.used_bytes / capacity) * 100) : null,
+        read: rate(disk.read_bytes_per_second),
+        write: rate(disk.write_bytes_per_second),
+      };
+    });
+}
+
+function formatRate(bytesPerSecond) {
+  return Number.isFinite(bytesPerSecond) && bytesPerSecond >= 0 ? `${formatBytes(bytesPerSecond)}/s` : "—";
+}
+
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes < 0) return "—";
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -4512,6 +4543,8 @@ if (typeof module !== "undefined" && module.exports) {
     memoryBreakdownRows,
     processRows,
     temperatureRows,
+    diskRows,
+    formatRate,
     markdownBlocks,
     messageFitsByteLimit,
     messageHistoryDirection,
@@ -8110,6 +8143,7 @@ function initialize() {
       memoryPanel(metrics),
       processPanel(metrics),
       side,
+      diskPanel(metrics.disks),
       temperaturePanel(metrics.temperatures),
     );
     $("machine-metrics").replaceChildren(machineStatRow(metrics), panels);
@@ -8238,6 +8272,11 @@ function initialize() {
     if (Number.isFinite(swapTotal) && swapTotal > 0) {
       const swapUsed = metrics.memory.swap_used_bytes;
       row.append(statTile("Swap", formatBytes(swapUsed), `of ${formatBytes(swapTotal)}`, percentOf(swapUsed, swapTotal)));
+    }
+    const root = diskRows(metrics.disks).find((disk) => disk.mount === "/");
+    if (root) {
+      row.append(statTile("Disk", formatBytes(root.used),
+        `of ${formatBytes(root.total)} · ${formatBytes(root.available)} free`, root.percent));
     }
     const load = cpu.load_average;
     if (load && Number.isFinite(load.one)) {
@@ -8515,6 +8554,47 @@ function initialize() {
     row.append(showMeter ? meter(percent, `GPU ${label}`) : textSpan("", "gpu-meter-spacer"));
     row.append(textSpan(value, "gpu-meter-value"));
     return row;
+  }
+
+  /// One block per filesystem, root first. A filling disk turns amber at 85%
+  /// and red at 95%, and its block keeps free space and current I/O together.
+  function diskPanel(disks) {
+    const rows = diskRows(disks);
+    const free = rows.reduce((sum, row) => sum + row.available, 0);
+    const card = metricPanel("Disks", "disk-panel",
+      rows.length ? `${rows.length} mounted · ${formatBytes(free)} free` : "");
+    if (!rows.length) {
+      card.append(textSpan("Disk detail needs a newer atmux on this machine.", "metric-sub"));
+      return card;
+    }
+    const list = document.createElement("div");
+    list.className = "disk-list";
+    for (const row of rows) {
+      const block = document.createElement("article");
+      block.className = "disk-block";
+      block.dataset.level = meterLevel(row.percent);
+      block.dataset.tip = [`${row.mount}${row.device ? ` (${row.device})` : ""}`,
+        `${formatBytes(row.used)} used`, `${formatBytes(row.available)} free`,
+        `${formatBytes(row.total)} total`].join(" · ");
+      block.dataset.tipKey = `disk-${row.mount}`;
+      const title = document.createElement("div");
+      title.className = "disk-title";
+      title.append(textSpan(row.mount, "disk-mount"), textSpan(formatPercent(row.percent), "disk-percent"));
+      block.append(title);
+      if (row.detail) block.append(textSpan(row.detail, "disk-detail"));
+      block.append(meter(row.percent, `${row.mount} used`));
+      const space = document.createElement("div");
+      space.className = "disk-space";
+      space.append(textSpan(`${formatBytes(row.used)} of ${formatBytes(row.total)}`, "disk-used"),
+        textSpan(`${formatBytes(row.available)} free`, "disk-free"));
+      block.append(space);
+      if (row.read !== null || row.write !== null) {
+        block.append(textSpan(`Read ${formatRate(row.read)} · Write ${formatRate(row.write)}`, "disk-io"));
+      }
+      list.append(block);
+    }
+    card.append(list);
+    return card;
   }
 
   function temperaturePanel(temperatures) {

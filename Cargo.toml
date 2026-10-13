@@ -71,6 +71,8 @@ jsonwebtoken = { version = "10.4.0", default-features = false, features = ["aws_
 
 [target.'cfg(target_os = "macos")'.dependencies]
 exacl = "0.13.0"
+# Volume names and APFS capacities; Linux reads mountinfo and statvfs directly.
+sysinfo = { version = "0.38.4", default-features = false, features = ["disk"] }
 
 [profile.release]
 lto = "thin"

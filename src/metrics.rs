@@ -5,8 +5,9 @@
 //! documented CSV query plus bounded DRM/sysfs reads for AMD and Intel, while
 //! macOS uses bounded `system_profiler`, `ioreg`, `pmset`, and
 //! `memory_pressure` output. Host CPU, memory composition, and process groups
-//! live in [`host`]. Missing counters stay `None` and are named in the
-//! device's `unavailable` list instead of being reported as zero.
+//! live in [`host`]; mounted disks live in [`disk`]. Missing counters stay
+//! `None` and are named in the device's `unavailable` list instead of being
+//! reported as zero.
 
 use std::{
     io::Read,
@@ -24,8 +25,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sysinfo::{Components, System};
 
+mod disk;
 mod host;
 
+pub use disk::DiskVolume;
 pub use host::{CpuDetail, LoadAverage, MemoryDetail, MemorySegment, ProcessGroup};
 
 const GPU_SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
@@ -250,6 +253,8 @@ pub struct MachineMetrics {
     pub processes: Vec<ProcessGroup>,
     /// Processes running when `processes` was sampled.
     pub process_count: Option<u32>,
+    /// Mounted disks, one entry per filesystem, root first.
+    pub disks: Vec<DiskVolume>,
 }
 
 #[derive(Default, Deserialize)]
@@ -268,6 +273,7 @@ struct MachineMetricsWire {
     memory: Option<MemoryDetail>,
     processes: Vec<ProcessGroup>,
     process_count: Option<u32>,
+    disks: Vec<DiskVolume>,
 }
 
 #[derive(Serialize)]
@@ -289,6 +295,8 @@ struct MachineMetricsOutput {
     processes: Vec<ProcessGroup>,
     #[serde(skip_serializing_if = "Option::is_none")]
     process_count: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    disks: Vec<DiskVolume>,
 }
 
 impl Serialize for MachineMetrics {
@@ -347,6 +355,7 @@ impl Serialize for MachineMetrics {
             memory: self.memory.clone().and_then(MemoryDetail::sanitized),
             processes: host::sanitize_processes(self.processes.clone()),
             process_count: self.process_count,
+            disks: disk::sanitize_disks(self.disks.clone()),
         }
         .serialize(serializer)
     }
@@ -393,6 +402,7 @@ impl<'de> Deserialize<'de> for MachineMetrics {
             memory: wire.memory.and_then(MemoryDetail::sanitized),
             processes: host::sanitize_processes(wire.processes),
             process_count: wire.process_count,
+            disks: disk::sanitize_disks(wire.disks),
         })
     }
 }
@@ -407,6 +417,7 @@ pub struct HardwareSampler {
     gpu_sample: GpuSample,
     gpu_sampled_at: Option<Instant>,
     host: host::HostSampler,
+    disks: disk::DiskSampler,
 }
 
 impl Default for HardwareSampler {
@@ -422,12 +433,14 @@ impl Default for HardwareSampler {
             gpu_sample: GpuSample::default(),
             gpu_sampled_at: None,
             host: host::HostSampler::default(),
+            disks: disk::DiskSampler::default(),
         }
     }
 }
 
 impl HardwareSampler {
-    /// Samples CPU, memory, temperatures, and safely available GPU telemetry.
+    /// Samples CPU, memory, temperatures, disks, and safely available GPU
+    /// telemetry.
     #[must_use]
     pub fn sample(&mut self) -> MachineMetrics {
         self.system.refresh_cpu_usage();
@@ -468,6 +481,7 @@ impl HardwareSampler {
             memory: host.memory,
             processes: host.processes,
             process_count: host.process_count,
+            disks: self.disks.sample(),
         }
     }
 }

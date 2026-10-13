@@ -66,6 +66,8 @@ const {
   memoryBreakdownRows,
   processRows,
   temperatureRows,
+  diskRows,
+  formatRate,
   formatRelativeTime,
   conversationSummaryLabel,
   transcriptEntryClock,
@@ -2705,6 +2707,32 @@ test("process rows keep owner order and report each group's share of RAM", () =>
   ]);
   assert.equal(rows[0].memoryPercent, 7 / 64 * 100);
   assert.deepEqual(processRows(null, 1), []);
+});
+
+test("disk rows use df's percent, join the owner's names, and drop malformed volumes", () => {
+  const GiB = 1024 ** 3;
+  const rows = diskRows([
+    { mount_point: "/", model: "Samsung SSD 9100 PRO 2TB", file_system: "ext4", device: "nvme0n1p2",
+      total_bytes: 1800 * GiB, used_bytes: 1440 * GiB, available_bytes: 270 * GiB,
+      read_bytes_per_second: 0, write_bytes_per_second: 12 * 1024 * 1024 },
+    { mount_point: " /mnt/data ", label: "Data", model: " ", file_system: "ext4",
+      total_bytes: 3700 * GiB, used_bytes: 63 * GiB, available_bytes: 3600 * GiB },
+    { mount_point: "", total_bytes: 1, used_bytes: 0, available_bytes: 1 },
+    { mount_point: "/zero", total_bytes: 0, used_bytes: 0, available_bytes: 0 },
+    { mount_point: "/broken", total_bytes: 10, used_bytes: -1, available_bytes: 1 },
+  ]);
+  assert.deepEqual(rows.map((row) => [row.mount, row.detail]), [
+    ["/", "Samsung SSD 9100 PRO 2TB · ext4"],
+    ["/mnt/data", "Data · ext4"],
+  ]);
+  // Reserved blocks (total minus used minus available) don't count as free.
+  assert.equal(Math.round(rows[0].percent), 84);
+  assert.equal(rows[0].device, "nvme0n1p2");
+  assert.deepEqual([rows[0].read, rows[0].write], [0, 12 * 1024 * 1024]);
+  assert.deepEqual([rows[1].read, rows[1].write], [null, null]);
+  assert.equal(formatRate(12 * 1024 * 1024), "12 MiB/s");
+  assert.equal(formatRate(null), "—");
+  assert.deepEqual(diskRows(undefined), []);
 });
 
 test("isMachineControllable blocks control only for a known-offline machine", () => {
