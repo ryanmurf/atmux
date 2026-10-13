@@ -18,8 +18,8 @@ use atmux::{
     attachment::{EncodedImage, ImageMessageRequest},
     config::{Config, MachineConfig},
     control::{
-        CloneLaunchRepositoryRequest, ControlPlane, CreateLaunchDirectoryRequest, ErrorKind,
-        LaunchRequest, SessionUpdateRequest, error_kind,
+        ChoiceAnswer, CloneLaunchRepositoryRequest, ControlPlane, CreateLaunchDirectoryRequest,
+        ErrorKind, LaunchRequest, SessionUpdateRequest, error_kind,
     },
     machine::MachineKind,
     remote::RemoteMachine,
@@ -432,6 +432,32 @@ async fn input_keys(
     Json(json!({ "ok": true })).into_response()
 }
 
+async fn choice(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let reject = {
+        let mut recorder = state.lock().unwrap();
+        record_locked(
+            &mut recorder,
+            &headers,
+            &format!("/api/v1/panes/{id}/choice"),
+            &body,
+        );
+        recorder.reject_generation_mutations
+    };
+    if reject && fixture_accepts_trainer_instance(&body) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "owner-only-generation-detail" })),
+        )
+            .into_response();
+    }
+    Json(json!({ "ok": true })).into_response()
+}
+
 async fn legacy_special_keys(
     State(state): State<Shared>,
     Path(id): Path<String>,
@@ -653,6 +679,7 @@ async fn start_node_with_memory(advertise_memory: bool) -> (SocketAddr, Shared) 
         .route("/api/v1/panes/{id}/image-messages", post(image_messages))
         .route("/api/v1/panes/{id}/special-keys", post(legacy_special_keys))
         .route("/api/v1/panes/{id}/input-keys", post(input_keys))
+        .route("/api/v1/panes/{id}/choice", post(choice))
         .route("/api/v1/panes/{id}/interrupt", post(interrupt))
         .route("/api/v1/panes/{id}/resume", post(resume))
         .route(
@@ -1625,6 +1652,39 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
         sent_before_key_mismatch,
         "mismatched machine or generation must not cross federation",
     );
+    let answer = |instance_id: String| ChoiceAnswer {
+        menu: "0123456789abcdef".to_owned(),
+        option: Some(1),
+        text: Some("Durian".to_owned()),
+        machine: Some("gpu-box".to_owned()),
+        instance_id: Some(instance_id),
+    };
+    control
+        .answer_choice("gpu-box~%7", answer(trainer_instance.clone()))
+        .await
+        .unwrap();
+    let sent_before_choice_mismatch = recorder.lock().unwrap().bodies.len();
+    let error = control
+        .answer_choice("gpu-box~%7", answer(format!("pane-v1-{}", "f".repeat(64))))
+        .await
+        .unwrap_err();
+    assert_eq!(error_kind(&error), ErrorKind::Conflict);
+    let error = control
+        .answer_choice(
+            "gpu-box~%7",
+            ChoiceAnswer {
+                text: Some("two\nlines".to_owned()),
+                ..answer(trainer_instance.clone())
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_kind(&error), ErrorKind::BadRequest);
+    assert_eq!(
+        recorder.lock().unwrap().bodies.len(),
+        sent_before_choice_mismatch,
+        "a menu answer for another generation or with bad text must not cross federation",
+    );
     control.interrupt("gpu-box~%7").await.unwrap();
     control.resume_current_claude("gpu-box~%7").await.unwrap();
     control.kill("gpu-box~%8").await.unwrap();
@@ -1759,6 +1819,23 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
     assert_eq!(image_message["images"][0]["media_type"], "image/png");
     assert_eq!(image_message["images"][0]["data"], "iVBORw0KGgo=");
     assert_eq!(image_message["instance_id"], trainer_instance);
+    let answer: Value = seen
+        .paths
+        .iter()
+        .zip(&seen.bodies)
+        .find(|(path, _)| path.as_str() == "/api/v1/panes/%7/choice")
+        .map(|(_, body)| serde_json::from_str(body).unwrap())
+        .expect("forwarded menu answer");
+    assert_eq!(
+        answer,
+        json!({
+            "menu": "0123456789abcdef",
+            "option": 1,
+            "text": "Durian",
+            "machine": "gpu-box",
+            "instance_id": trainer_instance,
+        })
+    );
     let special_keys: Value = seen
         .bodies
         .iter()
@@ -2158,6 +2235,15 @@ async fn owner_generation_conflicts_remain_conflicts_through_a_coordinator() {
             "/api/v1/panes/gpu-box~%257/input-keys",
             json!({
                 "action": "enter",
+                "machine": "gpu-box",
+                "instance_id": instance_id,
+            }),
+        ),
+        (
+            "/api/v1/panes/gpu-box~%257/choice",
+            json!({
+                "menu": "0123456789abcdef",
+                "option": 0,
                 "machine": "gpu-box",
                 "instance_id": instance_id,
             }),

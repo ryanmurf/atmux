@@ -807,6 +807,7 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
     let _ = shutdown.changed().await;
 }
 
+#[allow(clippy::too_many_lines)] // One table keeps every route and its body limit in view.
 fn routes(state: WebState) -> Router {
     let registry = crate::registry_web::routes(state.control.clone());
     Router::new()
@@ -900,6 +901,7 @@ fn routes(state: WebState) -> Router {
             post(send_legacy_special_keys),
         )
         .route("/api/v1/panes/{id}/input-keys", post(send_input_keys))
+        .route("/api/v1/panes/{id}/choice", post(answer_choice))
         .route("/api/v1/panes/{id}/interrupt", post(interrupt))
         .route("/api/v1/sessions/{id}", delete(kill).patch(update_session))
         .route(
@@ -1532,6 +1534,22 @@ async fn send_input_keys(
     state
         .control
         .send_special_key_for_instance(&id, key, request.machine, request.instance_id)
+        .await
+        .map_err(|error| ApiError::from_control(&error))?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+/// Picks one option in the menu an agent is holding open.
+async fn answer_choice(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(answer): Json<crate::control::ChoiceAnswer>,
+) -> Result<Json<OkResponse>, ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    state
+        .control
+        .answer_choice(&id, answer)
         .await
         .map_err(|error| ApiError::from_control(&error))?;
     Ok(Json(OkResponse { ok: true }))
@@ -3522,6 +3540,11 @@ mod tests {
                     r#"{"action":"tmux_prefix_twice","machine":"gpu-box","instance_id":"pane-v1-"#,
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
                 )),
+            ),
+            (
+                "POST",
+                "/api/v1/panes/gpu-box~%251/choice",
+                Some(r#"{"menu":"0123456789abcdef","option":0}"#),
             ),
             ("POST", "/api/v1/panes/gpu-box~%251/interrupt", Some("{}")),
             ("DELETE", "/api/v1/sessions/gpu-box~%251", None),

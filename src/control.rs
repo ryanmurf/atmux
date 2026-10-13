@@ -30,6 +30,7 @@ use crate::{
     attachment::{self, DeliveryErrorKind, ImageMessageRequest},
     auto_compact::{self, Decision as AutoCompactDecision},
     auto_update::{self, Harness as UpdateHarness, PendingMarker},
+    choice::{AnswerError, MenuKey},
     code_nav::{CodeNavRequest, CodeNavResponse},
     config::{AgentProfile, Config, ProfileMode},
     launch_directory,
@@ -236,6 +237,8 @@ fn launch_directory_error(error: &launch_directory::ActionError) -> anyhow::Erro
 const HANDOVER_DELIVERY_TIMEOUT: Duration = Duration::from_secs(180);
 const HANDOVER_DELIVERY_POLL: Duration = Duration::from_secs(2);
 const MAX_CAPTURE_BYTES: usize = 256 * 1024;
+/// How long answering a menu waits between reads of the pane.
+const MENU_SETTLE_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_BROWSE_PATH_BYTES: usize = 4_096;
 const MAX_BROWSE_SCAN_ENTRIES: usize = 4_096;
@@ -291,6 +294,10 @@ pub struct SessionSummary {
     pub window_index: u32,
     pub pane_index: u32,
     pub content_hash: String,
+    /// The selection menu the agent is holding open, read from its pane by
+    /// the owner. Absent when there is none, and from older owners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<crate::choice::PendingChoice>,
 }
 
 impl SessionSummary {
@@ -319,6 +326,7 @@ impl SessionSummary {
             window_index: session.window_index,
             pane_index: session.pane_index,
             content_hash: format!("{:016x}", observable_content_hash(&session.content)),
+            choice: crate::choice::pending_choice(session.agent, &session.content),
         }
     }
 }
@@ -345,6 +353,24 @@ pub struct PaneOutput {
     pub content_hash: String,
     pub content: Option<String>,
     pub changed: bool,
+}
+
+/// An answer to the menu an agent is holding open.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChoiceAnswer {
+    /// The `id` of the menu the answer was picked from.
+    pub menu: String,
+    /// Index into that menu's options. Absent to close the menu with Esc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option: Option<usize>,
+    /// The typed answer for an option that opens a text field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
 }
 
 /// One owner-reported model choice for a running agent pane.
@@ -3435,12 +3461,14 @@ impl ControlPlane {
             Target::Local {
                 pane_id,
                 instance_id,
+                agent,
                 ..
             } => {
                 validate_expected_pane_instance(expected_instance_id.as_deref(), &instance_id)?;
                 let prompt_lock = self.prompt_lock(&pane_id);
                 let expected_instance_id = expected_instance_id.clone();
                 let live_control = self.clone();
+                let capture_lines = self.inner.config.general.preview_lines;
                 local_message_mutation(
                     tokio::task::spawn_blocking(move || {
                         let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
@@ -3452,6 +3480,7 @@ impl ControlPlane {
                             &pane_id,
                             expected_instance_id.as_deref(),
                         )?;
+                        refuse_open_menu(&pane_id, agent, capture_lines)?;
                         begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
                         Tmux::send_text_checked(&pane_id, &text, submit, || {
                             live_control.validate_live_message_instance(
@@ -3908,6 +3937,7 @@ impl ControlPlane {
                 let prompt_lock = self.prompt_lock(&pane_id);
                 let expected_instance_id = expected_instance_id.clone();
                 let live_control = self.clone();
+                let capture_lines = self.inner.config.general.preview_lines;
                 let delivered = local_message_mutation(
                     tokio::task::spawn_blocking(move || -> Result<_> {
                         let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
@@ -3919,6 +3949,7 @@ impl ControlPlane {
                             &pane_id,
                             expected_instance_id.as_deref(),
                         )?;
+                        refuse_open_menu(&pane_id, agent, capture_lines)?;
                         begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
                         Ok(attachment::deliver(
                             &pane_id,
@@ -4082,6 +4113,95 @@ impl ControlPlane {
                             "machine": expected_machine_id,
                             "instance_id": expected_instance_id,
                         }),
+                    )
+                    .await
+                    .map_err(|error| remote_mutation_error(&error))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Answers the menu an agent is holding open, or closes it with Esc when
+    /// the answer names no option.
+    ///
+    /// The owner reads the menu again and refuses an answer picked from a
+    /// menu that has since closed or changed. It then moves the highlight one
+    /// key at a time, checking the pane after every key, and presses Enter
+    /// only once the highlight rests on the chosen option.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when the menu, the pane generation, or the machine
+    /// changed before the answer landed, and a bad request for an option or
+    /// text the menu can't take.
+    pub async fn answer_choice(&self, id: &str, answer: ChoiceAnswer) -> Result<()> {
+        if answer.menu.is_empty() || answer.menu.len() > 64 {
+            return Err(bad_request("the answer doesn't name a menu"));
+        }
+        if let Some(text) = &answer.text {
+            crate::choice::validate_answer_text(text).map_err(bad_request)?;
+        }
+        match self.resolve(id)? {
+            Target::Local {
+                pane_id,
+                instance_id,
+                agent,
+                ..
+            } => {
+                let checked_machine_id = answer.machine.as_deref().unwrap_or(&self.inner.local_id);
+                validate_expected_pane_machine(checked_machine_id, &self.inner.local_id)?;
+                validate_expected_pane_instance(answer.instance_id.as_deref(), &instance_id)?;
+                let prompt_lock = self.prompt_lock(&pane_id);
+                let live_control = self.clone();
+                let capture_lines = self.inner.config.general.preview_lines;
+                local_message_mutation(
+                    tokio::task::spawn_blocking(move || {
+                        let _process_lock = auto_update::PaneProcessLock::acquire(&pane_id)?;
+                        let mut guard = prompt_lock
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let expected = answer.instance_id.as_deref();
+                        live_control.validate_live_message_instance(&pane_id, expected)?;
+                        begin_pane_mutation(&pane_id, &prompt_lock, &mut guard)?;
+                        let mut pane = LiveMenuPane {
+                            pane_id: &pane_id,
+                            capture_lines,
+                            validate: || {
+                                live_control.validate_live_message_instance(&pane_id, expected)
+                            },
+                        };
+                        crate::choice::answer(
+                            &mut pane,
+                            agent,
+                            &answer.menu,
+                            answer.option,
+                            answer.text.as_deref(),
+                        )
+                        .map_err(|error| match error {
+                            AnswerError::Stale(message) => conflict(message),
+                            AnswerError::Invalid(message) => bad_request(message),
+                            AnswerError::Pane(error) => error,
+                        })
+                    })
+                    .await,
+                )?;
+                self.inner.refresh_now.notify_one();
+            }
+            Target::Remote {
+                machine,
+                pane_id,
+                instance_id,
+                ..
+            } => {
+                let checked_machine_id = answer.machine.as_deref().unwrap_or(&self.inner.local_id);
+                validate_expected_pane_machine(checked_machine_id, &machine.id)?;
+                validate_expected_pane_instance(answer.instance_id.as_deref(), &instance_id)?;
+                self.ensure_online(&machine.id)?;
+                machine
+                    .post_json(
+                        &format!("/api/v1/panes/{}/choice", encode_segment(&pane_id)),
+                        &answer,
                     )
                     .await
                     .map_err(|error| remote_mutation_error(&error))?;
@@ -6205,6 +6325,57 @@ fn local_tmux(joined: std::result::Result<Result<()>, tokio::task::JoinError>) -
 
 /// Classifies a blocking message mutation while preserving an intentional
 /// caller-visible conflict from its owner-local generation checks.
+/// Refuses text while Claude holds a menu open. The menu drops pasted text,
+/// and the Enter that follows would pick whichever option is highlighted.
+fn refuse_open_menu(pane_id: &str, agent: AgentKind, capture_lines: usize) -> Result<()> {
+    if agent != AgentKind::Claude {
+        return Ok(());
+    }
+    let mut content = Tmux.capture(pane_id, capture_lines)?;
+    truncate_front(&mut content, MAX_CAPTURE_BYTES);
+    if crate::choice::pending_choice(agent, &content).is_some() {
+        return Err(conflict(
+            "Claude is waiting for you to pick an option, so the message wasn't sent; answer its question first",
+        ));
+    }
+    Ok(())
+}
+
+/// Drives a menu in an owner-local pane for [`crate::choice::answer`].
+struct LiveMenuPane<'a, F> {
+    pane_id: &'a str,
+    capture_lines: usize,
+    /// Rechecks the pane generation before every key and paste.
+    validate: F,
+}
+
+impl<F: FnMut() -> Result<()>> crate::choice::MenuPane for LiveMenuPane<'_, F> {
+    fn read(&mut self) -> Result<String> {
+        let mut content = Tmux.capture(self.pane_id, self.capture_lines)?;
+        truncate_front(&mut content, MAX_CAPTURE_BYTES);
+        Ok(content)
+    }
+
+    fn press(&mut self, key: MenuKey) -> Result<()> {
+        (self.validate)()?;
+        let key = match key {
+            MenuKey::Up => PaneSpecialKey::Up,
+            MenuKey::Down => PaneSpecialKey::Down,
+            MenuKey::Enter => PaneSpecialKey::Enter,
+            MenuKey::Escape => return Tmux.interrupt(self.pane_id),
+        };
+        Tmux.send_special_key(self.pane_id, key)
+    }
+
+    fn type_text(&mut self, text: &str) -> Result<()> {
+        Tmux::send_text_checked(self.pane_id, text, false, &mut self.validate)
+    }
+
+    fn pause(&mut self) {
+        std::thread::sleep(MENU_SETTLE_INTERVAL);
+    }
+}
+
 fn local_message_mutation<T>(
     joined: std::result::Result<Result<T>, tokio::task::JoinError>,
 ) -> Result<T> {
@@ -8174,6 +8345,7 @@ mod tests {
             window_index: 0,
             pane_index: 0,
             content_hash: "0000000000000001".to_owned(),
+            choice: None,
         }
     }
 
@@ -8365,6 +8537,7 @@ mod tests {
             window_index: 0,
             pane_index: 0,
             content_hash: hash.to_owned(),
+            choice: None,
         }
     }
 

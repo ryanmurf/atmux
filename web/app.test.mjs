@@ -114,6 +114,9 @@ const {
   moveMessageHistory,
   paneTypingText,
   paneSpecialKeyDelivery,
+  pendingChoiceView,
+  choiceAnswerRequest,
+  choiceTextProblem,
   paneErrorLabel,
   paneFilesPath,
   paneGitPath,
@@ -1300,6 +1303,71 @@ test("special-key delivery binds one allowlisted action to machine and pane gene
   assert.equal(paneSpecialKeyDelivery({ ...session, instance_id: "%7" }, "enter"), null);
   assert.equal(paneSpecialKeyDelivery({ ...session, machine: "tron" }, "enter"), null);
   assert.equal(paneSpecialKeyDelivery({ ...session, id: "midnight~%8" }, "enter")?.paneId, "midnight~%8");
+});
+
+function menuSession(choice) {
+  return { id: "midnight~%7", machine: "midnight", instance_id: `pane-v1-${"a".repeat(64)}`, choice };
+}
+const FRUIT_MENU = {
+  id: "0123456789abcdef",
+  prompt: " ☐ Fruit\n\nWhich fruit should we use?",
+  options: [
+    { number: 1, label: "Apple", detail: "Crunchy red fruit" },
+    { number: 2, label: "Banana" },
+    { number: 3, label: "Type something.", text_entry: true },
+  ],
+  selected: 1,
+  hint: "Enter to select · ↑/↓ to navigate · Esc to cancel",
+};
+
+test("an open menu becomes a card view with marks, the highlight, and text entry", () => {
+  const view = pendingChoiceView(menuSession(FRUIT_MENU));
+  assert.equal(view.id, FRUIT_MENU.id);
+  assert.equal(view.prompt, FRUIT_MENU.prompt);
+  assert.equal(view.cancellable, true);
+  assert.deepEqual(view.options.map((option) => [option.mark, option.label, option.current, option.textEntry]), [
+    ["1.", "Apple", false, false],
+    ["2.", "Banana", true, false],
+    ["3.", "Type something.", false, true],
+  ]);
+  assert.equal(view.options[0].detail, "Crunchy red fruit");
+  const boxes = pendingChoiceView(menuSession({
+    ...FRUIT_MENU,
+    hint: "",
+    options: [{ number: 1, label: "Red", checked: true }, { number: 2, label: "Blue", checked: false }, { label: "Next" }],
+  }));
+  assert.deepEqual(boxes.options.map((option) => option.mark), ["☑", "☐", ""]);
+  assert.equal(boxes.cancellable, false);
+});
+
+test("a malformed menu is not drawn", () => {
+  assert.equal(pendingChoiceView(menuSession(undefined)), null);
+  assert.equal(pendingChoiceView(menuSession({ ...FRUIT_MENU, id: "<b>" })), null);
+  assert.equal(pendingChoiceView(menuSession({ ...FRUIT_MENU, options: [FRUIT_MENU.options[0]] })), null);
+  assert.equal(pendingChoiceView(menuSession({ ...FRUIT_MENU, options: [{ label: 1 }, { label: "x" }] })), null);
+  assert.equal(pendingChoiceView(menuSession({ ...FRUIT_MENU, options: Array.from({ length: 25 }, () => ({ label: "x" })) })), null);
+});
+
+test("a menu answer is bound to the menu, the machine, and the pane generation", () => {
+  const session = menuSession(FRUIT_MENU);
+  const view = pendingChoiceView(session);
+  const binding = { menu: FRUIT_MENU.id, machine: "midnight", instance_id: session.instance_id };
+  assert.deepEqual(choiceAnswerRequest(session, view, 0), { paneId: "midnight~%7", body: { ...binding, option: 0 } });
+  assert.deepEqual(choiceAnswerRequest(session, view, 2, "Durian"), { paneId: "midnight~%7", body: { ...binding, option: 2, text: "Durian" } });
+  assert.deepEqual(choiceAnswerRequest(session, view, null), { paneId: "midnight~%7", body: binding });
+  // Text only goes to the option that opens a text field, and it needs one.
+  assert.equal(choiceAnswerRequest(session, view, 0, "Durian"), null);
+  assert.equal(choiceAnswerRequest(session, view, 2), null);
+  assert.equal(choiceAnswerRequest(session, view, null, "Durian"), null);
+  assert.equal(choiceAnswerRequest(session, view, 9), null);
+  assert.equal(choiceAnswerRequest({ ...session, instance_id: "%7" }, view, 0), null);
+});
+
+test("a typed menu answer stays on one bounded line", () => {
+  assert.equal(choiceTextProblem("Durian"), null);
+  assert.match(choiceTextProblem("  "), /Type an answer/);
+  assert.match(choiceTextProblem("two\nlines"), /one line/);
+  assert.match(choiceTextProblem("é".repeat(2049)), /4 KiB/);
 });
 
 test("message history moves through sent comments and restores the draft", () => {

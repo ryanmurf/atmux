@@ -189,6 +189,15 @@
         </section>
 
         <form id="composer" class="composer" aria-label="Send message">
+          <section id="choice-card" class="choice-card" aria-labelledby="choice-title" hidden>
+            <div class="choice-head">
+              <strong id="choice-title">Claude is waiting for your answer</strong>
+              <button id="choice-cancel" class="subtle choice-cancel" type="button" title="Press Esc in the agent, which closes this menu without picking anything">Cancel (Esc)</button>
+            </div>
+            <pre id="choice-prompt" class="choice-prompt" tabindex="0" aria-label="Question"></pre>
+            <div id="choice-options" class="choice-options" role="group" aria-labelledby="choice-title"></div>
+            <p id="choice-status" class="choice-status" role="status" hidden></p>
+          </section>
           <label for="message">Message agent</label>
           <textarea id="message" rows="3" maxlength="65536" placeholder="What should this agent do next?"></textarea>
           <section id="attachment-tray" class="attachment-tray" aria-label="Image attachments" hidden>

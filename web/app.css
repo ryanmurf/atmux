@@ -355,6 +355,28 @@ button.code-line-number:focus-visible, button.code-line-number[aria-pressed="tru
 .attachment-preview { position: relative; width: 54px; height: 54px; margin: 0; border: 1px solid #31434b; border-radius: 6px; overflow: hidden; background: #05090b; }
 .attachment-preview img { width: 100%; height: 100%; display: block; object-fit: cover; }
 .attachment-remove { position: absolute; top: 2px; right: 2px; width: 22px; min-width: 22px; height: 22px; min-height: 22px; padding: 0; border: 1px solid #ffffff55; border-radius: 50%; color: white; background: #071014dd; font-size: 15px; line-height: 1; }
+.choice-card { min-width: 0; display: grid; gap: 7px; padding: 9px; border: 1px solid #6f5a2c; border-radius: 8px; background: #17140c; }
+.choice-head { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--amber); font-size: 12px; }
+.choice-cancel { min-height: 28px; padding: 0 8px; font-size: 11px; }
+.choice-prompt { max-height: min(30vh, 260px); margin: 0; overflow: auto; color: var(--text); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.choice-prompt:empty { display: none; }
+.choice-options { max-height: min(40vh, 320px); display: grid; gap: 5px; overflow: auto; }
+.choice-option { min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: baseline; gap: 2px 8px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; color: var(--text); background: var(--panel); text-align: left; font-size: 13px; touch-action: manipulation; }
+.choice-option:hover:not(:disabled), .choice-option:focus-visible { border-color: var(--amber); }
+.choice-option.current { border-color: #8a7136; background: #221d10; }
+.choice-option.expanded { border-color: var(--amber); }
+.choice-mark { color: var(--muted); font-variant-numeric: tabular-nums; }
+.choice-label { min-width: 0; overflow-wrap: anywhere; }
+.choice-detail { grid-column: 2 / -1; color: var(--muted); font-size: 11.5px; white-space: pre-line; overflow-wrap: anywhere; }
+.choice-current { color: var(--amber); font-size: 10px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; white-space: nowrap; }
+.choice-text { min-width: 0; display: flex; gap: 6px; }
+.choice-text input { min-width: 0; flex: 1; }
+.choice-status { margin: 0; color: var(--muted); font-size: 11.5px; line-height: 1.4; }
+.choice-status.warning { color: var(--amber); }
+@media (max-width: 600px) {
+  .choice-prompt { max-height: 22vh; }
+  .choice-options { max-height: 34vh; }
+}
 #send { touch-action: manipulation; }
 #talk { touch-action: none; user-select: none; }
 #talk.recording { color: #061416; background: var(--red); border-color: var(--red); }

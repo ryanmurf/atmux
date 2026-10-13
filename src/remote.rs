@@ -1248,6 +1248,7 @@ mod tests {
             window_index: 0,
             pane_index: 0,
             content_hash: "0000000000000001".to_owned(),
+            choice: None,
         }
     }
 

@@ -355,7 +355,7 @@ impl AtmuxMcp {
 
     #[tool(
         name = "agent_send",
-        description = "Send a literal message to an existing agent pane and normally submit it. Use this to communicate with another agent."
+        description = "Send a literal message to an existing agent pane and normally submit it. Use this to communicate with another agent. Refused while a Claude agent holds a selection menu open, because the menu would drop the text and Enter would pick the highlighted option."
     )]
     async fn agent_send(
         &self,
@@ -765,6 +765,7 @@ mod tests {
             window_index: 0,
             pane_index: 0,
             content_hash: "aaaa".to_owned(),
+            choice: None,
         };
         let machine = |id: &str, kind, online| MachineSummary {
             id: id.to_owned(),
@@ -898,6 +899,7 @@ mod tests {
                 window_index: 0,
                 pane_index: 0,
                 content_hash: "aaaa".to_owned(),
+                choice: None,
             }],
             None,
         );

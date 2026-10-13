@@ -320,6 +320,63 @@ function paneSpecialKeyTarget(delivery) {
     : null;
 }
 
+const MAX_CHOICE_OPTIONS = 24;
+const CHOICE_ID_PATTERN = /^[a-f0-9]{16}$/;
+
+/// The menu an agent is holding open, checked and shaped for the card. The
+/// owner reads it off the pane, so every string is agent output and is only
+/// ever set as text.
+function pendingChoiceView(session) {
+  const choice = session?.choice;
+  if (!choice || typeof choice !== "object" || !CHOICE_ID_PATTERN.test(String(choice.id || ""))) return null;
+  const options = Array.isArray(choice.options) ? choice.options : [];
+  if (options.length < 2 || options.length > MAX_CHOICE_OPTIONS
+    || options.some((option) => typeof option?.label !== "string")) return null;
+  const selected = Number.isInteger(choice.selected) ? choice.selected : -1;
+  return {
+    id: choice.id,
+    prompt: typeof choice.prompt === "string" ? choice.prompt : "",
+    cancellable: typeof choice.hint === "string" && /esc to cancel/i.test(choice.hint),
+    options: options.map((option, index) => {
+      const checked = typeof option.checked === "boolean" ? option.checked : null;
+      const number = Number.isInteger(option.number) && option.number > 0 ? option.number : null;
+      return {
+        index,
+        label: option.label,
+        detail: typeof option.detail === "string" ? option.detail : "",
+        mark: checked === null ? (number === null ? "" : `${number}.`) : checked ? "☑" : "☐",
+        checked,
+        current: index === selected,
+        textEntry: option.text_entry === true,
+      };
+    }),
+  };
+}
+
+/// Builds the owner request that picks `index` in `view`, or closes the menu
+/// with Esc when `index` is null. It is bound to the pane generation the
+/// browser saw, and the owner re-reads the menu before pressing anything.
+function choiceAnswerRequest(session, view, index, text = null, localMachineId = "local") {
+  const delivery = paneSpecialKeyDelivery(session, "enter", localMachineId);
+  if (!delivery || !view || !CHOICE_ID_PATTERN.test(String(view.id || ""))) return null;
+  const body = { menu: view.id, machine: delivery.machine, instance_id: delivery.instanceId };
+  if (index === null) return text === null ? { paneId: delivery.paneId, body } : null;
+  const option = view.options?.[index];
+  if (!option || option.textEntry !== (text !== null)) return null;
+  body.option = index;
+  if (text !== null) body.text = text;
+  return { paneId: delivery.paneId, body };
+}
+
+/// Mirrors the owner's check on a typed menu answer. A newline would reach
+/// the agent as Enter, so answers stay on one line.
+function choiceTextProblem(text) {
+  if (typeof text !== "string" || !text.trim()) return "Type an answer first.";
+  if (utf8ByteLength(text) > 4096) return "The answer is longer than 4 KiB.";
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(text)) return "The answer must be one line of text.";
+  return null;
+}
+
 /// Returns an incarnation-safe identity for browser-local composer state.
 /// Old owners without `instance_id` still get same-page isolation, but their
 /// recyclable pane ids are deliberately never written to persistent storage.
@@ -4461,6 +4518,9 @@ if (typeof module !== "undefined" && module.exports) {
     moveMessageHistory,
     paneTypingText,
     paneSpecialKeyDelivery,
+    pendingChoiceView,
+    choiceAnswerRequest,
+    choiceTextProblem,
     paneErrorLabel,
     paneFilesPath,
     paneGitPath,
@@ -4749,6 +4809,14 @@ function initialize() {
     transcriptDrawnHash: "",
     conversationVisibility: storedConversationVisibility,
     viewMode: "conversation",
+    /// The pane whose menu answer is in flight, so the card can't send twice.
+    choiceSending: null,
+    /// Per-pane outcome lines shown under the menu card.
+    choiceNotes: new Map(),
+    /// The text-entry option whose answer field is open, and its draft.
+    choiceText: null,
+    /// What the menu card last drew, so polls don't rebuild it under the cursor.
+    choiceDrawn: "",
     projectView: null,
     filesRequest: 0,
     fileSaveRequest: 0,
@@ -7771,6 +7839,7 @@ function initialize() {
       keyStatus.textContent = state.specialKeyStatuses.get(keyTargetId) || "One key is sent per tap.";
     }
     $("quick-duplicate").textContent = preparingDuplicate ? "Preparing duplicate…" : "Duplicate agent";
+    renderChoiceCard(selected, controllable && !resuming);
     $("message").disabled = !controllable || resuming;
     $("send").disabled = !controllable || state.composerSending || resuming
       || (state.attachments.length > 0 && !attachmentsMatchCurrentSelection());
@@ -10354,6 +10423,12 @@ function initialize() {
       if (options.fromQueue === true) drainQueuedComposerMessage();
       return false;
     }
+    const openMenu = pendingChoiceView(state.sessions.get(targetPaneId));
+    if (openMenu) {
+      holdMessageForChoice(targetPaneId, openMenu, attachments.length ? null : message);
+      if (options.fromQueue === true) drainQueuedComposerMessage();
+      return false;
+    }
     if (!composerTargetMatches(targetPaneId, targetIdentityKey)) return abortStaleTarget();
     const targetInstanceId = composerDraftInstanceId(targetIdentityKey);
     const messageLimit = attachments.length ? MAX_MESSAGE_BYTES - IMAGE_MESSAGE_TEXT_RESERVE : MAX_MESSAGE_BYTES;
@@ -10791,6 +10866,181 @@ function initialize() {
   $("tmux-prefix-twice").addEventListener("click", () => {
     sendPaneSpecialKey("tmux_prefix_twice", "Ctrl+B twice");
   });
+  /// Draws the menu the selected agent is holding open. Claude keeps these
+  /// out of its transcript until they're answered, so this card is the only
+  /// place Conversation can show them.
+  function renderChoiceCard(session, controllable) {
+    const card = $("choice-card");
+    const view = pendingChoiceView(session);
+    if (!view) {
+      card.hidden = true;
+      state.choiceDrawn = "";
+      return;
+    }
+    const sending = state.choiceSending?.paneId === session.id;
+    const disabled = sending || !controllable;
+    const editing = state.choiceText?.paneId === session.id && state.choiceText.menu === view.id
+      ? state.choiceText : null;
+    card.hidden = false;
+    $("choice-cancel").hidden = !view.cancellable;
+    $("choice-cancel").disabled = disabled;
+    const note = state.choiceNotes.get(session.id);
+    const noteText = note && (note.menu === view.id || note.carry) ? note.text : "";
+    const status = $("choice-status");
+    status.hidden = !noteText;
+    status.textContent = noteText;
+    status.classList.toggle("warning", Boolean(noteText && note.warning));
+    const signature = JSON.stringify([session.id, view, disabled, editing?.option ?? null]);
+    if (signature === state.choiceDrawn) return;
+    state.choiceDrawn = signature;
+    $("choice-prompt").textContent = view.prompt;
+    const options = $("choice-options");
+    const focused = options.contains(document.activeElement) ? document.activeElement.dataset.choiceFocus : null;
+    const nodes = [];
+    for (const option of view.options) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "choice-option";
+      button.classList.toggle("current", option.current);
+      button.classList.toggle("expanded", editing?.option === option.index);
+      button.disabled = disabled;
+      button.dataset.choiceFocus = `option:${option.index}`;
+      button.title = option.textEntry ? "Type an answer for this option"
+        : option.checked === null ? "Pick this option" : "Tick or untick this option";
+      button.append(textSpan(option.mark, "choice-mark"), textSpan(option.label, "choice-label"));
+      if (option.current) {
+        const current = textSpan("highlighted", "choice-current");
+        current.title = "Claude's menu highlight is here. Enter in the terminal would pick it.";
+        button.append(current);
+      }
+      if (option.detail) button.append(textSpan(option.detail, "choice-detail"));
+      button.addEventListener("click", () => {
+        if (option.textEntry) openChoiceText(session.id, view.id, option.index);
+        else void answerChoice(session.id, option.index);
+      });
+      nodes.push(button);
+      if (editing?.option === option.index) nodes.push(choiceTextEditor(session.id, view.id, option, disabled));
+    }
+    options.replaceChildren(...nodes);
+    if (focused) options.querySelector(`[data-choice-focus="${focused}"]`)?.focus();
+  }
+  function choiceTextEditor(paneId, menu, option, disabled) {
+    const row = document.createElement("div");
+    row.className = "choice-text";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = option.label;
+    input.value = state.choiceText?.draft || "";
+    input.disabled = disabled;
+    input.dataset.choiceFocus = "text";
+    input.setAttribute("aria-label", `Answer for ${option.label}`);
+    input.addEventListener("input", () => {
+      if (state.choiceText) state.choiceText.draft = input.value;
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.isComposing) {
+        // Inside the composer form, Enter would otherwise submit the composer.
+        event.preventDefault();
+        void submitChoiceText(paneId, menu, option.index);
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        state.choiceText = null;
+        state.choiceDrawn = "";
+        render();
+      }
+    });
+    const send = document.createElement("button");
+    send.type = "button";
+    send.className = "primary";
+    send.textContent = "Send answer";
+    send.disabled = disabled;
+    send.addEventListener("click", () => { void submitChoiceText(paneId, menu, option.index); });
+    row.append(input, send);
+    return row;
+  }
+  function noteChoice(paneId, menu, text, warning = false, carry = false) {
+    state.choiceNotes.set(paneId, { menu, text, warning, carry });
+  }
+  function openChoiceText(paneId, menu, option, draft = null, fromComposer = null) {
+    const same = state.choiceText?.paneId === paneId && state.choiceText.menu === menu
+      && state.choiceText.option === option;
+    state.choiceText = {
+      paneId,
+      menu,
+      option,
+      draft: draft ?? (same ? state.choiceText.draft : ""),
+      fromComposer: fromComposer ?? (same ? state.choiceText.fromComposer : null),
+    };
+    state.choiceDrawn = "";
+    render();
+    $("choice-options").querySelector('[data-choice-focus="text"]')?.focus();
+  }
+  async function submitChoiceText(paneId, menu, option) {
+    const text = state.choiceText?.draft ?? "";
+    const problem = choiceTextProblem(text);
+    if (problem) {
+      noteChoice(paneId, menu, problem, true);
+      render();
+      return;
+    }
+    const fromComposer = state.choiceText?.fromComposer ?? null;
+    if (!(await answerChoice(paneId, option, text))) return;
+    state.choiceText = null;
+    const input = $("message");
+    if (fromComposer !== null && state.selected === paneId && input.value === fromComposer) {
+      input.value = "";
+      input.dispatchEvent(new Event("input"));
+    }
+    state.choiceDrawn = "";
+    render();
+  }
+  /// Sends one answer through the owner, which re-reads the menu and refuses
+  /// when it changed. `index` null closes the menu with Esc.
+  async function answerChoice(paneId, index, text = null) {
+    const session = state.sessions.get(paneId);
+    const view = pendingChoiceView(session);
+    if (!view || state.choiceSending) return false;
+    const target = choiceAnswerRequest(session, view, index, text);
+    if (!target) {
+      toast("This agent changed or does not report a safe answer target");
+      return false;
+    }
+    const option = index === null ? null : view.options[index];
+    const verb = option?.checked === null || !option ? "Picked" : "Toggled";
+    state.choiceSending = { paneId, menu: view.id };
+    noteChoice(paneId, view.id, option ? `Sending “${text ?? option.label}”…` : "Closing the menu…");
+    render();
+    try {
+      await request(`/api/v1/panes/${encodeURIComponent(target.paneId)}/choice`, {
+        method: "POST",
+        body: JSON.stringify(target.body),
+      });
+      noteChoice(paneId, view.id, option ? `${verb} “${text ?? option.label}”.` : "Closed the menu.", false, true);
+      return true;
+    } catch (error) {
+      noteChoice(paneId, view.id, error.message, true);
+      return false;
+    } finally {
+      state.choiceSending = null;
+      state.choiceDrawn = "";
+      render();
+    }
+  }
+  /// Keeps a message out of an open menu, which would drop the text and pick
+  /// whichever option is highlighted. A one-line message can still become the
+  /// menu's typed answer, but only when the operator sends it from the card.
+  function holdMessageForChoice(paneId, view, text) {
+    const entry = view.options.find((option) => option.textEntry);
+    if (entry && text !== null && !choiceTextProblem(text)) {
+      noteChoice(paneId, view.id, `Not sent: Claude is waiting on this question. Send your message as the “${entry.label}” answer, or pick an option.`, true);
+      openChoiceText(paneId, view.id, entry.index, text, text);
+    } else {
+      noteChoice(paneId, view.id, "Not sent: Claude is waiting on this question. Pick an option first; your draft is kept.", true);
+      render();
+    }
+    toast("Claude is waiting for you to pick an option");
+  }
+  $("choice-cancel").addEventListener("click", () => { void answerChoice(state.selected, null); });
   $("message").addEventListener("input", () => {
     state.composerRevision += 1;
     state.messageHistoryNavigation = null;

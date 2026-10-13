@@ -109,6 +109,18 @@ arrived and reads "started" until then. A collapsed run of calls shows its newes
 part keeps up while the page stays open. Owners send a tool result's time as `finished_at`, next
 to the call's own `timestamp`.
 
+**Open menus.** Claude draws its questions (`AskUserQuestion`), permission prompts, plan approval,
+and the folder-trust dialog in place of its composer, and writes none of them to its log until
+they're answered. The owner reads an open menu off the pane and reports it on the session as
+`choice`: the question, each option with its description or checkbox, and the highlighted one.
+Conversation shows it as a card above the composer. Clicking an option goes through
+`POST /api/v1/panes/{id}/choice` with the menu's id; the owner refuses when that menu has since
+closed or changed, moves the highlight one key at a time while re-reading the pane, and presses
+Enter only once it rests on the chosen option. Options such as "Type something." take a one-line
+typed answer, and Cancel sends Esc only while the same menu is still open. While a menu is open,
+the owner refuses composer, image, and `agent_send` text, because the menu would drop the text
+and Enter would pick whichever option is highlighted.
+
 **Raw pane sizing.** tmux gives a window with no attached terminal its `default-size` (80×24), so a
 full-screen agent draws only 24 short rows. While Raw pane is open, the browser asks the pane's
 owner to fit that window to the view (60–300 columns, 16–150 rows) through

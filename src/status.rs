@@ -97,7 +97,7 @@ pub fn classify(
     if kind == AgentKind::Other {
         return AgentStatus::Other;
     }
-    if startup_prompt(kind, content) {
+    if startup_prompt(kind, content) || crate::choice::pending_choice(kind, content).is_some() {
         return AgentStatus::Waiting;
     }
 
@@ -224,7 +224,9 @@ pub fn input_reason(kind: AgentKind, content: &str) -> Option<&'static str> {
     .any(|v| tail.contains(v))
     {
         Some("permission")
-    } else if WAITING_MARKERS.iter().any(|v| tail.contains(v)) {
+    } else if WAITING_MARKERS.iter().any(|v| tail.contains(v))
+        || crate::choice::pending_choice(kind, content).is_some()
+    {
         Some("question")
     } else {
         None

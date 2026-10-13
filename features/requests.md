@@ -28,6 +28,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Stop Conversation going blank on mobile; run atmux background summaries on Tron's Qwen | `conversation-steady-summaries.md` | Deployed fleet-wide; reviews pending |
 | Show when each Conversation entry finished and how long ago | `conversation-entry-times.md` | Deployed fleet-wide; reviews pending |
 | Fix launches failing on Midnight with "fork failed: Device not configured" | `launch-pty-slot-race.md` | Deployed to Midnight; reviews pending |
+| Show Claude's choice menus in Conversation, answer them by click, and stop typed messages from picking an option by accident | `conversation-open-menus.md` | Implemented and tested; not yet deployed |
 
 ## Usage intelligence
 
