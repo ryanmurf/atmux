@@ -29,7 +29,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Show when each Conversation entry finished and how long ago | `conversation-entry-times.md` | Deployed fleet-wide; reviews pending |
 | Fix launches failing on Midnight with "fork failed: Device not configured" | `launch-pty-slot-race.md` | Deployed fleet-wide with `38682a6`; reviews pending |
 | Show Claude's choice menus in Conversation, answer them by click, and stop typed messages from picking an option by accident | `conversation-open-menus.md` | Deployed fleet-wide; reviews pending |
-| Show disks on the machine (computer) view | `machine-page-disks.md` | Implemented; rollout pending |
+| Show disks on the machine (computer) view | `machine-page-disks.md` | Deployed fleet-wide; reviews pending |
 
 ## Usage intelligence
 
