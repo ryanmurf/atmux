@@ -75,3 +75,6 @@ stay on `f7bb4e5` until the next rollout, which brings them the relaunch guard. 
 the LaunchAgent kickstart, after opening and closing 16 ptys so its own `respawn-pane -k` couldn't
 hit a full table. All 15 tmux sessions survived. A launch through the coordinator then started
 Claude on Midnight and was removed.
+
+On 2026-10-13 `38682a6` (`conversation-open-menus.md`) carried this change to Tron, Max, Clue, and
+the coordinator, so the relaunch guard now runs on every machine.

@@ -1,6 +1,6 @@
 # Conversation: Claude's open menus
 
-Status: implemented and tested 2026-10-13; not yet deployed.
+Status: deployed fleet-wide 2026-10-13 (runtime `38682a6`, Helm rev 43).
 
 ## Why
 
@@ -86,3 +86,29 @@ dev `atmux web`:
 
 The existing browser suites pass except `mobile browser Back stays inside atmux…`, which failed
 1 of 3 runs here and 1 of 3 on unchanged HEAD ("Inspected target navigated or closed").
+
+## Deployment (2026-10-13)
+
+| Machine | Artifact SHA-256 prefix | Rollback |
+| --- | --- | --- |
+| Tron | `5ab89a4bd401ea6d` | `target/release/atmux.rollback-f7bb4e5` |
+| Max | `5ab89a4bd401ea6d` (Tron's build) | `target/release/atmux.rollback-f7bb4e5` |
+| Midnight | `fce8e67fbe50a0fe` (built on Midnight, 4 jobs) | `target/release/atmux.rollback-8c8ba19` |
+| Clue | `14f5ffdccfa03abb` (aarch64, built on Clue) | `~/.local/bin/atmux.rollback-f7bb4e5` |
+| Coordinator | `localhost:32000/atmux:38682a6d0f2c@sha256:a584f79d…` | Helm rev 42 (`f7bb4e5`) |
+
+Only `server.image` changed in Helm; the values are in
+`/mnt/data/herodevs-agents/atmux-rollout-choice-6V9EP7` on Tron. Midnight restarted through the
+LaunchAgent kickstart, after 16 ptys were opened and closed. This build also brings the
+`launch-pty-slot-race.md` relaunch guard to every machine.
+
+The first `respawn-pane -k` on Tron failed. The new web exited at once and logged nothing, which
+ended the `atmux-web` session. A manual start of the same command with the same build then
+worked, so the likeliest cause is that the old process still held port 7345. The session was
+recreated on a `/bin/sleep` placeholder with `remain-on-exit` on, respawned with the original
+command, and `remain-on-exit` was cleared once the web was up.
+
+Session counts held: Tron 15 tmux sessions, Max 6, Midnight 18. Clue reports none, the same as
+before its restart. Through the coordinator all four machines are online. Three live menus came
+through right away: Claude's usage-limit dialog in two Tron sessions, and a multi-select question
+on Midnight whose options, descriptions, checkboxes, and `Submit` stop match its pane.
