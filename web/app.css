@@ -68,8 +68,18 @@ button { border: 1px solid var(--line); border-radius: 8px; padding: 0 14px; col
 .danger { color: var(--red); border-color: #6b333b; background: #25171a; }
 .subtle { background: transparent; }
 
-.workspace { grid-row: 3; min-width: 0; min-height: 0; display: grid; grid-template-columns: minmax(220px, 23vw) minmax(0, 1fr); transition: grid-template-columns .16s ease; }
+.workspace { grid-row: 3; position: relative; min-width: 0; min-height: 0; display: grid; grid-template-columns: var(--rail-width, minmax(220px, 23vw)) minmax(0, 1fr); transition: grid-template-columns .16s ease; }
 body.rail-collapsed .workspace { grid-template-columns: 0 1fr; }
+/* Absolutely positioned in the rail's grid area, so it rides the rail's right
+   edge at any width without joining auto-placement. Both column lines must be
+   named: an absolutely positioned item's `auto` end line is the container's
+   edge, so `grid-column: 1` alone would span the whole workspace. */
+.rail-resizer { position: absolute; grid-column: 1 / 2; grid-row: 1 / 2; top: 0; bottom: 0; right: -5px; width: 7px; z-index: 5; cursor: col-resize; touch-action: none; outline: none; }
+.rail-resizer::after { content: ""; position: absolute; top: 0; bottom: 0; left: 2px; width: 2px; background: transparent; transition: background .12s ease; }
+.rail-resizer:hover::after, .rail-resizer:focus-visible::after, body.rail-resizing .rail-resizer::after { background: var(--cyan); }
+body.rail-collapsed .rail-resizer { display: none; }
+body.rail-resizing { cursor: col-resize; user-select: none; }
+body.rail-resizing .workspace { transition: none; }
 .rail { min-width: 0; padding: 10px 8px; border-right: 1px solid var(--line); overflow-x: hidden; overflow-y: auto; background: #0d151a; transition: opacity .16s ease; }
 body.rail-collapsed .rail { visibility: hidden; padding-inline: 0; opacity: 0; border-right: 0; pointer-events: none; }
 .search-label { display: block; margin: 0 4px 7px; color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
@@ -692,6 +702,7 @@ dialog::backdrop { background: #000a; }
   .overview-notice button { min-height: 44px; }
   .workspace { min-height: 0; display: block; }
   body.rail-collapsed .workspace { display: block; }
+  .rail-resizer { display: none; }
   body.rail-collapsed .rail { visibility: visible; display: block; padding-inline: max(8px, env(safe-area-inset-left)) max(8px, env(safe-area-inset-right)); opacity: 1; pointer-events: auto; }
   .health-alert { padding: 8px 12px; }
   .pulse-account-form { width: 100%; grid-template-columns: auto minmax(0, 1fr); }

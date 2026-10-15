@@ -18,7 +18,8 @@
 
 ## What it does
 
-- Shows all tmux sessions in a compact left rail that grows to fit, stops at 25%, and ellipsizes long names.
+- Shows all tmux sessions in a left rail that ellipsizes long names. Drag its right edge to resize
+  it (double-click the edge to reset); this browser remembers the width.
 - Aggregates several machines into one dashboard, grouped by machine with online/offline health.
 - Marks detected Codex and Claude agents as `● working` or `◆ waiting`.
 - Shows a live preview of the selected session's active pane.

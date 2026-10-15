@@ -4061,6 +4061,20 @@ function formatRate(bytesPerSecond) {
   return Number.isFinite(bytesPerSecond) && bytesPerSecond >= 0 ? `${formatBytes(bytesPerSecond)}/s` : "—";
 }
 
+const RAIL_MIN_WIDTH = 180;
+const DETAIL_MIN_WIDTH = 420;
+
+/// The width the agent list takes, from a drag or a remembered value. It stays
+/// at least 180px and leaves the detail pane at least 420px, so a width saved
+/// on a wide monitor can't squeeze the agent view on a laptop. Null keeps the
+/// stylesheet's default.
+function railWidth(value, viewportWidth) {
+  const width = Number(value);
+  if (!Number.isFinite(width) || width <= 0) return null;
+  const max = Math.max(RAIL_MIN_WIDTH, viewportWidth - DETAIL_MIN_WIDTH);
+  return Math.round(Math.min(max, Math.max(RAIL_MIN_WIDTH, width)));
+}
+
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes < 0) return "—";
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -4545,6 +4559,7 @@ if (typeof module !== "undefined" && module.exports) {
     temperatureRows,
     diskRows,
     formatRate,
+    railWidth,
     markdownBlocks,
     messageFitsByteLimit,
     messageHistoryDirection,
@@ -4916,6 +4931,8 @@ function initialize() {
     updateBusy: new Set(),
     pendingUpdate: null,
     railCollapsed: readLocalStorage("atmux.rail-collapsed") === "true",
+    // The dragged width, unclamped, so a narrower window doesn't overwrite it.
+    railWidth: railWidth(readLocalStorage("atmux.rail-width"), Number.POSITIVE_INFINITY),
     pulseOpen: initialRoute.view === "usage",
     pulseAccount: requestedPulseAccount || storedPulseAccount,
     pulseAccounts: [],
@@ -5030,6 +5047,67 @@ function initialize() {
   }
 
   setRailCollapsed(state.railCollapsed);
+
+  const workspace = document.querySelector(".workspace");
+  const railResizer = $("rail-resizer");
+
+  function applyRailWidth() {
+    const width = railWidth(state.railWidth, window.innerWidth);
+    if (width === null) workspace.style.removeProperty("--rail-width");
+    else workspace.style.setProperty("--rail-width", `${width}px`);
+    railResizer.setAttribute("aria-valuemin", String(RAIL_MIN_WIDTH));
+    railResizer.setAttribute("aria-valuemax", String(Math.max(RAIL_MIN_WIDTH, window.innerWidth - DETAIL_MIN_WIDTH)));
+    railResizer.setAttribute("aria-valuenow", String(width ?? Math.round($("session-rail").getBoundingClientRect().width)));
+  }
+
+  function saveRailWidth() {
+    writeLocalStorage("atmux.rail-width", state.railWidth === null ? "" : String(state.railWidth));
+  }
+
+  function setRailWidth(width) {
+    state.railWidth = railWidth(width, window.innerWidth);
+    applyRailWidth();
+    saveRailWidth();
+  }
+
+  railResizer.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = $("session-rail").getBoundingClientRect().width;
+    railResizer.setPointerCapture(event.pointerId);
+    document.body.classList.add("rail-resizing");
+    let moved = false;
+    const move = (moveEvent) => {
+      moved = true;
+      state.railWidth = railWidth(startWidth + moveEvent.clientX - startX, window.innerWidth);
+      applyRailWidth();
+    };
+    const end = () => {
+      railResizer.removeEventListener("pointermove", move);
+      railResizer.removeEventListener("pointerup", end);
+      railResizer.removeEventListener("pointercancel", end);
+      document.body.classList.remove("rail-resizing");
+      // A plain click (or the first half of a double-click) keeps the default.
+      if (moved) saveRailWidth();
+    };
+    railResizer.addEventListener("pointermove", move);
+    railResizer.addEventListener("pointerup", end);
+    railResizer.addEventListener("pointercancel", end);
+  });
+  railResizer.addEventListener("dblclick", () => setRailWidth(null));
+  railResizer.addEventListener("keydown", (event) => {
+    const current = $("session-rail").getBoundingClientRect().width;
+    const step = event.shiftKey ? 64 : 16;
+    if (event.key === "ArrowLeft") setRailWidth(current - step);
+    else if (event.key === "ArrowRight") setRailWidth(current + step);
+    else if (event.key === "Home") setRailWidth(RAIL_MIN_WIDTH);
+    else if (event.key === "End") setRailWidth(window.innerWidth - DETAIL_MIN_WIDTH);
+    else return;
+    event.preventDefault();
+  });
+  window.addEventListener("resize", applyRailWidth, { passive: true });
+  applyRailWidth();
 
   function parseEvent(event) {
     try { return JSON.parse(event.data); }

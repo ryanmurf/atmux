@@ -499,7 +499,9 @@ fn codex_session_id(path: &Path, bytes: &[u8], directory: &Path) -> Option<Strin
 fn claude_preview(bytes: &[u8]) -> Option<String> {
     json_lines(bytes)
         .filter_map(|value| {
-            if value.pointer("/message/role").and_then(Value::as_str) != Some("user") {
+            if !crate::transcript::claude_message_record(&value)
+                || value.pointer("/message/role").and_then(Value::as_str) != Some("user")
+            {
                 return None;
             }
             let content = value.pointer("/message/content")?;

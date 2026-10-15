@@ -68,6 +68,7 @@ const {
   temperatureRows,
   diskRows,
   formatRate,
+  railWidth,
   formatRelativeTime,
   conversationSummaryLabel,
   transcriptEntryClock,
@@ -2707,6 +2708,20 @@ test("process rows keep owner order and report each group's share of RAM", () =>
   ]);
   assert.equal(rows[0].memoryPercent, 7 / 64 * 100);
   assert.deepEqual(processRows(null, 1), []);
+});
+
+test("rail width keeps the list usable and leaves the detail pane room", () => {
+  assert.equal(railWidth(null, 1440), null);
+  assert.equal(railWidth("", 1440), null);
+  assert.equal(railWidth("wide", 1440), null);
+  assert.equal(railWidth(-20, 1440), null);
+  assert.equal(railWidth("312.6", 1440), 313);
+  assert.equal(railWidth(90, 1440), 180);
+  // A width saved on a wide monitor shrinks to fit a laptop's window.
+  assert.equal(railWidth(1200, 1280), 860);
+  // A window too narrow for both keeps the list at its minimum.
+  assert.equal(railWidth(400, 500), 180);
+  assert.equal(railWidth(1200, Number.POSITIVE_INFINITY), 1200);
 });
 
 test("disk rows use df's percent, join the owner's names, and drop malformed volumes", () => {

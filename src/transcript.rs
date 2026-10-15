@@ -238,6 +238,9 @@ fn parse_native_context(agent: AgentKind, bytes: &[u8]) -> Option<(u64, usize, O
                 {
                     latest_compact = Some(index);
                 }
+                if !claude_message_record(&value) {
+                    continue;
+                }
                 let Some(message) = value.get("message") else {
                     continue;
                 };
@@ -1327,6 +1330,18 @@ fn first_json_values(path: &Path, limit: usize) -> Option<Vec<Value>> {
     )
 }
 
+/// Only `user` and `assistant` records are conversation entries. Claude Code
+/// 2.1.300 also logs `api-request-blob` records: copies of each request
+/// message with a `message.role` but no `uuid`, timestamp, or usage. Reading
+/// them as entries showed every prompt twice and, because an assistant copy has
+/// no usage, hid the native context count from auto-compact.
+pub(crate) fn claude_message_record(value: &Value) -> bool {
+    matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("user" | "assistant")
+    )
+}
+
 fn claude_request_usage(log: &LogTail) -> HashMap<String, (u64, u64)> {
     // Streaming content blocks can repeat the same model-request usage. Keep
     // its final counters and charge one visible entry, not every JSONL record.
@@ -1362,6 +1377,9 @@ fn parse_claude(log: &LogTail) -> (Vec<TranscriptMessage>, bool) {
         let id = value.get("uuid").and_then(Value::as_str);
         let timestamp = value.get("timestamp").and_then(Value::as_str);
         if push_claude_compaction(&mut messages, &value, id, timestamp) {
+            continue;
+        }
+        if !claude_message_record(&value) {
             continue;
         }
         let Some(content) = value.pointer("/message/content") else {
@@ -2770,6 +2788,52 @@ mod tests {
     }
 
     #[test]
+    fn claude_request_blobs_are_not_conversation_entries() {
+        // Claude Code 2.1.300 logs each request message again as an
+        // `api-request-blob` (with no uuid, timestamp, or usage), around the
+        // real records and their `last-prompt` and `api-request` siblings.
+        let source = concat!(
+            r#"{"type":"api-request-blob","sessionId":"s","hash":"h1","message":{"role":"user","content":"1. sure 2. go ahead"}}"#,
+            "\n",
+            r#"{"type":"user","uuid":"u1","timestamp":"one","message":{"role":"user","content":"1. sure 2. go ahead"}}"#,
+            "\n",
+            r#"{"type":"last-prompt","lastPrompt":"1. sure 2. go ahead","leafUuid":"u1"}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"a1","timestamp":"two","message":{"id":"msg_1","role":"assistant","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":90,"output_tokens":5},"content":[{"type":"text","text":"On it."}]}}"#,
+            "\n",
+            r#"{"type":"api-request-blob","sessionId":"s","hash":"h2","message":{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"x"},{"type":"text","text":"On it."}]}}"#,
+            "\n",
+            r#"{"type":"api-request-blob","sessionId":"s","hash":"h3","message":{"role":"user","content":[{"type":"text","text":"Tool loaded."}]}}"#,
+            "\n",
+            r#"{"type":"api-request","sessionId":"s","id":"r1","timestamp":"three","tail":["h1","h2","h3"]}"#,
+            "\n",
+        );
+        let (messages, _) = parse_claude(&tail(source));
+        let entries = messages
+            .iter()
+            .map(|message| {
+                (
+                    message.id.as_str(),
+                    message.role.as_str(),
+                    message.markdown.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            [
+                ("u1", "user", "1. sure 2. go ahead"),
+                ("a1:text:0", "assistant", "On it.")
+            ]
+        );
+        // The assistant copy has no usage; it must not hide the real count.
+        assert_eq!(
+            parse_native_context(AgentKind::Claude, source.as_bytes()),
+            Some((100, 3, None))
+        );
+    }
+
+    #[test]
     fn claude_subagent_turns_are_attributed_to_the_subagent_and_carry_request_usage() {
         let source = concat!(
             r#"{"type":"user","uuid":"human","message":{"role":"user","content":"do the thing"}}"#,
@@ -3002,6 +3066,7 @@ mod tests {
             .map(|index| serde_json::json!({ "type": "text", "text": format!("block {index}") }))
             .collect::<Vec<_>>();
         let source = serde_json::json!({
+            "type": "assistant",
             "uuid": oversized_id,
             "timestamp": "now",
             "message": { "role": "assistant", "content": blocks }
