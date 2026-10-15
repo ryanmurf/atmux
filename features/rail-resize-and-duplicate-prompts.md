@@ -1,6 +1,6 @@
 # Resizable agent list; one box per prompt in Conversation
 
-Status: implemented 2026-10-14; deployment below.
+Status: deployed fleet-wide 2026-10-14 (runtime `083db5a`, Helm rev 45).
 
 ## Why
 
@@ -54,3 +54,24 @@ driven in headless Chrome: dragging resized the list, the width survived a reloa
 past either limit stopped at 180 px and at the window minus 420 px. The arrow key moved it
 16 px, double-click restored the default and cleared the stored width, and the handle was
 hidden at 390 px with no horizontal scroll.
+
+## Deployment (2026-10-14)
+
+| Machine | Artifact SHA-256 prefix | Rollback |
+| --- | --- | --- |
+| Tron | `c6eedd11bb4dced9` | `target/release/atmux.rollback-23e66ae` |
+| Max | `c6eedd11bb4dced9` (Tron's build) | `target/release/atmux.rollback-23e66ae` |
+| Midnight | `8f90195d90e8e30d` (built on Midnight, 4 jobs) | `target/release/atmux.rollback-23e66ae` |
+| Clue | `6c434114440cf30a` (aarch64, built on Clue) | `~/.local/bin/atmux.rollback-23e66ae` |
+| Coordinator | `localhost:32000/atmux:083db5afb948@sha256:1affc1b8…` | Helm rev 44 (`23e66ae`) |
+
+Only `server.image` changed in Helm; the values are in
+`/mnt/data/herodevs-agents/atmux-rollout-rail-kKIuR7` on Tron. Tron's web was respawned with
+`remain-on-exit` on and came up on the first try. Midnight restarted through the LaunchAgent
+kickstart after 16 ptys were opened and closed.
+
+Session counts held: Tron 15 tmux sessions, Max 6, Midnight 20, Clue none (as before). After
+the restart, Midnight's own API returned the three affected transcripts with no copies and no
+repeated prompts; before, they held 27 copies between them. The coordinator, which forwards to
+Midnight, returned the same three transcripts with no copies, and all four machines report
+online through it.

@@ -30,8 +30,8 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Fix launches failing on Midnight with "fork failed: Device not configured" | `launch-pty-slot-race.md` | Deployed fleet-wide with `38682a6`; reviews pending |
 | Show Claude's choice menus in Conversation, answer them by click, and stop typed messages from picking an option by accident | `conversation-open-menus.md` | Deployed fleet-wide; reviews pending |
 | Show disks on the machine (computer) view | `machine-page-disks.md` | Deployed fleet-wide; reviews pending |
-| Make the left bar (agent list) resizable | `rail-resize-and-duplicate-prompts.md` | Implemented; deployment pending |
-| Stop Conversation from showing two boxes for every typed message | `rail-resize-and-duplicate-prompts.md` | Implemented; deployment pending |
+| Make the left bar (agent list) resizable | `rail-resize-and-duplicate-prompts.md` | Deployed fleet-wide; reviews pending |
+| Stop Conversation from showing two boxes for every typed message | `rail-resize-and-duplicate-prompts.md` | Deployed fleet-wide; reviews pending |
 
 ## Usage intelligence
 
