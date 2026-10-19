@@ -141,7 +141,7 @@ pub(crate) struct HostEnvironment {
 }
 
 impl HostEnvironment {
-    fn capture() -> Option<Self> {
+    pub(crate) fn capture() -> Option<Self> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|home| home.is_absolute())
@@ -159,7 +159,7 @@ impl HostEnvironment {
     }
 
     #[cfg(test)]
-    fn fixture(home: &Path) -> Self {
+    pub(crate) fn fixture(home: &Path) -> Self {
         Self {
             home: home.to_path_buf(),
             user: "fixture".to_owned(),
@@ -567,7 +567,7 @@ async fn run_script(
     }
 }
 
-fn configure_script_environment(command: &mut Command, environment: &HostEnvironment) {
+pub(crate) fn configure_script_environment(command: &mut Command, environment: &HostEnvironment) {
     // Bash evaluates BASH_ENV before stdin and imports exported shell
     // functions. Start from an empty environment so the pinned script bytes
     // are the only shell program that can execute, then add only the fixed
@@ -602,7 +602,7 @@ fn resolve_on_path(name: &str, path: &str) -> Option<PathBuf> {
         .find(|candidate| executable_file(candidate))
 }
 
-async fn terminate_process_group(child: &mut tokio::process::Child, group: Pid) {
+pub(crate) async fn terminate_process_group(child: &mut tokio::process::Child, group: Pid) {
     let _ = kill_process_group(group, Signal::TERM);
     let reaped = tokio::time::timeout(PROCESS_GROUP_GRACE, child.wait()).await;
     // The leader can exit before a TERM-ignoring descendant. Probe the group

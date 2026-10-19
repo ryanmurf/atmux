@@ -124,6 +124,14 @@ enabled = false
 # every one exists. bash and tmux are always required.
 # required_commands = ["~/.local/bin/claude", "~/.local/bin/codex"]
 
+# Restart machine: the machine page's Restart button runs this one fixed
+# command on the owning node and nothing else. Unset, Linux runs
+# `sudo -n systemctl reboot` (give the atmux user a passwordless sudoers entry
+# for it) and macOS asks System Events to restart the login session.
+[restart]
+# enabled = true
+# command = ["/usr/bin/sudo", "-n", "/usr/bin/systemctl", "reboot"]
+
 # Signed self-update from GitHub Releases. Each node verifies and installs its
 # own artifact; a coordinator only triggers and observes. Disabled by default.
 [self_update]
@@ -233,6 +241,8 @@ pub struct Config {
     #[serde(default)]
     pub recovery: RecoveryConfig,
     #[serde(default)]
+    pub restart: RestartConfig,
+    #[serde(default)]
     pub startup_prompts: crate::startup_prompts::StartupPromptConfig,
     #[serde(default)]
     pub self_update: SelfUpdateConfig,
@@ -298,6 +308,45 @@ impl RecoveryConfig {
         for command in &self.required_commands {
             if !command.is_absolute() {
                 bail!("[recovery].required_commands entries must be absolute paths");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Owner-scoped machine restart from the dashboard.
+///
+/// The browser can only ask the owning node to run this one fixed command; it
+/// never supplies a program or an argument. Unset, the node uses its platform
+/// default (`sudo -n systemctl reboot` on Linux, a System Events restart on
+/// macOS), see `host_restart::default_command`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RestartConfig {
+    /// Whether the machine page offers a restart at all.
+    pub enabled: bool,
+    /// The reboot command as an argument vector; the program must be an
+    /// absolute path.
+    pub command: Option<Vec<String>>,
+}
+
+impl Default for RestartConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            command: None,
+        }
+    }
+}
+
+impl RestartConfig {
+    fn validate(&self) -> Result<()> {
+        if let Some(command) = &self.command {
+            let Some(program) = command.first() else {
+                bail!("[restart].command must name a program");
+            };
+            if !Path::new(program).is_absolute() {
+                bail!("[restart].command must start with an absolute path");
             }
         }
         Ok(())
@@ -622,6 +671,10 @@ impl Config {
             .recovery
             .validate()
             .with_context(|| format!("invalid recovery configuration in {}", path.display()))?;
+        config
+            .restart
+            .validate()
+            .with_context(|| format!("invalid restart configuration in {}", path.display()))?;
         config
             .self_update
             .validate()
@@ -1003,6 +1056,16 @@ impl Config {
         }
         for path in &mut self.recovery.required_commands {
             *path = expand_tilde(path);
+        }
+        if let Some(program) = self
+            .restart
+            .command
+            .as_mut()
+            .and_then(|command| command.first_mut())
+        {
+            *program = expand_tilde(Path::new(program))
+                .to_string_lossy()
+                .into_owned();
         }
         #[cfg(feature = "pulse")]
         {
@@ -2708,6 +2771,47 @@ coordinator_only = true
                 Some("CLIENT_SECRET".to_owned());
             assert_rejected(config, "owner-local Pulse credential references");
         }
+    }
+
+    #[test]
+    fn restart_command_expands_tilde_and_must_be_absolute() {
+        let mut config: Config = toml::from_str(
+            r#"
+[restart]
+command = ["~/.local/bin/reboot-this-machine", "--now"]
+"#,
+        )
+        .unwrap();
+        config.normalize();
+        config.restart.validate().unwrap();
+        let command = config.restart.command.clone().unwrap();
+        assert!(Path::new(&command[0]).is_absolute());
+        assert!(command[0].ends_with("/.local/bin/reboot-this-machine"));
+        assert_eq!(command[1], "--now");
+        assert!(config.restart.enabled);
+
+        let relative: Config = toml::from_str("[restart]\ncommand = [\"reboot\"]\n").unwrap();
+        assert!(
+            relative
+                .restart
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("absolute path")
+        );
+        let empty: Config = toml::from_str("[restart]\ncommand = []\n").unwrap();
+        assert!(
+            empty
+                .restart
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must name a program")
+        );
+        let off: Config = toml::from_str("[restart]\nenabled = false\n").unwrap();
+        assert!(!off.restart.enabled);
+        assert_eq!(Config::default().restart, RestartConfig::default());
+        assert!(RestartConfig::default().command.is_none());
     }
 
     #[test]

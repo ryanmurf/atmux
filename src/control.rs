@@ -33,6 +33,7 @@ use crate::{
     choice::{AnswerError, MenuKey},
     code_nav::{CodeNavRequest, CodeNavResponse},
     config::{AgentProfile, Config, ProfileMode},
+    host_restart::{HostRestartRunner, HostRestartStartError, HostRestartStatus},
     launch_directory,
     machine::{
         MachineKind, MachineSummary, composite_id, now_ms, split_composite, validate_machine_id,
@@ -899,6 +900,9 @@ struct Inner {
     /// Owner-local, fixed-command restart recovery. Remote coordinators proxy
     /// to this runner; they never receive a script path or command line.
     recovery: RecoveryRunner,
+    /// Owner-local, fixed-command machine restart. A coordinator forwards the
+    /// request to the owning node; the command line never crosses the wire.
+    restart: HostRestartRunner,
     /// Owner-local signed self-update. A coordinator forwards a fixed verb to
     /// the owning node; it never hands a node a version, URL, or path.
     updater: Arc<SelfUpdater>,
@@ -1108,6 +1112,7 @@ impl ControlPlane {
         let configured_machine_ids = machines.keys().cloned().collect();
         let summarizer = crate::summarizer::Summarizer::configured(&config)?;
         let recovery = RecoveryRunner::production(&config);
+        let restart = HostRestartRunner::production(&config);
         let updater = SelfUpdater::production(&config.self_update)?;
         let coordinator =
             config.node.coordinator_only || !config.machines.is_empty() || config.discovery.enabled;
@@ -1145,6 +1150,7 @@ impl ControlPlane {
                 revisions,
                 refresh_now: Notify::new(),
                 recovery,
+                restart,
                 updater,
                 #[cfg(test)]
                 deny_local_agent_restart: false,
@@ -1235,6 +1241,63 @@ impl ControlPlane {
             )
             .await
             .map_err(|error| upstream(&error))
+    }
+
+    /// Reads the restart state of the owning machine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the machine is unknown, offline, or rejects the
+    /// owner-scoped status request.
+    pub async fn restart_status(&self, machine: &str) -> Result<HostRestartStatus> {
+        if machine == self.inner.local_id {
+            self.ensure_local_owner_enabled()?;
+            return Ok(self.inner.restart.status().await);
+        }
+        let remote = self.remote_machine(machine)?;
+        self.ensure_online(&remote.id)?;
+        remote
+            .get_json(&format!(
+                "/api/v1/machines/{}/restart",
+                encode_segment(machine)
+            ))
+            .await
+            .map_err(|error| upstream(&error))
+    }
+
+    /// Asks the owning machine to run its one fixed reboot command.
+    ///
+    /// A coordinator forwards only the machine id and an empty body; the
+    /// owning node decides whether and how it restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict when no restart command can run or one is already
+    /// running, and an error when the owning machine is unknown, offline, or
+    /// rejects the request.
+    pub async fn start_restart(&self, machine: &str) -> Result<HostRestartStatus> {
+        if machine == self.inner.local_id {
+            self.ensure_local_owner_enabled()?;
+            return self
+                .inner
+                .restart
+                .start()
+                .await
+                .map_err(|error| match error {
+                    HostRestartStartError::Running | HostRestartStartError::Unavailable(_) => {
+                        conflict(error.to_string())
+                    }
+                });
+        }
+        let remote = self.remote_machine(machine)?;
+        self.ensure_online(&remote.id)?;
+        remote
+            .post_json_response(
+                &format!("/api/v1/machines/{}/restart", encode_segment(machine)),
+                &serde_json::json!({}),
+            )
+            .await
+            .map_err(|error| remote_mutation_error(&error))
     }
 
     /// Every machine's Quick Resume state, read concurrently.
@@ -7762,6 +7825,7 @@ pub(crate) fn test_control_with_config(machines: &[&str], config: Config) -> Con
             revisions,
             refresh_now: Notify::new(),
             recovery: RecoveryRunner::detached(&local_id),
+            restart: HostRestartRunner::detached(&local_id),
             updater: SelfUpdater::with_environment(
                 &crate::self_update::SelfUpdateConfig::default(),
                 self_update::Environment {

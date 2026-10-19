@@ -79,6 +79,8 @@ const {
   recoveryPollDelay,
   recoveryRowState,
   updateConfirmCopy,
+  machinePowerModel,
+  restartConfirmCopy,
   groupSessionsByMachine,
   machineCanCheck,
   machineCanRollback,
@@ -3244,6 +3246,53 @@ test("Update all counts only the machines that can actually install", () => {
   ];
   assert.deepEqual(updatableMachines(roster).map((entry) => entry.id), ["tron", "max"]);
   assert.deepEqual(updatableMachines(null), []);
+});
+
+test("the Power card only offers Restart when the owning node says it can", () => {
+  const idle = { machine: "tron", available: true, phase: "idle", message: "Ready to restart this machine" };
+  assert.deepEqual(machinePowerModel(idle), {
+    message: "Ready to restart this machine", state: "", error: null, canRestart: true,
+  });
+  // A click in flight, an offline machine, and a status still loading never offer the button.
+  assert.equal(machinePowerModel(idle, { busy: true }).canRestart, false);
+  const offline = machinePowerModel(idle, { online: false });
+  assert.equal(offline.canRestart, false);
+  assert.match(offline.message, /offline/);
+  const loading = machinePowerModel(null);
+  assert.equal(loading.canRestart, false);
+  assert.match(loading.message, /Checking/);
+  // The owner's own refusal is shown as text, not as a live button.
+  const unavailable = machinePowerModel({
+    machine: "clue", available: false, phase: "unavailable",
+    message: "Restart command /usr/bin/sudo is missing or not executable on this machine",
+  });
+  assert.equal(unavailable.canRestart, false);
+  assert.match(unavailable.message, /missing/);
+  assert.equal(machinePowerModel({ error: "coordinator unreachable" }).error, "coordinator unreachable");
+  // In flight: the message moves to the status line and the button waits.
+  const restarting = machinePowerModel({ available: true, phase: "restarting", message: "Asking the system to restart" });
+  assert.equal(restarting.state, "Asking the system to restart");
+  assert.equal(restarting.message, "");
+  assert.equal(restarting.canRestart, false);
+  // Requested: the node accepted the reboot; another request is allowed once it is back.
+  const requested = machinePowerModel({ available: true, phase: "requested", message: "Restart requested" });
+  assert.equal(requested.state, "Restart requested");
+  assert.equal(requested.canRestart, true);
+  // Failed: the reason is an error and the button is live for a retry.
+  const failed = machinePowerModel({ available: true, phase: "failed", message: "Restart command exited with status 1" });
+  assert.equal(failed.error, "Restart command exited with status 1");
+  assert.equal(failed.state, "");
+  assert.equal(failed.canRestart, true);
+});
+
+test("restarting a machine is confirmed with its name and what stops", () => {
+  const copy = restartConfirmCopy("Midnight");
+  assert.equal(copy.title, "Restart Midnight?");
+  assert.equal(copy.target, "Reboot Midnight now. This restarts the whole computer, not just atmux.");
+  assert.match(copy.note, /Every tmux session and agent on Midnight stops/);
+  assert.match(copy.note, /Quick Resume/);
+  assert.equal(copy.confirm, "Restart machine");
+  assert.equal(restartConfirmCopy("").title, "Restart this machine?");
 });
 
 test("rolling back is confirmed exactly like installing, because it also restarts", () => {

@@ -547,6 +547,51 @@ async fn start_recovery(
         .into_response()
 }
 
+async fn restart_status(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    record(
+        &state,
+        &headers,
+        &format!("/api/v1/machines/{id}/restart"),
+        "",
+    );
+    Json(json!({
+        "machine": id,
+        "available": true,
+        "phase": "idle",
+        "message": "Ready to restart this machine"
+    }))
+    .into_response()
+}
+
+async fn start_restart(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    record(
+        &state,
+        &headers,
+        &format!("/api/v1/machines/{id}/restart"),
+        &body,
+    );
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "machine": id,
+            "available": true,
+            "phase": "restarting",
+            "requested_at_ms": 1,
+            "message": "Asking the system to restart"
+        })),
+    )
+        .into_response()
+}
+
 async fn kill(State(state): State<Shared>, Path(id): Path<String>, headers: HeaderMap) -> Response {
     record(&state, &headers, &format!("/api/v1/sessions/{id}"), "");
     Json(json!({ "ok": true })).into_response()
@@ -685,6 +730,10 @@ async fn start_node_with_memory(advertise_memory: bool) -> (SocketAddr, Shared) 
         .route(
             "/api/v1/machines/{id}/quick-resume",
             get(recovery_status).post(start_recovery),
+        )
+        .route(
+            "/api/v1/machines/{id}/restart",
+            get(restart_status).post(start_restart),
         )
         .route("/api/v1/sessions", post(launch))
         .route("/api/v1/memory-launches/v1", post(launch_with_memory))
@@ -1387,6 +1436,33 @@ async fn a_coordinator_groups_routes_and_survives_an_offline_machine() {
                 .bodies
                 .iter()
                 .any(|body| body.contains("resume-tron") || body.contains("/home/"))
+        );
+    }
+
+    // A machine restart is forwarded the same way: the coordinator sends the
+    // machine id and an empty body, and the owning node's command line never
+    // appears in anything it receives or returns.
+    let restart = control.restart_status("gpu-box").await.unwrap();
+    assert!(restart.available);
+    assert_eq!(restart.phase, atmux::host_restart::HostRestartPhase::Idle);
+    let restarting = control.start_restart("gpu-box").await.unwrap();
+    assert_eq!(
+        restarting.phase,
+        atmux::host_restart::HostRestartPhase::Restarting
+    );
+    {
+        let snapshot = recorder.lock().unwrap();
+        let hits = snapshot
+            .paths
+            .iter()
+            .filter(|path| *path == "/api/v1/machines/gpu-box/restart")
+            .count();
+        assert_eq!(hits, 2, "one status read and one start");
+        assert!(
+            !snapshot
+                .bodies
+                .iter()
+                .any(|body| body.contains("sudo") || body.contains("reboot"))
         );
     }
 

@@ -11,6 +11,7 @@ pub mod control;
 pub mod conversation;
 pub mod discovery;
 pub mod events;
+pub mod host_restart;
 mod launch_directory;
 pub mod machine;
 pub mod mcp;

@@ -34,6 +34,7 @@ use crate::{
         overview_patch, pane_patch,
     },
     discovery,
+    host_restart::HostRestartStatus,
     machine::{MachineSummary, Secret, resolve_token},
     mcp,
     recovery::RecoveryStatus,
@@ -163,6 +164,12 @@ struct RestartAgentInstanceRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct QuickResumeRequest {}
+
+/// Deliberately empty: callers choose only the machine. The owner runs its one
+/// configured reboot command with no browser-supplied program or argument.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestartRequest {}
 
 const fn default_submit() -> bool {
     true
@@ -824,6 +831,10 @@ fn routes(state: WebState) -> Router {
             "/api/v1/machines/{id}/quick-resume",
             get(quick_resume_status).post(start_quick_resume),
         )
+        .route(
+            "/api/v1/machines/{id}/restart",
+            get(restart_status).post(start_restart),
+        )
         // Owner-scoped view of this node's own executable.
         .route("/api/v1/update", get(update_status))
         .route("/api/v1/update/check", post(update_check))
@@ -1384,6 +1395,34 @@ async fn start_quick_resume(
     state
         .control
         .start_recovery(&id)
+        .await
+        .map(|status| (StatusCode::ACCEPTED, Json(status)))
+        .map_err(|error| ApiError::from_control(&error))
+}
+
+async fn restart_status(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+) -> Result<Json<HostRestartStatus>, ApiError> {
+    state
+        .control
+        .restart_status(&id)
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::from_control(&error))
+}
+
+/// Reboots one machine through its owning node's fixed command.
+async fn start_restart(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(_request): Json<RestartRequest>,
+) -> Result<(StatusCode, Json<HostRestartStatus>), ApiError> {
+    ensure_origin(&headers, &state.allowed_origins)?;
+    state
+        .control
+        .start_restart(&id)
         .await
         .map(|status| (StatusCode::ACCEPTED, Json(status)))
         .map_err(|error| ApiError::from_control(&error))
@@ -3236,6 +3275,104 @@ mod tests {
         assert_eq!(
             app.oneshot(same_origin).await.unwrap().status(),
             StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn machine_restart_is_owner_scoped_origin_protected_and_never_takes_a_command() {
+        let control = crate::control::test_control(&["gpu-box"]);
+        let (app, _shutdown) = authenticated_real_app(control);
+        let local = "/api/v1/machines/local/restart";
+        let token = Some("quick-resume-test-token");
+        let origin = Some("http://localhost:7345");
+
+        let status = app
+            .clone()
+            .oneshot(protected_api("GET", local, "", token, None))
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(status.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["machine"], "local");
+        assert_eq!(body["available"], false);
+        assert_eq!(body["phase"], "unavailable");
+        assert!(body.get("command").is_none());
+
+        let anonymous = protected_api("POST", local, "{}", None, origin);
+        assert_eq!(
+            app.clone().oneshot(anonymous).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let wrong_origin =
+            protected_api("POST", local, "{}", token, Some("https://attacker.example"));
+        assert_eq!(
+            app.clone().oneshot(wrong_origin).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        // A browser can never pick the program: the body schema has no fields.
+        let supplied_command = protected_api(
+            "POST",
+            local,
+            r#"{"command":["/bin/sh","-c","touch /tmp/pwned"]}"#,
+            token,
+            origin,
+        );
+        let refused = app
+            .clone()
+            .oneshot(supplied_command)
+            .await
+            .unwrap()
+            .status();
+        assert!(
+            matches!(
+                refused,
+                StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+            ),
+            "a supplied command produced {refused}"
+        );
+        // The test node's command does not exist, so the fixed runner fails
+        // closed after Origin validation and no process is spawned.
+        assert_eq!(
+            app.clone()
+                .oneshot(protected_api("POST", local, "{}", token, origin))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        // An unknown machine is refused, and the offline remote proves the
+        // coordinator never runs the owner's command on its behalf.
+        assert_eq!(
+            app.clone()
+                .oneshot(protected_api(
+                    "POST",
+                    "/api/v1/machines/ghost/restart",
+                    "{}",
+                    token,
+                    origin
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            app.oneshot(protected_api(
+                "POST",
+                "/api/v1/machines/gpu-box/restart",
+                "{}",
+                token,
+                origin
+            ))
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 

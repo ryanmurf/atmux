@@ -838,6 +838,45 @@ function updateConfirmCopy(action, labels) {
     };
 }
 
+/// What the machine view's Power card says and whether Restart is live.
+///
+/// The owning node decides whether it can restart; this only reads the status
+/// it published, so a coordinator never offers a button the owner would refuse.
+function machinePowerModel(status, { busy = false, online = true } = {}) {
+  if (!online) {
+    return {
+      message: "This machine is offline, so it cannot be asked to restart.",
+      state: "",
+      error: null,
+      canRestart: false,
+    };
+  }
+  if (!status) {
+    return { message: "Checking whether this machine can restart\u2026", state: "", error: null, canRestart: false };
+  }
+  if (status.error) return { message: "", state: "", error: status.error, canRestart: false };
+  const phase = status.phase || "unavailable";
+  const text = status.message || "";
+  const live = phase === "restarting" || phase === "requested";
+  return {
+    message: live || phase === "failed" ? "" : text,
+    state: live ? text : "",
+    error: phase === "failed" ? text : null,
+    canRestart: Boolean(status.available) && phase !== "restarting" && !busy,
+  };
+}
+
+/// The restart confirmation names the machine and says what stops.
+function restartConfirmCopy(label) {
+  const subject = label || "this machine";
+  return {
+    title: `Restart ${subject}?`,
+    target: `Reboot ${subject} now. This restarts the whole computer, not just atmux.`,
+    note: `Every tmux session and agent on ${subject} stops, and it stays offline until it is back. Quick Resume can restore its saved roster afterwards.`,
+    confirm: "Restart machine",
+  };
+}
+
 function updateProgressLabel(progress) {
   if (!progress || !Number.isFinite(progress.downloaded)) return "";
   const done = formatBytes(progress.downloaded);
@@ -4496,6 +4535,8 @@ if (typeof module !== "undefined" && module.exports) {
     recoveryPollDelay,
     recoveryRowState,
     updateConfirmCopy,
+    machinePowerModel,
+    restartConfirmCopy,
     groupSessionsByMachine,
     favoriteSessionKey,
     navigationPreferences,
@@ -4930,6 +4971,11 @@ function initialize() {
     /// disabled until the node answers.
     updateBusy: new Set(),
     pendingUpdate: null,
+    machineRestart: new Map(),
+    restartLoading: new Set(),
+    restartBusy: new Set(),
+    restartPoll: null,
+    pendingRestart: null,
     railCollapsed: readLocalStorage("atmux.rail-collapsed") === "true",
     // The dragged width, unclamped, so a narrower window doesn't overwrite it.
     railWidth: railWidth(readLocalStorage("atmux.rail-width"), Number.POSITIVE_INFINITY),
@@ -7640,6 +7686,10 @@ function initialize() {
     state.selected = null;
     state.selectedMachine = id;
     state.pulseOpen = false;
+    if (id) {
+      state.machineRestart.delete(id);
+      void refreshMachineRestart(id);
+    }
     closeSessionHistory();
     bindComposerDraftToSelection();
     resetProjectView();
@@ -8227,6 +8277,44 @@ function initialize() {
     $("machine-metrics").replaceChildren(machineStatRow(metrics), panels);
     refreshMachineTip();
     renderMachineSoftware(machine);
+    renderMachinePower(machine);
+  }
+
+  /// The machine view's Power card: one confirmed Restart.
+  function renderMachinePower(machine) {
+    const card = $("machine-power");
+    const status = state.machineRestart.get(machine.id) || null;
+    if (!status && machine.online !== false) void refreshMachineRestart(machine.id);
+    const model = machinePowerModel(status, {
+      busy: state.restartBusy.has(machine.id),
+      online: machine.online !== false,
+    });
+    const heading = document.createElement("h2");
+    heading.textContent = "Power";
+    const children = [heading];
+    if (model.message) children.push(textSpan(model.message, "software-latest"));
+    if (model.state) {
+      const line = textSpan(model.state, "software-state");
+      line.setAttribute("role", "status");
+      children.push(line);
+    }
+    if (model.error) {
+      const line = textSpan(model.error, "software-error");
+      line.setAttribute("role", "status");
+      children.push(line);
+    }
+    const actions = document.createElement("div");
+    actions.className = "software-actions";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "danger";
+    button.textContent = "Restart machine\u2026";
+    button.disabled = !model.canRestart;
+    button.dataset.restartMachine = machine.id;
+    button.addEventListener("click", () => openRestartConfirm(machine.id));
+    actions.append(button);
+    children.push(actions);
+    card.replaceChildren(...children);
   }
 
   /// The machine view's Software card.
@@ -10205,6 +10293,81 @@ function initialize() {
   }
 
   $("update-dialog").addEventListener("close", () => { state.pendingUpdate = null; });
+
+  /// Reads one machine's restart state from its owning node.
+  ///
+  /// While a restart is in flight the card polls until the owner answers with
+  /// a settled phase or stops answering because it is rebooting.
+  async function refreshMachineRestart(machineId) {
+    if (state.restartLoading.has(machineId)) return;
+    state.restartLoading.add(machineId);
+    try {
+      const status = await request(`/api/v1/machines/${encodeURIComponent(machineId)}/restart`);
+      state.machineRestart.set(machineId, status);
+    } catch (error) {
+      state.machineRestart.set(machineId, { error: error.message });
+    } finally {
+      state.restartLoading.delete(machineId);
+      scheduleRestartPoll(machineId);
+      render();
+    }
+  }
+
+  function scheduleRestartPoll(machineId) {
+    if (state.restartPoll !== null) clearTimeout(state.restartPoll);
+    state.restartPoll = null;
+    const phase = state.machineRestart.get(machineId)?.phase;
+    if (phase !== "restarting" && phase !== "requested") return;
+    state.restartPoll = setTimeout(() => {
+      state.restartPoll = null;
+      if (state.selectedMachine !== machineId || document.hidden) return;
+      const machine = state.machines.find((entry) => entry.id === machineId);
+      if (machine && machine.online === false) return;
+      void refreshMachineRestart(machineId);
+    }, 5000);
+  }
+
+  /// Nothing reboots a machine without a confirmation that names it.
+  function openRestartConfirm(machineId) {
+    state.pendingRestart = machineId;
+    const copy = restartConfirmCopy(machineLabelFor(machineId));
+    $("restart-dialog-title").textContent = copy.title;
+    $("restart-dialog-target").textContent = copy.target;
+    $("restart-dialog-note").textContent = copy.note;
+    $("restart-confirm").textContent = copy.confirm;
+    const dialog = $("restart-dialog");
+    if (!dialog.open) dialog.showModal();
+  }
+
+  async function runMachineRestart(machineId) {
+    if (state.restartBusy.has(machineId)) return false;
+    state.restartBusy.add(machineId);
+    render();
+    try {
+      const status = await request(
+        `/api/v1/machines/${encodeURIComponent(machineId)}/restart`,
+        { method: "POST", body: JSON.stringify({}) },
+      );
+      state.machineRestart.set(machineId, status);
+      return true;
+    } catch (error) {
+      toast(error.message);
+      void refreshMachineRestart(machineId);
+      return false;
+    } finally {
+      state.restartBusy.delete(machineId);
+      scheduleRestartPoll(machineId);
+      render();
+    }
+  }
+
+  $("restart-dialog").addEventListener("close", () => { state.pendingRestart = null; });
+  $("restart-confirm").addEventListener("click", async () => {
+    const machineId = state.pendingRestart;
+    $("restart-dialog").close();
+    if (!machineId) return;
+    if (await runMachineRestart(machineId)) toast(`Restarting ${machineLabelFor(machineId)}`);
+  });
   $("update-all-open").addEventListener("click", () => {
     openUpdateConfirm(
       updatableMachines([...state.fleetUpdates.values()]).map((entry) => entry.id),

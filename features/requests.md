@@ -32,6 +32,7 @@ implementation record. Status is governed by the gates in [README.md](README.md)
 | Show disks on the machine (computer) view | `machine-page-disks.md` | Deployed fleet-wide; reviews pending |
 | Make the left bar (agent list) resizable | `rail-resize-and-duplicate-prompts.md` | Deployed fleet-wide; reviews pending |
 | Stop Conversation from showing two boxes for every typed message | `rail-resize-and-duplicate-prompts.md` | Deployed fleet-wide; reviews pending |
+| Add a Restart command to the machine (monitor) page that reboots the computer | `machine-restart.md` | Deployed fleet-wide; reviews pending |
 
 ## Usage intelligence
 

@@ -129,7 +129,7 @@ owner to fit that window to the view (60–300 columns, 16–150 rows) through
 client, then unsets the window's `window-size` so the next terminal that attaches takes the size
 over exactly as before.
 
-Click a machine header in the session rail to open that machine's live view. Tiles at the top give the headline numbers, and the panels below break them down. Per-core bars show which cores are busy. The memory bar splits physical memory the way the operating system counts it, so cache the OS can reclaim stays apart from memory that's actually spoken for. On Apple silicon, GPU allocations count as wired memory, which is where a local model server shows up. The process table sums processes by name: ten `claude` processes read as one row with their combined memory and CPU. The Disks panel lists each mounted disk once, with its drive model, free space, and read and write rates, and a disk's block turns amber at 85% full and red at 95%. Bind mounts, container overlays, and snap images aren't separate disks, so they don't appear. GPU readings come from `nvidia-smi`, the Linux DRM driver files, or the macOS system tools, whichever the host has. A probe the host doesn't support stays empty instead of failing the page, and a machine still on an older atmux shows the basic meters with a note. The launch dialog has an **Agent** picker (Claude or Codex), a profile picker, and a project field that filters recursively discovered projects as you type. Its bounded, accessible suggestion list remains responsive for large project sets and supports keyboard, mouse, and touch selection. **Browse** safely explores the selected machine's configured project roots; it can navigate to every allowed parent, create a folder, or clone a credential-free HTTPS/SSH repository into the displayed directory. These mutations run only on the selected owning machine and never overwrite an existing target. A chosen folder is remembered for that machine while every launch remains server-validated. When viewing an agent in a browser that supports the Web Speech API, hold **Talk** to dictate and release it to send the recognized text directly to that agent.
+Click a machine header in the session rail to open that machine's live view. Tiles at the top give the headline numbers, and the panels below break them down. Per-core bars show which cores are busy. The memory bar splits physical memory the way the operating system counts it, so cache the OS can reclaim stays apart from memory that's actually spoken for. On Apple silicon, GPU allocations count as wired memory, which is where a local model server shows up. The process table sums processes by name: ten `claude` processes read as one row with their combined memory and CPU. The Disks panel lists each mounted disk once, with its drive model, free space, and read and write rates, and a disk's block turns amber at 85% full and red at 95%. Bind mounts, container overlays, and snap images aren't separate disks, so they don't appear. The Power card's **Restart machine** button reboots the computer after a confirmation; see [Restart a machine](#restart-a-machine) for the command it runs. GPU readings come from `nvidia-smi`, the Linux DRM driver files, or the macOS system tools, whichever the host has. A probe the host doesn't support stays empty instead of failing the page, and a machine still on an older atmux shows the basic meters with a note. The launch dialog has an **Agent** picker (Claude or Codex), a profile picker, and a project field that filters recursively discovered projects as you type. Its bounded, accessible suggestion list remains responsive for large project sets and supports keyboard, mouse, and touch selection. **Browse** safely explores the selected machine's configured project roots; it can navigate to every allowed parent, create a folder, or clone a credential-free HTTPS/SSH repository into the displayed directory. These mutations run only on the selected owning machine and never overwrite an existing target. A chosen folder is remembered for that machine while every launch remains server-validated. When viewing an agent in a browser that supports the Web Speech API, hold **Talk** to dictate and release it to send the recognized text directly to that agent.
 
 ### Files viewer and source navigation
 
@@ -462,6 +462,29 @@ pane's resume id and how to adapt the block for a memory-isolated node. A
 coordinator reads every machine's state through `/api/v1/fleet/quick-resume`
 and shows one row per answering owner, so a node without a roster explains
 itself instead of disappearing.
+
+### Restart a machine
+
+The machine view has a Power card with one **Restart machine** button. It reboots the whole
+computer, not just atmux, so it always confirms first and the confirmation names the machine and
+says what stops. The browser can only ask the owning machine to run its one configured reboot
+command; it never supplies a program or an argument, and it sees a phase and a message, never the
+command line or its output. A coordinator forwards the request to the owner the same way it
+forwards Quick Resume.
+
+```toml
+[restart]
+# enabled = true
+# Default on Linux; macOS asks System Events to restart instead.
+# command = ["/usr/bin/sudo", "-n", "/usr/bin/systemctl", "reboot"]
+```
+
+On Linux the default needs a passwordless sudoers entry for the atmux user, such as
+`ryan ALL=(root) NOPASSWD: /usr/bin/systemctl reboot`; without one the attempt fails with a
+message that says so, and nothing restarts. On macOS the default runs in the login session that
+owns the LaunchAgent, which may ask once for Automation permission to control System Events. Set
+`enabled = false` to take the button off a machine. After the restart, Quick Resume can restore
+that machine's saved roster.
 
 ### Owner-local CLI maintenance
 
