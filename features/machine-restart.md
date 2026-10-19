@@ -1,6 +1,6 @@
 # Machine page: Restart machine
 
-Status: deploying (runtime `TBD`).
+Status: deployed fleet-wide 2026-10-18 (runtime `17cbc4e`, Helm rev 46).
 
 ## Why
 
@@ -85,6 +85,24 @@ Three dev webs on Tron, each on a private socket:
 
 No real machine was rebooted during the check.
 
-## Deployment
+## Deployment (2026-10-18)
 
-TBD.
+| Machine | Artifact SHA-256 prefix | Rollback |
+| --- | --- | --- |
+| Tron | `c43d3cbeebd2988b` | `target/release/atmux.rollback-083db5a` |
+| Max | `c43d3cbeebd2988b` (Tron's build) | `target/release/atmux.rollback-083db5a` |
+| Midnight | `00a1d3f4570497e8` (built on Midnight, 4 jobs) | `target/release/atmux.rollback-083db5a` |
+| Clue | `addabb9420151968` (aarch64, built on Clue) | `~/.local/bin/atmux.rollback-083db5a` |
+| Coordinator | `localhost:32000/atmux:17cbc4e98608@sha256:640f19a7…` | Helm rev 45 (`083db5a`) |
+
+Only `server.image` changed in Helm; the values are in
+`/mnt/data/herodevs-agents/atmux-rollout-restart-wAeaOu` on Tron. Tron's web was respawned with
+`remain-on-exit` on and came up on the first try, though its Pulse preflight took long enough that
+the first health probe timed out before it listened; the option was cleared once port 7345 was
+open. Midnight restarted through the LaunchAgent kickstart after 16 ptys were opened and closed;
+its tmux server (up since the 2026-10-14 reboot) and all ten sessions were untouched.
+
+Session counts held: Tron 15 tmux sessions, Max 6, Midnight 10, Clue none (as before). Through the
+coordinator all four machines are online, and each reports `available: true`, `phase: idle` for
+restart: Tron, Max, and Clue through the Linux default with their passwordless sudo, Midnight
+through the macOS default. No configuration was changed on any machine and nothing was rebooted.
