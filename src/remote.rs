@@ -451,6 +451,27 @@ impl std::fmt::Display for RemoteResponseError {
 
 impl std::error::Error for RemoteResponseError {}
 
+/// The owner served a bundle other than the one the record described. A
+/// re-archived session changes its bundle between page revisions, so the
+/// puller treats this like a missing bundle rather than a failed page.
+#[derive(Debug)]
+pub(crate) struct PeerArchiveMismatch(&'static str);
+
+impl std::fmt::Display for PeerArchiveMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for PeerArchiveMismatch {}
+
+#[must_use]
+pub(crate) fn is_peer_archive_mismatch(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<PeerArchiveMismatch>().is_some())
+}
+
 /// Returns the owner's rejected HTTP status without exposing transport
 /// internals in the public control-plane API.
 #[must_use]
@@ -1180,11 +1201,10 @@ impl RemoteMachine {
             }
             .into());
         }
-        if let Some(length) = response.headers().get(header::CONTENT_LENGTH) {
-            anyhow::ensure!(
-                length.to_str()?.parse::<u64>()? == expected_bytes,
-                "peer archive size mismatch"
-            );
+        if let Some(length) = response.headers().get(header::CONTENT_LENGTH)
+            && length.to_str()?.parse::<u64>()? != expected_bytes
+        {
+            return Err(PeerArchiveMismatch("peer archive size mismatch").into());
         }
         let mut body = response.into_body();
         let mut output = tokio::fs::File::from_std(file);
@@ -1196,11 +1216,15 @@ impl RemoteMachine {
                     bytes = bytes
                         .checked_add(data.len() as u64)
                         .context("archive size overflow")?;
-                    anyhow::ensure!(bytes <= expected_bytes, "peer archive exceeds size cap");
+                    if bytes > expected_bytes {
+                        return Err(PeerArchiveMismatch("peer archive exceeds size cap").into());
+                    }
                     output.write_all(&data).await?;
                 }
             }
-            anyhow::ensure!(bytes == expected_bytes, "incomplete peer archive");
+            if bytes != expected_bytes {
+                return Err(PeerArchiveMismatch("incomplete peer archive").into());
+            }
             output.sync_all().await?;
             Ok::<_, anyhow::Error>(())
         })

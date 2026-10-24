@@ -1535,7 +1535,16 @@ archives their final native logs and Git position when panes disappear. Set `dir
 absolute private (0700) directory to choose another location. Owners retain up to 10,000 records
 and 90 days of archived history; bundles default to 256 MiB each and a 4 GiB total quota. Override
 `max_owner_records`, `archived_retention_days`, `bundle_max_bytes`, or `bundle_quota_bytes` in the
-same section. A bundle failure leaves a closed record available for search and retries locally.
+same section. A bundle failure leaves a closed record available for search and retries locally,
+30 s after the first failure and doubling to just over an hour, so a session over the size cap
+is not re-read every half minute.
+
+Archiving holds one descriptor per directory of a session tree (at most 512) and reopens each
+file through its directory for the manifest and again for the copy, so a Claude session with
+hundreds of tool results needs no more descriptors than a small one. `atmux web` also raises its
+own soft open-file limit toward the hard limit (capped at 65,536) at startup and prints the
+result when it changed; a service manager that hands it 256, as launchd does by default, is
+enough as long as the hard limit is higher.
 
 A configured coordinator pulls registry changes and checksummed tar.gz archives from trusted
 owners over the existing federation transport. Its records remain durable after owner retention

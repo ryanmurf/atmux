@@ -12,7 +12,6 @@
 use std::{
     io::Read,
     process::{Command, Stdio},
-    thread,
     time::{Duration, Instant},
 };
 
@@ -34,7 +33,6 @@ pub use host::{CpuDetail, LoadAverage, MemoryDetail, MemorySegment, ProcessGroup
 const GPU_SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const COMMAND_STDOUT_LIMIT: usize = 256 * 1024;
-const COMMAND_STDERR_LIMIT: usize = 16 * 1024;
 const MAX_GPU_DEVICES: usize = 16;
 const MAX_GPU_DIAGNOSTICS: usize = 24;
 const MAX_GPU_UNAVAILABLE: usize = 20;
@@ -712,47 +710,22 @@ fn run_command_bounded(
     args: &[&str],
     timeout: Duration,
 ) -> Result<String, CommandFailure> {
-    let mut child = Command::new(program)
-        .args(args)
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                CommandFailure::NotFound
-            } else {
-                CommandFailure::Io
-            }
-        })?;
-    let stdout = child.stdout.take().ok_or(CommandFailure::Io)?;
-    let stderr = child.stderr.take().ok_or(CommandFailure::Io)?;
-    let stdout_reader = thread::spawn(move || read_bounded(stdout, COMMAND_STDOUT_LIMIT));
-    let stderr_reader = thread::spawn(move || read_bounded(stderr, COMMAND_STDERR_LIMIT));
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait().map_err(|_| CommandFailure::Io)? {
-            Some(status) => break status,
-            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(CommandFailure::TimedOut);
-            }
-        }
-    };
-    let (stdout, stdout_truncated) = stdout_reader.join().map_err(|_| CommandFailure::Io)??;
-    let (_, stderr_truncated) = stderr_reader.join().map_err(|_| CommandFailure::Io)??;
-    if stdout_truncated || stderr_truncated {
+    let mut command = Command::new(program);
+    command.args(args).env("LC_ALL", "C").stdin(Stdio::null());
+    let output = crate::child::output_within(&mut command, timeout, COMMAND_STDOUT_LIMIT).map_err(
+        |error| match error.kind() {
+            std::io::ErrorKind::NotFound => CommandFailure::NotFound,
+            std::io::ErrorKind::TimedOut => CommandFailure::TimedOut,
+            _ => CommandFailure::Io,
+        },
+    )?;
+    if output.truncated {
         return Err(CommandFailure::OutputTooLarge);
     }
-    if !status.success() {
+    if !output.status.success() {
         return Err(CommandFailure::Failed);
     }
-    String::from_utf8(stdout).map_err(|_| CommandFailure::Io)
+    String::from_utf8(output.stdout).map_err(|_| CommandFailure::Io)
 }
 
 fn read_bounded(reader: impl Read, limit: usize) -> Result<(Vec<u8>, bool), CommandFailure> {

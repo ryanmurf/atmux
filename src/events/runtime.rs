@@ -695,8 +695,15 @@ impl EventService {
                 if weak.strong_count() == 0 {
                     break;
                 }
-                let Ok(Ok((stream, _))) = connection else {
-                    continue;
+                let (stream, _) = match connection {
+                    Ok(Ok(accepted)) => accepted,
+                    Ok(Err(_)) => {
+                        // Out of descriptors or a transient accept failure:
+                        // back off instead of spinning on the error.
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    Err(_) => continue,
                 };
                 let Ok(permit) = permits.clone().try_acquire_owned() else {
                     continue;

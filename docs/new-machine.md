@@ -304,6 +304,11 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.herodevs.atmux-web.p
 Restart later only with `launchctl kickstart -k gui/$(id -u)/dev.herodevs.atmux-web`. Never kill
 or rebuild that machine's default tmux server and never create a replacement tmux socket.
 
+launchd starts jobs with a soft limit of 256 open files (`launchctl limit maxfiles`). `atmux web`
+raises its own limit at startup, so nothing extra is needed for atmux. The tmux server the job
+creates keeps the 256, which is plenty for its panes; if you want more headroom for it, put
+`ulimit -n 65536;` at the front of the `sh -c` string above before the server is first created.
+
 ### Local check
 
 ```bash

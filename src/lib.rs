@@ -4,6 +4,7 @@ pub mod app;
 pub mod attachment;
 mod auto_compact;
 mod auto_update;
+mod child;
 pub mod choice;
 pub mod code_nav;
 pub mod config;

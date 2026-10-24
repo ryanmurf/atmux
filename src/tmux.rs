@@ -550,9 +550,7 @@ impl Tmux {
     ///
     /// Returns an error when tmux is missing or exits unsuccessfully.
     pub fn check() -> Result<()> {
-        let output = tmux_command()
-            .arg("-V")
-            .output()
+        let output = bounded_output(tmux_command().arg("-V"))
             .context("tmux is required but was not found")?;
         check_output(&output, "tmux -V").map(|_| ())
     }
@@ -1371,7 +1369,7 @@ impl Tmux {
         if arguments.is_empty() {
             return Ok(());
         }
-        let output = tmux_command().args(&arguments).output()?;
+        let output = bounded_output(tmux_command().args(&arguments))?;
         check_output(&output, "tmux update session metadata").map(|_| ())
     }
 
@@ -2275,9 +2273,7 @@ impl Tmux {
 
     fn run<const N: usize>(args: [&str; N]) -> Result<(Output, String)> {
         let summary = format!("tmux {}", args.join(" "));
-        let output = tmux_command()
-            .args(args)
-            .output()
+        let output = bounded_output(tmux_command().args(args))
             .with_context(|| format!("failed to run {summary}"))?;
         Ok((output, summary))
     }
@@ -3769,6 +3765,21 @@ fn tmux_program() -> PathBuf {
         }
     }
     PathBuf::from("tmux")
+}
+
+/// A tmux client that never answers (a server out of descriptors or ptys
+/// accepts the connection and goes quiet) must not pin the monitor thread
+/// and every lock it holds. Nothing atmux asks tmux takes anywhere near this.
+const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const TMUX_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+
+fn bounded_output(command: &mut Command) -> std::io::Result<Output> {
+    crate::child::output_within(
+        command.stdin(Stdio::null()),
+        TMUX_COMMAND_TIMEOUT,
+        TMUX_OUTPUT_LIMIT,
+    )
+    .map(crate::child::BoundedOutput::into_output)
 }
 
 fn tmux_command() -> Command {

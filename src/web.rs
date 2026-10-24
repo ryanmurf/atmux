@@ -392,6 +392,80 @@ async fn start_pulse_web_components(
     })
 }
 
+/// The soft open-file limit the web process asks for. Archives hold a
+/// descriptor per directory of a session tree, every peer keeps long-lived
+/// connections, and the process sampler caches one descriptor per process.
+const OPEN_FILES_CEILING: u64 = 65_536;
+/// Below this, the startup banner says so; launchd's default is 256.
+const OPEN_FILES_COMFORTABLE: u64 = 8_192;
+
+/// Raises the soft open-file limit toward the hard limit, capped at the
+/// ceiling. Returns `(before, after)` when it changed. A service manager's
+/// default (launchd gives 256) is far below what a fleet node needs, and the
+/// hard limit is normally much higher.
+pub(crate) fn raise_open_file_limit() -> Option<(u64, u64)> {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let limit = getrlimit(Resource::Nofile);
+    let current = limit.current?;
+    let wanted = limit.maximum.map_or(OPEN_FILES_CEILING, |maximum| {
+        maximum.min(OPEN_FILES_CEILING)
+    });
+    if current >= wanted {
+        return None;
+    }
+    // macOS refuses soft limits above kern.maxfilesperproc even under an
+    // unlimited hard limit; OPEN_MAX is always accepted there.
+    [wanted, 10_240]
+        .into_iter()
+        .filter(|target| *target > current)
+        .find(|target| {
+            setrlimit(
+                Resource::Nofile,
+                Rlimit {
+                    current: Some(*target),
+                    maximum: limit.maximum,
+                },
+            )
+            .is_ok()
+        })
+        .map(|target| (current, target))
+}
+
+fn report_open_file_limit() {
+    let raised = raise_open_file_limit();
+    let current = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
+    match (raised, current) {
+        (Some((before, after)), _) => println!("atmux web  open files {after} (was {before})"),
+        (None, Some(current)) if current < OPEN_FILES_COMFORTABLE => println!(
+            "atmux web  open files {current}: raise the limit before archiving large sessions"
+        ),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod open_file_limit_tests {
+    use super::*;
+
+    #[test]
+    fn the_soft_limit_ends_up_at_the_ceiling_or_the_hard_limit() {
+        raise_open_file_limit();
+        let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        let Some(current) = limit.current else {
+            return;
+        };
+        let expected = limit.maximum.map_or(OPEN_FILES_CEILING, |maximum| {
+            maximum.min(OPEN_FILES_CEILING)
+        });
+        assert!(
+            current >= expected.min(10_240),
+            "soft {current} did not reach {expected}"
+        );
+        // Raising again is a no-op once the target is met.
+        assert_eq!(raise_open_file_limit(), None);
+    }
+}
+
 /// Runs the web dashboard and stateless MCP server.
 ///
 /// # Errors
@@ -404,6 +478,7 @@ pub async fn serve(
     extra_hosts: Vec<String>,
     extra_origins: Vec<String>,
 ) -> Result<()> {
+    report_open_file_limit();
     let binding = prepare_web_binding(&config, bind, allow_remote)?;
     let machine_count = config.machines.len();
     let control = ControlPlane::start(config.clone()).await?;

@@ -8,7 +8,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -28,10 +28,17 @@ use crate::{
 
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
 const MAX_FILES: usize = 4096;
+/// Directories stay open for the whole archive, so they are capped separately.
+const MAX_DIRECTORIES: usize = 512;
 const MAX_DEPTH: usize = 32;
 const PAGE_SIZE: usize = 16; // Even maximally sized records fit the 1 MiB peer transport.
 const OBSERVATION_INTERVAL_MS: u64 = 30_000;
 const DAY_MS: u64 = 86_400_000;
+
+/// 30 s after the first rejected archive, doubling to just over an hour.
+fn archive_retry_delay_ms(attempts: u64) -> u64 {
+    OBSERVATION_INTERVAL_MS.saturating_mul(1 << attempts.clamp(1, 8).saturating_sub(1))
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -951,12 +958,21 @@ impl Registry {
                     record: stored.record.clone(),
                 });
             }
-            // Retry rejected/missing bundles only once per interval.
-            if state
-                .observed
-                .get(&key)
-                .is_some_and(|(_, at)| at_ms.saturating_sub(*at) < OBSERVATION_INTERVAL_MS)
-                && stored.record.archive_error.is_some()
+            // A rejected archive is retried with a growing delay. A session
+            // over the size cap fails the same way every time, and every
+            // attempt re-reads its whole tree.
+            let attempts = if stored.record.archive_error.is_some() {
+                state
+                    .observed
+                    .get(&key)
+                    .map_or(0, |(attempts, _)| *attempts)
+            } else {
+                0
+            };
+            if attempts > 0
+                && state.observed.get(&key).is_some_and(|(_, at)| {
+                    at_ms.saturating_sub(*at) < archive_retry_delay_ms(attempts)
+                })
             {
                 continue;
             }
@@ -975,7 +991,7 @@ impl Registry {
                     self.mark_owner_evictions(&mut state, &evicted)?;
                     self.create_bundle(&stored)
                 });
-            match creation {
+            let failures = match creation {
                 Ok(info) => {
                     stored.record.bundle = Some(info);
                     self.commit(&mut state, stored.clone())?;
@@ -983,21 +999,24 @@ impl Registry {
                         event_type: "session.archived",
                         record: stored.record,
                     });
+                    0
                 }
                 Err(error) => {
                     // Do not reflect provider roots/ids or arbitrary OS messages.
                     eprintln!(
-                        "atmux archive {} failed: {error:#}",
-                        stored.record.session_key
+                        "atmux archive {} failed (attempt {}): {error:#}",
+                        stored.record.session_key,
+                        attempts + 1
                     );
                     stored.record.state = SessionState::Closed;
                     stored.record.archived_ms = None;
                     stored.record.archive_error =
                         Some("bundle unavailable; owner will retry".to_owned());
                     self.commit(&mut state, stored)?;
+                    attempts.saturating_add(1)
                 }
-            }
-            state.observed.insert(key, (0, at_ms));
+            };
+            state.observed.insert(key, (failures, at_ms));
         }
         let retained = state.records.keys().cloned().collect::<BTreeSet<_>>();
         state.observed.retain(|key, _| retained.contains(key));
@@ -1402,30 +1421,60 @@ impl Registry {
         }
         result
     }
-    #[allow(clippy::too_many_lines)] // Native identity checks and bounded archive copy share descriptor ownership.
+    /// Only the directories of a session tree stay open while it is archived:
+    /// a Claude session keeps hundreds of tool results and subagent logs, and
+    /// holding every one open blew through launchd's 256-descriptor default.
+    /// Each file is opened through its held directory for the manifest pass
+    /// and again for the copy, and a changed inode, size, or mtime between
+    /// the two fails the archive exactly as a changed open file did.
+    #[allow(clippy::too_many_lines)] // Native identity checks and the two-pass bounded copy share directory ownership.
     fn write_bundle(&self, stored: &StoredRecord, file: File) -> Result<(File, bool)> {
-        let mut native_files = Vec::new();
+        let mut tree = NativeTree::default();
         if let Some(native) = &stored.native {
             let root = workspace::open_absolute_directory(&native.config_root)?;
             let relative = native.log_path.strip_prefix(&native.config_root)?;
-            let log = open_relative(&root, relative)?;
+            let parent = relative.parent().context("missing native parent")?;
+            let name = relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("missing native log name")?;
+            let log_dir = open_relative(&root, parent)?;
+            let log = open_at(&log_dir, name, OFlags::RDONLY, 0)?;
             ensure!(log.metadata()?.is_file(), "native log is not a file");
-            native_files.push((PathBuf::from("native").join(relative), log));
+            drop(log);
+            let log_dir = tree.hold(log_dir)?;
+            tree.entries.push(NativeEntry {
+                relative: PathBuf::from("native").join(relative),
+                parent: log_dir,
+                name: name.to_owned(),
+                directory: false,
+            });
             if stored.record.harness == "claude" {
                 let sibling = relative.with_extension("");
-                let parent = sibling.parent().context("missing native parent")?;
-                let parent_fd = open_relative(&root, parent)?;
-                let name = sibling.file_name().context("missing native sibling")?;
-                match rustix::fs::statat(&parent_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+                let sibling_name = sibling
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("missing native sibling")?;
+                match rustix::fs::statat(
+                    &tree.dirs[log_dir],
+                    sibling_name,
+                    AtFlags::SYMLINK_NOFOLLOW,
+                ) {
                     Ok(_) => {
-                        let child = open_relative(&root, &sibling)?;
+                        let child = open_at(&tree.dirs[log_dir], sibling_name, OFlags::RDONLY, 0)?;
                         ensure!(
                             child.metadata()?.is_dir(),
                             "Claude sibling is not a directory"
                         );
-                        let relative = PathBuf::from("native").join(sibling);
-                        native_files.push((relative.clone(), child.try_clone()?));
-                        collect_tree(&child, &relative, 0, &mut native_files)?;
+                        let relative = PathBuf::from("native").join(&sibling);
+                        let index = tree.hold(child)?;
+                        tree.entries.push(NativeEntry {
+                            relative: relative.clone(),
+                            parent: log_dir,
+                            name: sibling_name.to_owned(),
+                            directory: true,
+                        });
+                        collect_tree(&mut tree, index, &relative, 0)?;
                     }
                     Err(rustix::io::Errno::NOENT) => {}
                     Err(error) => return Err(error.into()),
@@ -1433,23 +1482,26 @@ impl Registry {
             }
         }
         let mut entries = Vec::new();
+        let mut fingerprints = Vec::new();
         let mut total = 0_u64;
-        for (path, file) in &mut native_files {
-            let directory = file.metadata()?.is_dir();
-            let (checksum, bytes) = if directory {
-                (format!("{:x}", Sha256::digest([])), 0)
+        for entry in &tree.entries {
+            let (checksum, bytes, fingerprint) = if entry.directory {
+                (format!("{:x}", Sha256::digest([])), 0, None)
             } else {
-                hash_reader(file, self.config.bundle_max_bytes.saturating_sub(total))?
+                let mut file = tree.open(entry)?;
+                let (checksum, bytes) = hash_reader(
+                    &mut file,
+                    self.config.bundle_max_bytes.saturating_sub(total),
+                )?;
+                (checksum, bytes, Some(Fingerprint::of(&file)?))
             };
             total = total.checked_add(bytes).context("bundle size overflow")?;
-            if !directory {
-                file.seek(SeekFrom::Start(0))?;
-            }
+            fingerprints.push(fingerprint);
             entries.push(ManifestFile {
-                path: path.to_string_lossy().into_owned(),
+                path: entry.relative.to_string_lossy().into_owned(),
                 bytes,
                 sha256: checksum,
-                directory,
+                directory: entry.directory,
             });
         }
         let manifest = serde_json::to_vec(&BundleManifest {
@@ -1473,40 +1525,102 @@ impl Registry {
             manifest.len() as u64,
             manifest.as_slice(),
         )?;
-        for ((path, file), entry) in native_files.iter_mut().zip(&entries) {
+        for (entry, (manifest, fingerprint)) in
+            tree.entries.iter().zip(entries.iter().zip(&fingerprints))
+        {
             if entry.directory {
                 let mut header = tar::Header::new_gnu();
                 header.set_entry_type(tar::EntryType::Directory);
                 header.set_size(0);
                 header.set_mode(0o700);
                 header.set_cksum();
-                tar.append_data(&mut header, path, std::io::empty())?;
+                tar.append_data(&mut header, &entry.relative, std::io::empty())?;
                 continue;
             }
-            let before = file.metadata()?;
+            let expected = fingerprint.context("native file lost its fingerprint")?;
+            let mut file = tree.open(entry)?;
             ensure!(
-                before.len() == entry.bytes,
-                "native log changed during archive"
-            );
-            let mut checked = HashingReader {
-                inner: file.take(entry.bytes),
-                digest: Sha256::new(),
-            };
-            append_file(&mut tar, path, entry.bytes, &mut checked)?;
-            ensure!(
-                format!("{:x}", checked.digest.finalize()) == entry.sha256,
+                Fingerprint::of(&file)? == expected && expected.len == manifest.bytes,
                 "native file changed during archive"
             );
-            let after = file.metadata()?;
+            let mut checked = HashingReader {
+                inner: (&mut file).take(manifest.bytes),
+                digest: Sha256::new(),
+            };
+            append_file(&mut tar, &entry.relative, manifest.bytes, &mut checked)?;
+            let digest = format!("{:x}", checked.digest.finalize());
             ensure!(
-                before.len() == after.len()
-                    && before.mtime() == after.mtime()
-                    && before.mtime_nsec() == after.mtime_nsec(),
+                digest == manifest.sha256 && Fingerprint::of(&file)? == expected,
                 "native file changed during archive"
             );
         }
         let writer = tar.into_inner()?.finish()?;
-        Ok((writer.inner, !native_files.is_empty()))
+        Ok((writer.inner, !tree.entries.is_empty()))
+    }
+}
+
+/// The directories of a session tree, held open for the archive, and the
+/// files found beneath them, reopened through their directory on demand.
+#[derive(Default)]
+struct NativeTree {
+    dirs: Vec<File>,
+    entries: Vec<NativeEntry>,
+}
+
+struct NativeEntry {
+    /// Path inside the archive (`native/...`).
+    relative: PathBuf,
+    /// Index into `NativeTree::dirs` of the directory holding this entry.
+    parent: usize,
+    name: String,
+    directory: bool,
+}
+
+impl NativeTree {
+    fn hold(&mut self, dir: File) -> Result<usize> {
+        ensure!(
+            self.dirs.len() < MAX_DIRECTORIES,
+            "too many native directories"
+        );
+        self.dirs.push(dir);
+        Ok(self.dirs.len() - 1)
+    }
+
+    fn open(&self, entry: &NativeEntry) -> Result<File> {
+        let file = open_at(
+            &self.dirs[entry.parent],
+            entry.name.as_str(),
+            OFlags::RDONLY,
+            0,
+        )?;
+        ensure!(
+            file.metadata()?.is_file(),
+            "native file changed during archive"
+        );
+        Ok(file)
+    }
+}
+
+/// What the manifest pass saw of a file; the copy pass must see the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Fingerprint {
+    device: u64,
+    inode: u64,
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl Fingerprint {
+    fn of(file: &File) -> Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            len: metadata.len(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+        })
     }
 }
 
@@ -1933,14 +2047,9 @@ impl<W: Write> Write for CappedWriter<W> {
         self.inner.flush()
     }
 }
-fn collect_tree(
-    dir: &File,
-    relative: &Path,
-    depth: usize,
-    files: &mut Vec<(PathBuf, File)>,
-) -> Result<()> {
+fn collect_tree(tree: &mut NativeTree, dir: usize, relative: &Path, depth: usize) -> Result<()> {
     ensure!(depth < MAX_DEPTH, "native directory too deep");
-    let mut entries = Dir::read_from(dir)?;
+    let mut entries = Dir::read_from(&tree.dirs[dir])?;
     let mut count = 0;
     while let Some(entry) = entries.read() {
         let entry = entry?;
@@ -1950,17 +2059,32 @@ fn collect_tree(
         }
         count += 1;
         ensure!(
-            count <= MAX_FILES && files.len() < MAX_FILES,
+            count <= MAX_FILES && tree.entries.len() < MAX_FILES,
             "too many native files"
         );
         let name = name.to_str().context("non-UTF8 native filename")?;
         ensure!(name.len() <= 255, "native filename too long");
-        let file = open_at(dir, name, OFlags::RDONLY, 0)?;
+        // Opened once here so special files and hardlinks are refused up
+        // front; regular files are closed again until they are needed.
+        let file = open_at(&tree.dirs[dir], name, OFlags::RDONLY, 0)?;
+        let relative = relative.join(name);
         if file.metadata()?.is_dir() {
-            files.push((relative.join(name), file.try_clone()?));
-            collect_tree(&file, &relative.join(name), depth + 1, files)?;
+            let index = tree.hold(file)?;
+            tree.entries.push(NativeEntry {
+                relative: relative.clone(),
+                parent: dir,
+                name: name.to_owned(),
+                directory: true,
+            });
+            collect_tree(tree, index, &relative, depth + 1)?;
         } else {
-            files.push((relative.join(name), file));
+            drop(file);
+            tree.entries.push(NativeEntry {
+                relative,
+                parent: dir,
+                name: name.to_owned(),
+                directory: false,
+            });
         }
     }
     Ok(())
@@ -2132,46 +2256,22 @@ fn git_position(cwd: &Path) -> ProjectPosition {
     }
 }
 fn git_text(cwd: &Path, args: &[&str]) -> Option<String> {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("--no-optional-locks")
         .args(["-c", "core.fsmonitor=false", "-c", "gc.auto=0"])
         .arg("-C")
         .arg(cwd)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut pipe = child.stdout.take()?;
-    // Drain in parallel with the deadline so a full pipe cannot deadlock.
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut buffer = [0; 8192];
-        while let Ok(n) = pipe.read(&mut buffer) {
-            if n == 0 {
-                break;
-            }
-            if bytes.len() < 8192 {
-                bytes.extend_from_slice(&buffer[..n.min(8192 - bytes.len())]);
-            }
-        }
-        bytes
-    });
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let success = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.success(),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break false;
-            }
-        }
-    };
-    let bytes = reader.join().ok()?;
-    success.then(|| String::from_utf8_lossy(&bytes).trim().to_owned())
+        .stdin(Stdio::null());
+    // This runs under the registry lock: a git that stalls, or a helper it
+    // leaves holding the pipe, must become "unknown" within the deadline.
+    let output = crate::child::output_within(&mut command, Duration::from_secs(2), 8192).ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 /// One registry pull plus streaming checksum-verified bundle transfers.
@@ -2197,15 +2297,17 @@ pub async fn pull_once(
     let machine = remote.id.clone();
     let records = page.clone();
     tokio::task::spawn_blocking(move || worker.import_page(&machine, &records)).await??;
-    let _permit = registry.archive_gate.acquire().await?;
     let worker = Arc::clone(registry);
     let pending_page = page.clone();
     let pending =
         tokio::task::spawn_blocking(move || worker.missing_bundles(&pending_page)).await?;
     for (key, info) in pending {
-        let worker = Arc::clone(registry);
-        let bytes = info.bytes;
-        tokio::task::spawn_blocking(move || worker.reserve_bundle_space(bytes)).await??;
+        if info.bytes > registry.config.bundle_max_bytes {
+            // Larger than this node keeps; the record stays searchable.
+            continue;
+        }
+        // The transfer streams before the archive gate is taken, so a slow
+        // or failing peer never holds up this node's own archives.
         let (temporary, file) = registry.incoming_file()?;
         let staged = IncomingCleanup {
             registry: Arc::clone(registry),
@@ -2216,11 +2318,19 @@ pub async fn pull_once(
             .download_registry_bundle(&path, file, info.bytes)
             .await
         {
-            if crate::remote::rejected_status(&error) == Some(404) {
+            if crate::remote::rejected_status(&error) == Some(404)
+                || crate::remote::is_peer_archive_mismatch(&error)
+            {
+                // The owner no longer serves the bundle this revision
+                // described; a later page carries its current one.
                 continue;
             }
             return Err(error);
         }
+        let _permit = registry.archive_gate.acquire().await?;
+        let worker = Arc::clone(registry);
+        let bytes = info.bytes;
+        tokio::task::spawn_blocking(move || worker.reserve_bundle_space(bytes)).await??;
         let worker = Arc::clone(registry);
         let temp = temporary.clone();
         tokio::task::spawn_blocking(move || worker.finish_incoming(&temp, &info)).await??;
@@ -3163,5 +3273,180 @@ mod tests {
         assert_eq!(registry.get(&key).unwrap().unwrap().name, session.name);
         assert!(registry.state.lock().unwrap().pending_changes.is_empty());
         assert_eq!(attempts.load(Ordering::SeqCst), 4);
+    }
+
+    /// Runs itself again under a tiny descriptor limit: the archive may only
+    /// ever hold a session tree's directories open, never its files.
+    #[test]
+    fn a_session_tree_archives_under_a_small_descriptor_limit() {
+        const CHILD: &str = "ATMUX_TEST_SMALL_FD_LIMIT";
+        if std::env::var_os(CHILD).is_none() {
+            let exe = std::env::current_exe().unwrap();
+            let status = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(concat!(
+                    "ulimit -n 48 && exec \"$0\" ",
+                    "registry::tests::a_session_tree_archives_under_a_small_descriptor_limit ",
+                    "--exact --test-threads 1"
+                ))
+                .arg(&exe)
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "archiving a 300-file session failed under a 48-descriptor limit"
+            );
+            return;
+        }
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        let native = fixture.native("claude");
+        let sibling = native.log_path.with_extension("");
+        fs::create_dir_all(sibling.join("tool-results")).unwrap();
+        fs::create_dir_all(sibling.join("subagents/nested/deeper")).unwrap();
+        for index in 0..300 {
+            fs::write(
+                sibling.join(format!("tool-results/{index}.txt")),
+                format!("result {index}"),
+            )
+            .unwrap();
+        }
+        fs::write(
+            sibling.join("subagents/nested/deeper/agent.jsonl"),
+            "child log",
+        )
+        .unwrap();
+        let key = seed(&registry, native, "claude");
+        registry.observe(&[], 2000).unwrap();
+        let record = registry.get(&key).unwrap().unwrap();
+        assert_eq!(
+            record.state,
+            SessionState::Archived,
+            "{:?}",
+            record.archive_error
+        );
+        let files = entries(&registry, &key);
+        assert_eq!(
+            files.keys().filter(|p| p.contains("tool-results/")).count(),
+            300
+        );
+        assert!(files.keys().any(|p| p.ends_with("deeper/agent.jsonl")));
+    }
+
+    #[test]
+    fn a_rejected_archive_backs_off_instead_of_retrying_every_interval() {
+        let mut fixture = Fixture::new();
+        fixture.config.bundle_max_bytes = 64 * 1024;
+        fixture.config.bundle_quota_bytes = 64 * 1024;
+        let registry = fixture.registry();
+        let native = fixture.native("claude");
+        fs::write(&native.log_path, vec![b'x'; 70 * 1024]).unwrap();
+        let key = seed(&registry, native, "claude");
+        let attempts = |at_ms: u64| {
+            registry.observe(&[], at_ms).unwrap();
+            registry.state.lock().unwrap().observed[&key]
+        };
+        // The fixture log is larger than the cap, so every attempt fails.
+        assert_eq!(attempts(2_000), (1, 2_000));
+        assert!(registry.get(&key).unwrap().unwrap().archive_error.is_some());
+        assert_eq!(
+            attempts(31_000),
+            (1, 2_000),
+            "29 s is inside the first delay"
+        );
+        assert_eq!(attempts(32_000), (2, 32_000));
+        assert_eq!(
+            attempts(91_000),
+            (2, 32_000),
+            "59 s is inside the second delay"
+        );
+        assert_eq!(attempts(92_000), (3, 92_000));
+        assert_eq!(archive_retry_delay_ms(1), 30_000);
+        assert_eq!(archive_retry_delay_ms(3), 120_000);
+        assert_eq!(archive_retry_delay_ms(8), 30_000 * 128);
+        assert_eq!(archive_retry_delay_ms(40), 30_000 * 128);
+    }
+
+    #[tokio::test]
+    async fn a_bundle_the_owner_no_longer_serves_does_not_wedge_the_pull() {
+        use axum::{Router, http::header, routing::get};
+        let fixture = Fixture::new();
+        let receiver = Registry::open(&fixture.config, "coordinator")
+            .unwrap()
+            .unwrap();
+        let key = tmux::new_session_key().unwrap();
+        let id = format!("{:x}", Sha256::digest(b"stale"));
+        let page = RegistryPage {
+            cursor: "1:1".to_owned(),
+            reset: true,
+            more: false,
+            records: vec![StoredRecord {
+                record: SessionRecord {
+                    session_key: key.clone(),
+                    machine: "owner".to_owned(),
+                    name: "stale".to_owned(),
+                    cwd: "/nonexistent/atmux-a3-test".to_owned(),
+                    harness: "claude".to_owned(),
+                    created_ms: 1000,
+                    last_seen_ms: 1000,
+                    last_active_ms: 1000,
+                    state: SessionState::Archived,
+                    closed_ms: Some(1200),
+                    archived_ms: Some(1500),
+                    bundle: Some(BundleInfo {
+                        available: true,
+                        id: id.clone(),
+                        bytes: 10,
+                        sha256: id,
+                        native_log: false,
+                    }),
+                    ..SessionRecord::default()
+                },
+                ..StoredRecord::default()
+            }],
+        };
+        let body = serde_json::to_string(&page).unwrap();
+        // The owner's page describes a 10-byte bundle; it now serves 3 bytes.
+        let app = Router::new()
+            .route(
+                "/api/v1/registry",
+                get(move || {
+                    let body = body.clone();
+                    async move { ([(header::CONTENT_TYPE, "application/json")], body) }
+                }),
+            )
+            .route(
+                "/api/v1/registry/{key}/bundle",
+                get(|| async { ([(header::CONTENT_TYPE, "application/gzip")], "abc") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let token_path = fixture.directory.join("node.token");
+        fs::write(&token_path, "a3-fixture-node-token").unwrap();
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let remote = crate::remote::RemoteMachine::from_config(&crate::config::MachineConfig {
+            id: "owner".to_owned(),
+            label: None,
+            url: format!("http://{address}"),
+            token_env: None,
+            token_file: Some(token_path),
+        })
+        .unwrap();
+        let cursor = pull_once(&receiver, &remote, None).await.unwrap();
+        assert_eq!(cursor, "1:1");
+        assert_eq!(
+            receiver.get(&key).unwrap().unwrap().state,
+            SessionState::Archived
+        );
+        assert!(receiver.bundle_file(&key).is_err());
+        let leftovers = fs::read_dir(fixture.config.directory.as_ref().unwrap().join("bundles"))
+            .unwrap()
+            .count();
+        assert_eq!(leftovers, 0, "the staged download was discarded");
+        server.abort();
     }
 }
