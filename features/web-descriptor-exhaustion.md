@@ -1,6 +1,6 @@
 # Web descriptor exhaustion and the archive that caused it
 
-Status: fixed, rollout pending (branch `dashboard-improvements-20260907`).
+Status: deployed fleet-wide 2026-10-23 (runtime `0e15f85`, Helm rev 48).
 
 ## Why
 
@@ -68,9 +68,30 @@ closed it answered again on its own within two seconds. It also logged
 `atmux web  open files 64: raise the limit before archiving large sessions` at startup, since its
 hard limit left no room to raise. The pre-fix binary in the same situation never recovered.
 
-## Deployment
+## Deployment (2026-10-23)
 
-Pending. Tron/Max in-place and scp, Clue and Midnight native builds, coordinator Helm image swap,
-per [[atmux-fleet-rollout-procedure]]. On Midnight the LaunchAgent already carries a
-`ulimit -n 65536` that a prior session added by hand; the binary's own raise makes that redundant
-but harmless.
+Two commits: `6ec4066` (the hang and the four related defects) and `0e15f85` (the oversized-session
+size pre-check). The whole fleet runs `0e15f85`.
+
+| Machine | Artifact SHA-256 prefix | Rollback |
+| --- | --- | --- |
+| Tron | `aa877f90eba6875d` | `target/release/atmux.rollback-0e15f85` (the `6ec4066` build) |
+| Max | `aa877f90eba6875d` (Tron's build) | `target/release/atmux.rollback-0e15f85` |
+| Midnight | `523778761c184fdf` (built on Midnight) | `target/release/atmux.rollback-0e15f85` |
+| Clue | `f0b24f2cf9596483` (aarch64, built on Clue) | `~/.local/bin/atmux.rollback-0e15f85` |
+| Coordinator | `localhost:32000/atmux:0e15f8586452@sha256:7ebf318e…` | Helm rev 47 (`6ec4066`), rev 46 (`17cbc4e`) |
+
+Each machine also still has an `atmux.rollback-6ec4066` copy of the pre-fix binary. Only
+`server.image` changed in Helm; values saved in `/mnt/data/claude-tmp/hd/claude-1000/herodevs-agents/atmux-rollout-fdfix`
+on Tron.
+
+Verified after rollout: all four machines online through the coordinator (tron 14, max 6,
+midnight 16, clue 0 agent sessions); Midnight's and Clue's startup banners reported the soft
+descriptor limit raised (256→65536 and 1024→65536); the coordinator and Tron logged no new
+"peer archive size mismatch" lines; Midnight's archive log is clean; Max's eight over-cap
+sessions now fail at once with "session is larger than the … cap" instead of being re-read, and
+the "no permits available" starvation is gone. Midnight kept all its sessions through the
+kickstart (pty table grown first). No machine was rebooted.
+
+Those eight Max sessions are genuinely larger than the 256 MiB `bundle_max_bytes`; they can only
+be archived if that cap is raised, which is a `[registry]` policy choice for the owner.
