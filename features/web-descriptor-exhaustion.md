@@ -37,8 +37,12 @@ on its own. Three separate defects combined to produce it, and all three are fix
   until a later page carries the current record. The permit is taken only for the local finish,
   after the transfer, and a bundle larger than this node's cap is skipped up front
   (`src/registry.rs`, `src/remote.rs`).
-- **A rejected archive backs off.** A session over the size cap failed every 30 s forever,
-  re-reading its whole tree each time. Retries now start at 30 s and double to just over an hour.
+- **A rejected archive backs off, and an oversized one fails without reading.** A session over
+  the size cap failed every 30 s forever, re-reading its whole tree each time. Retries now start
+  at 30 s and double to just over an hour, and the archive sums the tree's file sizes first and
+  fails before reading when the total already exceeds the cap. On Max eight sessions over the
+  256 MiB cap were each being hashed up to the cap every interval, which also starved the archive
+  permit ("no permits available").
 
 ## Gate
 

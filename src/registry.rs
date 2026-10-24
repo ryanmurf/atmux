@@ -1481,6 +1481,27 @@ impl Registry {
                 }
             }
         }
+        // A session already larger than the cap would otherwise be hashed up
+        // to the cap on every retry before failing. Sum the sizes first and
+        // fail without reading; the hashing pass still enforces the cap for a
+        // file that grows between the two.
+        let mut declared = 0_u64;
+        for entry in &tree.entries {
+            if entry.directory {
+                continue;
+            }
+            let stat = rustix::fs::statat(
+                &tree.dirs[entry.parent],
+                entry.name.as_str(),
+                AtFlags::SYMLINK_NOFOLLOW,
+            )?;
+            declared = declared.saturating_add(stat.st_size.try_into().unwrap_or(u64::MAX));
+        }
+        ensure!(
+            declared <= self.config.bundle_max_bytes,
+            "session is larger than the {}-byte bundle size cap",
+            self.config.bundle_max_bytes
+        );
         let mut entries = Vec::new();
         let mut fingerprints = Vec::new();
         let mut total = 0_u64;
@@ -3349,7 +3370,10 @@ mod tests {
         };
         // The fixture log is larger than the cap, so every attempt fails.
         assert_eq!(attempts(2_000), (1, 2_000));
-        assert!(registry.get(&key).unwrap().unwrap().archive_error.is_some());
+        let failed = registry.get(&key).unwrap().unwrap();
+        assert!(failed.archive_error.is_some());
+        // It failed on the size pre-check, so no bundle file was written.
+        assert!(registry.bundle_file(&key).is_err());
         assert_eq!(
             attempts(31_000),
             (1, 2_000),
