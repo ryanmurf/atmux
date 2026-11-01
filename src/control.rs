@@ -4743,7 +4743,10 @@ fn mode_switchable(
             }
             AgentKind::Codex => {
                 mode.service_tier.is_none()
-                    && mode.effort.as_deref().is_none_or(|effort| effort != "none")
+                    && mode
+                        .effort
+                        .as_deref()
+                        .is_none_or(|effort| effort != "none" && effort != "max")
             }
             AgentKind::Other => false,
         }

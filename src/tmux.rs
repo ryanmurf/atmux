@@ -1699,7 +1699,8 @@ impl Tmux {
                 }
             }
             AgentKind::Codex
-                if session_scoped_tier && effort.is_none_or(|effort| effort != "none") =>
+                if session_scoped_tier
+                    && effort.is_none_or(|effort| effort != "none" && effort != "max") =>
             {
                 self.switch_codex_model(pane_id, model, effort)?;
             }
