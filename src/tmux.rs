@@ -769,6 +769,10 @@ impl Tmux {
             .to_str()
             .with_context(|| format!("directory is not valid UTF-8: {}", directory.display()))?;
         let directory = escape_tmux_argument(directory);
+        // The name needs the same escaping as the directory and the shell
+        // command: an unescaped trailing `;` would end the new-session
+        // command there and execute the next argument as a tmux command.
+        let escaped_name = escape_tmux_argument(name);
         // Publish every durable claim on a harmless placeholder pane before
         // the native agent starts. If atmux exits mid-launch, restart recovery
         // can either see the lease or see no resumed conversation at all.
@@ -779,12 +783,18 @@ impl Tmux {
             "-F",
             "#{session_id}\t#{pane_id}",
             "-s",
-            name,
+            &escaped_name,
             "-c",
             &directory,
             "/bin/sleep 2147483647",
         ])?;
         let Some((session_id, pane_id)) = parse_tmux_created_target(&created) else {
+            // The placeholder is already running under this name; remove it
+            // by name (the only handle available when its identity cannot be
+            // parsed), as every later failure path removes it by id. Left
+            // behind, the sleeping placeholder would hold the name and make
+            // a retry fail as a duplicate.
+            let _ = Self::output(["kill-session", "-t", &format!("={name}")]);
             bail!("tmux did not return a valid identity for session {name}");
         };
         if let Err(error) = Self::output([
