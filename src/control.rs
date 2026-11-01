@@ -3675,7 +3675,26 @@ impl ControlPlane {
                 }
                 // A launch that never happened must not overwrite the project's
                 // recorded launch preference.
-                launched.and_then(|()| project::remember_launch(&directory, &name, &profile))
+                match launched {
+                    Ok(()) => {
+                        // The session is already running at this point, so a
+                        // bookkeeping failure (a malformed or symlinked
+                        // .atmux.toml, an unwritable directory) must not fail
+                        // the launch: the caller would be told a live session
+                        // failed with a 500, and the refresh and handover
+                        // delivery after this block would be skipped. Log and
+                        // continue without the recorded preference.
+                        if let Err(error) =
+                            project::remember_launch(&directory, &name, &profile)
+                        {
+                            eprintln!(
+                                "atmux could not record the launch preference for {name}: {error:#}"
+                            );
+                        }
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
             })
             .await,
         );
