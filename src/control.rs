@@ -1003,7 +1003,7 @@ impl ControlPlane {
                 &serde_json::json!({}),
             )
             .await
-            .map_err(|error| upstream(&error))
+            .map_err(|error| remote_mutation_error(&error))
     }
 
     /// Identifier this coordinator uses for its own tmux server.
@@ -3182,7 +3182,7 @@ impl ControlPlane {
                         &request,
                     )
                     .await
-                    .map_err(|error| upstream(&error))?;
+                    .map_err(|error| remote_mutation_error(&error))?;
                 // The owner names the pane by its local id; this aggregator's
                 // callers only know the federated one.
                 models.pane_id = composite_id(&machine.id, &pane_id);
@@ -3282,7 +3282,7 @@ impl ControlPlane {
                         &serde_json::json!({}),
                     )
                     .await
-                    .map_err(|error| upstream(&error))?;
+                    .map_err(|error| remote_mutation_error(&error))?;
             }
         }
         Ok(())
@@ -3536,7 +3536,7 @@ impl ControlPlane {
                         &serde_json::json!({}),
                     )
                     .await
-                    .map_err(|error| upstream(&error))?;
+                    .map_err(|error| remote_mutation_error(&error))?;
             }
         }
         Ok(())
@@ -3581,7 +3581,7 @@ impl ControlPlane {
                 machine
                     .delete(&format!("/api/v1/sessions/{}", encode_segment(&pane_id)))
                     .await
-                    .map_err(|error| upstream(&error))?;
+                    .map_err(|error| remote_mutation_error(&error))?;
             }
         }
         Ok(())
@@ -3730,7 +3730,7 @@ impl ControlPlane {
         machine
             .post_json(launch_path, &forwarded)
             .await
-            .map_err(|error| upstream(&error))
+            .map_err(|error| remote_mutation_error(&error))
     }
 
     /// Runs the target profile's CLI non-interactively over one local pane's
