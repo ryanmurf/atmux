@@ -121,7 +121,7 @@ pub fn classify(
         || config
             .waiting_markers
             .iter()
-            .any(|marker| immediate.contains(&marker.to_lowercase()))
+            .any(|marker| custom_marker_matches(marker, &immediate))
     {
         return AgentStatus::Waiting;
     }
@@ -130,7 +130,7 @@ pub fn classify(
         || config
             .working_markers
             .iter()
-            .any(|marker| lower.contains(&marker.to_lowercase()))
+            .any(|marker| custom_marker_matches(marker, &lower))
         || title
             .chars()
             .next()
@@ -154,6 +154,17 @@ pub fn classify(
     } else {
         AgentStatus::Waiting
     }
+}
+
+/// Matches one owner-configured status marker against pane text.
+///
+/// The marker is trimmed and lowercased first, and a marker that is empty
+/// after trimming never matches: an empty needle is a substring of every
+/// pane, so one blank entry in the config would otherwise pin every agent
+/// to a single status.
+fn custom_marker_matches(marker: &str, text: &str) -> bool {
+    let marker = marker.trim().to_lowercase();
+    !marker.is_empty() && text.contains(&marker)
 }
 
 /// Characters the harnesses use to rule off the composer box.
@@ -295,7 +306,7 @@ pub(crate) fn automation_idle(
         || config
             .working_markers
             .iter()
-            .any(|marker| window.contains(&marker.to_lowercase()))
+            .any(|marker| custom_marker_matches(marker, &window))
     {
         return false;
     }
@@ -407,6 +418,30 @@ mod tests {
                 &custom
             ),
             AgentStatus::Working
+        );
+    }
+
+    #[test]
+    fn blank_custom_markers_never_match() {
+        // A blank entry is a substring of every pane; it must not pin the
+        // status. With only blank markers configured, classification falls
+        // through to the built-in rules (here: unchanged content with no
+        // markers classifies as Waiting, changed content as Working).
+        let blank_waiting = StatusConfig {
+            working_markers: Vec::new(),
+            waiting_markers: vec![String::new(), "  ".to_owned()],
+        };
+        assert_eq!(
+            classify(AgentKind::Codex, "some output", "", "", true, &blank_waiting),
+            AgentStatus::Working
+        );
+        let blank_working = StatusConfig {
+            working_markers: vec![String::new()],
+            waiting_markers: Vec::new(),
+        };
+        assert_eq!(
+            classify(AgentKind::Codex, "some output", "", "", false, &blank_working),
+            AgentStatus::Waiting
         );
     }
 
@@ -536,6 +571,27 @@ mod tests {
             panes::CODEX_TYPED,
             "",
             &config()
+        ));
+    }
+
+    #[test]
+    fn blank_custom_working_markers_do_not_block_automation_idle() {
+        // A blank entry in the operator's working_markers is a substring
+        // of every status window; it must not read as "still working" on
+        // every pane and suppress automation forever.
+        let mut config = config();
+        config.working_markers = vec![String::new(), "  ".to_owned()];
+        assert!(automation_idle(
+            AgentKind::Claude,
+            panes::CLAUDE_FRESH,
+            "",
+            &config
+        ));
+        assert!(automation_idle(
+            AgentKind::Codex,
+            panes::CODEX_IDLE,
+            "",
+            &config
         ));
     }
 

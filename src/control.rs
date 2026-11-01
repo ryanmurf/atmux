@@ -3472,12 +3472,17 @@ impl ControlPlane {
                 instance_id,
                 ..
             } => {
-                // Validate against this node's own id when unset, but still
-                // forward the caller's original (possibly absent) ids rather
-                // than this node's id, which would not describe the owner.
+                // An omitted machine id means "wherever this pane already
+                // lives", which for a remote pane is the resolved owner:
+                // fall back to the owner's own id so the check only bites
+                // when the caller named a different machine. (Falling back
+                // to this node's id instead made every such request fail
+                // with a spurious ownership conflict.) Still forward the
+                // caller's original (possibly absent) ids rather than the
+                // owner's id, which the caller did not assert.
                 let checked_machine_id = expected_machine_id
                     .as_deref()
-                    .unwrap_or(&self.inner.local_id);
+                    .unwrap_or(&machine.id);
                 validate_expected_pane_machine(checked_machine_id, &machine.id)?;
                 validate_expected_pane_instance(expected_instance_id.as_deref(), &instance_id)?;
                 self.ensure_online(&machine.id)?;
