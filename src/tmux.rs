@@ -1699,7 +1699,8 @@ impl Tmux {
                 }
             }
             AgentKind::Codex
-                if session_scoped_tier && effort.is_none_or(|effort| effort != "none") =>
+                if session_scoped_tier
+                    && effort.is_none_or(|effort| effort != "none" && effort != "max") =>
             {
                 self.switch_codex_model(pane_id, model, effort)?;
             }
@@ -1758,29 +1759,37 @@ impl Tmux {
 
     fn switch_claude_effort(&self, pane_id: &str, effort: &str) -> Result<()> {
         let target = claude_effort_index(effort)?;
-        self.send_text(pane_id, "/effort", true)?;
-        wait_for_capture(pane_id, |content| {
-            content.contains("←/→ to adjust").then_some(())
-        })?;
-        for _ in 0..5 {
-            Self::output(["send-keys", "-t", pane_id, "Left"])?;
+        // Like the model switches, any failure after the picker may have
+        // opened dismisses it before the error returns.
+        let switched = (|| {
+            self.send_text(pane_id, "/effort", true)?;
+            wait_for_capture(pane_id, |content| {
+                content.contains("←/→ to adjust").then_some(())
+            })?;
+            for _ in 0..5 {
+                Self::output(["send-keys", "-t", pane_id, "Left"])?;
+            }
+            for _ in 0..target {
+                Self::output(["send-keys", "-t", pane_id, "Right"])?;
+            }
+            Self::output(["send-keys", "-t", pane_id, "Enter"])?;
+            wait_for_capture(pane_id, |content| {
+                content
+                    .to_ascii_lowercase()
+                    .contains(&format!("set effort level to {effort}"))
+                    .then_some(())
+            })
+            .map_err(|error| {
+                UnsupportedModelControl(format!(
+                    "Claude did not confirm its effort change: {error:#}"
+                ))
+                .into()
+            })
+        })();
+        if switched.is_err() {
+            Self::close_picker(pane_id);
         }
-        for _ in 0..target {
-            Self::output(["send-keys", "-t", pane_id, "Right"])?;
-        }
-        Self::output(["send-keys", "-t", pane_id, "Enter"])?;
-        wait_for_capture(pane_id, |content| {
-            content
-                .to_ascii_lowercase()
-                .contains(&format!("set effort level to {effort}"))
-                .then_some(())
-        })
-        .map_err(|error| {
-            UnsupportedModelControl(format!(
-                "Claude did not confirm its effort change: {error:#}"
-            ))
-            .into()
-        })
+        switched
     }
 
     fn switch_codex_model(
@@ -1833,27 +1842,35 @@ impl Tmux {
     /// already-highlighted row keeps the running model, so the second page of
     /// the same picker changes the effort on its own.
     fn switch_codex_effort(&self, pane_id: &str, effort: &str) -> Result<()> {
-        self.send_text(pane_id, "/model", true)?;
-        wait_for_capture(pane_id, |content| {
-            content.contains("Select Model and Effort").then_some(())
-        })?;
-        Self::output(["send-keys", "-t", pane_id, "Enter"])?;
-        let effort_menu = wait_for_capture(pane_id, |content| {
-            reason_menu_selection(content, Some(effort))
-        })?;
-        if let ReasonMenu::Move { current, target } = effort_menu {
-            move_menu_selection(pane_id, current, target)?;
+        // Like the model switches, any failure after the picker may have
+        // opened dismisses it before the error returns.
+        let switched = (|| {
+            self.send_text(pane_id, "/model", true)?;
+            wait_for_capture(pane_id, |content| {
+                content.contains("Select Model and Effort").then_some(())
+            })?;
+            Self::output(["send-keys", "-t", pane_id, "Enter"])?;
+            let effort_menu = wait_for_capture(pane_id, |content| {
+                reason_menu_selection(content, Some(effort))
+            })?;
+            if let ReasonMenu::Move { current, target } = effort_menu {
+                move_menu_selection(pane_id, current, target)?;
+            }
+            Self::output(["send-keys", "-t", pane_id, "Enter"])?;
+            wait_for_capture(pane_id, |content| {
+                (codex_effort(content).as_deref() == Some(effort)).then_some(())
+            })
+            .map_err(|error| {
+                UnsupportedModelControl(format!(
+                    "Codex did not confirm its effort change: {error:#}"
+                ))
+                .into()
+            })
+        })();
+        if switched.is_err() {
+            Self::close_picker(pane_id);
         }
-        Self::output(["send-keys", "-t", pane_id, "Enter"])?;
-        wait_for_capture(pane_id, |content| {
-            (codex_effort(content).as_deref() == Some(effort)).then_some(())
-        })
-        .map_err(|error| {
-            UnsupportedModelControl(format!(
-                "Codex did not confirm its effort change: {error:#}"
-            ))
-            .into()
-        })
+        switched
     }
 
     /// Claude's `/fast` accepts an explicit `on`/`off` argument, so the desired
