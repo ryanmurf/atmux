@@ -138,7 +138,17 @@ impl ReporterTransport for HttpReporterTransport {
                     .await?;
                 return Ok(ReporterResponse {
                     status: response.status.as_u16(),
-                    retry_after: None,
+                    // The HTTPS client already allowlists retry-after
+                    // across its transport boundary; honor it here exactly
+                    // as the loopback path does, instead of retrying a
+                    // throttled receiver on this reporter's own backoff.
+                    retry_after: response
+                        .headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                        .and_then(|(_, value)| value.parse::<u64>().ok())
+                        .map(Duration::from_secs)
+                        .map(|duration| duration.min(MAX_RETRY_AFTER)),
                 });
             }
             send_loopback_http(endpoint, request).await
