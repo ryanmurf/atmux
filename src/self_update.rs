@@ -588,7 +588,22 @@ fn restore_previous(exe: &Path, previous: &Path, staging: &Path) -> Result<Strin
     if !linked {
         fs::rename(exe, staging).context("could not set the running atmux aside for a rollback")?;
     }
-    let leaving_sha = file_sha256(staging)?;
+    let leaving_sha = match file_sha256(staging) {
+        Ok(sha) => sha,
+        Err(error) => {
+            // The rename-error path below unwinds; the hash step must
+            // too. On a filesystem without hard links the running
+            // executable was renamed to `staging`, so returning here
+            // without putting it back would leave the executable path
+            // missing entirely.
+            if linked {
+                let _ = fs::remove_file(staging);
+            } else {
+                let _ = fs::rename(staging, exe);
+            }
+            return Err(error);
+        }
+    };
     if let Err(error) = fs::rename(previous, exe) {
         if linked {
             let _ = fs::remove_file(staging);
@@ -1798,7 +1813,14 @@ fn write_state(directory: &Path, state: &PersistedState) -> Result<()> {
         file.sync_all()
             .context("could not flush the self-update state file")?;
     }
-    fs::rename(&temporary, &path).context("could not replace the self-update state file")
+    fs::rename(&temporary, &path).context("could not replace the self-update state file")?;
+    // Persist the rename itself, as the executable swap does: without a
+    // directory flush, power loss can resurrect the previous state file,
+    // whose recorded previous SHA-256 then no longer matches the binary
+    // the swap set aside, and rollback refuses a valid previous release.
+    File::open(directory)
+        .and_then(|handle| handle.sync_all())
+        .context("could not flush the self-update state directory")
 }
 
 fn read_state(directory: &Path) -> Result<PersistedState> {
