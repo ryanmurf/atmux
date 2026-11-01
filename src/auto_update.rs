@@ -38,6 +38,12 @@ const MAX_STATE_BYTES: u64 = 256 * 1024;
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const PROCESS_GROUP_GRACE: Duration = Duration::from_secs(5);
 const CODEX_INSTALL_URL: &str = "https://chatgpt.com/codex/install.sh";
+/// Upper bound on the downloaded Codex installer script, enforced by
+/// curl during the download and re-checked before the script runs: the
+/// script arrives over the network and is executed by a shell, and
+/// nothing else bounded how much a hostile or broken response could
+/// write to the state volume on its way there.
+const MAX_CODEX_INSTALLER_BYTES: u64 = 16 * 1024 * 1024;
 const CODEX_INSTALL_COMMAND: &str = "umask 077 && exec /bin/sh \"$1\"";
 const CODEX_INSTALL_ARGV0: &str = "atmux-codex-installer";
 pub(crate) const PENDING_OPTION: &str = "@atmux_cli_update_pending";
@@ -986,17 +992,26 @@ impl OwnerLock {
         if bytes.len() as u64 > MAX_STATE_BYTES {
             bail!("CLI maintenance state exceeds its size bound");
         }
+        // temp_path() is unique per call, so a temp file left behind by a
+        // failed store is never reused or cleaned up by a later one;
+        // remove it on any error instead of accumulating one per failure.
         let temp = self.temp_path("state");
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        fs::rename(&temp, &self.state_path)?;
-        File::open(&self.temp_dir)?.sync_all()?;
-        Ok(())
+        let stored = (|| -> Result<()> {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            fs::rename(&temp, &self.state_path)?;
+            File::open(&self.temp_dir)?.sync_all()?;
+            Ok(())
+        })();
+        if stored.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        stored
     }
 
     fn temp_path(&self, label: &str) -> PathBuf {
@@ -1233,11 +1248,12 @@ async fn update_codex(timeout: Duration, lock: &OwnerLock) -> Result<()> {
     let files = CodexUpdateFiles::prepare(lock)?;
     async {
         let timeout_seconds = timeout.as_secs().to_string();
+        let max_filesize = MAX_CODEX_INSTALLER_BYTES.to_string();
         let script_path = files
             .script
             .to_str()
             .context("maintenance path is not UTF-8")?;
-        let curl_arguments = codex_download_arguments(&timeout_seconds, script_path);
+        let curl_arguments = codex_download_arguments(&timeout_seconds, &max_filesize, script_path);
         bounded_system_output(
             Path::new("/usr/bin/curl"),
             &curl_arguments,
@@ -1246,6 +1262,13 @@ async fn update_codex(timeout: Duration, lock: &OwnerLock) -> Result<()> {
         )
         .await?;
         reject_symlink_or_unowned(&files.script)?;
+        if fs::metadata(&files.script)
+            .context("could not inspect the downloaded Codex installer")?
+            .len()
+            > MAX_CODEX_INSTALLER_BYTES
+        {
+            bail!("the downloaded Codex installer exceeds its size bound");
+        }
         reject_secure_empty_file(&files.curl_config)?;
         let installer_arguments = codex_installer_arguments(script_path)?;
         bounded_system_output(
@@ -1274,7 +1297,11 @@ fn codex_installer_arguments(script: &str) -> Result<[&str; 4]> {
     Ok(["-c", CODEX_INSTALL_COMMAND, CODEX_INSTALL_ARGV0, script])
 }
 
-fn codex_download_arguments<'a>(timeout_seconds: &'a str, script: &'a str) -> [&'a str; 14] {
+fn codex_download_arguments<'a>(
+    timeout_seconds: &'a str,
+    max_filesize: &'a str,
+    script: &'a str,
+) -> [&'a str; 16] {
     [
         // curl only honors this switch before every other argument. It blocks
         // owner-controlled ~/.curlrc and CURL_HOME configuration.
@@ -1289,6 +1316,8 @@ fn codex_download_arguments<'a>(timeout_seconds: &'a str, script: &'a str) -> [&
         "=https",
         "--max-time",
         timeout_seconds,
+        "--max-filesize",
+        max_filesize,
         "--output",
         script,
         CODEX_INSTALL_URL,
@@ -2385,7 +2414,7 @@ mod tests {
 
     #[test]
     fn codex_installer_download_is_fixed_and_deadline_bounded() {
-        let arguments = codex_download_arguments("180", "/owner/state/codex-install-1");
+        let arguments = codex_download_arguments("180", "16777216", "/owner/state/codex-install-1");
         assert_eq!(
             arguments,
             [
@@ -2400,6 +2429,8 @@ mod tests {
                 "=https",
                 "--max-time",
                 "180",
+                "--max-filesize",
+                "16777216",
                 "--output",
                 "/owner/state/codex-install-1",
                 "https://chatgpt.com/codex/install.sh",
@@ -2734,7 +2765,7 @@ mod tests {
         assert!(shell_resolver.0.lock().unwrap().is_empty());
 
         let curl_resolver = QueuedSystemResolver::stable(direct_curl_resolution());
-        let arguments = codex_download_arguments("180", "/owner/state/install");
+        let arguments = codex_download_arguments("180", "16777216", "/owner/state/install");
         let (curl, curl_command) = validated_system_command_with(
             Path::new("/usr/bin/curl"),
             &arguments,
