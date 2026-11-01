@@ -527,6 +527,23 @@ impl IngestReceiver {
             self.limits,
             request.received_at,
         )?;
+        // Complete the token liveness check before committing anything:
+        // a token revoked mid-request must fail authentication with
+        // nothing ingested. Touching after the batch committed (and the
+        // invalidation was published) instead reported authentication
+        // failure for data that was already durably stored, and a retry
+        // could never recover the success result.
+        if !self
+            .store
+            .touch_ingest_token(
+                authenticated.account_id,
+                authenticated.id,
+                request.received_at,
+            )
+            .await?
+        {
+            return Err(authentication_failed());
+        }
         let result = self
             .store
             .ingest_batch_once(
@@ -539,17 +556,6 @@ impl IngestReceiver {
             .await?;
         if let Some(invalidations) = &self.invalidations {
             let _ = invalidations.publish(authenticated.account_id);
-        }
-        if !self
-            .store
-            .touch_ingest_token(
-                authenticated.account_id,
-                authenticated.id,
-                request.received_at,
-            )
-            .await?
-        {
-            return Err(authentication_failed());
         }
         Ok(result)
     }
