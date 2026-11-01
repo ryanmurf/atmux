@@ -1538,6 +1538,26 @@ impl SelfUpdater {
             return Err(error);
         }
 
+        // The executable on disk may already be this candidate: an earlier
+        // install can have swapped it in while this process kept running
+        // the old image (the restart exec failed, or restarts are
+        // suppressed). Applying again would set the *new* binary aside as
+        // `.prev` and record the still-running version as the release it
+        // replaced — destroying the real rollback binary and falsifying
+        // the recorded previous release. Refuse instead; a restart is
+        // what is actually missing.
+        if probe_version(
+            &self.environment.exe,
+            Some(&expected_version),
+            VERSION_PROBE_TIMEOUT,
+        )
+        .await
+        .is_ok()
+        {
+            let _ = fs::remove_file(&staged);
+            bail!("atmux {expected_version} is already installed; restart to run it");
+        }
+
         lock(&self.shared).phase = Phase::Applying;
         let exe = self.environment.exe.clone();
         let previous = self.previous_path();
@@ -1549,8 +1569,14 @@ impl SelfUpdater {
             Ok(replaced_sha)
         })
         .await?;
-        self.record_applied(&expected_version, VERSION, &replaced_sha)?;
+        let recorded = self.record_applied(&expected_version, VERSION, &replaced_sha);
+        // The swap has committed and the new executable is live on disk
+        // either way. Restart into it even when recording the install
+        // failed, so this process does not keep serving the old image on
+        // top of a new binary until some external restart; the recording
+        // error is still reported to the caller.
         self.restart();
+        recorded?;
         Ok(())
     }
 
@@ -1586,8 +1612,11 @@ impl SelfUpdater {
             restore_previous(&exe, &target, &staging)
         })
         .await?;
-        self.record_applied(&restored.to_string(), VERSION, &leaving_sha)?;
+        let recorded = self.record_applied(&restored.to_string(), VERSION, &leaving_sha);
+        // As in install(): the restore has already committed, so restart
+        // into the restored executable even if recording it failed.
         self.restart();
+        recorded?;
         Ok(())
     }
 
@@ -2711,6 +2740,41 @@ mod tests {
         assert_eq!(state.applied_version.as_deref(), Some(FIXTURE_VERSION));
         assert_eq!(state.previous_version.as_deref(), Some(VERSION));
         // The recorded digest is what a rollback later checks `.prev` against.
+        assert_eq!(
+            state.previous_sha256.unwrap(),
+            file_sha256(&directory.join("atmux.prev")).unwrap()
+        );
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reapplying_an_installed_release_keeps_the_real_rollback_binary() {
+        let Fixture {
+            directory, updater, ..
+        } = open_fixture("reapply");
+        updater.check(true).await.unwrap();
+        let candidate = lock(&updater.shared).candidate.clone().unwrap();
+        updater.install(&candidate).await.unwrap();
+        // The install swapped the new binary in, but this process still
+        // runs (and reports) the old version — the state a failed or
+        // suppressed restart leaves behind. A retry, manual or from the
+        // auto-apply loop, must refuse rather than set the *new* binary
+        // aside as `.prev` and record the running version as the release
+        // it replaced.
+        let error = updater.install(&candidate).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("already installed"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            fs::read_to_string(directory.join("atmux.prev"))
+                .unwrap()
+                .contains("0.2.0"),
+            "the rollback binary must still be the release that was replaced"
+        );
+        let state: PersistedState =
+            serde_json::from_slice(&fs::read(directory.join("state/state.json")).unwrap()).unwrap();
+        assert_eq!(state.previous_version.as_deref(), Some(VERSION));
         assert_eq!(
             state.previous_sha256.unwrap(),
             file_sha256(&directory.join("atmux.prev")).unwrap()
