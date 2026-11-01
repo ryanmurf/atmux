@@ -3017,6 +3017,24 @@ impl Store for PostgresStore {
                     }
                     result.machines.push(inserted);
                 }
+                // Take the per-profile snapshot locks in the sorted order
+                // the ingest paths use, before any snapshot is inserted.
+                // The loop below originally acquired each profile's lock in
+                // batch input order, so two concurrent writers (an import
+                // against an ingest, or two imports from different
+                // processes) could acquire the same profiles in opposite
+                // orders and deadlock. The per-row lock in the loop then
+                // re-acquires a lock this transaction already holds.
+                let mut snapshot_profiles = batch
+                    .snapshots
+                    .iter()
+                    .map(|row| row.value.profile.clone())
+                    .collect::<Vec<_>>();
+                snapshot_profiles.sort();
+                snapshot_profiles.dedup();
+                for profile in &snapshot_profiles {
+                    lock_snapshot_profile(transaction, batch.account_id, profile).await?;
+                }
                 for row in &batch.snapshots {
                     let inserted = claim_import(transaction, &row.provenance).await?;
                     if inserted {
@@ -3199,6 +3217,29 @@ impl Store for PostgresStore {
                         }
                         None => pending.push((record, fingerprint)),
                     }
+                }
+
+                // Pre-take the per-profile snapshot locks in the sorted
+                // order the ingest paths use. Applying the page in
+                // apply-priority order would otherwise acquire each Usage
+                // row's profile lock in page order, which can deadlock
+                // against a concurrent ingest or import acquiring the same
+                // profiles in another order. The per-row lock in
+                // apply_pg_federated_row then re-acquires a lock this
+                // transaction already holds, so row order is unchanged.
+                let mut snapshot_profiles = pending
+                    .iter()
+                    .filter_map(|(record, _)| match &record.row {
+                        FederatedPulseRow::Usage(snapshot) => {
+                            Some(snapshot.profile.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                snapshot_profiles.sort();
+                snapshot_profiles.dedup();
+                for profile in &snapshot_profiles {
+                    lock_snapshot_profile(transaction, account_id, profile).await?;
                 }
 
                 for (record, _) in &pending {
