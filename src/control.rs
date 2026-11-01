@@ -1003,7 +1003,7 @@ impl ControlPlane {
                 &serde_json::json!({}),
             )
             .await
-            .map_err(|error| upstream(&error))
+            .map_err(|error| remote_mutation_error(&error))
     }
 
     /// Identifier this coordinator uses for its own tmux server.
@@ -3182,7 +3182,7 @@ impl ControlPlane {
                         &request,
                     )
                     .await
-                    .map_err(|error| upstream(&error))?;
+                    .map_err(|error| remote_mutation_error(&error))?;
                 // The owner names the pane by its local id; this aggregator's
                 // callers only know the federated one.
                 models.pane_id = composite_id(&machine.id, &pane_id);
@@ -3282,7 +3282,7 @@ impl ControlPlane {
                         &serde_json::json!({}),
                     )
                     .await
-                    .map_err(|error| upstream(&error))?;
+                    .map_err(|error| remote_mutation_error(&error))?;
             }
         }
         Ok(())
@@ -3472,12 +3472,17 @@ impl ControlPlane {
                 instance_id,
                 ..
             } => {
-                // Validate against this node's own id when unset, but still
-                // forward the caller's original (possibly absent) ids rather
-                // than this node's id, which would not describe the owner.
+                // An omitted machine id means "wherever this pane already
+                // lives", which for a remote pane is the resolved owner:
+                // fall back to the owner's own id so the check only bites
+                // when the caller named a different machine. (Falling back
+                // to this node's id instead made every such request fail
+                // with a spurious ownership conflict.) Still forward the
+                // caller's original (possibly absent) ids rather than the
+                // owner's id, which the caller did not assert.
                 let checked_machine_id = expected_machine_id
                     .as_deref()
-                    .unwrap_or(&self.inner.local_id);
+                    .unwrap_or(&machine.id);
                 validate_expected_pane_machine(checked_machine_id, &machine.id)?;
                 validate_expected_pane_instance(expected_instance_id.as_deref(), &instance_id)?;
                 self.ensure_online(&machine.id)?;
@@ -3531,7 +3536,7 @@ impl ControlPlane {
                         &serde_json::json!({}),
                     )
                     .await
-                    .map_err(|error| upstream(&error))?;
+                    .map_err(|error| remote_mutation_error(&error))?;
             }
         }
         Ok(())
@@ -3576,7 +3581,7 @@ impl ControlPlane {
                 machine
                     .delete(&format!("/api/v1/sessions/{}", encode_segment(&pane_id)))
                     .await
-                    .map_err(|error| upstream(&error))?;
+                    .map_err(|error| remote_mutation_error(&error))?;
             }
         }
         Ok(())
@@ -3670,7 +3675,26 @@ impl ControlPlane {
                 }
                 // A launch that never happened must not overwrite the project's
                 // recorded launch preference.
-                launched.and_then(|()| project::remember_launch(&directory, &name, &profile))
+                match launched {
+                    Ok(()) => {
+                        // The session is already running at this point, so a
+                        // bookkeeping failure (a malformed or symlinked
+                        // .atmux.toml, an unwritable directory) must not fail
+                        // the launch: the caller would be told a live session
+                        // failed with a 500, and the refresh and handover
+                        // delivery after this block would be skipped. Log and
+                        // continue without the recorded preference.
+                        if let Err(error) =
+                            project::remember_launch(&directory, &name, &profile)
+                        {
+                            eprintln!(
+                                "atmux could not record the launch preference for {name}: {error:#}"
+                            );
+                        }
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
             })
             .await,
         );
@@ -3706,7 +3730,7 @@ impl ControlPlane {
         machine
             .post_json(launch_path, &forwarded)
             .await
-            .map_err(|error| upstream(&error))
+            .map_err(|error| remote_mutation_error(&error))
     }
 
     /// Runs the target profile's CLI non-interactively over one local pane's

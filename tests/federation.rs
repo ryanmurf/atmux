@@ -1705,6 +1705,37 @@ async fn route_commands_to_the_owning_machine(control: &ControlPlane, recorder: 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn special_key_without_machine_reaches_the_owning_machine() {
+    if !tmux_available("special_key_without_machine_reaches_the_owning_machine") {
+        return;
+    }
+    let (address, recorder) = start_node().await;
+    let control = ControlPlane::start(federated_config(address))
+        .await
+        .unwrap();
+    assert!(wait_for_session(&control, "gpu-box~%7").await);
+    // Omitting both expected ids means "wherever this pane already lives":
+    // the key must reach the resolved owner. Validating the absent machine
+    // against this node's own id instead made every such request fail with
+    // a spurious ownership conflict before anything was forwarded.
+    control
+        .send_special_key_for_instance("gpu-box~%7", PaneSpecialKey::Enter, None, None)
+        .await
+        .unwrap();
+    let seen = recorder.lock().unwrap();
+    let forwarded = seen
+        .bodies
+        .iter()
+        .find(|body| body.contains("\"enter\""))
+        .expect("forwarded input-keys body");
+    let forwarded: Value = serde_json::from_str(forwarded).unwrap();
+    assert_eq!(forwarded["action"], "enter");
+    // The caller's original absent ids are forwarded untouched.
+    assert_eq!(forwarded["machine"], Value::Null);
+    assert_eq!(forwarded["instance_id"], Value::Null);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn one_unreachable_machine_never_breaks_local_or_healthy_machines() {
     if !tmux_available("one_unreachable_machine_never_breaks_local_or_healthy_machines") {
         return;
