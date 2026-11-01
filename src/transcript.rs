@@ -170,6 +170,7 @@ fn parse_native_context_tail(
 
 fn parse_native_context(agent: AgentKind, bytes: &[u8]) -> Option<(u64, usize, Option<usize>)> {
     let mut latest_usage = None;
+    let mut latest_incomplete_usage = None;
     let mut latest_compact = None;
     let physical = bytes.split(|byte| *byte == b'\n').collect::<Vec<_>>();
     let newest_nonempty = physical.iter().rposition(|line| !line.is_empty());
@@ -205,18 +206,26 @@ fn parse_native_context(agent: AgentKind, bytes: &[u8]) -> Option<(u64, usize, O
                 if !assistant {
                     continue;
                 }
-                let usage = message.get("usage")?;
-                let input = usage.get("input_tokens").and_then(Value::as_u64)?;
-                let cache_creation = usage
-                    .get("cache_creation_input_tokens")
-                    .and_then(Value::as_u64)?;
-                let cache_read = usage
-                    .get("cache_read_input_tokens")
-                    .and_then(Value::as_u64)?;
-                let total = input
-                    .checked_add(cache_creation)
-                    .and_then(|total| total.checked_add(cache_read))?;
-                latest_usage = Some((total, index));
+                // A record with a partial usage object is noted, not
+                // fatal: like an older malformed record above, it must not
+                // hide a later complete sample. It still poisons the parse
+                // if no complete sample follows it (see the return below).
+                let total = message.get("usage").and_then(|usage| {
+                    let input = usage.get("input_tokens").and_then(Value::as_u64)?;
+                    let cache_creation = usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(Value::as_u64)?;
+                    let cache_read = usage
+                        .get("cache_read_input_tokens")
+                        .and_then(Value::as_u64)?;
+                    input
+                        .checked_add(cache_creation)
+                        .and_then(|total| total.checked_add(cache_read))
+                });
+                match total {
+                    Some(total) => latest_usage = Some((total, index)),
+                    None => latest_incomplete_usage = Some(index),
+                }
             }
             AgentKind::Codex => {
                 if value.get("type").and_then(Value::as_str) == Some("compacted") {
@@ -231,15 +240,30 @@ fn parse_native_context(agent: AgentKind, bytes: &[u8]) -> Option<(u64, usize, O
                 // Codex's native last_token_usage is the current request's
                 // context input. total_token_usage is conversation-cumulative
                 // and cached_input_tokens is already included in input_tokens.
-                let input = value
+                // A token_count event without it (e.g. a rate-limit event
+                // with info: null) is noted like a partial Claude record.
+                match value
                     .pointer("/payload/info/last_token_usage/input_tokens")
-                    .and_then(Value::as_u64)?;
-                latest_usage = Some((input, index));
+                    .and_then(Value::as_u64)
+                {
+                    Some(input) => latest_usage = Some((input, index)),
+                    None => latest_incomplete_usage = Some(index),
+                }
             }
             AgentKind::Other => return None,
         }
     }
-    latest_usage.map(|(tokens, index)| (tokens, index, latest_compact))
+    // A partial usage record newer than the newest complete sample means
+    // the current context size is unknown: fail closed rather than reuse
+    // the older metric, exactly as for a malformed newest record.
+    match latest_usage {
+        Some((tokens, index))
+            if latest_incomplete_usage.is_none_or(|partial| partial < index) =>
+        {
+            Some((tokens, index, latest_compact))
+        }
+        _ => None,
+    }
 }
 
 /// Reads the newest bounded conversation view for one local tmux session.
@@ -1569,6 +1593,45 @@ mod tests {
         assert_eq!(
             parse_native_context(AgentKind::Other, bytes.as_bytes()),
             None
+        );
+    }
+
+    #[test]
+    fn an_older_partial_usage_record_does_not_hide_a_later_complete_sample() {
+        // Regression: the partial-record extraction used `?` on the whole
+        // function, so one partial record anywhere in the tail discarded
+        // every complete sample, including later ones.
+        let partial_claude = serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "usage": {"input_tokens": 5}}
+        });
+        let complete_claude = serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 20,
+                "cache_read_input_tokens": 30
+            }}
+        });
+        let bytes = format!("{partial_claude}\n{complete_claude}\n");
+        assert_eq!(
+            parse_native_context(AgentKind::Claude, bytes.as_bytes()),
+            Some((150, 1, None))
+        );
+        let partial_codex = serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": null}
+        });
+        let complete_codex = serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {
+                "last_token_usage": {"input_tokens": 200_001}
+            }}
+        });
+        let bytes = format!("{partial_codex}\n{complete_codex}\n");
+        assert_eq!(
+            parse_native_context(AgentKind::Codex, bytes.as_bytes()),
+            Some((200_001, 1, None))
         );
     }
 
