@@ -1003,7 +1003,7 @@ impl ControlPlane {
                 &serde_json::json!({}),
             )
             .await
-            .map_err(|error| remote_mutation_error(&error))
+            .map_err(|error| upstream(&error))
     }
 
     /// Identifier this coordinator uses for its own tmux server.
@@ -3182,7 +3182,7 @@ impl ControlPlane {
                         &request,
                     )
                     .await
-                    .map_err(|error| remote_mutation_error(&error))?;
+                    .map_err(|error| upstream(&error))?;
                 // The owner names the pane by its local id; this aggregator's
                 // callers only know the federated one.
                 models.pane_id = composite_id(&machine.id, &pane_id);
@@ -3282,7 +3282,7 @@ impl ControlPlane {
                         &serde_json::json!({}),
                     )
                     .await
-                    .map_err(|error| remote_mutation_error(&error))?;
+                    .map_err(|error| upstream(&error))?;
             }
         }
         Ok(())
@@ -3536,7 +3536,7 @@ impl ControlPlane {
                         &serde_json::json!({}),
                     )
                     .await
-                    .map_err(|error| remote_mutation_error(&error))?;
+                    .map_err(|error| upstream(&error))?;
             }
         }
         Ok(())
@@ -3581,7 +3581,7 @@ impl ControlPlane {
                 machine
                     .delete(&format!("/api/v1/sessions/{}", encode_segment(&pane_id)))
                     .await
-                    .map_err(|error| remote_mutation_error(&error))?;
+                    .map_err(|error| upstream(&error))?;
             }
         }
         Ok(())
@@ -3675,26 +3675,7 @@ impl ControlPlane {
                 }
                 // A launch that never happened must not overwrite the project's
                 // recorded launch preference.
-                match launched {
-                    Ok(()) => {
-                        // The session is already running at this point, so a
-                        // bookkeeping failure (a malformed or symlinked
-                        // .atmux.toml, an unwritable directory) must not fail
-                        // the launch: the caller would be told a live session
-                        // failed with a 500, and the refresh and handover
-                        // delivery after this block would be skipped. Log and
-                        // continue without the recorded preference.
-                        if let Err(error) =
-                            project::remember_launch(&directory, &name, &profile)
-                        {
-                            eprintln!(
-                                "atmux could not record the launch preference for {name}: {error:#}"
-                            );
-                        }
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                }
+                launched.and_then(|()| project::remember_launch(&directory, &name, &profile))
             })
             .await,
         );
@@ -3730,7 +3711,7 @@ impl ControlPlane {
         machine
             .post_json(launch_path, &forwarded)
             .await
-            .map_err(|error| remote_mutation_error(&error))
+            .map_err(|error| upstream(&error))
     }
 
     /// Runs the target profile's CLI non-interactively over one local pane's
@@ -4743,10 +4724,7 @@ fn mode_switchable(
             }
             AgentKind::Codex => {
                 mode.service_tier.is_none()
-                    && mode
-                        .effort
-                        .as_deref()
-                        .is_none_or(|effort| effort != "none" && effort != "max")
+                    && mode.effort.as_deref().is_none_or(|effort| effort != "none")
             }
             AgentKind::Other => false,
         }
